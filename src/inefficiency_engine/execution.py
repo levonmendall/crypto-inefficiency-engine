@@ -178,6 +178,20 @@ def _leg_key(venue: str, asset: str, market_kind) -> tuple[str, str, str]:
     return (venue, asset, market_kind.value)
 
 
+def _rejected_tier(opportunity: Opportunity, notional: float, reason: str) -> CapitalTierQualification:
+    return CapitalTierQualification(
+        opportunity_id=opportunity.id,
+        notional_usd_per_leg=notional,
+        executable=False,
+        gross_edge_bps_per_hour=opportunity.gross_edge_bps_per_hour,
+        static_modeled_cost_bps=opportunity.modeled_cost_bps,
+        total_modeled_cost_bps=opportunity.modeled_cost_bps,
+        net_edge_bps_per_hour=0.0,
+        net_annualized_return=0.0,
+        rejection_reason=reason,
+    )
+
+
 def qualify_opportunity(
     opportunity: Opportunity,
     books: list[OrderBookSnapshot],
@@ -186,39 +200,28 @@ def qualify_opportunity(
     notionals_usd: tuple[float, ...] | None = None,
     now: datetime | None = None,
 ) -> OpportunityExecutability:
-    """Qualify two-leg opportunities using equal-base-quantity observable fills.
+    """Qualify a two-leg opportunity and estimate its continuous capacity frontier.
 
     Both legs must fill the same base quantity. Observed entry slippage is charged
-    immediately and then conservatively projected onto the exit using
-    ``exit_slippage_multiplier``. This is still a paper estimate: it makes no
-    queue-position or latency claim.
+    immediately and then conservatively projected onto the exit. After testing the
+    configured capital tiers, a bounded monotonic search estimates the largest USD
+    notional that still clears the return hurdle within observed L2 depth.
+
+    This remains a paper estimate: visible depth is evidence, not a queue-position
+    or latency guarantee.
     """
     now = now or datetime.now(timezone.utc)
     notionals = notionals_usd or settings.capital_tiers_usd
     book_map = {_book_key(book): book for book in books}
 
-    tiers: list[CapitalTierQualification] = []
     if len(opportunity.legs) != 2:
-        for notional in notionals:
-            tiers.append(
-                CapitalTierQualification(
-                    opportunity_id=opportunity.id,
-                    notional_usd_per_leg=notional,
-                    executable=False,
-                    gross_edge_bps_per_hour=opportunity.gross_edge_bps_per_hour,
-                    static_modeled_cost_bps=opportunity.modeled_cost_bps,
-                    total_modeled_cost_bps=opportunity.modeled_cost_bps,
-                    net_edge_bps_per_hour=0.0,
-                    net_annualized_return=0.0,
-                    rejection_reason="opportunity must have exactly two legs",
-                )
-            )
+        reason = "opportunity must have exactly two legs"
         return OpportunityExecutability(
             opportunity_id=opportunity.id,
             strategy=opportunity.strategy,
             asset=opportunity.asset,
             observed_at=now,
-            tiers=tiers,
+            tiers=[_rejected_tier(opportunity, n, reason) for n in notionals],
         )
 
     leg_books: list[OrderBookSnapshot] = []
@@ -232,26 +235,12 @@ def qualify_opportunity(
 
     if missing:
         reason = "missing order book(s): " + ", ".join(missing)
-        for notional in notionals:
-            tiers.append(
-                CapitalTierQualification(
-                    opportunity_id=opportunity.id,
-                    notional_usd_per_leg=notional,
-                    executable=False,
-                    gross_edge_bps_per_hour=opportunity.gross_edge_bps_per_hour,
-                    static_modeled_cost_bps=opportunity.modeled_cost_bps,
-                    total_modeled_cost_bps=opportunity.modeled_cost_bps,
-                    net_edge_bps_per_hour=0.0,
-                    net_annualized_return=0.0,
-                    rejection_reason=reason,
-                )
-            )
         return OpportunityExecutability(
             opportunity_id=opportunity.id,
             strategy=opportunity.strategy,
             asset=opportunity.asset,
             observed_at=now,
-            tiers=tiers,
+            tiers=[_rejected_tier(opportunity, n, reason) for n in notionals],
         )
 
     age_limit = settings.max_order_book_age_seconds
@@ -259,38 +248,26 @@ def qualify_opportunity(
     skew = abs((leg_books[0].observed_at - leg_books[1].observed_at).total_seconds())
     if stale or skew > settings.max_order_book_skew_seconds:
         reason = "stale order book" if stale else f"order-book time skew {skew:.3f}s exceeds limit"
-        for notional in notionals:
-            tiers.append(
-                CapitalTierQualification(
-                    opportunity_id=opportunity.id,
-                    notional_usd_per_leg=notional,
-                    executable=False,
-                    gross_edge_bps_per_hour=opportunity.gross_edge_bps_per_hour,
-                    static_modeled_cost_bps=opportunity.modeled_cost_bps,
-                    total_modeled_cost_bps=opportunity.modeled_cost_bps,
-                    net_edge_bps_per_hour=0.0,
-                    net_annualized_return=0.0,
-                    rejection_reason=reason,
-                )
-            )
         return OpportunityExecutability(
             opportunity_id=opportunity.id,
             strategy=opportunity.strategy,
             asset=opportunity.asset,
             observed_at=now,
-            tiers=tiers,
+            tiers=[_rejected_tier(opportunity, n, reason) for n in notionals],
         )
 
-    # A shared base quantity is essential. Target quantity uses the most
-    # expensive current touch so neither leg starts materially above the tier.
     best_prices: list[float] = []
+    side_pairs: list[tuple[TradeSide, OrderBookSnapshot]] = []
     for leg, book in zip(opportunity.legs, leg_books):
         side = _trade_side(leg.side)
         levels = book.asks if side == TradeSide.BUY else book.bids
         best_prices.append((min if side == TradeSide.BUY else max)(level.price for level in levels))
+        side_pairs.append((side, book))
     conservative_reference = max(best_prices)
+    max_shared_quantity = min(max_executable_quantity(book, side) for side, book in side_pairs)
+    visible_depth_ceiling = conservative_reference * max_shared_quantity
 
-    for notional in notionals:
+    def evaluate(notional: float) -> CapitalTierQualification:
         target_quantity = notional / conservative_reference
         leg_estimates: list[LegExecutionEstimate] = []
         try:
@@ -313,22 +290,10 @@ def qualify_opportunity(
                     )
                 )
         except InsufficientDepthError as exc:
-            tiers.append(
-                CapitalTierQualification(
-                    opportunity_id=opportunity.id,
-                    notional_usd_per_leg=notional,
-                    target_base_quantity=target_quantity,
-                    executable=False,
-                    gross_edge_bps_per_hour=opportunity.gross_edge_bps_per_hour,
-                    static_modeled_cost_bps=opportunity.modeled_cost_bps,
-                    total_modeled_cost_bps=opportunity.modeled_cost_bps,
-                    net_edge_bps_per_hour=0.0,
-                    net_annualized_return=0.0,
-                    leg_estimates=leg_estimates,
-                    rejection_reason=str(exc),
-                )
-            )
-            continue
+            tier = _rejected_tier(opportunity, notional, str(exc))
+            tier.target_base_quantity = target_quantity
+            tier.leg_estimates = leg_estimates
+            return tier
 
         entry_slippage = sum(item.slippage_bps for item in leg_estimates)
         assumed_exit_slippage = entry_slippage * settings.exit_slippage_multiplier
@@ -340,34 +305,69 @@ def qualify_opportunity(
         annualized = (net_hourly_bps / 10_000.0) * 24 * 365
         passes = net_hourly_bps > 0 and annualized >= settings.min_net_annualized_return
 
-        tiers.append(
-            CapitalTierQualification(
-                opportunity_id=opportunity.id,
-                notional_usd_per_leg=notional,
-                target_base_quantity=target_quantity,
-                executable=True,
-                passes_return_hurdle=passes,
-                gross_edge_bps_per_hour=opportunity.gross_edge_bps_per_hour,
-                static_modeled_cost_bps=opportunity.modeled_cost_bps,
-                observed_entry_slippage_bps=entry_slippage,
-                assumed_exit_slippage_bps=assumed_exit_slippage,
-                total_modeled_cost_bps=total_cost_bps,
-                net_edge_bps_per_hour=net_hourly_bps,
-                net_annualized_return=annualized,
-                leg_estimates=leg_estimates,
-                rejection_reason=None if passes else "net return falls below hurdle after executable slippage",
-            )
+        return CapitalTierQualification(
+            opportunity_id=opportunity.id,
+            notional_usd_per_leg=notional,
+            target_base_quantity=target_quantity,
+            executable=True,
+            passes_return_hurdle=passes,
+            gross_edge_bps_per_hour=opportunity.gross_edge_bps_per_hour,
+            static_modeled_cost_bps=opportunity.modeled_cost_bps,
+            observed_entry_slippage_bps=entry_slippage,
+            assumed_exit_slippage_bps=assumed_exit_slippage,
+            total_modeled_cost_bps=total_cost_bps,
+            net_edge_bps_per_hour=net_hourly_bps,
+            net_annualized_return=annualized,
+            leg_estimates=leg_estimates,
+            rejection_reason=None if passes else "net return falls below hurdle after executable slippage",
         )
 
-    max_qualified = max(
+    tiers = [evaluate(notional) for notional in notionals]
+    max_tested_qualified = max(
         (tier.notional_usd_per_leg for tier in tiers if tier.executable and tier.passes_return_hurdle),
         default=0.0,
     )
+
+    # Slippage from walking a conventional L2 book is non-decreasing with size,
+    # so pass/fail against a fixed return hurdle is monotonic. Binary search lets
+    # us estimate the break-even capacity between coarse configured tiers.
+    tolerance = max(0.01, settings.capacity_search_tolerance_usd)
+    capacity = 0.0
+    capacity_return: float | None = None
+    if visible_depth_ceiling > 0:
+        upper = visible_depth_ceiling
+        upper_eval = evaluate(upper)
+        if upper_eval.executable and upper_eval.passes_return_hurdle:
+            capacity = upper
+            capacity_return = upper_eval.net_annualized_return
+        else:
+            probe = min(tolerance, upper)
+            probe_eval = evaluate(probe)
+            if probe_eval.executable and probe_eval.passes_return_hurdle:
+                low = probe
+                high = upper
+                best = probe_eval
+                for _ in range(64):
+                    if high - low <= tolerance:
+                        break
+                    mid = (low + high) / 2.0
+                    candidate = evaluate(mid)
+                    if candidate.executable and candidate.passes_return_hurdle:
+                        low = mid
+                        best = candidate
+                    else:
+                        high = mid
+                capacity = low
+                capacity_return = best.net_annualized_return
+
     return OpportunityExecutability(
         opportunity_id=opportunity.id,
         strategy=opportunity.strategy,
         asset=opportunity.asset,
         observed_at=now,
         tiers=tiers,
-        max_qualified_notional_usd=max_qualified,
+        max_qualified_notional_usd=max_tested_qualified,
+        visible_depth_ceiling_usd=visible_depth_ceiling,
+        estimated_capacity_notional_usd=capacity,
+        capacity_frontier_net_annualized_return=capacity_return,
     )
