@@ -60,13 +60,21 @@ def _book_metrics(book: OrderBookSnapshot, side: Side, target_quantity: float | 
         reverse=side == Side.SHORT,
     )
     best_price = levels[0].price
+    available_base_quantity = sum(level.size for level in levels)
     available_depth_usd = sum(level.price * level.size for level in levels)
+    depth_multiple = (
+        available_base_quantity / target_quantity
+        if target_quantity is not None and target_quantity > 0
+        else None
+    )
 
     if not target_quantity or target_quantity <= 0:
         return {
             "best_price": best_price,
             "spread_bps": spread_bps,
             "available_depth_usd": available_depth_usd,
+            "available_base_quantity": available_base_quantity,
+            "depth_multiple": depth_multiple,
             "slippage_bps": None,
         }
 
@@ -94,6 +102,8 @@ def _book_metrics(book: OrderBookSnapshot, side: Side, target_quantity: float | 
         "best_price": best_price,
         "spread_bps": spread_bps,
         "available_depth_usd": available_depth_usd,
+        "available_base_quantity": available_base_quantity,
+        "depth_multiple": depth_multiple,
         "slippage_bps": slippage_bps,
     }
 
@@ -139,6 +149,10 @@ def build_leg_attribution(
                 verification_spread_bps=verification.get("spread_bps"),
                 initial_available_depth_usd=initial.get("available_depth_usd"),
                 verification_available_depth_usd=verification.get("available_depth_usd"),
+                initial_available_base_quantity=initial.get("available_base_quantity"),
+                verification_available_base_quantity=verification.get("available_base_quantity"),
+                initial_depth_multiple=initial.get("depth_multiple"),
+                verification_depth_multiple=verification.get("depth_multiple"),
                 initial_slippage_bps=initial.get("slippage_bps"),
                 verification_slippage_bps=verification.get("slippage_bps"),
             )
@@ -146,6 +160,29 @@ def build_leg_attribution(
 
     divergence = (max(adverse_moves) - min(adverse_moves)) if len(adverse_moves) >= 2 else None
     return rows, divergence
+
+
+def reconstruct_pair_fill_state(
+    leg_attribution: list[ShadowLegAttribution],
+    *,
+    reserve_ratio: float,
+) -> tuple[bool, bool, bool]:
+    """Reconstruct visible pair fillability without claiming real queue fills.
+
+    `pair_fillable` means both legs retained at least 1.0x the original target
+    base quantity. `pair_fillable_with_reserve` also preserves the configured
+    hedge-liquidity reserve. `hedge_recovery_required` marks asymmetric visible
+    depth where one leg remained fillable and the other did not.
+    """
+    depth_multiples = [leg.verification_depth_multiple for leg in leg_attribution]
+    if not depth_multiples or any(value is None for value in depth_multiples):
+        return False, False, False
+    full = [float(value) >= 1.0 for value in depth_multiples if value is not None]
+    reserve = [float(value) >= max(1.0, reserve_ratio) for value in depth_multiples if value is not None]
+    pair_fillable = bool(full) and all(full)
+    pair_fillable_with_reserve = bool(reserve) and all(reserve)
+    hedge_recovery_required = any(full) and not all(full)
+    return pair_fillable, pair_fillable_with_reserve, hedge_recovery_required
 
 
 def classify_shadow_failure(
@@ -277,6 +314,20 @@ def summarize_shadow_cycles(cycles: list[ShadowCycle]) -> dict[str, object]:
             "median_edge_decay_annualized": median(values) if values else None,
         }
 
+    fill_rows = [row for row in observations if row.pair_fillable is not None]
+    reconstructed_pair_fill_rate = (
+        sum(bool(row.pair_fillable) for row in fill_rows) / len(fill_rows)
+        if fill_rows else None
+    )
+    reconstructed_reserve_fill_rate = (
+        sum(bool(row.pair_fillable_with_reserve) for row in fill_rows) / len(fill_rows)
+        if fill_rows else None
+    )
+    hedge_recovery_rate = (
+        sum(bool(row.hedge_recovery_required) for row in fill_rows) / len(fill_rows)
+        if fill_rows else None
+    )
+
     return {
         "cycle_count": len(cycles),
         "observation_count": len(observations),
@@ -296,6 +347,10 @@ def summarize_shadow_cycles(cycles: list[ShadowCycle]) -> dict[str, object]:
         "mean_post_detection_edge_decay_annualized": mean(edge_decays) if edge_decays else None,
         "median_post_detection_edge_decay_annualized": median(edge_decays) if edge_decays else None,
         "edge_decay_by_horizon_seconds": edge_decay_by_horizon,
+        "reconstructed_pair_fill_rate": reconstructed_pair_fill_rate,
+        "reconstructed_reserve_fill_rate": reconstructed_reserve_fill_rate,
+        "reconstructed_hedge_recovery_rate": hedge_recovery_rate,
+        "fill_metric_note": "visible-L2 reconstruction only; this does not claim queue position or an exchange-confirmed fill",
         "max_realistically_deployable_capital_usd": _quantile(deployable_capacities, 0.10),
         "deployable_capital_definition": "conservative p10 of min(initial capacity, surviving verification capacity)",
         "capacity_quantiles_usd": {

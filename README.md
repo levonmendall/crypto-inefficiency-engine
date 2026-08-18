@@ -1,39 +1,41 @@
 # Crypto Inefficiency Engine
 
-A **paper-first, fail-closed** engine for discovering structural crypto-market inefficiencies and testing whether apparent edge survives real fees, visible L2 depth, slippage, capital usage, hedge risk, latency, and time. v0.7 does not place live orders and does not require exchange trading keys.
+A **paper-first, fail-closed** engine for discovering structural crypto-market inefficiencies and testing whether apparent edge survives fees, visible L2 depth, slippage, capital usage, hedge risk, latency, and time. v0.8 does not place live orders and does not require exchange trading keys.
 
-## v0.7 — Multi-Horizon Shadow Attribution
+## v0.8 — Empirical Fill / Latency Modeling
 
-v0.7 changes the shadow layer from a single delayed re-check into an empirical capture study.
+v0.8 begins replacing assumed execution timing with measured evidence while keeping the existing fixed model as the automatic fallback until the sample set is large enough.
 
-For every initially qualified opportunity and every qualified configured capital tier, the worker re-checks the same economic structure at **1s, 5s, 15s, 30s, and 60s**. Each horizon records whether the signal still exists, whether both legs remain executable, whether the net-return hurdle still clears, and how the market changed after detection.
+Each multi-horizon shadow observation now records:
 
-The persisted attribution includes:
+- the original target base quantity;
+- measured end-to-end scan duration for the initial and verification scans;
+- per-leg visible base depth and depth multiple versus the original target;
+- whether both legs remained visibly fillable at the original size;
+- whether both legs still preserved the configured hedge-liquidity reserve;
+- whether asymmetric depth would have created a hedge-recovery state;
+- per-leg adverse selection and the existing spread/slippage/edge/capacity attribution.
 
-- per-leg adverse selection;
-- spread, visible depth, and slippage deterioration;
-- funding/basis gross-edge decay;
-- modeled-cost expansion;
-- executable-capacity deterioration;
-- hedge-leg divergence;
-- explicit primary failure causes: signal disappeared, insufficient depth, slippage expansion, fee/cost hurdle failure, stale data/provider failure, or hedge-leg divergence.
+From those observations the engine builds an `EmpiricalLatencyModel`:
 
-`GET /v1/shadow/summary` now derives empirical metrics from the append-only evidence ledger, including:
+1. Deduplicate measured verification-scan latencies.
+2. Take the configured latency quantile (default p95).
+3. Map that measured latency to the first shadow horizon at or beyond it.
+4. At that conservative horizon, estimate pair-fill probability, reserve-fill probability, capture probability, hedge-recovery probability, and the distribution of adverse price movement across the hedge pair.
+5. Use p95 observed pair adverse selection as the empirical hedge-latency risk charge **only after** minimum scan and cohort sample thresholds are met.
+6. Otherwise retain the prior fixed expected-hedge-latency charge automatically.
 
-- median observed opportunity lifetime (reported as a lower bound because final-horizon survivors are right-censored);
-- survival probability at 5s, 15s, and 30s;
-- post-detection edge decay by horizon;
-- conservative realistically deployable capital from surviving capacity observations;
-- shortest-horizon capture-probability proxy and false-positive rate;
-- survival segmented by strategy, asset, venue pair, capital size, UTC hour, and initial expected-return bucket.
+Book-age risk is not removed by the empirical model; stale current books remain explicitly charged and freshness gates remain fail-closed.
 
-The pipeline is now:
+New endpoint:
 
-**Detect → qualify economics → prove L2 executability → observe over time → measure edge decay → estimate capture probability.**
+- `GET /v1/latency/model` — current empirical model, evidence counts, selected latency horizon, fill/capture probabilities, adverse-selection quantiles, and whether the model is permitted to affect qualification.
 
-## Existing foundations
+`GET /v1/executability/live` and `GET /v1/shadow/summary` also expose the active latency model. Individual capital-tier qualifications record whether they used `fixed` or `empirical_shadow` latency risk.
 
-The engine also provides public Coinbase spot and Hyperliquid perpetual adapters, funding-dispersion and spot/perp-basis detection, point-in-time append-only evidence, replay, explicit taker-fee/capital/latency/hedge-risk economics, continuous capacity-frontier estimation, SQLite/PostgreSQL persistence, an always-on worker with heartbeats/backoff, and a read-only FastAPI surface.
+## Current evidence pipeline
+
+**Detect → qualify economics → prove L2 executability → observe 1/5/15/30/60s → reconstruct pair fillability → measure scan latency → measure adverse selection → estimate fill/capture probability → calibrate latency risk.**
 
 ## Safety boundary
 
@@ -42,8 +44,8 @@ The engine also provides public Coinbase spot and Hyperliquid perpetual adapters
 - Stale/incomplete evidence fails closed.
 - Unknown venue fees fail closed during executable qualification.
 - Short spot fails closed without an explicit borrow-cost assumption.
-- Visible L2 depth and shadow survival are evidence, not guarantees of queue position or fills.
-- v0.7 capture probability is an empirical **proxy** based on opportunity survival; v0.8 is intended to add measured fill/latency distributions.
+- Reconstructed fills mean only that sufficient visible public L2 depth existed at the sampled instant; they do **not** claim exchange queue priority or a confirmed fill.
+- Empirical latency cannot influence qualification until configured minimum sample thresholds are satisfied.
 
 ## Quick start
 
@@ -77,6 +79,7 @@ Endpoints:
 - `GET /v1/evidence/{scan_id}/replay`
 - `POST /v1/shadow/cycle`
 - `GET /v1/shadow/summary`
+- `GET /v1/latency/model`
 - `GET /v1/worker/health`
 - `GET /v1/evidence/counts`
 

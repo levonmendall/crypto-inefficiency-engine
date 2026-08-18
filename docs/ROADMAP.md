@@ -25,7 +25,7 @@ Next: retention/export policy, historical funding ingestion, partition/archival 
 - Freshness/skew gates
 - Venue-specific taker fees
 - Capital requirement and collateral opportunity cost
-- Conservative latency and hedge-recovery buffers
+- Conservative latency and hedge-recovery fallback buffers
 - Extra hedge-liquidity reserve
 - Fail-closed short-spot borrow economics
 
@@ -43,20 +43,31 @@ This remains secondary until the existing alpha is empirically shown to survive 
 - Stable economic opportunity signatures
 - Re-test every initially qualified capital-tier cohort
 - Default 1s/5s/15s/30s/60s verification horizons
-- Per-leg adverse-selection attribution
-- Spread/depth/slippage deterioration
-- Funding/basis edge decay and cost expansion
-- Capacity deterioration
-- Failure causes: signal disappearance, insufficient depth, slippage expansion, fee/cost hurdle, stale/provider failure, hedge-leg divergence
-- Survival by strategy, asset, venue pair, capital size, time of day, and initial expected return
-- Median lifetime lower bound, survival probabilities, edge decay, deployable-capital estimate, false-positive rate, and capture-probability proxy
+- Adverse selection, spread/depth/slippage, edge decay, cost expansion, and capacity deterioration
+- Explicit failure causes and segmented survival statistics
 
-## v0.8 — Empirical fill/latency modeling — next
-- Replace conservative hard-coded latency buffers with measured latency distributions
-- Estimate likely fill probability from observed book evolution
-- Reconstruct partial-fill and hedge-delay states
-- Model queue/arrival uncertainty where public data supports it
-- Calibrate capture probability from measured execution timing rather than horizon survival alone
+## v0.8 — Empirical fill/latency modeling — in progress
+### Foundation implemented
+- Persist original target base quantity into shadow attribution
+- Measure initial/verification scan duration as observation-path latency
+- Reconstruct per-leg visible base-depth multiples
+- Reconstruct pair fillability and hedge-reserve fillability
+- Flag asymmetric visible-depth states that would require hedge recovery
+- Build latency p50/p90/p95 distributions from unique verification scans
+- Map measured latency quantile to a conservative shadow horizon
+- Estimate pair-fill, reserve-fill, capture, and hedge-recovery probabilities at that horizon
+- Derive p50/p90/p95 pair adverse-selection distributions
+- Gate empirical latency-risk use behind minimum evidence thresholds
+- Automatically retain the fixed expected-latency model until the evidence gate passes
+- Expose latency-model source and probabilities in executable qualifications/API
+
+### Next v0.8 refinements
+- Hierarchical models by strategy / asset / venue pair / capital tier instead of global-only calibration
+- Interval-censored interpolation between the 1/5/15/30/60s horizons
+- Separate network/data latency from hypothetical order-submission/acknowledgement latency
+- Queue-position and maker-fill modeling where public venue data makes it defensible
+- More explicit partial-fill sequencing and hedge-recovery cost distributions
+- Statistical confidence intervals / minimum effective sample size by cohort
 
 ## Milestone 6 — Tiny-capital controlled execution — blocked
 Separate service, credentials, explicit authorization, hard caps, paired-leg atomicity/hedge recovery, venue concentration limits, dead-man switches, and kill switch. This remains blocked until shadow and fill/latency evidence are statistically convincing.

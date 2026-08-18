@@ -76,6 +76,7 @@ async def live_executability():
         "qualified_opportunity_count": len(qualified),
         "order_book_count": len(snapshot.order_books),
         "capital_tiers_usd": list(settings.capital_tiers_usd),
+        "latency_model": service.empirical_latency_model().model_dump(mode="json"),
         "providers": [status.model_dump(mode="json") for status in snapshot.providers],
         "executability": [item.model_dump(mode="json") for item in snapshot.executability],
     }
@@ -94,7 +95,16 @@ async def run_shadow_cycle():
 def shadow_summary():
     if evidence_store is None:
         raise HTTPException(status_code=503, detail="evidence persistence is not configured")
-    return summarize_evidence_store(evidence_store)
+    payload = summarize_evidence_store(evidence_store)
+    payload["empirical_latency_model"] = service.empirical_latency_model().model_dump(mode="json")
+    return payload
+
+
+@app.get("/v1/latency/model")
+def empirical_latency_model():
+    if evidence_store is None:
+        raise HTTPException(status_code=503, detail="evidence persistence is not configured")
+    return service.empirical_latency_model().model_dump(mode="json")
 
 
 @app.get("/v1/worker/health")
