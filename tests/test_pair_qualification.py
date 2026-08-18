@@ -96,3 +96,34 @@ def test_visible_slippage_can_erase_apparent_edge():
     assert tier.observed_entry_slippage_bps > 0
     assert tier.passes_return_hurdle is False
     assert tier.net_annualized_return < settings().min_net_annualized_return
+
+
+def test_capacity_frontier_estimates_break_even_between_configured_tiers():
+    constrained_books = [
+        OrderBookSnapshot(
+            venue="Coinbase", asset="ETH", market_kind=MarketKind.SPOT, symbol="ETH-USD",
+            bids=[OrderBookLevel(price=99.9, size=100)],
+            asks=[OrderBookLevel(price=100.0, size=2.0), OrderBookLevel(price=103.0, size=100.0)],
+            observed_at=NOW, source="fixture",
+        ),
+        OrderBookSnapshot(
+            venue="HlPerp", asset="ETH", market_kind=MarketKind.PERPETUAL, symbol="ETH",
+            bids=[OrderBookLevel(price=101.0, size=2.0), OrderBookLevel(price=98.0, size=100.0)],
+            asks=[OrderBookLevel(price=101.1, size=100)],
+            observed_at=NOW, source="fixture",
+        ),
+    ]
+    result = qualify_opportunity(
+        opportunity(gross_bps_hour=1.0),
+        constrained_books,
+        settings(),
+        notionals_usd=(100.0, 1000.0),
+        now=NOW,
+    )
+    assert result.tiers[0].passes_return_hurdle is True
+    assert result.tiers[1].passes_return_hurdle is False
+    assert result.max_qualified_notional_usd == 100.0
+    assert 100.0 < result.estimated_capacity_notional_usd < 1000.0
+    assert result.estimated_capacity_notional_usd < result.visible_depth_ceiling_usd
+    assert result.capacity_frontier_net_annualized_return is not None
+    assert result.capacity_frontier_net_annualized_return >= settings().min_net_annualized_return

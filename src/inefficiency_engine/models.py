@@ -138,6 +138,9 @@ class OpportunityExecutability(BaseModel):
     observed_at: datetime
     tiers: list[CapitalTierQualification]
     max_qualified_notional_usd: float = 0.0
+    visible_depth_ceiling_usd: float = 0.0
+    estimated_capacity_notional_usd: float = 0.0
+    capacity_frontier_net_annualized_return: float | None = None
     paper_only: bool = True
 
 

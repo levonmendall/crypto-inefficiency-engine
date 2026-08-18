@@ -33,6 +33,7 @@ Next: long-running collection process, retention/export policy, Postgres option,
 - Book freshness and cross-book timestamp-skew gates
 - Missing venue depth and insufficient depth fail closed
 - Order books and execution qualification persisted and replayable
+- Continuous capacity-frontier search between configured capital tiers
 
 Next: partial-fill/hedge recovery simulation, latency haircuts, venue-specific fee schedules, borrow/collateral costs, and direct L2 adapters for additional perp venues.
 

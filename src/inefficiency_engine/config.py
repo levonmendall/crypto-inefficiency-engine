@@ -38,6 +38,7 @@ class Settings:
     max_order_book_age_seconds: float = 15.0
     max_order_book_skew_seconds: float = 5.0
     exit_slippage_multiplier: float = 1.0
+    capacity_search_tolerance_usd: float = 1.0
     capital_tiers_usd: tuple[float, ...] = (1000.0, 10000.0, 25000.0, 50000.0, 100000.0)
     evidence_db_path: str | None = None
 
@@ -57,6 +58,7 @@ class Settings:
             max_order_book_age_seconds=_float("CIE_MAX_ORDER_BOOK_AGE_SECONDS", 15.0),
             max_order_book_skew_seconds=_float("CIE_MAX_ORDER_BOOK_SKEW_SECONDS", 5.0),
             exit_slippage_multiplier=_float("CIE_EXIT_SLIPPAGE_MULTIPLIER", 1.0),
+            capacity_search_tolerance_usd=_float("CIE_CAPACITY_SEARCH_TOLERANCE_USD", 1.0),
             capital_tiers_usd=_float_tuple("CIE_CAPITAL_TIERS_USD", (1000.0, 10000.0, 25000.0, 50000.0, 100000.0)),
             evidence_db_path=os.getenv("CIE_EVIDENCE_DB_PATH") or None,
         )

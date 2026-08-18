@@ -1,6 +1,6 @@
 # Crypto Inefficiency Engine
 
-A **paper-first, fail-closed** engine for discovering structural crypto-market inefficiencies and proving whether the apparent edge survives point-in-time evidence and execution constraints. V0.3 does not place live orders and does not require exchange trading keys.
+A **paper-first, fail-closed** engine for discovering structural crypto-market inefficiencies and proving whether the apparent edge survives point-in-time evidence and execution constraints. V0.4 does not place live orders and does not require exchange trading keys.
 
 ## Current capabilities
 
@@ -15,9 +15,10 @@ A **paper-first, fail-closed** engine for discovering structural crypto-market i
 9. Parse Hyperliquid perpetual and Coinbase spot L2 order books.
 10. Qualify two-leg opportunities at $1K/$10K/$25K/$50K/$100K tiers using the same base quantity on both legs.
 11. Recalculate net return after observed depth, entry slippage, conservative exit slippage, static costs, and the safety buffer.
-12. Fail closed when either leg lacks a supported book, is stale, has excessive timestamp skew, or cannot fill the target hedge quantity.
-13. Persist order books and executability decisions so execution qualification can be deterministically replayed.
-14. Expose a read-only API designed to become a future paid machine-to-machine intelligence service.
+12. Estimate the continuous **capacity frontier** between coarse capital tiers: the largest visible notional that still clears the return hurdle.
+13. Fail closed when either leg lacks a supported book, is stale, has excessive timestamp skew, or cannot fill the target hedge quantity.
+14. Persist order books and executability decisions so execution qualification can be deterministically replayed.
+15. Expose a read-only API designed to become a future paid machine-to-machine intelligence service.
 
 ## Non-negotiable safety boundary
 

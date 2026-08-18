@@ -29,6 +29,8 @@ L2 snapshots are represented canonically. A two-leg opportunity is tested at con
 
 Observed entry slippage is added to the static round-trip cost, then conservatively projected onto the exit. Net annualized return is recomputed for each tier after those costs and the safety buffer. This lets the engine distinguish "detectable" from "executable at $1K/$10K/$25K/$50K/$100K."
 
+After the coarse tier checks, the engine computes the shared visible-depth ceiling and performs a bounded monotonic search for the largest notional that still clears the return hurdle. The result is an estimated capacity frontier rather than a misleading claim that the last passing configured tier is the true capacity.
+
 This is not yet a latency-aware fill model: visible L2 is necessary evidence, not proof that the liquidity would remain available by the time an order arrived.
 
 ### Cost model
