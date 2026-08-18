@@ -2,76 +2,68 @@
 
 ## Milestone 1 — Discovery core — complete
 - Canonical quote/funding models
-- Hyperliquid predicted-funding parser
-- Coinbase public spot adapter
-- Hyperliquid perp context adapter
-- Funding-dispersion detector
-- Basis detector
+- Public Hyperliquid and Coinbase adapters
+- Funding-dispersion and spot/perp-basis detectors
 - Conservative screening hurdle
-- Paper executor
-- Read-only FastAPI service
-- Unit tests
+- Paper-only execution boundary
+- Read-only API
 
 ## Milestone 2 — Point-in-time evidence — foundation complete
-- Append-only SQLite observation store
-- PostgreSQL-backed production evidence store through the same persistence interface
-- Append-only opportunity snapshots
-- Provider health/degradation records
-- Source timestamps and lineage hashes
-- Exact analysis configuration captured per scan
+- Append-only SQLite/PostgreSQL observation store
+- Provider health and source timestamps
+- Opportunity/order-book/executability snapshots
+- Lineage hashes and exact analysis configuration
 - Deterministic replay harness
 
 Next: retention/export policy, historical funding ingestion, partition/archival policy, and scan-level quality metrics.
 
 ## Milestone 3 — Executability and economic realism — core complete
-- Canonical L2 order-book model
-- Hyperliquid perpetual L2 parser/adapter
-- Coinbase spot Level-2 parser/adapter
+- L2 parsers/adapters
 - Depth-aware VWAP and slippage
 - Exact-base-quantity paired-leg sizing
-- Configurable capital tiers
-- Continuous capacity-frontier search
-- Book freshness and cross-book timestamp-skew gates
-- Conservative venue-specific taker fees
-- Capital requirement across both legs
-- Collateral opportunity-cost model
-- Book-age + expected hedge-latency risk charge
-- Hedge-recovery buffer
-- Extra visible hedge-liquidity reserve
-- Short-spot borrow cost fails closed when unavailable
-- Execution evidence persisted and replayable
-
-Next: authenticated account-specific fee tiers, measured latency distributions, dynamic borrow feeds, collateral/liquidation stress, partial-fill state machine, and direct L2 adapters for additional perp venues.
+- Capital tiers and continuous capacity frontier
+- Freshness/skew gates
+- Venue-specific taker fees
+- Capital requirement and collateral opportunity cost
+- Conservative latency and hedge-recovery buffers
+- Extra hedge-liquidity reserve
+- Fail-closed short-spot borrow economics
 
 ## Milestone 4 — Broader alpha graph
 - Direct exchange adapters
 - CEX/CEX spot dislocations
-- CEX/DEX routing
-- DEX/DEX arbitrage
-- Cross-chain liquidity
-- Stablecoin dislocations
-- Futures term structure
-- Options relative value
+- CEX/DEX and DEX/DEX routing
+- Cross-chain liquidity and stablecoin dislocations
+- Futures term structure and options relative value
 
-## Milestone 5 — Live shadow trading — foundation complete
-- Re-scan live opportunities after a configurable delay
-- Match opportunities by stable economic signature rather than observation ID
-- Re-test the original target notional against fresh market data and L2
-- Classify signal disappearance vs execution failure vs survival
-- Persist append-only shadow-cycle evidence
-- Aggregate empirical survival rate
-- Long-running `cie shadow-loop`
-- Resilient `cie worker` with durable heartbeat/error telemetry
-- Render worker + managed Postgres Blueprint
+This remains secondary until the existing alpha is empirically shown to survive market contact.
 
-Next: deploy the persistent worker, accumulate a statistically useful evidence set, then add multiple verification horizons, price-path/adverse-selection attribution, empirical latency distributions, likely-fill reconstruction, and survival estimates by strategy/venue/asset/size.
+## Milestone 5 — Shadow evidence runtime — v0.7 complete
+- Durable always-on worker and managed PostgreSQL topology
+- Stable economic opportunity signatures
+- Re-test every initially qualified capital-tier cohort
+- Default 1s/5s/15s/30s/60s verification horizons
+- Per-leg adverse-selection attribution
+- Spread/depth/slippage deterioration
+- Funding/basis edge decay and cost expansion
+- Capacity deterioration
+- Failure causes: signal disappearance, insufficient depth, slippage expansion, fee/cost hurdle, stale/provider failure, hedge-leg divergence
+- Survival by strategy, asset, venue pair, capital size, time of day, and initial expected return
+- Median lifetime lower bound, survival probabilities, edge decay, deployable-capital estimate, false-positive rate, and capture-probability proxy
 
-## Milestone 6 — Tiny-capital controlled execution
-Separate service, separate credentials, explicit authorization, hard capital caps, dead-man switches, paired-leg atomicity/hedge recovery, venue concentration limits, kill switch. This milestone remains blocked until shadow evidence is statistically convincing.
+## v0.8 — Empirical fill/latency modeling — next
+- Replace conservative hard-coded latency buffers with measured latency distributions
+- Estimate likely fill probability from observed book evolution
+- Reconstruct partial-fill and hedge-delay states
+- Model queue/arrival uncertainty where public data supports it
+- Calibrate capture probability from measured execution timing rather than horizon survival alone
+
+## Milestone 6 — Tiny-capital controlled execution — blocked
+Separate service, credentials, explicit authorization, hard caps, paired-leg atomicity/hedge recovery, venue concentration limits, dead-man switches, and kill switch. This remains blocked until shadow and fill/latency evidence are statistically convincing.
 
 ## Milestone 7 — Machine-paid intelligence API
-- API keys / usage metering
+- API keys and usage metering
 - Per-query pricing
 - Bot/agent endpoints
-- Optional x402-compatible payment gateway
+- Optional machine-payment gateway
 - Never expose private positions or proprietary execution timing

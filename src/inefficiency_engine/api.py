@@ -7,6 +7,7 @@ from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import build_evidence_store
 from inefficiency_engine.replay import replay_scan
 from inefficiency_engine.service import OpportunityService
+from inefficiency_engine.shadow_summary import summarize_evidence_store
 
 
 settings = Settings.from_env()
@@ -93,7 +94,7 @@ async def run_shadow_cycle():
 def shadow_summary():
     if evidence_store is None:
         raise HTTPException(status_code=503, detail="evidence persistence is not configured")
-    return evidence_store.shadow_summary()
+    return summarize_evidence_store(evidence_store)
 
 
 @app.get("/v1/worker/health")

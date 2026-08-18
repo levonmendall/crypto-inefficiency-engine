@@ -16,8 +16,10 @@ services:
           property: connectionString
       - key: CIE_PAPER_ONLY
         value: "true"
-      - key: CIE_SHADOW_DELAY_SECONDS
-        value: "5"
+      - key: CIE_SHADOW_HORIZONS_SECONDS
+        value: "1,5,15,30,60"
+      - key: CIE_SHADOW_MAX_CANDIDATES
+        value: "0"
       - key: CIE_SHADOW_CYCLE_INTERVAL_SECONDS
         value: "30"
       - key: CIE_SHADOW_NOTIONAL_USD
