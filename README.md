@@ -1,25 +1,29 @@
 # Crypto Inefficiency Engine
 
-A **paper-first, fail-closed** engine for discovering structural crypto-market inefficiencies. V1 does not place orders and does not require exchange API keys.
+A **paper-first, fail-closed** engine for discovering structural crypto-market inefficiencies and proving whether the apparent edge survives point-in-time evidence and execution constraints. V0.2 does not place live orders and does not require exchange trading keys.
 
-## V1 scope
+## Current capabilities
 
 1. Pull predicted perpetual funding across venues from Hyperliquid's public info API.
 2. Normalize funding intervals so venue rates are comparable.
 3. Detect cross-venue funding dispersion opportunities.
-4. Pull public Coinbase spot quotes and Hyperliquid perpetual context for selected assets.
+4. Pull public Coinbase spot quotes and Hyperliquid perpetual context.
 5. Detect spot/perp basis candidates.
-6. Apply explicit transaction-cost, freshness, liquidity, and safety-haircut assumptions.
-7. Rank opportunities by estimated **net annualized return**, never gross spread alone.
-8. Expose read-only API endpoints suitable for a future paid machine-to-machine API.
+6. Apply explicit transaction-cost, freshness, and safety-haircut assumptions.
+7. Persist append-only scans with provider health, lineage hashes, and the exact analysis configuration.
+8. Replay a stored scan to detect research/configuration drift.
+9. Parse Hyperliquid L2 order books and calculate visible executable notional, VWAP, and slippage.
+10. Fail closed when requested size exceeds observed depth.
+11. Expose a read-only API designed to become a future paid machine-to-machine intelligence service.
 
-## Non-negotiable V1 safety boundary
+## Non-negotiable safety boundary
 
 - `paper_only=true` is hard-coded into the execution boundary.
-- No private keys, API secrets, custody, deposits, withdrawals, or live order placement.
+- No private keys, trading API secrets, custody, deposits, withdrawals, or live order placement.
 - An opportunity with stale/incomplete data is rejected.
 - Apparent edge below modeled costs + safety buffer is rejected.
-- Venue names in third-party market data are observations, **not assertions that the venue is legally accessible to a given user**.
+- Visible order-book depth is treated as evidence, not a promise of a future fill.
+- Venue names in third-party market data are observations, not assertions that a venue is legally accessible to a given user.
 
 ## Quick start
 
@@ -28,19 +32,19 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
 pytest
+export CIE_EVIDENCE_DB_PATH=data/cie-evidence.sqlite3
 uvicorn inefficiency_engine.api:app --reload
 ```
 
-Then open:
+Endpoints:
 
 - `GET /health`
 - `GET /v1/opportunities/demo`
-- `GET /v1/opportunities/live` (requires outbound internet from the runtime)
+- `GET /v1/opportunities/live`
+- `GET /v1/evidence/{scan_id}/replay`
 
-## Why funding dispersion first?
+## Why this architecture?
 
-Funding is a mechanical transfer between longs and shorts. When the same asset has meaningfully different normalized funding across venues, a hedged pair can potentially capture the difference. V1 models the full paired round-trip cost and refuses opportunities that do not clear it.
+Finding a spread is easy. Proving the spread existed **point-in-time, after costs, at executable size** is the difficult part. The project is deliberately building evidence and executability before adding live capital.
 
-## Roadmap
-
-See [`docs/ROADMAP.md`](docs/ROADMAP.md). The next major milestones are persistent point-in-time data, order-book executable sizing, live shadow fills, additional venue adapters, strategy attribution, and only then a separately authorized tiny-capital execution service.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/ROADMAP.md`](docs/ROADMAP.md).
