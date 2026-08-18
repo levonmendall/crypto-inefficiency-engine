@@ -6,18 +6,18 @@ Continuously identify structural crypto-market inefficiencies and rank them by c
 
 ## Pipeline
 
-`Public market data -> normalization -> append-only evidence -> freshness validation -> strategy detectors -> cost model -> risk filters -> ranker -> depth/slippage checks -> paper ledger -> read-only API`
+`Public market data -> normalization -> append-only evidence -> freshness validation -> strategy detectors -> cost model -> risk filters -> ranker -> paired L2 qualification -> paper ledger -> read-only API`
 
 ## Core boundaries
 
 ### Data adapters
-Adapters convert venue-specific responses into canonical models. No strategy logic belongs in an adapter. Current public adapters cover Coinbase spot tickers, Hyperliquid perpetual contexts/predicted funding, and Hyperliquid L2 book snapshots.
+Adapters convert venue-specific responses into canonical models. No strategy logic belongs in an adapter. Current public adapters cover Coinbase spot tickers and aggregated Level-2 books plus Hyperliquid perpetual contexts, predicted funding, and L2 book snapshots.
 
 ### Point-in-time evidence
-Each persisted scan has an immutable scan ID, provider-health records, canonical quote payloads, opportunity payloads, lineage hashes, and the exact analysis configuration used for that scan. Evidence is append-only; a repeated observation creates a new record rather than rewriting history.
+Each persisted scan has an immutable scan ID, provider-health records, canonical quote payloads, opportunity payloads, optional L2 order-book snapshots, executability decisions, lineage hashes, and the exact analysis configuration used for that scan. Evidence is append-only; a repeated observation creates a new record rather than rewriting history.
 
 ### Replay
-A stored scan can be recomputed with its original configuration. The replay result reports whether the opportunity IDs match the original scan. This is the first guard against backtest/research drift.
+A stored scan can be recomputed with its original configuration. The replay result reports whether the opportunity IDs match the original scan and, when L2 evidence exists, whether the capital-tier executability decisions reproduce exactly. This guards both research logic and execution assumptions against drift.
 
 ### Detectors
 Detectors consume canonical observations and emit candidate opportunities. V1 implements:
@@ -25,7 +25,9 @@ Detectors consume canonical observations and emit candidate opportunities. V1 im
 - spot/perpetual basis.
 
 ### Executability
-L2 snapshots are represented canonically. The execution estimator walks observed levels and computes visible VWAP, maximum notional, and slippage. If the requested paper order cannot be fully filled from observed depth it fails closed instead of extrapolating liquidity.
+L2 snapshots are represented canonically. A two-leg opportunity is tested at configured capital tiers using one shared base quantity, so the hedge cannot qualify merely because two independent USD notionals happen to fill. Each leg must have fresh supported depth, cross-book timestamps must fall within the skew limit, and the exact hedge quantity must fully fill on both books.
+
+Observed entry slippage is added to the static round-trip cost, then conservatively projected onto the exit. Net annualized return is recomputed for each tier after those costs and the safety buffer. This lets the engine distinguish "detectable" from "executable at $1K/$10K/$25K/$50K/$100K."
 
 This is not yet a latency-aware fill model: visible L2 is necessary evidence, not proof that the liquidity would remain available by the time an order arrived.
 
@@ -39,7 +41,7 @@ Public-data collection is isolated by provider. One failed source is recorded as
 Rejects stale, incomplete, non-finite, negative-net, or below-threshold opportunities. Future versions add venue concentration, collateral, liquidation, transfer, settlement, and chain-risk gates.
 
 ### Execution boundary
-V1 has no live executor. `PaperExecutor` records hypothetical paired fills only. A future live executor must be a separate component with explicit enablement and independent risk controls.
+The current release has no live executor. `PaperExecutor` records hypothetical paired fills only. A future live executor must be a separate component with explicit enablement and independent risk controls.
 
 ### API boundary
 Read-only endpoints expose derived intelligence and provider status. This is intentionally shaped so a paid per-query API (including machine-payment protocols) can be layered on later without exposing proprietary internals.

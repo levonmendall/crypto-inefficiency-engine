@@ -22,14 +22,19 @@
 
 Next: long-running collection process, retention/export policy, Postgres option, historical funding ingestion, and scan-level quality metrics.
 
-## Milestone 3 — Executability — in progress
+## Milestone 3 — Executability — core complete
 - Canonical L2 order-book model
-- Hyperliquid L2 parser/adapter
+- Hyperliquid perpetual L2 parser/adapter
+- Coinbase spot Level-2 parser/adapter
 - Depth-aware VWAP and slippage
-- Maximum visible executable size
-- Insufficient depth fails closed
+- Exact-base-quantity paired-leg sizing
+- $1K/$10K/$25K/$50K/$100K qualification tiers
+- Dynamic net-return recomputation after observed entry slippage and conservative exit slippage
+- Book freshness and cross-book timestamp-skew gates
+- Missing venue depth and insufficient depth fail closed
+- Order books and execution qualification persisted and replayable
 
-Next: Coinbase/other venue L2 adapters, paired-leg sizing, partial-fill/hedge simulation, entry/exit latency assumptions, borrow/collateral costs, and venue-specific fee schedules.
+Next: partial-fill/hedge recovery simulation, latency haircuts, venue-specific fee schedules, borrow/collateral costs, and direct L2 adapters for additional perp venues.
 
 ## Milestone 4 — Broader alpha graph
 - Direct exchange adapters

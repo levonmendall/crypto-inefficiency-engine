@@ -100,6 +100,47 @@ class OpportunityLeg(BaseModel):
     reference_price: float | None = None
 
 
+class LegExecutionEstimate(BaseModel):
+    venue: str
+    asset: str
+    market_kind: MarketKind
+    trade_side: TradeSide
+    requested_base_quantity: float = Field(gt=0)
+    filled_base_quantity: float = Field(gt=0)
+    filled_notional_usd: float = Field(gt=0)
+    average_price: float = Field(gt=0)
+    best_price: float = Field(gt=0)
+    slippage_bps: float = Field(ge=0)
+    levels_consumed: int = Field(gt=0)
+
+
+class CapitalTierQualification(BaseModel):
+    opportunity_id: str
+    notional_usd_per_leg: float = Field(gt=0)
+    target_base_quantity: float | None = Field(default=None, gt=0)
+    executable: bool
+    passes_return_hurdle: bool = False
+    gross_edge_bps_per_hour: float
+    static_modeled_cost_bps: float
+    observed_entry_slippage_bps: float = 0.0
+    assumed_exit_slippage_bps: float = 0.0
+    total_modeled_cost_bps: float
+    net_edge_bps_per_hour: float
+    net_annualized_return: float
+    leg_estimates: list[LegExecutionEstimate] = Field(default_factory=list)
+    rejection_reason: str | None = None
+
+
+class OpportunityExecutability(BaseModel):
+    opportunity_id: str
+    strategy: Strategy
+    asset: str
+    observed_at: datetime
+    tiers: list[CapitalTierQualification]
+    max_qualified_notional_usd: float = 0.0
+    paper_only: bool = True
+
+
 class Opportunity(BaseModel):
     id: str
     strategy: Strategy

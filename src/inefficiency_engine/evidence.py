@@ -10,7 +10,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from inefficiency_engine.models import FundingQuote, MarketQuote, Opportunity
+from inefficiency_engine.models import FundingQuote, MarketQuote, Opportunity, OpportunityExecutability, OrderBookSnapshot
 
 
 def _utc_now() -> datetime:
@@ -45,6 +45,8 @@ class ScanSnapshot(BaseModel):
     funding_quotes: list[FundingQuote]
     market_quotes: list[MarketQuote]
     opportunities: list[Opportunity]
+    order_books: list[OrderBookSnapshot] = Field(default_factory=list)
+    executability: list[OpportunityExecutability] = Field(default_factory=list)
     analysis_config: dict[str, object] = Field(default_factory=dict)
 
 
@@ -55,6 +57,8 @@ class PersistedCounts:
     funding_quotes: int
     market_quotes: int
     opportunities: int
+    order_books: int
+    executability: int
 
 
 class EvidenceStore:
@@ -122,9 +126,30 @@ class EvidenceStore:
                     payload_json TEXT NOT NULL,
                     lineage_hash TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS order_books (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scan_id TEXT NOT NULL REFERENCES scans(scan_id),
+                    venue TEXT NOT NULL,
+                    asset TEXT NOT NULL,
+                    market_kind TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    lineage_hash TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS executability (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scan_id TEXT NOT NULL REFERENCES scans(scan_id),
+                    opportunity_id TEXT NOT NULL,
+                    asset TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    lineage_hash TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS ix_funding_scan ON funding_quotes(scan_id);
                 CREATE INDEX IF NOT EXISTS ix_market_scan ON market_quotes(scan_id);
                 CREATE INDEX IF NOT EXISTS ix_opportunity_scan ON opportunities(scan_id);
+                CREATE INDEX IF NOT EXISTS ix_order_book_scan ON order_books(scan_id);
+                CREATE INDEX IF NOT EXISTS ix_executability_scan ON executability(scan_id);
                 """
             )
 
@@ -139,6 +164,8 @@ class EvidenceStore:
         completed_at: datetime,
         scan_id: str | None = None,
         analysis_config: dict[str, object] | None = None,
+        order_books: list[OrderBookSnapshot] | None = None,
+        executability: list[OpportunityExecutability] | None = None,
     ) -> str:
         scan_id = scan_id or uuid.uuid4().hex
         with self._connect() as db:
@@ -197,6 +224,28 @@ class EvidenceStore:
                         hashlib.sha256(payload.encode()).hexdigest(),
                     ),
                 )
+            for book in order_books or []:
+                payload = _canonical_json(book)
+                db.execute(
+                    """INSERT INTO order_books
+                    (scan_id, venue, asset, market_kind, observed_at, payload_json, lineage_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        scan_id, book.venue, book.asset, book.market_kind.value, book.observed_at.isoformat(),
+                        payload, hashlib.sha256(payload.encode()).hexdigest(),
+                    ),
+                )
+            for qualification in executability or []:
+                payload = _canonical_json(qualification)
+                db.execute(
+                    """INSERT INTO executability
+                    (scan_id, opportunity_id, asset, observed_at, payload_json, lineage_hash)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        scan_id, qualification.opportunity_id, qualification.asset, qualification.observed_at.isoformat(),
+                        payload, hashlib.sha256(payload.encode()).hexdigest(),
+                    ),
+                )
         return scan_id
 
     def load_scan(self, scan_id: str) -> ScanSnapshot:
@@ -216,6 +265,12 @@ class EvidenceStore:
             opportunity_rows = db.execute(
                 "SELECT payload_json FROM opportunities WHERE scan_id = ? ORDER BY id", (scan_id,)
             ).fetchall()
+            order_book_rows = db.execute(
+                "SELECT payload_json FROM order_books WHERE scan_id = ? ORDER BY id", (scan_id,)
+            ).fetchall()
+            executability_rows = db.execute(
+                "SELECT payload_json FROM executability WHERE scan_id = ? ORDER BY id", (scan_id,)
+            ).fetchall()
 
         return ScanSnapshot(
             scan_id=scan_id,
@@ -225,6 +280,8 @@ class EvidenceStore:
             funding_quotes=[FundingQuote.model_validate_json(row["payload_json"]) for row in funding_rows],
             market_quotes=[MarketQuote.model_validate_json(row["payload_json"]) for row in market_rows],
             opportunities=[Opportunity.model_validate_json(row["payload_json"]) for row in opportunity_rows],
+            order_books=[OrderBookSnapshot.model_validate_json(row["payload_json"]) for row in order_book_rows],
+            executability=[OpportunityExecutability.model_validate_json(row["payload_json"]) for row in executability_rows],
             analysis_config=json.loads(scan["analysis_config_json"]),
         )
 
@@ -239,4 +296,6 @@ class EvidenceStore:
                 funding_quotes=count("funding_quotes"),
                 market_quotes=count("market_quotes"),
                 opportunities=count("opportunities"),
+                order_books=count("order_books"),
+                executability=count("executability"),
             )
