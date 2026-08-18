@@ -12,8 +12,8 @@ from inefficiency_engine.detectors.basis import SpotPerpBasisDetector
 from inefficiency_engine.detectors.funding import FundingDispersionDetector
 from inefficiency_engine.evidence import EvidenceStore, ProviderStatus, ScanSnapshot
 from inefficiency_engine.execution import qualify_opportunity
-from inefficiency_engine.latency import build_empirical_latency_model
-from inefficiency_engine.models import EmpiricalLatencyModel, FundingQuote, MarketKind, MarketQuote, Opportunity, OrderBookSnapshot, ShadowCycle, ShadowObservation, ShadowOutcome
+from inefficiency_engine.latency import EmpiricalLatencyResolver
+from inefficiency_engine.models import EmpiricalLatencyModel, FundingQuote, MarketKind, MarketQuote, Opportunity, OrderBookSnapshot, ShadowCycle, ShadowObservation, ShadowOutcome, Strategy
 from inefficiency_engine.risk import RiskGate
 from inefficiency_engine.shadow import (
     build_leg_attribution,
@@ -34,8 +34,25 @@ class OpportunityService:
         self.basis_detector = SpotPerpBasisDetector(self.settings)
         self.risk_gate = RiskGate(self.settings)
 
-    def empirical_latency_model(self) -> EmpiricalLatencyModel:
-        return build_empirical_latency_model(self.evidence_store, self.settings)
+    def empirical_latency_resolver(self) -> EmpiricalLatencyResolver:
+        return EmpiricalLatencyResolver(self.evidence_store, self.settings)
+
+    def empirical_latency_model(
+        self,
+        opportunity: Opportunity | None = None,
+        notional_usd_per_leg: float | None = None,
+        *,
+        strategy: Strategy | str | None = None,
+        venue_pair_name: str | None = None,
+        asset: str | None = None,
+    ) -> EmpiricalLatencyModel:
+        return self.empirical_latency_resolver().resolve(
+            opportunity,
+            notional_usd_per_leg,
+            strategy=strategy,
+            venue_pair=venue_pair_name,
+            asset=asset,
+        )
 
     def analyze(self, funding_quotes: list[FundingQuote], market_quotes: list[MarketQuote]) -> list[Opportunity]:
         candidates = self.funding_detector.detect(funding_quotes) + self.basis_detector.detect(market_quotes)
@@ -123,7 +140,7 @@ class OpportunityService:
                     order_books.append(book)
 
         qualification_time = datetime.now(timezone.utc)
-        latency_model = self.empirical_latency_model()
+        latency_resolver = self.empirical_latency_resolver()
         executability = [
             qualify_opportunity(
                 opportunity,
@@ -131,7 +148,7 @@ class OpportunityService:
                 self.settings,
                 notionals_usd=self.settings.capital_tiers_usd,
                 now=qualification_time,
-                latency_model=latency_model,
+                latency_model_resolver=latency_resolver.resolve,
             )
             for opportunity in opportunities
         ]
@@ -174,7 +191,7 @@ class OpportunityService:
 
         started_at = datetime.now(timezone.utc)
         initial = await self.collect_live_executability()
-        latency_model = self.empirical_latency_model()
+        latency_resolver = self.empirical_latency_resolver()
         initial_by_id = {op.id: op for op in initial.opportunities}
         initial_scan_latency_ms = max(0.0, (initial.completed_at - initial.started_at).total_seconds() * 1000.0)
 
@@ -200,7 +217,7 @@ class OpportunityService:
                         self.settings,
                         notionals_usd=(target,),
                         now=executability.observed_at,
-                        latency_model=latency_model,
+                        latency_model_resolver=latency_resolver.resolve,
                     )
                     tier = exact.tiers[0]
                     if tier.executable and tier.passes_return_hurdle:
@@ -241,7 +258,7 @@ class OpportunityService:
                         self.settings,
                         notionals_usd=(target,),
                         now=verified_at,
-                        latency_model=latency_model,
+                        latency_model_resolver=latency_resolver.resolve,
                     )
                     current_tier = current_exec.tiers[0]
 
