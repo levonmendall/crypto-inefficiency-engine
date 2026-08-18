@@ -26,6 +26,10 @@ class EconomicCostBreakdown:
     latency_model_scope: str
     latency_scope_fallbacks: list[str] = field(default_factory=list)
     latency_reference_ms: float | None = None
+    latency_reference_horizon_seconds: float | None = None
+    latency_reference_lower_horizon_seconds: float | None = None
+    latency_interpolation_weight: float = 0.0
+    latency_interpolation_mode: str = "fixed"
     latency_sample_count: int = 0
     empirical_pair_fill_probability: float | None = None
     empirical_reserve_fill_probability: float | None = None
@@ -38,7 +42,6 @@ class EconomicCostBreakdown:
 
 
 def taker_fee_bps(leg: OpportunityLeg, settings: Settings) -> float:
-    """Return the conservative taker fee assumption for one fill."""
     if leg.venue == "Coinbase" and leg.market_kind == MarketKind.SPOT:
         return settings.coinbase_spot_taker_fee_bps
     if leg.venue == "HlPerp" and leg.market_kind == MarketKind.PERPETUAL:
@@ -88,6 +91,10 @@ def economic_costs(
     latency_model_scope = "fixed"
     latency_scope_fallbacks: list[str] = []
     latency_reference_ms: float | None = settings.expected_hedge_latency_ms
+    latency_reference_horizon_seconds = None
+    latency_reference_lower_horizon_seconds = None
+    latency_interpolation_weight = 0.0
+    latency_interpolation_mode = "fixed"
     latency_sample_count = 0
     pair_fill_probability = None
     reserve_fill_probability = None
@@ -100,6 +107,10 @@ def economic_costs(
         latency_model_scope = latency_model.model_scope
         latency_scope_fallbacks = list(latency_model.scope_fallbacks)
         latency_reference_ms = latency_model.reference_latency_ms
+        latency_reference_horizon_seconds = latency_model.reference_upper_horizon_seconds
+        latency_reference_lower_horizon_seconds = latency_model.reference_lower_horizon_seconds
+        latency_interpolation_weight = latency_model.interpolation_weight
+        latency_interpolation_mode = latency_model.interpolation_mode
         latency_sample_count = latency_model.cohort_sample_count
         pair_fill_probability = latency_model.pair_fill_probability
         reserve_fill_probability = latency_model.reserve_fill_probability
@@ -121,6 +132,10 @@ def economic_costs(
         latency_model_scope=latency_model_scope,
         latency_scope_fallbacks=latency_scope_fallbacks,
         latency_reference_ms=latency_reference_ms,
+        latency_reference_horizon_seconds=latency_reference_horizon_seconds,
+        latency_reference_lower_horizon_seconds=latency_reference_lower_horizon_seconds,
+        latency_interpolation_weight=latency_interpolation_weight,
+        latency_interpolation_mode=latency_interpolation_mode,
         latency_sample_count=latency_sample_count,
         empirical_pair_fill_probability=pair_fill_probability,
         empirical_reserve_fill_probability=reserve_fill_probability,

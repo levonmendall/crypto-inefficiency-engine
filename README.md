@@ -10,19 +10,27 @@ Each multi-horizon shadow observation records original target size, scan duratio
 
 ### v0.8.1 — hierarchical calibration
 
-Empirical fill and adverse-selection distributions are no longer global-only. For each evaluated capital size the resolver tries the narrowest cohort first:
+Empirical fill and adverse-selection distributions are selected per evaluated capital size using the narrowest statistically valid cohort:
 
 **strategy + venue pair + asset + capital → strategy + venue pair + asset → strategy + venue pair → strategy → global**
 
-A scope is used only when it meets the configured minimum sample threshold for both reconstructed fills and adverse-selection observations. Sparse scopes fall back automatically, and the fallback path is persisted in each capital-tier qualification so broader evidence cannot masquerade as a precise cohort.
+Sparse scopes fall back automatically and the fallback path is preserved in model provenance.
 
-Observation-path latency remains measured globally from unique verification scans because it reflects collector/runtime performance; that measured latency is mapped to the first conservative 1/5/15/30/60-second shadow horizon. Fill, reserve-fill, capture, hedge-recovery, and adverse-selection distributions are then selected from the hierarchical cohort at that horizon.
+### v0.8.2 — interval-censored latency interpolation
 
-`GET /v1/latency/model` accepts optional `strategy`, `venue_pair`, `asset`, and `notional_usd_per_leg` query parameters for inspecting the selected cohort and fallback provenance. Individual executable capital tiers expose their active latency-model scope and empirical probabilities.
+Measured observation-path latency no longer snaps blindly to the next 1/5/15/30/60-second checkpoint. When the selected latency quantile falls between two shadow horizons, both endpoints must independently satisfy the cohort evidence threshold before interpolation is allowed.
+
+Interpolation is deliberately one-way conservative:
+
+- pair-fill, reserve-fill, and capture probabilities may stay flat or deteriorate with elapsed time, but cannot improve because of noisy later samples;
+- adverse-selection and hedge-recovery risk may stay flat or increase, but cannot decrease merely because the later checkpoint happened to look better;
+- if either endpoint lacks enough evidence, the resolver falls back to a broader hierarchical cohort; if no scope qualifies, the fixed latency model remains active.
+
+`GET /v1/latency/model` exposes the selected lower/upper horizons, interpolation weight, per-scope horizon counts, cohort fallback provenance, fill/capture probabilities, and adverse-selection quantiles.
 
 ## Current evidence pipeline
 
-**Detect → qualify economics → prove L2 executability → observe 1/5/15/30/60s → reconstruct pair fillability → measure scan latency → select the narrowest valid empirical cohort → measure adverse selection → estimate fill/capture probability → calibrate latency risk.**
+**Detect → qualify economics → prove L2 executability → observe 1/5/15/30/60s → reconstruct pair fillability → measure scan latency → select the narrowest valid cohort → interpolate conservatively across the measured latency interval → estimate fill/capture probability and adverse-selection risk.**
 
 ## Safety boundary
 

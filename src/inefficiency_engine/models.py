@@ -130,19 +130,26 @@ class ShadowFailureCause(str, Enum):
 
 
 class EmpiricalLatencyModel(BaseModel):
-    model_version: str = "v0.8.1"
+    model_version: str = "v0.8.2"
     model_scope: str = "global"
     scope_strategy: Strategy | None = None
     scope_venue_pair: str | None = None
     scope_asset: str | None = None
     scope_notional_usd_per_leg: float | None = Field(default=None, gt=0)
     scope_candidate_counts: dict[str, int] = Field(default_factory=dict)
+    scope_horizon_counts: dict[str, dict[str, int]] = Field(default_factory=dict)
     scope_fallbacks: list[str] = Field(default_factory=list)
     latency_quantile: float = 0.95
     scan_latency_sample_count: int = 0
     cohort_sample_count: int = 0
+    lower_horizon_sample_count: int = 0
+    upper_horizon_sample_count: int = 0
     reference_latency_ms: float | None = None
     reference_horizon_seconds: float | None = None
+    reference_lower_horizon_seconds: float | None = None
+    reference_upper_horizon_seconds: float | None = None
+    interpolation_weight: float = Field(default=0.0, ge=0.0, le=1.0)
+    interpolation_mode: Literal["single_horizon", "linear_interval"] = "single_horizon"
     scan_latency_p50_ms: float | None = None
     scan_latency_p90_ms: float | None = None
     scan_latency_p95_ms: float | None = None
