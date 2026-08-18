@@ -12,13 +12,15 @@ from inefficiency_engine.detectors.basis import SpotPerpBasisDetector
 from inefficiency_engine.detectors.funding import FundingDispersionDetector
 from inefficiency_engine.evidence import EvidenceStore, ProviderStatus, ScanSnapshot
 from inefficiency_engine.execution import qualify_opportunity
-from inefficiency_engine.models import FundingQuote, MarketKind, MarketQuote, Opportunity, OrderBookSnapshot, ShadowCycle, ShadowObservation, ShadowOutcome
+from inefficiency_engine.latency import build_empirical_latency_model
+from inefficiency_engine.models import EmpiricalLatencyModel, FundingQuote, MarketKind, MarketQuote, Opportunity, OrderBookSnapshot, ShadowCycle, ShadowObservation, ShadowOutcome
 from inefficiency_engine.risk import RiskGate
 from inefficiency_engine.shadow import (
     build_leg_attribution,
     classify_shadow_failure,
     expected_return_bucket,
     opportunity_signature,
+    reconstruct_pair_fill_state,
     time_of_day_bucket,
     venue_pair,
 )
@@ -31,6 +33,9 @@ class OpportunityService:
         self.funding_detector = FundingDispersionDetector(self.settings)
         self.basis_detector = SpotPerpBasisDetector(self.settings)
         self.risk_gate = RiskGate(self.settings)
+
+    def empirical_latency_model(self) -> EmpiricalLatencyModel:
+        return build_empirical_latency_model(self.evidence_store, self.settings)
 
     def analyze(self, funding_quotes: list[FundingQuote], market_quotes: list[MarketQuote]) -> list[Opportunity]:
         candidates = self.funding_detector.detect(funding_quotes) + self.basis_detector.detect(market_quotes)
@@ -118,8 +123,16 @@ class OpportunityService:
                     order_books.append(book)
 
         qualification_time = datetime.now(timezone.utc)
+        latency_model = self.empirical_latency_model()
         executability = [
-            qualify_opportunity(opportunity, order_books, self.settings, notionals_usd=self.settings.capital_tiers_usd, now=qualification_time)
+            qualify_opportunity(
+                opportunity,
+                order_books,
+                self.settings,
+                notionals_usd=self.settings.capital_tiers_usd,
+                now=qualification_time,
+                latency_model=latency_model,
+            )
             for opportunity in opportunities
         ]
         completed_at = datetime.now(timezone.utc)
@@ -161,7 +174,9 @@ class OpportunityService:
 
         started_at = datetime.now(timezone.utc)
         initial = await self.collect_live_executability()
+        latency_model = self.empirical_latency_model()
         initial_by_id = {op.id: op for op in initial.opportunities}
+        initial_scan_latency_ms = max(0.0, (initial.completed_at - initial.started_at).total_seconds() * 1000.0)
 
         candidates: list[tuple[Opportunity, object, float, object]] = []
         for executability in initial.executability:
@@ -185,6 +200,7 @@ class OpportunityService:
                         self.settings,
                         notionals_usd=(target,),
                         now=executability.observed_at,
+                        latency_model=latency_model,
                     )
                     tier = exact.tiers[0]
                     if tier.executable and tier.passes_return_hurdle:
@@ -211,6 +227,7 @@ class OpportunityService:
             verification_ops = {opportunity_signature(op): op for op in verification.opportunities}
             provider_failed = any(not status.ok for status in verification.providers)
             verified_at = verification.completed_at
+            verification_scan_latency_ms = max(0.0, (verification.completed_at - verification.started_at).total_seconds() * 1000.0)
 
             for opportunity, initial_exec, target, initial_tier in candidates:
                 signature = opportunity_signature(opportunity)
@@ -224,6 +241,7 @@ class OpportunityService:
                         self.settings,
                         notionals_usd=(target,),
                         now=verified_at,
+                        latency_model=latency_model,
                     )
                     current_tier = current_exec.tiers[0]
 
@@ -233,6 +251,10 @@ class OpportunityService:
                     initial.order_books,
                     verification.order_books,
                     target_quantity=target_quantity,
+                )
+                pair_fillable, pair_fillable_with_reserve, hedge_recovery_required = reconstruct_pair_fill_state(
+                    leg_attribution,
+                    reserve_ratio=self.settings.hedge_liquidity_reserve_ratio,
                 )
                 survived = bool(
                     current is not None
@@ -286,12 +308,18 @@ class OpportunityService:
                         strategy=opportunity.strategy,
                         asset=opportunity.asset,
                         notional_usd_per_leg=target,
+                        target_base_quantity=target_quantity,
                         started_at=started_at,
                         verified_at=verified_at,
                         delay_seconds=horizon,
+                        initial_scan_latency_ms=initial_scan_latency_ms,
+                        verification_scan_latency_ms=verification_scan_latency_ms,
                         initial_net_annualized_return=initial_tier.net_annualized_return,
                         initial_capacity_notional_usd=initial_exec.estimated_capacity_notional_usd,
                         survived=survived,
+                        pair_fillable=pair_fillable,
+                        pair_fillable_with_reserve=pair_fillable_with_reserve,
+                        hedge_recovery_required=hedge_recovery_required,
                         verification_net_annualized_return=verification_return,
                         outcome=outcome,
                         reason=reason,

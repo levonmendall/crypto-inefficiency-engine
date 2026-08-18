@@ -129,6 +129,30 @@ class ShadowFailureCause(str, Enum):
     HEDGE_LEG_DIVERGENCE = "hedge_leg_divergence"
 
 
+class EmpiricalLatencyModel(BaseModel):
+    model_version: str = "v0.8"
+    model_scope: str = "global"
+    latency_quantile: float = 0.95
+    scan_latency_sample_count: int = 0
+    cohort_sample_count: int = 0
+    reference_latency_ms: float | None = None
+    reference_horizon_seconds: float | None = None
+    scan_latency_p50_ms: float | None = None
+    scan_latency_p90_ms: float | None = None
+    scan_latency_p95_ms: float | None = None
+    pair_fill_probability: float | None = None
+    reserve_fill_probability: float | None = None
+    capture_probability: float | None = None
+    hedge_recovery_probability: float | None = None
+    adverse_selection_p50_bps: float | None = None
+    adverse_selection_p90_bps: float | None = None
+    adverse_selection_p95_bps: float | None = None
+    empirical_latency_risk_bps: float | None = None
+    usable_for_qualification: bool = False
+    reason: str | None = None
+    paper_only: bool = True
+
+
 class CapitalTierQualification(BaseModel):
     opportunity_id: str
     notional_usd_per_leg: float = Field(gt=0)
@@ -141,6 +165,11 @@ class CapitalTierQualification(BaseModel):
     financing_cost_bps: float = 0.0
     collateral_opportunity_cost_bps: float = 0.0
     latency_risk_bps: float = 0.0
+    latency_model_source: Literal["fixed", "empirical_shadow"] = "fixed"
+    latency_reference_ms: float | None = None
+    latency_sample_count: int = 0
+    empirical_pair_fill_probability: float | None = None
+    empirical_capture_probability: float | None = None
     hedge_recovery_buffer_bps: float = 0.0
     capital_required_usd: float = 0.0
     capital_multiple: float = 0.0
@@ -197,6 +226,10 @@ class ShadowLegAttribution(BaseModel):
     verification_spread_bps: float | None = None
     initial_available_depth_usd: float | None = None
     verification_available_depth_usd: float | None = None
+    initial_available_base_quantity: float | None = None
+    verification_available_base_quantity: float | None = None
+    initial_depth_multiple: float | None = None
+    verification_depth_multiple: float | None = None
     initial_slippage_bps: float | None = None
     verification_slippage_bps: float | None = None
 
@@ -210,12 +243,18 @@ class ShadowObservation(BaseModel):
     strategy: Strategy
     asset: str
     notional_usd_per_leg: float = Field(gt=0)
+    target_base_quantity: float | None = Field(default=None, gt=0)
     started_at: datetime
     verified_at: datetime
     delay_seconds: float = Field(ge=0)
+    initial_scan_latency_ms: float | None = Field(default=None, ge=0)
+    verification_scan_latency_ms: float | None = Field(default=None, ge=0)
     initial_net_annualized_return: float
     initial_capacity_notional_usd: float
     survived: bool
+    pair_fillable: bool | None = None
+    pair_fillable_with_reserve: bool | None = None
+    hedge_recovery_required: bool | None = None
     verification_net_annualized_return: float | None = None
     outcome: ShadowOutcome
     reason: str | None = None

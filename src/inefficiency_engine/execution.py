@@ -7,6 +7,7 @@ from inefficiency_engine.config import Settings
 from inefficiency_engine.costs import BorrowCostUnavailableError, UnknownVenueFeeError, economic_costs
 from inefficiency_engine.models import (
     CapitalTierQualification,
+    EmpiricalLatencyModel,
     LegExecutionEstimate,
     Opportunity,
     OpportunityExecutability,
@@ -200,14 +201,14 @@ def qualify_opportunity(
     *,
     notionals_usd: tuple[float, ...] | None = None,
     now: datetime | None = None,
+    latency_model: EmpiricalLatencyModel | None = None,
 ) -> OpportunityExecutability:
-    """Qualify a two-leg opportunity with explicit fees, capital, and hedge risk.
+    """Qualify a two-leg opportunity with explicit fees, capital, depth, and hedge risk.
 
-    Both legs must fill the same base quantity and retain an additional visible
-    liquidity reserve. Entry and exit taker fees are venue-specific; financing,
-    collateral opportunity cost, book age/hedge latency risk, and a hedge-recovery
-    buffer are charged before the return hurdle is applied. Returns are measured
-    on modeled capital required, not merely one leg's notional.
+    When enough v0.8 shadow evidence exists, the fixed expected-hedge-latency
+    component is replaced by an empirical adverse-selection distribution. Book
+    age risk remains explicit and current. If empirical evidence is insufficient,
+    qualification automatically falls back to the conservative fixed model.
     """
     now = now or datetime.now(timezone.utc)
     notionals = notionals_usd or settings.capital_tiers_usd
@@ -283,7 +284,13 @@ def qualify_opportunity(
                 return tier
 
         try:
-            costs = economic_costs(opportunity, notional, settings, worst_book_age_seconds=worst_book_age)
+            costs = economic_costs(
+                opportunity,
+                notional,
+                settings,
+                worst_book_age_seconds=worst_book_age,
+                latency_model=latency_model,
+            )
         except (UnknownVenueFeeError, BorrowCostUnavailableError) as exc:
             tier = _rejected_tier(opportunity, notional, str(exc))
             tier.target_base_quantity = target_quantity
@@ -338,6 +345,11 @@ def qualify_opportunity(
             financing_cost_bps=costs.financing_cost_bps,
             collateral_opportunity_cost_bps=costs.collateral_opportunity_cost_bps,
             latency_risk_bps=costs.latency_risk_bps,
+            latency_model_source=costs.latency_model_source,
+            latency_reference_ms=costs.latency_reference_ms,
+            latency_sample_count=costs.latency_sample_count,
+            empirical_pair_fill_probability=costs.empirical_pair_fill_probability,
+            empirical_capture_probability=costs.empirical_capture_probability,
             hedge_recovery_buffer_bps=costs.hedge_recovery_buffer_bps,
             capital_required_usd=costs.capital_required_usd,
             capital_multiple=costs.capital_multiple,

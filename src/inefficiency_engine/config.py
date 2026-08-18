@@ -57,6 +57,10 @@ class Settings:
     spot_short_borrow_annual: float | None = None
     expected_hedge_latency_ms: float = 750.0
     latency_risk_bps_per_second: float = 0.5
+    empirical_latency_enabled: bool = True
+    empirical_latency_min_samples: int = 100
+    empirical_latency_min_scan_samples: int = 30
+    empirical_latency_quantile: float = 0.95
     hedge_liquidity_reserve_ratio: float = 1.25
     hedge_recovery_buffer_bps: float = 2.0
     shadow_delay_seconds: float = 5.0
@@ -96,6 +100,10 @@ class Settings:
             spot_short_borrow_annual=_optional_float("CIE_SPOT_SHORT_BORROW_ANNUAL", None),
             expected_hedge_latency_ms=_float("CIE_EXPECTED_HEDGE_LATENCY_MS", 750.0),
             latency_risk_bps_per_second=_float("CIE_LATENCY_RISK_BPS_PER_SECOND", 0.5),
+            empirical_latency_enabled=_bool("CIE_EMPIRICAL_LATENCY_ENABLED", True),
+            empirical_latency_min_samples=_int("CIE_EMPIRICAL_LATENCY_MIN_SAMPLES", 100),
+            empirical_latency_min_scan_samples=_int("CIE_EMPIRICAL_LATENCY_MIN_SCAN_SAMPLES", 30),
+            empirical_latency_quantile=_float("CIE_EMPIRICAL_LATENCY_QUANTILE", 0.95),
             hedge_liquidity_reserve_ratio=_float("CIE_HEDGE_LIQUIDITY_RESERVE_RATIO", 1.25),
             hedge_recovery_buffer_bps=_float("CIE_HEDGE_RECOVERY_BUFFER_BPS", 2.0),
             shadow_delay_seconds=_float("CIE_SHADOW_DELAY_SECONDS", 5.0),
