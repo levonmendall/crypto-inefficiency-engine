@@ -17,12 +17,7 @@ service = OpportunityService(settings=settings, evidence_store=evidence_store)
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "version": __version__,
-        "paper_only": True,
-        "evidence_persistence": evidence_store is not None,
-    }
+    return {"status": "ok", "version": __version__, "paper_only": True, "evidence_persistence": evidence_store is not None}
 
 
 @app.get("/v1/opportunities/demo")
@@ -37,13 +32,7 @@ async def live_opportunities():
         snapshot = await service.collect_live_evidence()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"live public-data scan failed: {type(exc).__name__}") from exc
-    return {
-        "scan_id": snapshot.scan_id,
-        "count": len(snapshot.opportunities),
-        "paper_only": True,
-        "providers": [status.model_dump(mode="json") for status in snapshot.providers],
-        "opportunities": [o.model_dump(mode="json") for o in snapshot.opportunities],
-    }
+    return {"scan_id": snapshot.scan_id, "count": len(snapshot.opportunities), "paper_only": True, "providers": [status.model_dump(mode="json") for status in snapshot.providers], "opportunities": [o.model_dump(mode="json") for o in snapshot.opportunities]}
 
 
 @app.get("/v1/evidence/{scan_id}/replay")
@@ -64,13 +53,20 @@ async def live_executability():
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"live executability scan failed: {type(exc).__name__}") from exc
     qualified = [item for item in snapshot.executability if item.max_qualified_notional_usd > 0]
-    return {
-        "scan_id": snapshot.scan_id,
-        "paper_only": True,
-        "opportunity_count": len(snapshot.opportunities),
-        "qualified_opportunity_count": len(qualified),
-        "order_book_count": len(snapshot.order_books),
-        "capital_tiers_usd": list(settings.capital_tiers_usd),
-        "providers": [status.model_dump(mode="json") for status in snapshot.providers],
-        "executability": [item.model_dump(mode="json") for item in snapshot.executability],
-    }
+    return {"scan_id": snapshot.scan_id, "paper_only": True, "opportunity_count": len(snapshot.opportunities), "qualified_opportunity_count": len(qualified), "order_book_count": len(snapshot.order_books), "capital_tiers_usd": list(settings.capital_tiers_usd), "providers": [status.model_dump(mode="json") for status in snapshot.providers], "executability": [item.model_dump(mode="json") for item in snapshot.executability]}
+
+
+@app.post("/v1/shadow/cycle")
+async def run_shadow_cycle():
+    try:
+        cycle = await service.run_shadow_cycle()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"shadow cycle failed: {type(exc).__name__}") from exc
+    return cycle.model_dump(mode="json")
+
+
+@app.get("/v1/shadow/summary")
+def shadow_summary():
+    if evidence_store is None:
+        raise HTTPException(status_code=503, detail="evidence persistence is not configured")
+    return evidence_store.shadow_summary()

@@ -7,7 +7,7 @@
 - Hyperliquid perp context adapter
 - Funding-dispersion detector
 - Basis detector
-- Conservative cost hurdle
+- Conservative screening hurdle
 - Paper executor
 - Read-only FastAPI service
 - Unit tests
@@ -20,22 +20,27 @@
 - Exact analysis configuration captured per scan
 - Deterministic replay harness
 
-Next: long-running collection process, retention/export policy, Postgres option, historical funding ingestion, and scan-level quality metrics.
+Next: retention/export policy, Postgres option, historical funding ingestion, and scan-level quality metrics.
 
-## Milestone 3 — Executability — core complete
+## Milestone 3 — Executability and economic realism — core complete
 - Canonical L2 order-book model
 - Hyperliquid perpetual L2 parser/adapter
 - Coinbase spot Level-2 parser/adapter
 - Depth-aware VWAP and slippage
 - Exact-base-quantity paired-leg sizing
-- $1K/$10K/$25K/$50K/$100K qualification tiers
-- Dynamic net-return recomputation after observed entry slippage and conservative exit slippage
+- Configurable capital tiers
+- Continuous capacity-frontier search
 - Book freshness and cross-book timestamp-skew gates
-- Missing venue depth and insufficient depth fail closed
-- Order books and execution qualification persisted and replayable
-- Continuous capacity-frontier search between configured capital tiers
+- Conservative venue-specific taker fees
+- Capital requirement across both legs
+- Collateral opportunity-cost model
+- Book-age + expected hedge-latency risk charge
+- Hedge-recovery buffer
+- Extra visible hedge-liquidity reserve
+- Short-spot borrow cost fails closed when unavailable
+- Execution evidence persisted and replayable
 
-Next: partial-fill/hedge recovery simulation, latency haircuts, venue-specific fee schedules, borrow/collateral costs, and direct L2 adapters for additional perp venues.
+Next: authenticated account-specific fee tiers, measured latency distributions, dynamic borrow feeds, collateral/liquidation stress, partial-fill state machine, and direct L2 adapters for additional perp venues.
 
 ## Milestone 4 — Broader alpha graph
 - Direct exchange adapters
@@ -47,15 +52,19 @@ Next: partial-fill/hedge recovery simulation, latency haircuts, venue-specific f
 - Futures term structure
 - Options relative value
 
-## Milestone 5 — Live shadow trading
-- Observe live quotes/books
-- Generate intended orders without sending them
-- Reconstruct likely fills
-- Track simulated vs observed execution quality
-- Require statistically meaningful evidence before any live-capital consideration
+## Milestone 5 — Live shadow trading — foundation complete
+- Re-scan live opportunities after a configurable delay
+- Match opportunities by stable economic signature rather than observation ID
+- Re-test the original target notional against fresh market data and L2
+- Classify signal disappearance vs execution failure vs survival
+- Persist append-only shadow-cycle evidence
+- Aggregate empirical survival rate
+- Long-running `cie shadow-loop`
+
+Next: multiple verification horizons, price-path/adverse-selection attribution, empirical latency distributions, likely-fill reconstruction, and enough observations to estimate survival by strategy/venue/asset/size.
 
 ## Milestone 6 — Tiny-capital controlled execution
-Separate service, separate credentials, explicit authorization, hard capital caps, dead-man switches, paired-leg atomicity/hedge recovery, venue concentration limits, kill switch.
+Separate service, separate credentials, explicit authorization, hard capital caps, dead-man switches, paired-leg atomicity/hedge recovery, venue concentration limits, kill switch. This milestone remains blocked until shadow evidence is statistically convincing.
 
 ## Milestone 7 — Machine-paid intelligence API
 - API keys / usage metering

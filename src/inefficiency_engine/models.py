@@ -114,6 +114,12 @@ class LegExecutionEstimate(BaseModel):
     levels_consumed: int = Field(gt=0)
 
 
+class ShadowOutcome(str, Enum):
+    SURVIVED = "survived"
+    SIGNAL_DISAPPEARED = "signal_disappeared"
+    EXECUTABILITY_FAILED = "executability_failed"
+
+
 class CapitalTierQualification(BaseModel):
     opportunity_id: str
     notional_usd_per_leg: float = Field(gt=0)
@@ -122,11 +128,19 @@ class CapitalTierQualification(BaseModel):
     passes_return_hurdle: bool = False
     gross_edge_bps_per_hour: float
     static_modeled_cost_bps: float
+    venue_roundtrip_fee_bps: float = 0.0
+    financing_cost_bps: float = 0.0
+    collateral_opportunity_cost_bps: float = 0.0
+    latency_risk_bps: float = 0.0
+    hedge_recovery_buffer_bps: float = 0.0
+    capital_required_usd: float = 0.0
+    capital_multiple: float = 0.0
     observed_entry_slippage_bps: float = 0.0
     assumed_exit_slippage_bps: float = 0.0
     total_modeled_cost_bps: float
     net_edge_bps_per_hour: float
     net_annualized_return: float
+    leg_notional_net_annualized_return: float = 0.0
     leg_estimates: list[LegExecutionEstimate] = Field(default_factory=list)
     rejection_reason: str | None = None
 
@@ -159,4 +173,36 @@ class Opportunity(BaseModel):
     expires_at: datetime
     confidence: Literal["low", "medium", "high"] = "medium"
     evidence: dict[str, object] = Field(default_factory=dict)
+    paper_only: bool = True
+
+
+class ShadowObservation(BaseModel):
+    shadow_id: str
+    initial_scan_id: str
+    verification_scan_id: str
+    opportunity_signature: str
+    opportunity_id: str
+    strategy: Strategy
+    asset: str
+    notional_usd_per_leg: float = Field(gt=0)
+    started_at: datetime
+    verified_at: datetime
+    delay_seconds: float = Field(ge=0)
+    initial_net_annualized_return: float
+    initial_capacity_notional_usd: float
+    survived: bool
+    verification_net_annualized_return: float | None = None
+    outcome: ShadowOutcome
+    reason: str | None = None
+    paper_only: bool = True
+
+
+class ShadowCycle(BaseModel):
+    cycle_id: str
+    started_at: datetime
+    completed_at: datetime
+    delay_seconds: float = Field(ge=0)
+    initial_scan_id: str
+    verification_scan_id: str
+    observations: list[ShadowObservation] = Field(default_factory=list)
     paper_only: bool = True
