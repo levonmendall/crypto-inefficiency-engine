@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from inefficiency_engine.config import Settings
 from inefficiency_engine.models import EmpiricalLatencyModel, MarketKind, Opportunity, OpportunityLeg, Side
@@ -23,22 +23,22 @@ class EconomicCostBreakdown:
     collateral_opportunity_cost_bps: float
     latency_risk_bps: float
     latency_model_source: str
-    latency_reference_ms: float | None
-    latency_sample_count: int
-    empirical_pair_fill_probability: float | None
-    empirical_capture_probability: float | None
-    hedge_recovery_buffer_bps: float
-    total_non_slippage_cost_bps: float
-    capital_required_usd: float
-    capital_multiple: float
+    latency_model_scope: str
+    latency_scope_fallbacks: list[str] = field(default_factory=list)
+    latency_reference_ms: float | None = None
+    latency_sample_count: int = 0
+    empirical_pair_fill_probability: float | None = None
+    empirical_reserve_fill_probability: float | None = None
+    empirical_capture_probability: float | None = None
+    empirical_hedge_recovery_probability: float | None = None
+    hedge_recovery_buffer_bps: float = 0.0
+    total_non_slippage_cost_bps: float = 0.0
+    capital_required_usd: float = 0.0
+    capital_multiple: float = 0.0
 
 
 def taker_fee_bps(leg: OpportunityLeg, settings: Settings) -> float:
-    """Return the conservative taker fee assumption for one fill.
-
-    V1 only has executable L2 support for Coinbase spot and Hyperliquid perps,
-    so unknown venues fail closed rather than inheriting a generic fee guess.
-    """
+    """Return the conservative taker fee assumption for one fill."""
     if leg.venue == "Coinbase" and leg.market_kind == MarketKind.SPOT:
         return settings.coinbase_spot_taker_fee_bps
     if leg.venue == "HlPerp" and leg.market_kind == MarketKind.PERPETUAL:
@@ -85,18 +85,26 @@ def economic_costs(
     book_age_risk_bps = max(0.0, worst_book_age_seconds) * settings.latency_risk_bps_per_second
     fixed_hedge_latency_risk_bps = max(0.0, settings.expected_hedge_latency_ms) / 1000.0 * settings.latency_risk_bps_per_second
     latency_model_source = "fixed"
+    latency_model_scope = "fixed"
+    latency_scope_fallbacks: list[str] = []
     latency_reference_ms: float | None = settings.expected_hedge_latency_ms
     latency_sample_count = 0
     pair_fill_probability = None
+    reserve_fill_probability = None
     capture_probability = None
+    hedge_recovery_probability = None
     hedge_latency_risk_bps = fixed_hedge_latency_risk_bps
 
     if latency_model is not None and latency_model.usable_for_qualification:
         latency_model_source = "empirical_shadow"
+        latency_model_scope = latency_model.model_scope
+        latency_scope_fallbacks = list(latency_model.scope_fallbacks)
         latency_reference_ms = latency_model.reference_latency_ms
         latency_sample_count = latency_model.cohort_sample_count
         pair_fill_probability = latency_model.pair_fill_probability
+        reserve_fill_probability = latency_model.reserve_fill_probability
         capture_probability = latency_model.capture_probability
+        hedge_recovery_probability = latency_model.hedge_recovery_probability
         hedge_latency_risk_bps = max(0.0, latency_model.empirical_latency_risk_bps or 0.0)
 
     latency_risk_bps = book_age_risk_bps + hedge_latency_risk_bps
@@ -110,10 +118,14 @@ def economic_costs(
         collateral_opportunity_cost_bps=collateral_cost_bps,
         latency_risk_bps=latency_risk_bps,
         latency_model_source=latency_model_source,
+        latency_model_scope=latency_model_scope,
+        latency_scope_fallbacks=latency_scope_fallbacks,
         latency_reference_ms=latency_reference_ms,
         latency_sample_count=latency_sample_count,
         empirical_pair_fill_probability=pair_fill_probability,
+        empirical_reserve_fill_probability=reserve_fill_probability,
         empirical_capture_probability=capture_probability,
+        empirical_hedge_recovery_probability=hedge_recovery_probability,
         hedge_recovery_buffer_bps=settings.hedge_recovery_buffer_bps,
         total_non_slippage_cost_bps=total,
         capital_required_usd=capital_required,

@@ -130,8 +130,14 @@ class ShadowFailureCause(str, Enum):
 
 
 class EmpiricalLatencyModel(BaseModel):
-    model_version: str = "v0.8"
+    model_version: str = "v0.8.1"
     model_scope: str = "global"
+    scope_strategy: Strategy | None = None
+    scope_venue_pair: str | None = None
+    scope_asset: str | None = None
+    scope_notional_usd_per_leg: float | None = Field(default=None, gt=0)
+    scope_candidate_counts: dict[str, int] = Field(default_factory=dict)
+    scope_fallbacks: list[str] = Field(default_factory=list)
     latency_quantile: float = 0.95
     scan_latency_sample_count: int = 0
     cohort_sample_count: int = 0
@@ -166,10 +172,14 @@ class CapitalTierQualification(BaseModel):
     collateral_opportunity_cost_bps: float = 0.0
     latency_risk_bps: float = 0.0
     latency_model_source: Literal["fixed", "empirical_shadow"] = "fixed"
+    latency_model_scope: str = "fixed"
+    latency_scope_fallbacks: list[str] = Field(default_factory=list)
     latency_reference_ms: float | None = None
     latency_sample_count: int = 0
     empirical_pair_fill_probability: float | None = None
+    empirical_reserve_fill_probability: float | None = None
     empirical_capture_probability: float | None = None
+    empirical_hedge_recovery_probability: float | None = None
     hedge_recovery_buffer_bps: float = 0.0
     capital_required_usd: float = 0.0
     capital_multiple: float = 0.0

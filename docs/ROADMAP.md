@@ -47,7 +47,7 @@ This remains secondary until the existing alpha is empirically shown to survive 
 - Explicit failure causes and segmented survival statistics
 
 ## v0.8 — Empirical fill/latency modeling — in progress
-### Foundation implemented
+### Implemented
 - Persist original target base quantity into shadow attribution
 - Measure initial/verification scan duration as observation-path latency
 - Reconstruct per-leg visible base-depth multiples
@@ -55,14 +55,16 @@ This remains secondary until the existing alpha is empirically shown to survive 
 - Flag asymmetric visible-depth states that would require hedge recovery
 - Build latency p50/p90/p95 distributions from unique verification scans
 - Map measured latency quantile to a conservative shadow horizon
-- Estimate pair-fill, reserve-fill, capture, and hedge-recovery probabilities at that horizon
+- Estimate pair-fill, reserve-fill, capture, and hedge-recovery probabilities
 - Derive p50/p90/p95 pair adverse-selection distributions
 - Gate empirical latency-risk use behind minimum evidence thresholds
 - Automatically retain the fixed expected-latency model until the evidence gate passes
-- Expose latency-model source and probabilities in executable qualifications/API
+- Hierarchical empirical cohorts: strategy + venue pair + asset + capital, with controlled fallback through broader scopes
+- Resolve a separate empirical model for each evaluated capital size
+- Persist model scope and fallback provenance in executable capital-tier output
+- Support scoped inspection through `GET /v1/latency/model`
 
 ### Next v0.8 refinements
-- Hierarchical models by strategy / asset / venue pair / capital tier instead of global-only calibration
 - Interval-censored interpolation between the 1/5/15/30/60s horizons
 - Separate network/data latency from hypothetical order-submission/acknowledgement latency
 - Queue-position and maker-fill modeling where public venue data makes it defensible

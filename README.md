@@ -4,38 +4,25 @@ A **paper-first, fail-closed** engine for discovering structural crypto-market i
 
 ## v0.8 — Empirical Fill / Latency Modeling
 
-v0.8 begins replacing assumed execution timing with measured evidence while keeping the existing fixed model as the automatic fallback until the sample set is large enough.
+v0.8 replaces assumed execution timing only when measured evidence is sufficiently strong; otherwise the conservative fixed model remains active automatically.
 
-Each multi-horizon shadow observation now records:
+Each multi-horizon shadow observation records original target size, scan duration, per-leg visible depth, reconstructed pair/reserve fillability, asymmetric hedge-recovery states, adverse selection, and the existing spread/slippage/edge/capacity attribution.
 
-- the original target base quantity;
-- measured end-to-end scan duration for the initial and verification scans;
-- per-leg visible base depth and depth multiple versus the original target;
-- whether both legs remained visibly fillable at the original size;
-- whether both legs still preserved the configured hedge-liquidity reserve;
-- whether asymmetric depth would have created a hedge-recovery state;
-- per-leg adverse selection and the existing spread/slippage/edge/capacity attribution.
+### v0.8.1 — hierarchical calibration
 
-From those observations the engine builds an `EmpiricalLatencyModel`:
+Empirical fill and adverse-selection distributions are no longer global-only. For each evaluated capital size the resolver tries the narrowest cohort first:
 
-1. Deduplicate measured verification-scan latencies.
-2. Take the configured latency quantile (default p95).
-3. Map that measured latency to the first shadow horizon at or beyond it.
-4. At that conservative horizon, estimate pair-fill probability, reserve-fill probability, capture probability, hedge-recovery probability, and the distribution of adverse price movement across the hedge pair.
-5. Use p95 observed pair adverse selection as the empirical hedge-latency risk charge **only after** minimum scan and cohort sample thresholds are met.
-6. Otherwise retain the prior fixed expected-hedge-latency charge automatically.
+**strategy + venue pair + asset + capital → strategy + venue pair + asset → strategy + venue pair → strategy → global**
 
-Book-age risk is not removed by the empirical model; stale current books remain explicitly charged and freshness gates remain fail-closed.
+A scope is used only when it meets the configured minimum sample threshold for both reconstructed fills and adverse-selection observations. Sparse scopes fall back automatically, and the fallback path is persisted in each capital-tier qualification so broader evidence cannot masquerade as a precise cohort.
 
-New endpoint:
+Observation-path latency remains measured globally from unique verification scans because it reflects collector/runtime performance; that measured latency is mapped to the first conservative 1/5/15/30/60-second shadow horizon. Fill, reserve-fill, capture, hedge-recovery, and adverse-selection distributions are then selected from the hierarchical cohort at that horizon.
 
-- `GET /v1/latency/model` — current empirical model, evidence counts, selected latency horizon, fill/capture probabilities, adverse-selection quantiles, and whether the model is permitted to affect qualification.
-
-`GET /v1/executability/live` and `GET /v1/shadow/summary` also expose the active latency model. Individual capital-tier qualifications record whether they used `fixed` or `empirical_shadow` latency risk.
+`GET /v1/latency/model` accepts optional `strategy`, `venue_pair`, `asset`, and `notional_usd_per_leg` query parameters for inspecting the selected cohort and fallback provenance. Individual executable capital tiers expose their active latency-model scope and empirical probabilities.
 
 ## Current evidence pipeline
 
-**Detect → qualify economics → prove L2 executability → observe 1/5/15/30/60s → reconstruct pair fillability → measure scan latency → measure adverse selection → estimate fill/capture probability → calibrate latency risk.**
+**Detect → qualify economics → prove L2 executability → observe 1/5/15/30/60s → reconstruct pair fillability → measure scan latency → select the narrowest valid empirical cohort → measure adverse selection → estimate fill/capture probability → calibrate latency risk.**
 
 ## Safety boundary
 

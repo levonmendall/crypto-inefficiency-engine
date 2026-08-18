@@ -101,10 +101,21 @@ def shadow_summary():
 
 
 @app.get("/v1/latency/model")
-def empirical_latency_model():
+def empirical_latency_model(
+    strategy: str | None = None,
+    venue_pair: str | None = None,
+    asset: str | None = None,
+    notional_usd_per_leg: float | None = None,
+):
     if evidence_store is None:
         raise HTTPException(status_code=503, detail="evidence persistence is not configured")
-    return service.empirical_latency_model().model_dump(mode="json")
+    model = service.empirical_latency_model(
+        notional_usd_per_leg=notional_usd_per_leg,
+        strategy=strategy,
+        venue_pair_name=venue_pair,
+        asset=asset,
+    )
+    return model.model_dump(mode="json")
 
 
 @app.get("/v1/worker/health")
