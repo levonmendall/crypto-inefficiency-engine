@@ -60,8 +60,11 @@ class Settings:
     hedge_liquidity_reserve_ratio: float = 1.25
     hedge_recovery_buffer_bps: float = 2.0
     shadow_delay_seconds: float = 5.0
+    shadow_horizons_seconds: tuple[float, ...] = (1.0, 5.0, 15.0, 30.0, 60.0)
     shadow_notional_usd: float = 1000.0
-    shadow_max_candidates: int = 10
+    shadow_max_candidates: int = 0
+    shadow_slippage_expansion_bps: float = 1.0
+    shadow_hedge_divergence_bps: float = 5.0
     shadow_cycle_interval_seconds: float = 30.0
     worker_error_backoff_seconds: float = 15.0
     worker_heartbeat_stale_seconds: float = 180.0
@@ -96,8 +99,11 @@ class Settings:
             hedge_liquidity_reserve_ratio=_float("CIE_HEDGE_LIQUIDITY_RESERVE_RATIO", 1.25),
             hedge_recovery_buffer_bps=_float("CIE_HEDGE_RECOVERY_BUFFER_BPS", 2.0),
             shadow_delay_seconds=_float("CIE_SHADOW_DELAY_SECONDS", 5.0),
+            shadow_horizons_seconds=_float_tuple("CIE_SHADOW_HORIZONS_SECONDS", (1.0, 5.0, 15.0, 30.0, 60.0)),
             shadow_notional_usd=_float("CIE_SHADOW_NOTIONAL_USD", 1000.0),
-            shadow_max_candidates=_int("CIE_SHADOW_MAX_CANDIDATES", 10),
+            shadow_max_candidates=_int("CIE_SHADOW_MAX_CANDIDATES", 0),
+            shadow_slippage_expansion_bps=_float("CIE_SHADOW_SLIPPAGE_EXPANSION_BPS", 1.0),
+            shadow_hedge_divergence_bps=_float("CIE_SHADOW_HEDGE_DIVERGENCE_BPS", 5.0),
             shadow_cycle_interval_seconds=_float("CIE_SHADOW_CYCLE_INTERVAL_SECONDS", 30.0),
             worker_error_backoff_seconds=_float("CIE_WORKER_ERROR_BACKOFF_SECONDS", 15.0),
             worker_heartbeat_stale_seconds=_float("CIE_WORKER_HEARTBEAT_STALE_SECONDS", 180.0),

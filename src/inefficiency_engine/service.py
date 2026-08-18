@@ -14,7 +14,14 @@ from inefficiency_engine.evidence import EvidenceStore, ProviderStatus, ScanSnap
 from inefficiency_engine.execution import qualify_opportunity
 from inefficiency_engine.models import FundingQuote, MarketKind, MarketQuote, Opportunity, OrderBookSnapshot, ShadowCycle, ShadowObservation, ShadowOutcome
 from inefficiency_engine.risk import RiskGate
-from inefficiency_engine.shadow import opportunity_signature
+from inefficiency_engine.shadow import (
+    build_leg_attribution,
+    classify_shadow_failure,
+    expected_return_bucket,
+    opportunity_signature,
+    time_of_day_bucket,
+    venue_pair,
+)
 
 
 class OpportunityService:
@@ -144,87 +151,180 @@ class OpportunityService:
         )
 
     async def run_shadow_cycle(self, *, delay_seconds: float | None = None) -> ShadowCycle:
-        delay = self.settings.shadow_delay_seconds if delay_seconds is None else max(0.0, delay_seconds)
+        horizons = (
+            (max(0.0, delay_seconds),)
+            if delay_seconds is not None
+            else tuple(sorted(set(max(0.0, value) for value in self.settings.shadow_horizons_seconds)))
+        )
+        if not horizons:
+            horizons = (max(0.0, self.settings.shadow_delay_seconds),)
+
         started_at = datetime.now(timezone.utc)
         initial = await self.collect_live_executability()
         initial_by_id = {op.id: op for op in initial.opportunities}
 
-        candidates: list[tuple[Opportunity, object, float, float]] = []
+        candidates: list[tuple[Opportunity, object, float, object]] = []
         for executability in initial.executability:
             opportunity = initial_by_id.get(executability.opportunity_id)
             if opportunity is None or executability.estimated_capacity_notional_usd <= 0:
                 continue
-            target = min(self.settings.shadow_notional_usd, executability.estimated_capacity_notional_usd)
-            initial_exact = qualify_opportunity(opportunity, initial.order_books, self.settings, notionals_usd=(target,), now=executability.observed_at)
-            tier = initial_exact.tiers[0]
-            if not (tier.executable and tier.passes_return_hurdle):
-                continue
-            candidates.append((opportunity, executability, target, tier.net_annualized_return))
 
-        candidates.sort(key=lambda item: item[3], reverse=True)
-        candidates = candidates[: max(0, self.settings.shadow_max_candidates)]
+            qualified_tiers = [
+                tier for tier in executability.tiers
+                if tier.executable and tier.passes_return_hurdle
+            ]
+            if qualified_tiers:
+                for tier in qualified_tiers:
+                    candidates.append((opportunity, executability, tier.notional_usd_per_leg, tier))
+            else:
+                target = min(self.settings.shadow_notional_usd, executability.estimated_capacity_notional_usd)
+                if target > 0:
+                    exact = qualify_opportunity(
+                        opportunity,
+                        initial.order_books,
+                        self.settings,
+                        notionals_usd=(target,),
+                        now=executability.observed_at,
+                    )
+                    tier = exact.tiers[0]
+                    if tier.executable and tier.passes_return_hurdle:
+                        candidates.append((opportunity, executability, target, tier))
 
-        if delay > 0:
-            await asyncio.sleep(delay)
-        verification = await self.collect_live_executability()
-        verification_ops = {opportunity_signature(op): op for op in verification.opportunities}
+        candidates.sort(key=lambda item: item[3].net_annualized_return, reverse=True)
+        if self.settings.shadow_max_candidates > 0:
+            candidates = candidates[: self.settings.shadow_max_candidates]
 
         observations: list[ShadowObservation] = []
-        verified_at = verification.completed_at
-        for opportunity, initial_exec, target, initial_return in candidates:
-            signature = opportunity_signature(opportunity)
-            current = verification_ops.get(signature)
-            if current is None:
-                observations.append(ShadowObservation(
-                    shadow_id=uuid.uuid4().hex,
-                    initial_scan_id=initial.scan_id,
-                    verification_scan_id=verification.scan_id,
-                    opportunity_signature=signature,
-                    opportunity_id=opportunity.id,
-                    strategy=opportunity.strategy,
-                    asset=opportunity.asset,
-                    notional_usd_per_leg=target,
-                    started_at=started_at,
-                    verified_at=verified_at,
-                    delay_seconds=delay,
-                    initial_net_annualized_return=initial_return,
-                    initial_capacity_notional_usd=initial_exec.estimated_capacity_notional_usd,
-                    survived=False,
-                    outcome=ShadowOutcome.SIGNAL_DISAPPEARED,
-                    reason="economic opportunity was not rediscovered at verification",
-                ))
-                continue
+        verification_scan_ids: list[str] = []
+        elapsed = 0.0
+        final_verification = initial
 
-            current_exec = qualify_opportunity(current, verification.order_books, self.settings, notionals_usd=(target,), now=verified_at)
-            tier = current_exec.tiers[0]
-            survived = tier.executable and tier.passes_return_hurdle
-            observations.append(ShadowObservation(
-                shadow_id=uuid.uuid4().hex,
-                initial_scan_id=initial.scan_id,
-                verification_scan_id=verification.scan_id,
-                opportunity_signature=signature,
-                opportunity_id=opportunity.id,
-                strategy=opportunity.strategy,
-                asset=opportunity.asset,
-                notional_usd_per_leg=target,
-                started_at=started_at,
-                verified_at=verified_at,
-                delay_seconds=delay,
-                initial_net_annualized_return=initial_return,
-                initial_capacity_notional_usd=initial_exec.estimated_capacity_notional_usd,
-                survived=survived,
-                verification_net_annualized_return=tier.net_annualized_return,
-                outcome=ShadowOutcome.SURVIVED if survived else ShadowOutcome.EXECUTABILITY_FAILED,
-                reason=None if survived else tier.rejection_reason,
-            ))
+        for horizon in horizons:
+            wait = max(0.0, horizon - elapsed)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            elapsed = horizon
+
+            verification = await self.collect_live_executability()
+            final_verification = verification
+            verification_scan_ids.append(verification.scan_id)
+            verification_ops = {opportunity_signature(op): op for op in verification.opportunities}
+            provider_failed = any(not status.ok for status in verification.providers)
+            verified_at = verification.completed_at
+
+            for opportunity, initial_exec, target, initial_tier in candidates:
+                signature = opportunity_signature(opportunity)
+                current = verification_ops.get(signature)
+                current_exec = None
+                current_tier = None
+                if current is not None:
+                    current_exec = qualify_opportunity(
+                        current,
+                        verification.order_books,
+                        self.settings,
+                        notionals_usd=(target,),
+                        now=verified_at,
+                    )
+                    current_tier = current_exec.tiers[0]
+
+                target_quantity = initial_tier.target_base_quantity
+                leg_attribution, divergence = build_leg_attribution(
+                    opportunity,
+                    initial.order_books,
+                    verification.order_books,
+                    target_quantity=target_quantity,
+                )
+                survived = bool(
+                    current is not None
+                    and current_tier is not None
+                    and current_tier.executable
+                    and current_tier.passes_return_hurdle
+                    and not provider_failed
+                )
+
+                failure_cause = None
+                if not survived:
+                    failure_cause = classify_shadow_failure(
+                        current_present=current is not None,
+                        provider_failed=provider_failed,
+                        verification_tier=current_tier,
+                        initial_tier=initial_tier,
+                        hedge_leg_divergence_bps=divergence,
+                        slippage_expansion_threshold_bps=self.settings.shadow_slippage_expansion_bps,
+                        hedge_divergence_threshold_bps=self.settings.shadow_hedge_divergence_bps,
+                    )
+
+                verification_return = current_tier.net_annualized_return if current_tier is not None else None
+                verification_capacity = current_exec.estimated_capacity_notional_usd if current_exec is not None else None
+                verification_gross = current.gross_edge_bps_per_hour if current is not None else None
+                initial_cost = initial_tier.total_modeled_cost_bps
+                verification_cost = current_tier.total_modeled_cost_bps if current_tier is not None else None
+                initial_slippage = initial_tier.observed_entry_slippage_bps
+                verification_slippage = current_tier.observed_entry_slippage_bps if current_tier is not None else None
+
+                if survived:
+                    outcome = ShadowOutcome.SURVIVED
+                    reason = None
+                elif current is None and not provider_failed:
+                    outcome = ShadowOutcome.SIGNAL_DISAPPEARED
+                    reason = "economic opportunity was not rediscovered at verification"
+                else:
+                    outcome = ShadowOutcome.EXECUTABILITY_FAILED
+                    reason = (
+                        "provider/data failure during verification"
+                        if provider_failed
+                        else (current_tier.rejection_reason if current_tier is not None else "verification failed closed")
+                    )
+
+                observations.append(
+                    ShadowObservation(
+                        shadow_id=uuid.uuid4().hex,
+                        initial_scan_id=initial.scan_id,
+                        verification_scan_id=verification.scan_id,
+                        opportunity_signature=signature,
+                        opportunity_id=opportunity.id,
+                        strategy=opportunity.strategy,
+                        asset=opportunity.asset,
+                        notional_usd_per_leg=target,
+                        started_at=started_at,
+                        verified_at=verified_at,
+                        delay_seconds=horizon,
+                        initial_net_annualized_return=initial_tier.net_annualized_return,
+                        initial_capacity_notional_usd=initial_exec.estimated_capacity_notional_usd,
+                        survived=survived,
+                        verification_net_annualized_return=verification_return,
+                        outcome=outcome,
+                        reason=reason,
+                        venue_pair=venue_pair(opportunity),
+                        time_of_day_bucket=time_of_day_bucket(initial.completed_at),
+                        initial_expected_return_bucket=expected_return_bucket(initial_tier.net_annualized_return),
+                        initial_gross_edge_bps_per_hour=opportunity.gross_edge_bps_per_hour,
+                        verification_gross_edge_bps_per_hour=verification_gross,
+                        gross_edge_decay_bps_per_hour=(opportunity.gross_edge_bps_per_hour - verification_gross) if verification_gross is not None else None,
+                        initial_total_modeled_cost_bps=initial_cost,
+                        verification_total_modeled_cost_bps=verification_cost,
+                        cost_expansion_bps=(verification_cost - initial_cost) if verification_cost is not None else None,
+                        initial_entry_slippage_bps=initial_slippage,
+                        verification_entry_slippage_bps=verification_slippage,
+                        slippage_expansion_bps=(verification_slippage - initial_slippage) if verification_slippage is not None else None,
+                        verification_capacity_notional_usd=verification_capacity,
+                        capacity_deterioration_usd=(initial_exec.estimated_capacity_notional_usd - verification_capacity) if verification_capacity is not None else None,
+                        edge_decay_annualized=(initial_tier.net_annualized_return - verification_return) if verification_return is not None else None,
+                        hedge_leg_divergence_bps=divergence,
+                        failure_cause=failure_cause,
+                        leg_attribution=leg_attribution,
+                    )
+                )
 
         cycle = ShadowCycle(
             cycle_id=uuid.uuid4().hex,
             started_at=started_at,
             completed_at=datetime.now(timezone.utc),
-            delay_seconds=delay,
+            delay_seconds=max(horizons),
+            horizons_seconds=list(horizons),
             initial_scan_id=initial.scan_id,
-            verification_scan_id=verification.scan_id,
+            verification_scan_id=final_verification.scan_id,
+            verification_scan_ids=verification_scan_ids,
             observations=observations,
         )
         if self.evidence_store is not None:

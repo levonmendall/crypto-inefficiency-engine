@@ -120,6 +120,15 @@ class ShadowOutcome(str, Enum):
     EXECUTABILITY_FAILED = "executability_failed"
 
 
+class ShadowFailureCause(str, Enum):
+    SIGNAL_DISAPPEARED = "signal_disappeared"
+    INSUFFICIENT_DEPTH = "insufficient_depth"
+    SLIPPAGE_EXPANSION = "slippage_expansion"
+    FEE_COST_HURDLE_FAILURE = "fee_cost_hurdle_failure"
+    STALE_DATA_PROVIDER_FAILURE = "stale_data_provider_failure"
+    HEDGE_LEG_DIVERGENCE = "hedge_leg_divergence"
+
+
 class CapitalTierQualification(BaseModel):
     opportunity_id: str
     notional_usd_per_leg: float = Field(gt=0)
@@ -176,6 +185,22 @@ class Opportunity(BaseModel):
     paper_only: bool = True
 
 
+class ShadowLegAttribution(BaseModel):
+    venue: str
+    asset: str
+    market_kind: MarketKind
+    side: Side
+    initial_best_price: float | None = None
+    verification_best_price: float | None = None
+    adverse_selection_bps: float | None = None
+    initial_spread_bps: float | None = None
+    verification_spread_bps: float | None = None
+    initial_available_depth_usd: float | None = None
+    verification_available_depth_usd: float | None = None
+    initial_slippage_bps: float | None = None
+    verification_slippage_bps: float | None = None
+
+
 class ShadowObservation(BaseModel):
     shadow_id: str
     initial_scan_id: str
@@ -194,6 +219,24 @@ class ShadowObservation(BaseModel):
     verification_net_annualized_return: float | None = None
     outcome: ShadowOutcome
     reason: str | None = None
+    venue_pair: str | None = None
+    time_of_day_bucket: str | None = None
+    initial_expected_return_bucket: str | None = None
+    initial_gross_edge_bps_per_hour: float | None = None
+    verification_gross_edge_bps_per_hour: float | None = None
+    gross_edge_decay_bps_per_hour: float | None = None
+    initial_total_modeled_cost_bps: float | None = None
+    verification_total_modeled_cost_bps: float | None = None
+    cost_expansion_bps: float | None = None
+    initial_entry_slippage_bps: float | None = None
+    verification_entry_slippage_bps: float | None = None
+    slippage_expansion_bps: float | None = None
+    verification_capacity_notional_usd: float | None = None
+    capacity_deterioration_usd: float | None = None
+    edge_decay_annualized: float | None = None
+    hedge_leg_divergence_bps: float | None = None
+    failure_cause: ShadowFailureCause | None = None
+    leg_attribution: list[ShadowLegAttribution] = Field(default_factory=list)
     paper_only: bool = True
 
 
@@ -204,5 +247,7 @@ class ShadowCycle(BaseModel):
     delay_seconds: float = Field(ge=0)
     initial_scan_id: str
     verification_scan_id: str
+    verification_scan_ids: list[str] = Field(default_factory=list)
+    horizons_seconds: list[float] = Field(default_factory=list)
     observations: list[ShadowObservation] = Field(default_factory=list)
     paper_only: bool = True
