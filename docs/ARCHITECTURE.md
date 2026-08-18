@@ -6,7 +6,7 @@ Continuously identify structural crypto-market inefficiencies and rank them by c
 
 ## Pipeline
 
-`Public market data -> normalization -> append-only evidence -> strategy detectors -> L2 books -> explicit economic cost model -> paired executability -> capacity frontier -> shadow persistence test -> API`
+`Public market data -> normalization -> strategy detectors -> L2 books -> economic cost model -> paired executability -> capacity frontier -> shadow persistence test -> durable evidence database -> read-only API`
 
 ## Core boundaries
 
@@ -41,3 +41,13 @@ There is still no live executor. Shadow mode never sends orders. Real-money exec
 
 ### API boundary
 The API exposes derived intelligence and shadow evidence without exposing private positions or future proprietary execution timing. This surface can later support metering and machine payments.
+
+
+### Durable evidence runtime
+SQLite remains the zero-configuration local backend. Production can provide `DATABASE_URL` or `CIE_DATABASE_URL`; the same `EvidenceStore` then uses PostgreSQL through SQLAlchemy while preserving the existing append-only schema and lineage hashes. Database credentials are resolved outside `Settings`, so they are never copied into persisted analysis-configuration snapshots.
+
+### Worker liveness and failure isolation
+The production worker writes heartbeats before and after every shadow cycle. Transient market/provider failures are persisted as `error` heartbeats and trigger bounded backoff rather than process termination. A stale-heartbeat health check distinguishes a live-but-idle API from a dead evidence collector. SIGTERM/SIGINT set a stop event so a deployment can finish the active cycle and record a final state before exit.
+
+### Deployment topology
+The repository includes a Render Blueprint with one always-on background worker, one lightweight read-only web API, and one managed PostgreSQL database. The database blocks public IP access and is injected into both services over Render's internal connection string. The worker is the only component required for evidence collection; the web service is observational.

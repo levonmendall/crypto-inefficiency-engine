@@ -63,6 +63,8 @@ class Settings:
     shadow_notional_usd: float = 1000.0
     shadow_max_candidates: int = 10
     shadow_cycle_interval_seconds: float = 30.0
+    worker_error_backoff_seconds: float = 15.0
+    worker_heartbeat_stale_seconds: float = 180.0
     capital_tiers_usd: tuple[float, ...] = (1000.0, 10000.0, 25000.0, 50000.0, 100000.0)
     evidence_db_path: str | None = None
 
@@ -97,6 +99,8 @@ class Settings:
             shadow_notional_usd=_float("CIE_SHADOW_NOTIONAL_USD", 1000.0),
             shadow_max_candidates=_int("CIE_SHADOW_MAX_CANDIDATES", 10),
             shadow_cycle_interval_seconds=_float("CIE_SHADOW_CYCLE_INTERVAL_SECONDS", 30.0),
+            worker_error_backoff_seconds=_float("CIE_WORKER_ERROR_BACKOFF_SECONDS", 15.0),
+            worker_heartbeat_stale_seconds=_float("CIE_WORKER_HEARTBEAT_STALE_SECONDS", 180.0),
             capital_tiers_usd=_float_tuple("CIE_CAPITAL_TIERS_USD", (1000.0, 10000.0, 25000.0, 50000.0, 100000.0)),
             evidence_db_path=os.getenv("CIE_EVIDENCE_DB_PATH") or None,
         )

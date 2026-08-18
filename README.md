@@ -1,6 +1,6 @@
 # Crypto Inefficiency Engine
 
-A **paper-first, fail-closed** engine for discovering structural crypto-market inefficiencies and proving whether apparent edge survives point-in-time evidence, real visible depth, explicit fees, capital usage, latency risk, and repeated shadow observation. V0.5 does not place live orders and does not require exchange trading keys.
+A **paper-first, fail-closed** engine for discovering structural crypto-market inefficiencies and proving whether apparent edge survives point-in-time evidence, real visible depth, explicit fees, capital usage, latency risk, and repeated shadow observation. V0.6 does not place live orders and does not require exchange trading keys.
 
 ## Current capabilities
 
@@ -21,7 +21,10 @@ A **paper-first, fail-closed** engine for discovering structural crypto-market i
 15. Fail closed when short-spot borrow cost is required but unavailable.
 16. Run live **shadow cycles** that re-scan after a delay and record whether the same economic opportunity remains executable at the original target size.
 17. Persist shadow survival evidence and expose aggregate survival statistics.
-18. Expose a read-only/API-first surface designed to become a future paid machine-to-machine intelligence service.
+18. Persist the evidence ledger to either local SQLite or managed PostgreSQL without changing append-only semantics.
+19. Run a resilient background worker with durable `starting`/`running`/`success`/`error` heartbeats and transient-failure backoff.
+20. Ship a Render Blueprint for an always-on shadow worker, read-only API, and private-network Postgres.
+21. Expose a read-only/API-first surface designed to become a future paid machine-to-machine intelligence service.
 
 ## Conservative fee defaults
 
@@ -51,6 +54,7 @@ source .venv/bin/activate
 pip install -e '.[dev]'
 pytest
 export CIE_EVIDENCE_DB_PATH=data/cie-evidence.sqlite3
+# Production: set DATABASE_URL or CIE_DATABASE_URL to PostgreSQL instead.
 uvicorn inefficiency_engine.api:app --reload
 ```
 
@@ -62,6 +66,8 @@ cie live
 cie executability
 cie shadow-once
 cie shadow-loop
+cie worker
+cie worker-health
 ```
 
 Endpoints:
@@ -73,9 +79,22 @@ Endpoints:
 - `GET /v1/evidence/{scan_id}/replay`
 - `POST /v1/shadow/cycle`
 - `GET /v1/shadow/summary`
+- `GET /v1/worker/health`
+- `GET /v1/evidence/counts`
 
 ## Why this architecture?
 
-Finding a spread is easy. The valuable question is whether the spread remained available **after real fee schedules, capital requirements, depth, slippage, latency exposure, hedge risk, and time**. V0.5 begins measuring that question instead of assuming it.
+Finding a spread is easy. The valuable question is whether the spread remained available **after real fee schedules, capital requirements, depth, slippage, latency exposure, hedge risk, and time**. V0.6 also makes that measurement durable across deploys and restarts so the evidence set can grow continuously rather than resetting with a process or filesystem.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
+
+## Persistent shadow deployment
+
+`render.yaml` defines the intended evidence-collection topology:
+
+`public market APIs -> always-on shadow worker -> managed Postgres <- read-only API`
+
+The database is intentionally configured as a paid `basic-256mb` instance because free Render Postgres expires after 30 days and has no managed backups. The worker is a `starter` background worker because Render does not offer free background workers. Creating the Blueprint can therefore incur Render charges; the repository change itself does not provision anything.
+
+See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).

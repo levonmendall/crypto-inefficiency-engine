@@ -2,37 +2,37 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
+from sqlalchemy import Boolean, Column, ForeignKey, Index, Integer, MetaData, String, Table, Text, create_engine, func, insert, select, text
+from sqlalchemy.engine import Engine
 
 from inefficiency_engine.models import FundingQuote, MarketQuote, Opportunity, OpportunityExecutability, OrderBookSnapshot, ShadowCycle
 
 
-def _utc_now() -> datetime:
+def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _canonical_json(model: BaseModel | dict[str, object]) -> str:
-    if isinstance(model, BaseModel):
-        payload = model.model_dump(mode="json")
-    else:
-        payload = model
+def _json(value: BaseModel | dict[str, object]) -> str:
+    payload = value.model_dump(mode="json") if isinstance(value, BaseModel) else value
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
-def lineage_hash(model: BaseModel | dict[str, object]) -> str:
-    return hashlib.sha256(_canonical_json(model).encode()).hexdigest()
+def lineage_hash(value: BaseModel | dict[str, object]) -> str:
+    return hashlib.sha256(_json(value).encode()).hexdigest()
 
 
 class ProviderStatus(BaseModel):
     provider: str
     ok: bool
-    observed_at: datetime = Field(default_factory=_utc_now)
+    observed_at: datetime = Field(default_factory=_now)
     item_count: int = 0
     error_type: str | None = None
 
@@ -50,6 +50,16 @@ class ScanSnapshot(BaseModel):
     analysis_config: dict[str, object] = Field(default_factory=dict)
 
 
+class WorkerHeartbeat(BaseModel):
+    worker_id: str
+    observed_at: datetime = Field(default_factory=_now)
+    state: str
+    cycle_id: str | None = None
+    scan_id: str | None = None
+    error_type: str | None = None
+    detail: dict[str, object] = Field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class PersistedCounts:
     scans: int
@@ -60,238 +70,215 @@ class PersistedCounts:
     order_books: int
     executability: int
     shadow_cycles: int
+    worker_heartbeats: int = 0
+
+
+def evidence_location_from_env(fallback_path: str | Path | None = None) -> str | Path | None:
+    return os.getenv("CIE_DATABASE_URL") or os.getenv("DATABASE_URL") or fallback_path
+
+
+def build_evidence_store(fallback_path: str | Path | None = None) -> EvidenceStore | None:
+    location = evidence_location_from_env(fallback_path)
+    return None if location is None else EvidenceStore(location)
+
+
+def _database_url(location: str | Path) -> str:
+    raw = str(location)
+    if raw.startswith("postgres://"):
+        return "postgresql+psycopg://" + raw[11:]
+    if raw.startswith("postgresql://"):
+        return "postgresql+psycopg://" + raw[13:]
+    if raw.startswith(("postgresql+psycopg://", "sqlite://")):
+        return raw
+    path = Path(raw).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite:///{path}"
 
 
 class EvidenceStore:
-    """Append-only SQLite evidence ledger for point-in-time market observations."""
+    """Append-only evidence ledger using SQLite locally or PostgreSQL in production."""
 
-    def __init__(self, path: str | Path):
-        self.path = str(path)
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+    def __init__(self, location: str | Path):
+        url = _database_url(location)
+        kwargs: dict[str, Any] = {"pool_pre_ping": True}
+        if url.startswith("sqlite:"):
+            kwargs["connect_args"] = {"check_same_thread": False}
+        self.engine: Engine = create_engine(url, **kwargs)
+        self.backend = self.engine.url.get_backend_name()
+        self.safe_database_url = self.engine.url.render_as_string(hide_password=True)
+        self.metadata = MetaData()
+        self._schema()
+        self.metadata.create_all(self.engine)
+        if self.backend == "sqlite":
+            with self.engine.begin() as db:
+                db.execute(text("PRAGMA journal_mode=WAL"))
+                db.execute(text("PRAGMA foreign_keys=ON"))
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+    def _schema(self) -> None:
+        self.scans = Table(
+            "scans", self.metadata,
+            Column("scan_id", String(64), primary_key=True),
+            Column("started_at", Text, nullable=False), Column("completed_at", Text, nullable=False),
+            Column("created_at", Text, nullable=False), Column("analysis_config_json", Text, nullable=False),
+        )
 
-    def _initialize(self) -> None:
-        with self._connect() as db:
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS scans (
-                    scan_id TEXT PRIMARY KEY,
-                    started_at TEXT NOT NULL,
-                    completed_at TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    analysis_config_json TEXT NOT NULL DEFAULT '{}'
-                );
-                CREATE TABLE IF NOT EXISTS provider_statuses (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scan_id TEXT NOT NULL REFERENCES scans(scan_id),
-                    provider TEXT NOT NULL,
-                    ok INTEGER NOT NULL,
-                    observed_at TEXT NOT NULL,
-                    item_count INTEGER NOT NULL,
-                    error_type TEXT,
-                    payload_json TEXT NOT NULL,
-                    lineage_hash TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS funding_quotes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scan_id TEXT NOT NULL REFERENCES scans(scan_id),
-                    venue TEXT NOT NULL,
-                    asset TEXT NOT NULL,
-                    observed_at TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    lineage_hash TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS market_quotes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scan_id TEXT NOT NULL REFERENCES scans(scan_id),
-                    venue TEXT NOT NULL,
-                    asset TEXT NOT NULL,
-                    observed_at TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    lineage_hash TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS opportunities (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scan_id TEXT NOT NULL REFERENCES scans(scan_id),
-                    opportunity_id TEXT NOT NULL,
-                    strategy TEXT NOT NULL,
-                    asset TEXT NOT NULL,
-                    observed_at TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    lineage_hash TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS order_books (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scan_id TEXT NOT NULL REFERENCES scans(scan_id),
-                    venue TEXT NOT NULL,
-                    asset TEXT NOT NULL,
-                    market_kind TEXT NOT NULL,
-                    observed_at TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    lineage_hash TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS executability (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scan_id TEXT NOT NULL REFERENCES scans(scan_id),
-                    opportunity_id TEXT NOT NULL,
-                    asset TEXT NOT NULL,
-                    observed_at TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    lineage_hash TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS shadow_cycles (
-                    cycle_id TEXT PRIMARY KEY,
-                    started_at TEXT NOT NULL,
-                    completed_at TEXT NOT NULL,
-                    initial_scan_id TEXT NOT NULL,
-                    verification_scan_id TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    lineage_hash TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS ix_funding_scan ON funding_quotes(scan_id);
-                CREATE INDEX IF NOT EXISTS ix_market_scan ON market_quotes(scan_id);
-                CREATE INDEX IF NOT EXISTS ix_opportunity_scan ON opportunities(scan_id);
-                CREATE INDEX IF NOT EXISTS ix_order_book_scan ON order_books(scan_id);
-                CREATE INDEX IF NOT EXISTS ix_executability_scan ON executability(scan_id);
-                CREATE INDEX IF NOT EXISTS ix_shadow_completed ON shadow_cycles(completed_at);
-                """
+        def payload_table(name: str, *extra: Column) -> Table:
+            return Table(
+                name, self.metadata,
+                Column("id", Integer, primary_key=True, autoincrement=True),
+                Column("scan_id", String(64), ForeignKey("scans.scan_id"), nullable=False),
+                *extra,
+                Column("observed_at", Text, nullable=False), Column("payload_json", Text, nullable=False),
+                Column("lineage_hash", String(64), nullable=False),
             )
 
-    def record_scan(
-        self,
-        *,
-        funding_quotes: list[FundingQuote],
-        market_quotes: list[MarketQuote],
-        opportunities: list[Opportunity],
-        providers: list[ProviderStatus],
-        started_at: datetime,
-        completed_at: datetime,
-        scan_id: str | None = None,
-        analysis_config: dict[str, object] | None = None,
-        order_books: list[OrderBookSnapshot] | None = None,
-        executability: list[OpportunityExecutability] | None = None,
-    ) -> str:
+        self.provider_statuses = payload_table(
+            "provider_statuses", Column("provider", Text, nullable=False), Column("ok", Boolean, nullable=False),
+            Column("item_count", Integer, nullable=False), Column("error_type", Text),
+        )
+        self.funding_quotes = payload_table("funding_quotes", Column("venue", Text, nullable=False), Column("asset", Text, nullable=False))
+        self.market_quotes = payload_table("market_quotes", Column("venue", Text, nullable=False), Column("asset", Text, nullable=False))
+        self.opportunities = payload_table(
+            "opportunities", Column("opportunity_id", Text, nullable=False), Column("strategy", Text, nullable=False), Column("asset", Text, nullable=False),
+        )
+        self.order_books = payload_table(
+            "order_books", Column("venue", Text, nullable=False), Column("asset", Text, nullable=False), Column("market_kind", Text, nullable=False),
+        )
+        self.executability = payload_table("executability", Column("opportunity_id", Text, nullable=False), Column("asset", Text, nullable=False))
+        self.shadow_cycles = Table(
+            "shadow_cycles", self.metadata,
+            Column("cycle_id", String(64), primary_key=True), Column("started_at", Text, nullable=False), Column("completed_at", Text, nullable=False),
+            Column("initial_scan_id", String(64), nullable=False), Column("verification_scan_id", String(64), nullable=False),
+            Column("payload_json", Text, nullable=False), Column("lineage_hash", String(64), nullable=False),
+        )
+        self.worker_heartbeats = Table(
+            "worker_heartbeats", self.metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True), Column("worker_id", Text, nullable=False),
+            Column("observed_at", Text, nullable=False), Column("state", Text, nullable=False), Column("cycle_id", Text), Column("scan_id", Text),
+            Column("error_type", Text), Column("payload_json", Text, nullable=False), Column("lineage_hash", String(64), nullable=False),
+        )
+        for name, table, column in [
+            ("ix_funding_scan", self.funding_quotes, "scan_id"), ("ix_market_scan", self.market_quotes, "scan_id"),
+            ("ix_opportunity_scan", self.opportunities, "scan_id"), ("ix_order_book_scan", self.order_books, "scan_id"),
+            ("ix_executability_scan", self.executability, "scan_id"), ("ix_shadow_completed", self.shadow_cycles, "completed_at"),
+            ("ix_worker_heartbeat_observed", self.worker_heartbeats, "observed_at"), ("ix_worker_heartbeat_worker", self.worker_heartbeats, "worker_id"),
+        ]:
+            Index(name, getattr(table.c, column))
+
+    @staticmethod
+    def _payload_rows(scan_id: str, values: list[BaseModel], extra) -> list[dict[str, object]]:
+        rows = []
+        for value in values:
+            payload = _json(value)
+            rows.append({
+                "scan_id": scan_id, "observed_at": value.observed_at.isoformat(), "payload_json": payload,
+                "lineage_hash": hashlib.sha256(payload.encode()).hexdigest(), **extra(value),
+            })
+        return rows
+
+    def ping(self) -> bool:
+        with self.engine.connect() as db:
+            return db.execute(text("SELECT 1")).scalar_one() == 1
+
+    def record_scan(self, *, funding_quotes: list[FundingQuote], market_quotes: list[MarketQuote], opportunities: list[Opportunity],
+                    providers: list[ProviderStatus], started_at: datetime, completed_at: datetime, scan_id: str | None = None,
+                    analysis_config: dict[str, object] | None = None, order_books: list[OrderBookSnapshot] | None = None,
+                    executability: list[OpportunityExecutability] | None = None) -> str:
         scan_id = scan_id or uuid.uuid4().hex
-        with self._connect() as db:
-            db.execute(
-                "INSERT INTO scans(scan_id, started_at, completed_at, created_at, analysis_config_json) VALUES (?, ?, ?, ?, ?)",
-                (scan_id, started_at.isoformat(), completed_at.isoformat(), _utc_now().isoformat(), json.dumps(analysis_config or {}, sort_keys=True)),
-            )
-            for status in providers:
-                payload = _canonical_json(status)
-                db.execute(
-                    """INSERT INTO provider_statuses
-                    (scan_id, provider, ok, observed_at, item_count, error_type, payload_json, lineage_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (scan_id, status.provider, int(status.ok), status.observed_at.isoformat(), status.item_count, status.error_type, payload, hashlib.sha256(payload.encode()).hexdigest()),
-                )
-            for quote in funding_quotes:
-                payload = _canonical_json(quote)
-                db.execute("INSERT INTO funding_quotes(scan_id, venue, asset, observed_at, payload_json, lineage_hash) VALUES (?, ?, ?, ?, ?, ?)", (scan_id, quote.venue, quote.asset, quote.observed_at.isoformat(), payload, hashlib.sha256(payload.encode()).hexdigest()))
-            for quote in market_quotes:
-                payload = _canonical_json(quote)
-                db.execute("INSERT INTO market_quotes(scan_id, venue, asset, observed_at, payload_json, lineage_hash) VALUES (?, ?, ?, ?, ?, ?)", (scan_id, quote.venue, quote.asset, quote.observed_at.isoformat(), payload, hashlib.sha256(payload.encode()).hexdigest()))
-            for opportunity in opportunities:
-                payload = _canonical_json(opportunity)
-                db.execute(
-                    """INSERT INTO opportunities
-                    (scan_id, opportunity_id, strategy, asset, observed_at, payload_json, lineage_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (scan_id, opportunity.id, opportunity.strategy.value, opportunity.asset, opportunity.observed_at.isoformat(), payload, hashlib.sha256(payload.encode()).hexdigest()),
-                )
-            for book in order_books or []:
-                payload = _canonical_json(book)
-                db.execute(
-                    """INSERT INTO order_books
-                    (scan_id, venue, asset, market_kind, observed_at, payload_json, lineage_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (scan_id, book.venue, book.asset, book.market_kind.value, book.observed_at.isoformat(), payload, hashlib.sha256(payload.encode()).hexdigest()),
-                )
-            for qualification in executability or []:
-                payload = _canonical_json(qualification)
-                db.execute(
-                    """INSERT INTO executability
-                    (scan_id, opportunity_id, asset, observed_at, payload_json, lineage_hash)
-                    VALUES (?, ?, ?, ?, ?, ?)""",
-                    (scan_id, qualification.opportunity_id, qualification.asset, qualification.observed_at.isoformat(), payload, hashlib.sha256(payload.encode()).hexdigest()),
-                )
+        batches = [
+            (self.provider_statuses, self._payload_rows(scan_id, providers, lambda x: {"provider": x.provider, "ok": x.ok, "item_count": x.item_count, "error_type": x.error_type})),
+            (self.funding_quotes, self._payload_rows(scan_id, funding_quotes, lambda x: {"venue": x.venue, "asset": x.asset})),
+            (self.market_quotes, self._payload_rows(scan_id, market_quotes, lambda x: {"venue": x.venue, "asset": x.asset})),
+            (self.opportunities, self._payload_rows(scan_id, opportunities, lambda x: {"opportunity_id": x.id, "strategy": x.strategy.value, "asset": x.asset})),
+            (self.order_books, self._payload_rows(scan_id, order_books or [], lambda x: {"venue": x.venue, "asset": x.asset, "market_kind": x.market_kind.value})),
+            (self.executability, self._payload_rows(scan_id, executability or [], lambda x: {"opportunity_id": x.opportunity_id, "asset": x.asset})),
+        ]
+        with self.engine.begin() as db:
+            db.execute(insert(self.scans), {"scan_id": scan_id, "started_at": started_at.isoformat(), "completed_at": completed_at.isoformat(),
+                                           "created_at": _now().isoformat(), "analysis_config_json": json.dumps(analysis_config or {}, sort_keys=True)})
+            for table, rows in batches:
+                if rows:
+                    db.execute(insert(table), rows)
         return scan_id
 
-    def load_scan(self, scan_id: str) -> ScanSnapshot:
-        with self._connect() as db:
-            scan = db.execute("SELECT * FROM scans WHERE scan_id = ?", (scan_id,)).fetchone()
-            if scan is None:
-                raise KeyError(f"unknown scan_id: {scan_id}")
-            provider_rows = db.execute("SELECT payload_json FROM provider_statuses WHERE scan_id = ? ORDER BY id", (scan_id,)).fetchall()
-            funding_rows = db.execute("SELECT payload_json FROM funding_quotes WHERE scan_id = ? ORDER BY id", (scan_id,)).fetchall()
-            market_rows = db.execute("SELECT payload_json FROM market_quotes WHERE scan_id = ? ORDER BY id", (scan_id,)).fetchall()
-            opportunity_rows = db.execute("SELECT payload_json FROM opportunities WHERE scan_id = ? ORDER BY id", (scan_id,)).fetchall()
-            order_book_rows = db.execute("SELECT payload_json FROM order_books WHERE scan_id = ? ORDER BY id", (scan_id,)).fetchall()
-            executability_rows = db.execute("SELECT payload_json FROM executability WHERE scan_id = ? ORDER BY id", (scan_id,)).fetchall()
+    def _payloads(self, table: Table, scan_id: str) -> list[str]:
+        with self.engine.connect() as db:
+            return list(db.execute(select(table.c.payload_json).where(table.c.scan_id == scan_id).order_by(table.c.id)).scalars())
 
+    def load_scan(self, scan_id: str) -> ScanSnapshot:
+        with self.engine.connect() as db:
+            scan = db.execute(select(self.scans).where(self.scans.c.scan_id == scan_id)).mappings().first()
+        if scan is None:
+            raise KeyError(f"unknown scan_id: {scan_id}")
         return ScanSnapshot(
-            scan_id=scan_id,
-            started_at=datetime.fromisoformat(scan["started_at"]),
-            completed_at=datetime.fromisoformat(scan["completed_at"]),
-            providers=[ProviderStatus.model_validate_json(row["payload_json"]) for row in provider_rows],
-            funding_quotes=[FundingQuote.model_validate_json(row["payload_json"]) for row in funding_rows],
-            market_quotes=[MarketQuote.model_validate_json(row["payload_json"]) for row in market_rows],
-            opportunities=[Opportunity.model_validate_json(row["payload_json"]) for row in opportunity_rows],
-            order_books=[OrderBookSnapshot.model_validate_json(row["payload_json"]) for row in order_book_rows],
-            executability=[OpportunityExecutability.model_validate_json(row["payload_json"]) for row in executability_rows],
+            scan_id=scan_id, started_at=datetime.fromisoformat(scan["started_at"]), completed_at=datetime.fromisoformat(scan["completed_at"]),
+            providers=[ProviderStatus.model_validate_json(x) for x in self._payloads(self.provider_statuses, scan_id)],
+            funding_quotes=[FundingQuote.model_validate_json(x) for x in self._payloads(self.funding_quotes, scan_id)],
+            market_quotes=[MarketQuote.model_validate_json(x) for x in self._payloads(self.market_quotes, scan_id)],
+            opportunities=[Opportunity.model_validate_json(x) for x in self._payloads(self.opportunities, scan_id)],
+            order_books=[OrderBookSnapshot.model_validate_json(x) for x in self._payloads(self.order_books, scan_id)],
+            executability=[OpportunityExecutability.model_validate_json(x) for x in self._payloads(self.executability, scan_id)],
             analysis_config=json.loads(scan["analysis_config_json"]),
         )
 
     def record_shadow_cycle(self, cycle: ShadowCycle) -> str:
-        payload = _canonical_json(cycle)
-        with self._connect() as db:
-            db.execute(
-                """INSERT INTO shadow_cycles
-                (cycle_id, started_at, completed_at, initial_scan_id, verification_scan_id, payload_json, lineage_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (cycle.cycle_id, cycle.started_at.isoformat(), cycle.completed_at.isoformat(), cycle.initial_scan_id, cycle.verification_scan_id, payload, hashlib.sha256(payload.encode()).hexdigest()),
-            )
+        payload = _json(cycle)
+        with self.engine.begin() as db:
+            db.execute(insert(self.shadow_cycles), {"cycle_id": cycle.cycle_id, "started_at": cycle.started_at.isoformat(), "completed_at": cycle.completed_at.isoformat(),
+                                                    "initial_scan_id": cycle.initial_scan_id, "verification_scan_id": cycle.verification_scan_id,
+                                                    "payload_json": payload, "lineage_hash": hashlib.sha256(payload.encode()).hexdigest()})
         return cycle.cycle_id
 
     def load_shadow_cycle(self, cycle_id: str) -> ShadowCycle:
-        with self._connect() as db:
-            row = db.execute("SELECT payload_json FROM shadow_cycles WHERE cycle_id = ?", (cycle_id,)).fetchone()
-        if row is None:
+        with self.engine.connect() as db:
+            payload = db.execute(select(self.shadow_cycles.c.payload_json).where(self.shadow_cycles.c.cycle_id == cycle_id)).scalar_one_or_none()
+        if payload is None:
             raise KeyError(f"unknown cycle_id: {cycle_id}")
-        return ShadowCycle.model_validate_json(row["payload_json"])
+        return ShadowCycle.model_validate_json(payload)
 
     def shadow_summary(self) -> dict[str, object]:
-        with self._connect() as db:
-            rows = db.execute("SELECT payload_json FROM shadow_cycles ORDER BY completed_at").fetchall()
-        cycles = [ShadowCycle.model_validate_json(row["payload_json"]) for row in rows]
-        observations = [obs for cycle in cycles for obs in cycle.observations]
-        survived = sum(1 for obs in observations if obs.survived)
-        return {
-            "cycle_count": len(cycles),
-            "observation_count": len(observations),
-            "survived_count": survived,
-            "survival_rate": (survived / len(observations)) if observations else None,
-        }
+        with self.engine.connect() as db:
+            payloads = list(db.execute(select(self.shadow_cycles.c.payload_json).order_by(self.shadow_cycles.c.completed_at)).scalars())
+        observations = [obs for payload in payloads for obs in ShadowCycle.model_validate_json(payload).observations]
+        survived = sum(obs.survived for obs in observations)
+        outcomes: dict[str, int] = {}
+        for obs in observations:
+            outcomes[obs.outcome.value] = outcomes.get(obs.outcome.value, 0) + 1
+        return {"cycle_count": len(payloads), "observation_count": len(observations), "survived_count": survived,
+                "survival_rate": survived / len(observations) if observations else None, "outcomes": outcomes}
+
+    def record_worker_heartbeat(self, *, worker_id: str, state: str, cycle_id: str | None = None, scan_id: str | None = None,
+                                error_type: str | None = None, detail: dict[str, object] | None = None,
+                                observed_at: datetime | None = None) -> WorkerHeartbeat:
+        heartbeat = WorkerHeartbeat(worker_id=worker_id, observed_at=observed_at or _now(), state=state, cycle_id=cycle_id,
+                                    scan_id=scan_id, error_type=error_type, detail=detail or {})
+        payload = _json(heartbeat)
+        with self.engine.begin() as db:
+            db.execute(insert(self.worker_heartbeats), {"worker_id": worker_id, "observed_at": heartbeat.observed_at.isoformat(), "state": state,
+                                                       "cycle_id": cycle_id, "scan_id": scan_id, "error_type": error_type, "payload_json": payload,
+                                                       "lineage_hash": hashlib.sha256(payload.encode()).hexdigest()})
+        return heartbeat
+
+    def latest_worker_heartbeat(self, worker_id: str | None = None) -> WorkerHeartbeat | None:
+        query = select(self.worker_heartbeats.c.payload_json)
+        if worker_id:
+            query = query.where(self.worker_heartbeats.c.worker_id == worker_id)
+        with self.engine.connect() as db:
+            payload = db.execute(query.order_by(self.worker_heartbeats.c.id.desc()).limit(1)).scalar_one_or_none()
+        return WorkerHeartbeat.model_validate_json(payload) if payload else None
+
+    def worker_health(self, *, stale_after_seconds: float = 180.0, now: datetime | None = None) -> dict[str, object]:
+        latest = self.latest_worker_heartbeat()
+        if latest is None:
+            return {"healthy": False, "reason": "no worker heartbeat recorded", "backend": self.backend, "database_ok": self.ping(), "latest_heartbeat": None}
+        age = max(0.0, ((now or _now()) - latest.observed_at).total_seconds())
+        healthy = latest.state not in {"error", "stopped"} and age <= stale_after_seconds
+        return {"healthy": healthy, "reason": None if healthy else (f"heartbeat stale by {age:.1f}s" if age > stale_after_seconds else f"worker state={latest.state}"),
+                "backend": self.backend, "database_ok": self.ping(), "heartbeat_age_seconds": age, "latest_heartbeat": latest.model_dump(mode="json")}
 
     def counts(self) -> PersistedCounts:
-        with self._connect() as db:
-            def count(table: str) -> int:
-                return int(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-
-            return PersistedCounts(
-                scans=count("scans"),
-                provider_statuses=count("provider_statuses"),
-                funding_quotes=count("funding_quotes"),
-                market_quotes=count("market_quotes"),
-                opportunities=count("opportunities"),
-                order_books=count("order_books"),
-                executability=count("executability"),
-                shadow_cycles=count("shadow_cycles"),
-            )
+        tables = [self.scans, self.provider_statuses, self.funding_quotes, self.market_quotes, self.opportunities,
+                  self.order_books, self.executability, self.shadow_cycles, self.worker_heartbeats]
+        with self.engine.connect() as db:
+            values = [int(db.execute(select(func.count()).select_from(table)).scalar_one()) for table in tables]
+        return PersistedCounts(*values)
