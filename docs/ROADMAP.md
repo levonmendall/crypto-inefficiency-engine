@@ -14,13 +14,14 @@
 
 ## Milestone 2 — Point-in-time evidence — foundation complete
 - Append-only SQLite observation store
+- PostgreSQL-backed production evidence store through the same persistence interface
 - Append-only opportunity snapshots
 - Provider health/degradation records
 - Source timestamps and lineage hashes
 - Exact analysis configuration captured per scan
 - Deterministic replay harness
 
-Next: retention/export policy, Postgres option, historical funding ingestion, and scan-level quality metrics.
+Next: retention/export policy, historical funding ingestion, partition/archival policy, and scan-level quality metrics.
 
 ## Milestone 3 — Executability and economic realism — core complete
 - Canonical L2 order-book model
@@ -60,8 +61,10 @@ Next: authenticated account-specific fee tiers, measured latency distributions, 
 - Persist append-only shadow-cycle evidence
 - Aggregate empirical survival rate
 - Long-running `cie shadow-loop`
+- Resilient `cie worker` with durable heartbeat/error telemetry
+- Render worker + managed Postgres Blueprint
 
-Next: multiple verification horizons, price-path/adverse-selection attribution, empirical latency distributions, likely-fill reconstruction, and enough observations to estimate survival by strategy/venue/asset/size.
+Next: deploy the persistent worker, accumulate a statistically useful evidence set, then add multiple verification horizons, price-path/adverse-selection attribution, empirical latency distributions, likely-fill reconstruction, and survival estimates by strategy/venue/asset/size.
 
 ## Milestone 6 — Tiny-capital controlled execution
 Separate service, separate credentials, explicit authorization, hard capital caps, dead-man switches, paired-leg atomicity/hedge recovery, venue concentration limits, kill switch. This milestone remains blocked until shadow evidence is statistically convincing.
