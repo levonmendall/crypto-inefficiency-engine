@@ -54,7 +54,6 @@ This remains secondary until the existing alpha is empirically shown to survive 
 - Reconstruct pair fillability and hedge-reserve fillability
 - Flag asymmetric visible-depth states that would require hedge recovery
 - Build latency p50/p90/p95 distributions from unique verification scans
-- Map measured latency quantile to a conservative shadow horizon
 - Estimate pair-fill, reserve-fill, capture, and hedge-recovery probabilities
 - Derive p50/p90/p95 pair adverse-selection distributions
 - Gate empirical latency-risk use behind minimum evidence thresholds
@@ -63,9 +62,11 @@ This remains secondary until the existing alpha is empirically shown to survive 
 - Resolve a separate empirical model for each evaluated capital size
 - Persist model scope and fallback provenance in executable capital-tier output
 - Support scoped inspection through `GET /v1/latency/model`
+- Interval-censored interpolation between adjacent 1/5/15/30/60s horizons
+- Require sufficient observations at both interpolation endpoints
+- Enforce monotone-conservative probability and adverse-risk interpolation
 
 ### Next v0.8 refinements
-- Interval-censored interpolation between the 1/5/15/30/60s horizons
 - Separate network/data latency from hypothetical order-submission/acknowledgement latency
 - Queue-position and maker-fill modeling where public venue data makes it defensible
 - More explicit partial-fill sequencing and hedge-recovery cost distributions
