@@ -55,3 +55,22 @@ def replay_evidence(scan_id: str):
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="scan not found") from exc
     return result.model_dump(mode="json")
+
+
+@app.get("/v1/executability/live")
+async def live_executability():
+    try:
+        snapshot = await service.collect_live_executability()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"live executability scan failed: {type(exc).__name__}") from exc
+    qualified = [item for item in snapshot.executability if item.max_qualified_notional_usd > 0]
+    return {
+        "scan_id": snapshot.scan_id,
+        "paper_only": True,
+        "opportunity_count": len(snapshot.opportunities),
+        "qualified_opportunity_count": len(qualified),
+        "order_book_count": len(snapshot.order_books),
+        "capital_tiers_usd": list(settings.capital_tiers_usd),
+        "providers": [status.model_dump(mode="json") for status in snapshot.providers],
+        "executability": [item.model_dump(mode="json") for item in snapshot.executability],
+    }
