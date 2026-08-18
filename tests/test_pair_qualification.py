@@ -63,6 +63,13 @@ def settings() -> Settings:
         max_order_book_age_seconds=30,
         max_order_book_skew_seconds=2,
         capital_tiers_usd=(1000.0, 10000.0),
+        coinbase_spot_taker_fee_bps=0.0,
+        hyperliquid_perp_taker_fee_bps=0.0,
+        collateral_opportunity_cost_annual=0.0,
+        expected_hedge_latency_ms=0.0,
+        latency_risk_bps_per_second=0.0,
+        hedge_liquidity_reserve_ratio=1.0,
+        hedge_recovery_buffer_bps=0.0,
     )
 
 
@@ -90,7 +97,7 @@ def test_pair_qualification_rejects_tier_when_depth_is_insufficient():
 
 
 def test_visible_slippage_can_erase_apparent_edge():
-    result = qualify_opportunity(opportunity(gross_bps_hour=1.0), books(impact=True), settings(), notionals_usd=(10000.0,), now=NOW)
+    result = qualify_opportunity(opportunity(gross_bps_hour=1.05), books(impact=True), settings(), notionals_usd=(10000.0,), now=NOW)
     tier = result.tiers[0]
     assert tier.executable is True
     assert tier.observed_entry_slippage_bps > 0
@@ -114,7 +121,7 @@ def test_capacity_frontier_estimates_break_even_between_configured_tiers():
         ),
     ]
     result = qualify_opportunity(
-        opportunity(gross_bps_hour=1.0),
+        opportunity(gross_bps_hour=1.05),
         constrained_books,
         settings(),
         notionals_usd=(100.0, 1000.0),

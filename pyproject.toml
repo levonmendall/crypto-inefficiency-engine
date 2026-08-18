@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-inefficiency-engine"
-version = "0.4.0"
+version = "0.5.0"
 description = "Paper-first engine for discovering and ranking structural crypto market inefficiencies."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10"]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<1"]
 
 [project.scripts]
 cie = "inefficiency_engine.cli:main"

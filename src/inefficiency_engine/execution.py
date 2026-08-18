@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from inefficiency_engine.config import Settings
+from inefficiency_engine.costs import BorrowCostUnavailableError, UnknownVenueFeeError, economic_costs
 from inefficiency_engine.models import (
     CapitalTierQualification,
     LegExecutionEstimate,
@@ -200,15 +201,13 @@ def qualify_opportunity(
     notionals_usd: tuple[float, ...] | None = None,
     now: datetime | None = None,
 ) -> OpportunityExecutability:
-    """Qualify a two-leg opportunity and estimate its continuous capacity frontier.
+    """Qualify a two-leg opportunity with explicit fees, capital, and hedge risk.
 
-    Both legs must fill the same base quantity. Observed entry slippage is charged
-    immediately and then conservatively projected onto the exit. After testing the
-    configured capital tiers, a bounded monotonic search estimates the largest USD
-    notional that still clears the return hurdle within observed L2 depth.
-
-    This remains a paper estimate: visible depth is evidence, not a queue-position
-    or latency guarantee.
+    Both legs must fill the same base quantity and retain an additional visible
+    liquidity reserve. Entry and exit taker fees are venue-specific; financing,
+    collateral opportunity cost, book age/hedge latency risk, and a hedge-recovery
+    buffer are charged before the return hurdle is applied. Returns are measured
+    on modeled capital required, not merely one leg's notional.
     """
     now = now or datetime.now(timezone.utc)
     notionals = notionals_usd or settings.capital_tiers_usd
@@ -244,7 +243,8 @@ def qualify_opportunity(
         )
 
     age_limit = settings.max_order_book_age_seconds
-    stale = [book for book in leg_books if (now - book.observed_at).total_seconds() > age_limit]
+    book_ages = [max(0.0, (now - book.observed_at).total_seconds()) for book in leg_books]
+    stale = [book for book, age in zip(leg_books, book_ages) if age > age_limit]
     skew = abs((leg_books[0].observed_at - leg_books[1].observed_at).total_seconds())
     if stale or skew > settings.max_order_book_skew_seconds:
         reason = "stale order book" if stale else f"order-book time skew {skew:.3f}s exceeds limit"
@@ -264,11 +264,31 @@ def qualify_opportunity(
         best_prices.append((min if side == TradeSide.BUY else max)(level.price for level in levels))
         side_pairs.append((side, book))
     conservative_reference = max(best_prices)
+    reserve_ratio = max(1.0, settings.hedge_liquidity_reserve_ratio)
     max_shared_quantity = min(max_executable_quantity(book, side) for side, book in side_pairs)
-    visible_depth_ceiling = conservative_reference * max_shared_quantity
+    visible_depth_ceiling = conservative_reference * max_shared_quantity / reserve_ratio
+    worst_book_age = max(book_ages, default=0.0)
 
     def evaluate(notional: float) -> CapitalTierQualification:
         target_quantity = notional / conservative_reference
+        reserve_quantity = target_quantity * reserve_ratio
+        for side, book in side_pairs:
+            if max_executable_quantity(book, side) + 1e-12 < reserve_quantity:
+                tier = _rejected_tier(
+                    opportunity,
+                    notional,
+                    f"visible depth does not preserve {reserve_ratio:.2f}x hedge liquidity reserve",
+                )
+                tier.target_base_quantity = target_quantity
+                return tier
+
+        try:
+            costs = economic_costs(opportunity, notional, settings, worst_book_age_seconds=worst_book_age)
+        except (UnknownVenueFeeError, BorrowCostUnavailableError) as exc:
+            tier = _rejected_tier(opportunity, notional, str(exc))
+            tier.target_base_quantity = target_quantity
+            return tier
+
         leg_estimates: list[LegExecutionEstimate] = []
         try:
             for leg, book in zip(opportunity.legs, leg_books):
@@ -297,13 +317,14 @@ def qualify_opportunity(
 
         entry_slippage = sum(item.slippage_bps for item in leg_estimates)
         assumed_exit_slippage = entry_slippage * settings.exit_slippage_multiplier
-        total_cost_bps = opportunity.modeled_cost_bps + entry_slippage + assumed_exit_slippage
+        total_cost_bps = costs.total_non_slippage_cost_bps + entry_slippage + assumed_exit_slippage
         total_gross_bps = opportunity.gross_edge_bps_per_hour * opportunity.holding_hours
         total_safety_bps = opportunity.safety_buffer_bps_per_hour * opportunity.holding_hours
         net_total_bps = total_gross_bps - total_cost_bps - total_safety_bps
-        net_hourly_bps = net_total_bps / opportunity.holding_hours
-        annualized = (net_hourly_bps / 10_000.0) * 24 * 365
-        passes = net_hourly_bps > 0 and annualized >= settings.min_net_annualized_return
+        net_hourly_bps_on_leg_notional = net_total_bps / opportunity.holding_hours
+        leg_notional_annualized = (net_hourly_bps_on_leg_notional / 10_000.0) * 24 * 365
+        capital_adjusted_annualized = leg_notional_annualized / costs.capital_multiple if costs.capital_multiple > 0 else float("-inf")
+        passes = net_hourly_bps_on_leg_notional > 0 and capital_adjusted_annualized >= settings.min_net_annualized_return
 
         return CapitalTierQualification(
             opportunity_id=opportunity.id,
@@ -313,13 +334,21 @@ def qualify_opportunity(
             passes_return_hurdle=passes,
             gross_edge_bps_per_hour=opportunity.gross_edge_bps_per_hour,
             static_modeled_cost_bps=opportunity.modeled_cost_bps,
+            venue_roundtrip_fee_bps=costs.venue_roundtrip_fee_bps,
+            financing_cost_bps=costs.financing_cost_bps,
+            collateral_opportunity_cost_bps=costs.collateral_opportunity_cost_bps,
+            latency_risk_bps=costs.latency_risk_bps,
+            hedge_recovery_buffer_bps=costs.hedge_recovery_buffer_bps,
+            capital_required_usd=costs.capital_required_usd,
+            capital_multiple=costs.capital_multiple,
             observed_entry_slippage_bps=entry_slippage,
             assumed_exit_slippage_bps=assumed_exit_slippage,
             total_modeled_cost_bps=total_cost_bps,
-            net_edge_bps_per_hour=net_hourly_bps,
-            net_annualized_return=annualized,
+            net_edge_bps_per_hour=net_hourly_bps_on_leg_notional,
+            net_annualized_return=capital_adjusted_annualized,
+            leg_notional_net_annualized_return=leg_notional_annualized,
             leg_estimates=leg_estimates,
-            rejection_reason=None if passes else "net return falls below hurdle after executable slippage",
+            rejection_reason=None if passes else "capital-adjusted net return falls below hurdle after fees, risk, and slippage",
         )
 
     tiers = [evaluate(notional) for notional in notionals]
@@ -328,9 +357,6 @@ def qualify_opportunity(
         default=0.0,
     )
 
-    # Slippage from walking a conventional L2 book is non-decreasing with size,
-    # so pass/fail against a fixed return hurdle is monotonic. Binary search lets
-    # us estimate the break-even capacity between coarse configured tiers.
     tolerance = max(0.01, settings.capacity_search_tolerance_usd)
     capacity = 0.0
     capacity_return: float | None = None
