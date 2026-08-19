@@ -122,6 +122,7 @@ async def run_canonical_portfolio_loop(
                 "portfolio_cycle_interval_seconds": interval,
                 "stage": "canonical_accounting_only",
                 "certification_decoupled": True,
+                "portfolio_nav_usd": latest.nav_usd if latest is not None else None,
                 "portfolio_snapshot_observed_at": (
                     latest.observed_at.isoformat() if latest is not None else None
                 ),
