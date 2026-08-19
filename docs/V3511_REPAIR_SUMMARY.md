@@ -1,0 +1,5 @@
+Production symptom: canonical account snapshot time advanced under v3.5.10, but market-evidence time remained frozen and the dashboard still showed `Cycle failed · fallback accounting snapshot`.
+
+Diagnosis: v3.5.10 fixed the watchdog, not the downstream portfolio hot path. The canonical cycle still invoked the full unified allocator after obtaining an executable scan. That allocator evaluated mechanism families the canonical ledger cannot settle (core multi-leg CEX and CEX↔DEX) and alpha promotion could issue a second direct L2 request outside the already-collected scan. Those extra provider-heavy operations could exhaust the 120-second portfolio-stage budget, forcing a fallback snapshot even though the account process itself was alive.
+
+Repair: canonical accounting now uses a settlement-compatible allocator that consumes the persisted executable scan and only evaluates currently settleable alpha positions. Full mechanism research and forward certification continue to use the full unified allocator. Alpha promotion reuses the scan's fresh order book and bounds any fallback L2 fetch.
