@@ -92,6 +92,16 @@ class Settings:
     dex_route_frontier_notionals_usd: tuple[float, ...] = (1000.0, 5000.0, 10000.0, 25000.0)
     dex_route_frontier_max_deterioration_bps: float = 25.0
     dex_route_frontier_every_cycles: int = 10
+    dex_statistical_reference_horizon_seconds: float = 5.0
+    dex_statistical_min_effective_samples: int = 30
+    dex_statistical_min_tail_samples: int = 20
+    dex_statistical_confidence_level: float = 0.95
+    dex_statistical_max_ci_width: float = 0.25
+    dex_statistical_min_survival_lower_bound: float = 0.80
+    dex_statistical_min_frontier_acceptance_lower_bound: float = 0.80
+    dex_statistical_max_p95_deterioration_bps: float = 25.0
+    dex_statistical_notional_tolerance_fraction: float = 0.10
+    dex_statistical_min_net_edge_bps: float = 12.0
     option_relative_value_min_iv_points: float = 8.0
     allocator_max_venue_fraction: float = 0.50
     allocator_max_asset_fraction: float = 0.50
@@ -162,6 +172,28 @@ class Settings:
                 "CIE_DEX_ROUTE_FRONTIER_MAX_DETERIORATION_BPS", 25.0
             ),
             dex_route_frontier_every_cycles=max(1, _int("CIE_DEX_ROUTE_FRONTIER_EVERY_CYCLES", 10)),
+            dex_statistical_reference_horizon_seconds=max(
+                0.0, _float("CIE_DEX_STATISTICAL_REFERENCE_HORIZON_SECONDS", 5.0)
+            ),
+            dex_statistical_min_effective_samples=max(
+                1, _int("CIE_DEX_STATISTICAL_MIN_EFFECTIVE_SAMPLES", 30)
+            ),
+            dex_statistical_min_tail_samples=max(1, _int("CIE_DEX_STATISTICAL_MIN_TAIL_SAMPLES", 20)),
+            dex_statistical_confidence_level=_float("CIE_DEX_STATISTICAL_CONFIDENCE_LEVEL", 0.95),
+            dex_statistical_max_ci_width=_float("CIE_DEX_STATISTICAL_MAX_CI_WIDTH", 0.25),
+            dex_statistical_min_survival_lower_bound=_float(
+                "CIE_DEX_STATISTICAL_MIN_SURVIVAL_LOWER_BOUND", 0.80
+            ),
+            dex_statistical_min_frontier_acceptance_lower_bound=_float(
+                "CIE_DEX_STATISTICAL_MIN_FRONTIER_ACCEPTANCE_LOWER_BOUND", 0.80
+            ),
+            dex_statistical_max_p95_deterioration_bps=_float(
+                "CIE_DEX_STATISTICAL_MAX_P95_DETERIORATION_BPS", 25.0
+            ),
+            dex_statistical_notional_tolerance_fraction=_float(
+                "CIE_DEX_STATISTICAL_NOTIONAL_TOLERANCE_FRACTION", 0.10
+            ),
+            dex_statistical_min_net_edge_bps=_float("CIE_DEX_STATISTICAL_MIN_NET_EDGE_BPS", 12.0),
             option_relative_value_min_iv_points=_float("CIE_OPTION_RELATIVE_VALUE_MIN_IV_POINTS", 8.0),
             allocator_max_venue_fraction=_float("CIE_ALLOCATOR_MAX_VENUE_FRACTION", 0.50),
             allocator_max_asset_fraction=_float("CIE_ALLOCATOR_MAX_ASSET_FRACTION", 0.50),
