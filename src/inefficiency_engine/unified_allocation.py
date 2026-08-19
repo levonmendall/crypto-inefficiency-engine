@@ -15,6 +15,21 @@ if TYPE_CHECKING:
     from inefficiency_engine.alpha_factory import AlphaFactoryService
 
 
+class PaperSettlementLeg(BaseModel):
+    """Point-in-time leg metadata required for honest forward paper settlement."""
+
+    venue: str
+    asset: str
+    market_kind: str
+    side: Literal["long", "short"]
+    symbol: str
+    base_quantity: float = Field(gt=0)
+    entry_price: float = Field(gt=0)
+    entry_notional_usd: float = Field(gt=0)
+    quote_currency: str | None = None
+    contract_key: str | None = None
+
+
 class UnifiedPaperCandidate(BaseModel):
     candidate_id: str
     family: Literal["core_cex", "cex_dex", "alpha"]
@@ -34,6 +49,10 @@ class UnifiedPaperCandidate(BaseModel):
     instrument_market_kind: str | None = None
     entry_reference_price: float | None = Field(default=None, gt=0)
     modeled_roundtrip_cost_return: float | None = Field(default=None, ge=0)
+    settlement_legs: list[PaperSettlementLeg] = Field(default_factory=list)
+    modeled_non_slippage_cost_bps: float | None = Field(default=None, ge=0)
+    modeled_safety_buffer_bps: float | None = Field(default=None, ge=0)
+    capital_multiple: float | None = Field(default=None, gt=0)
     conflict_keys: list[str] = Field(default_factory=list)
     evidence_id: str | None = None
     opportunity_id: str | None = None
@@ -63,6 +82,10 @@ class UnifiedPaperAllocation(BaseModel):
     instrument_market_kind: str | None = None
     entry_reference_price: float | None = Field(default=None, gt=0)
     modeled_roundtrip_cost_return: float | None = Field(default=None, ge=0)
+    settlement_legs: list[PaperSettlementLeg] = Field(default_factory=list)
+    modeled_non_slippage_cost_bps: float | None = Field(default=None, ge=0)
+    modeled_safety_buffer_bps: float | None = Field(default=None, ge=0)
+    capital_multiple: float | None = Field(default=None, gt=0)
     evidence_id: str | None = None
     opportunity_id: str | None = None
     capacity_claimed: bool = False
@@ -86,6 +109,35 @@ class UnifiedPaperAllocationPlan(BaseModel):
     authorizes_execution: bool = False
     live_execution_eligible: bool = False
     paper_only: bool = True
+
+
+def _core_settlement_legs(opportunity: Opportunity, tier) -> list[PaperSettlementLeg]:
+    if len(opportunity.legs) != len(tier.leg_estimates):
+        return []
+    rows: list[PaperSettlementLeg] = []
+    for leg, estimate in zip(opportunity.legs, tier.leg_estimates):
+        symbol = leg.symbol or estimate.symbol
+        if not symbol:
+            return []
+        if (
+            estimate.venue != leg.venue
+            or estimate.asset.upper() != leg.asset.upper()
+            or estimate.market_kind != leg.market_kind
+        ):
+            return []
+        rows.append(PaperSettlementLeg(
+            venue=leg.venue,
+            asset=leg.asset.upper(),
+            market_kind=leg.market_kind.value,
+            side=leg.side.value,
+            symbol=symbol,
+            base_quantity=estimate.filled_base_quantity,
+            entry_price=estimate.average_price,
+            entry_notional_usd=estimate.filled_notional_usd,
+            quote_currency=leg.quote_currency,
+            contract_key=leg.contract_key,
+        ))
+    return rows
 
 
 def _core_candidates(
@@ -124,6 +176,12 @@ def _core_candidates(
                 f"leg:{leg.venue}:{leg.symbol or leg.asset}:{leg.market_kind.value}:{leg.side.value}"
                 for leg in opportunity.legs
             ]
+        non_slippage_cost_bps = max(
+            0.0,
+            tier.total_modeled_cost_bps
+            - tier.observed_entry_slippage_bps
+            - tier.assumed_exit_slippage_bps,
+        )
         rows.append(UnifiedPaperCandidate(
             candidate_id=f"core:{opportunity.id}",
             family="core_cex",
@@ -139,6 +197,12 @@ def _core_candidates(
             source_return_value=tier.net_annualized_return,
             exposure_kind="market_neutral",
             source_observed_at=opportunity.observed_at,
+            settlement_legs=_core_settlement_legs(opportunity, tier),
+            modeled_non_slippage_cost_bps=non_slippage_cost_bps,
+            modeled_safety_buffer_bps=max(
+                0.0, opportunity.safety_buffer_bps_per_hour * opportunity.holding_hours
+            ),
+            capital_multiple=tier.capital_multiple if tier.capital_multiple > 0 else None,
             conflict_keys=sorted(set(conflict_keys)),
             opportunity_id=opportunity.id,
             capacity_reference_usd=execution.estimated_capacity_notional_usd,
@@ -387,6 +451,10 @@ class UnifiedPaperAllocatorService:
                 instrument_market_kind=item.instrument_market_kind,
                 entry_reference_price=item.entry_reference_price,
                 modeled_roundtrip_cost_return=item.modeled_roundtrip_cost_return,
+                settlement_legs=item.settlement_legs,
+                modeled_non_slippage_cost_bps=item.modeled_non_slippage_cost_bps,
+                modeled_safety_buffer_bps=item.modeled_safety_buffer_bps,
+                capital_multiple=item.capital_multiple,
                 evidence_id=item.evidence_id,
                 opportunity_id=item.opportunity_id,
                 capacity_claimed=False,
