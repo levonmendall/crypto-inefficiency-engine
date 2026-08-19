@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 
@@ -13,6 +15,7 @@ from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidence
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.expanded_alpha_factory import ExpandedAlphaFactoryService
+from inefficiency_engine.operating_worker import PORTFOLIO_WORKER_ID
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.unified_allocation import UnifiedPaperAllocatorService
 from inefficiency_engine.universal_service import UniversalOpportunityService
@@ -53,6 +56,47 @@ def build_canonical_paper_portfolio_router(
         payload = latest.model_dump(mode="json")
         payload["available"] = True
         return payload
+
+    @router.get("/v3/portfolio/runtime-status")
+    def canonical_portfolio_runtime_status():
+        engine = require_portfolio()
+        now = datetime.now(timezone.utc)
+        latest = engine.ledger.latest_snapshot()
+        heartbeat = engine.store.latest_worker_heartbeat(PORTFOLIO_WORKER_ID)
+        expected_interval = max(60.0, service.settings.shadow_cycle_interval_seconds * 10.0)
+        stale_after = max(600.0, expected_interval * 2.5)
+        snapshot_age = (
+            max(0.0, (now - latest.observed_at).total_seconds()) if latest is not None else None
+        )
+        heartbeat_age = (
+            max(0.0, (now - heartbeat.observed_at).total_seconds()) if heartbeat is not None else None
+        )
+        heartbeat_recent = heartbeat is not None and heartbeat_age is not None and heartbeat_age <= stale_after
+        portfolio_failed = bool(
+            heartbeat is not None
+            and heartbeat.detail.get("portfolio_error_type")
+        )
+        snapshot_fresh = latest is not None and snapshot_age is not None and snapshot_age <= stale_after
+        operational = bool(
+            heartbeat_recent
+            and heartbeat is not None
+            and heartbeat.state not in {"error", "stopped"}
+            and not portfolio_failed
+            and snapshot_fresh
+        )
+        return {
+            "portfolio_id": CANONICAL_PORTFOLIO_ID,
+            "paper_only": True,
+            "operational": operational,
+            "degraded": bool(heartbeat is not None and heartbeat.state == "degraded"),
+            "expected_cycle_interval_seconds": expected_interval,
+            "stale_after_seconds": stale_after,
+            "snapshot_fresh": snapshot_fresh,
+            "snapshot_age_seconds": snapshot_age,
+            "latest_snapshot_observed_at": latest.observed_at if latest is not None else None,
+            "heartbeat_age_seconds": heartbeat_age,
+            "heartbeat": heartbeat.model_dump(mode="json") if heartbeat is not None else None,
+        }
 
     @router.get("/v3/portfolio/performance")
     def canonical_portfolio_performance():
