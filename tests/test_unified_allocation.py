@@ -94,6 +94,11 @@ class FakeCore:
         )
 
 
+class FailingCore(FakeCore):
+    async def collect_live_executability(self):
+        raise RuntimeError("core market provider unavailable")
+
+
 class FakeCexDexPromotion:
     async def live_qualification(self, *, paper_inventory_usd_per_side: float):
         assert paper_inventory_usd_per_side > 0
@@ -112,6 +117,12 @@ class FakeCexDexPromotion:
         )
         blocked = SimpleNamespace(paper_allocation_eligible=False)
         return SimpleNamespace(qualifications=[qualified, blocked])
+
+
+class FailingCexDexPromotion:
+    async def live_qualification(self, *, paper_inventory_usd_per_side: float):
+        assert paper_inventory_usd_per_side > 0
+        raise ConnectionError("DEX qualification provider unavailable")
 
 
 class FakeAlphaFactory:
@@ -136,6 +147,11 @@ class FakeAlphaFactory:
             horizon_hours=6.0,
             conflict_keys=["alpha-instrument:OKX:SOL-USDT"],
         )]
+
+
+class FailingAlphaFactory:
+    async def promoted_candidates(self, snapshot, *, total_capital_usd: float):
+        raise LookupError("alpha evidence unavailable")
 
 
 @pytest.mark.asyncio
@@ -167,6 +183,9 @@ async def test_unified_allocator_compares_only_qualified_current_deployments_and
     assert plan.portfolio_risk_budget.directional_capital_usd == 0.0
     assert plan.authorizes_execution is False
     assert plan.live_execution_eligible is False
+    assert plan.degraded is False
+    assert plan.family_failures == {}
+    assert set(plan.available_families) == {"core_cex", "cex_dex"}
     assert all(item.authorizes_execution is False for item in plan.allocations)
 
 
@@ -194,4 +213,67 @@ async def test_unified_allocator_accepts_only_promoted_alpha_and_tracks_directio
     assert plan.portfolio_risk_budget is not None
     assert plan.portfolio_risk_budget.directional_long_capital_usd == 5000.0
     assert plan.portfolio_risk_budget.directional_net_capital_usd == 5000.0
+    assert plan.degraded is False
     assert all(row.authorizes_execution is False for row in plan.allocations)
+
+
+@pytest.mark.asyncio
+async def test_cex_dex_failure_does_not_erase_core_or_alpha_candidates():
+    service = UnifiedPaperAllocatorService(
+        FakeCore(),  # type: ignore[arg-type]
+        FailingCexDexPromotion(),  # type: ignore[arg-type]
+        FakeAlphaFactory(),  # type: ignore[arg-type]
+    )
+
+    batch = await service.candidate_batch(total_capital_usd=30000.0)
+    assert [row.family for row in batch.candidates] == ["alpha", "core_cex"]
+    assert set(batch.available_families) == {"core_cex", "alpha"}
+    assert "cex_dex" in batch.family_failures
+    assert batch.degraded is True
+
+    plan = await service.allocate(total_capital_usd=30000.0)
+    assert {row.family for row in plan.allocations} == {"alpha", "core_cex"}
+    assert plan.degraded is True
+    assert "cex_dex" in plan.family_failures
+    assert plan.unused_cash_usd == 15000.0
+
+
+@pytest.mark.asyncio
+async def test_core_failure_still_allows_cex_dex_and_explicitly_blocks_snapshot_dependent_alpha():
+    service = UnifiedPaperAllocatorService(
+        FailingCore(),  # type: ignore[arg-type]
+        FakeCexDexPromotion(),  # type: ignore[arg-type]
+        FakeAlphaFactory(),  # type: ignore[arg-type]
+    )
+
+    batch = await service.candidate_batch(total_capital_usd=30000.0)
+    assert [row.family for row in batch.candidates] == ["cex_dex"]
+    assert batch.available_families == ["cex_dex"]
+    assert "core_cex" in batch.family_failures
+    assert batch.family_failures["alpha"].startswith("market_snapshot_unavailable")
+    assert batch.degraded is True
+
+    plan = await service.allocate(total_capital_usd=30000.0)
+    assert [row.family for row in plan.allocations] == ["cex_dex"]
+    assert plan.allocated_capital_usd == 10000.0
+    assert plan.unused_cash_usd == 20000.0
+    assert plan.degraded is True
+
+
+@pytest.mark.asyncio
+async def test_all_candidate_families_can_fail_closed_to_cash_without_allocator_crash():
+    service = UnifiedPaperAllocatorService(
+        FailingCore(),  # type: ignore[arg-type]
+        FailingCexDexPromotion(),  # type: ignore[arg-type]
+        FailingAlphaFactory(),  # type: ignore[arg-type]
+    )
+
+    plan = await service.allocate(total_capital_usd=250000.0)
+    assert plan.candidate_count == 0
+    assert plan.allocations == []
+    assert plan.allocated_capital_usd == 0.0
+    assert plan.unused_cash_usd == 250000.0
+    assert plan.degraded is True
+    assert set(plan.family_failures) == {"core_cex", "cex_dex", "alpha"}
+    assert plan.authorizes_execution is False
+    assert plan.live_execution_eligible is False
