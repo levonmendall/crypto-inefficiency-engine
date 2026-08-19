@@ -108,6 +108,20 @@ async def dex_route_quotes_live():
         "quotes": [item.model_dump(mode="json") for item in surface.dex_route_quotes],
     }
 
+@app.post("/v1/dex/route-shadow/cycle")
+async def dex_route_shadow_cycle():
+    try:
+        cycle = await universal_service.run_dex_route_shadow_cycle()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"DEX route shadow cycle failed: {type(exc).__name__}") from exc
+    return cycle.model_dump(mode="json")
+
+@app.get("/v1/dex/route-shadow/summary")
+def dex_route_shadow_summary():
+    if evidence_store is None:
+        raise HTTPException(status_code=503, detail="evidence persistence is not configured")
+    return evidence_store.dex_route_shadow_summary()
+
 @app.get("/v1/allocation/live")
 async def paper_allocation(capital_usd: float = 100000.0, max_venue_fraction: float | None = None,
                            max_asset_fraction: float | None = None, max_allocations: int | None = None):

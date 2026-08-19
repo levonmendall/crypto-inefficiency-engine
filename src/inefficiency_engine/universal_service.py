@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from statistics import median
+from typing import Awaitable, Callable
 
 from pydantic import BaseModel, Field
 
@@ -10,6 +12,12 @@ from inefficiency_engine.adapters.universal_public import CoinbaseStablecoinAdap
 from inefficiency_engine.adapters.velora import VeloraPriceRouteAdapter
 from inefficiency_engine.allocation import AllocationConstraintSet, AllocationPlan, allocate_qualified_opportunities
 from inefficiency_engine.dex_routes import DexRouteQuote, detect_route_quoted_cex_dex
+from inefficiency_engine.dex_shadow import (
+    DexRouteQuoteRecord,
+    DexRouteShadowCycle,
+    build_shadow_observation,
+    route_signature,
+)
 from inefficiency_engine.evidence import ProviderStatus
 from inefficiency_engine.models import MarketKind
 from inefficiency_engine.service import OpportunityService
@@ -24,6 +32,7 @@ from inefficiency_engine.universal_models import (
 
 
 DEX_ROUTE_EVIDENCE_NOTIONAL_USD = 1000.0
+SleepFn = Callable[[float], Awaitable[None]]
 
 
 class UniversalSurfaceSnapshot(BaseModel):
@@ -41,9 +50,15 @@ class UniversalSurfaceSnapshot(BaseModel):
 
 
 class UniversalOpportunityService:
-    def __init__(self, core_service: OpportunityService):
+    def __init__(
+        self,
+        core_service: OpportunityService,
+        *,
+        velora_adapter: VeloraPriceRouteAdapter | None = None,
+    ):
         self.core = core_service
         self.settings = core_service.settings
+        self.velora = velora_adapter or VeloraPriceRouteAdapter()
 
     @staticmethod
     def _reference_prices(market_quotes) -> dict[str, float]:
@@ -54,11 +69,18 @@ class UniversalOpportunityService:
             by_asset.setdefault(quote.asset.upper(), []).append(quote.mid)
         return {asset: median(values) for asset, values in by_asset.items() if values}
 
+    async def collect_route_quotes(self) -> list[DexRouteQuote]:
+        evidence = await self.core.collect_live_evidence()
+        reference_prices = self._reference_prices(evidence.market_quotes)
+        return await self.velora.quotes_for_market(
+            reference_prices,
+            notional_usd=DEX_ROUTE_EVIDENCE_NOTIONAL_USD,
+        )
+
     async def collect_surface(self) -> UniversalSurfaceSnapshot:
         stablecoins = CoinbaseStablecoinAdapter()
         dex = DexScreenerAdapter()
         deribit = DeribitOptionsAdapter()
-        velora = VeloraPriceRouteAdapter()
 
         async def capture(provider: str, awaitable, empty):
             try:
@@ -82,7 +104,7 @@ class UniversalOpportunityService:
         reference_prices = self._reference_prices(evidence.market_quotes)
         route_task = asyncio.create_task(capture(
             "velora-market:prices:v6.2",
-            velora.quotes_for_market(reference_prices, notional_usd=DEX_ROUTE_EVIDENCE_NOTIONAL_USD),
+            self.velora.quotes_for_market(reference_prices, notional_usd=DEX_ROUTE_EVIDENCE_NOTIONAL_USD),
             [],
         ))
 
@@ -91,8 +113,6 @@ class UniversalOpportunityService:
         option_quotes, option_status = await option_task
         dex_route_quotes, route_status = await route_task
 
-        # Core evidence already contains every promoted CEX adapter, including OKX.
-        # Universal collection must not re-fetch or duplicate promoted venues.
         market_quotes = list(evidence.market_quotes)
         funding_quotes = list(evidence.funding_quotes)
         core_graph = self.core.market_graph(funding_quotes, market_quotes)
@@ -144,6 +164,88 @@ class UniversalOpportunityService:
             core_opportunity_count=len(core_opportunities),
         )
 
+    async def run_dex_route_shadow_cycle(
+        self,
+        *,
+        horizons_seconds: tuple[float, ...] | None = None,
+        sleep: SleepFn = asyncio.sleep,
+    ) -> DexRouteShadowCycle:
+        horizons = tuple(sorted(set(
+            max(0.0, value)
+            for value in (horizons_seconds or self.settings.shadow_horizons_seconds)
+        )))
+        if not horizons:
+            horizons = (max(0.0, self.settings.shadow_delay_seconds),)
+
+        cycle_id = uuid.uuid4().hex
+        started_at = datetime.now(timezone.utc)
+        initial_quotes = await self.collect_route_quotes()
+        records: list[DexRouteQuoteRecord] = []
+        initial_records: dict[str, DexRouteQuoteRecord] = {}
+        for quote in initial_quotes:
+            signature = route_signature(quote)
+            record = DexRouteQuoteRecord(
+                cycle_id=cycle_id,
+                phase="initial",
+                horizon_seconds=0.0,
+                route_signature=signature,
+                observed_at=quote.observed_at,
+                quote=quote,
+            )
+            records.append(record)
+            initial_records[signature] = record
+
+        observations = []
+        elapsed = 0.0
+        for horizon in horizons:
+            wait = max(0.0, horizon - elapsed)
+            if wait > 0:
+                await sleep(wait)
+            elapsed = horizon
+
+            async def capture(initial_record: DexRouteQuoteRecord):
+                try:
+                    quote = await self.velora.requote(initial_record.quote)
+                    return quote, None
+                except Exception as exc:
+                    return None, type(exc).__name__
+
+            results = await asyncio.gather(*(capture(record) for record in initial_records.values()))
+            verified_at = datetime.now(timezone.utc)
+            for initial_record, (verification_quote, failure_type) in zip(initial_records.values(), results):
+                verification_record = None
+                if verification_quote is not None:
+                    verification_record = DexRouteQuoteRecord(
+                        cycle_id=cycle_id,
+                        phase="verification",
+                        horizon_seconds=horizon,
+                        route_signature=initial_record.route_signature,
+                        observed_at=verification_quote.observed_at,
+                        quote=verification_quote,
+                    )
+                    records.append(verification_record)
+                observations.append(build_shadow_observation(
+                    cycle_id=cycle_id,
+                    initial_record=initial_record,
+                    verification_record=verification_record,
+                    delay_seconds=horizon,
+                    verified_at=verified_at,
+                    failure_type=failure_type,
+                ))
+
+        cycle = DexRouteShadowCycle(
+            cycle_id=cycle_id,
+            started_at=started_at,
+            completed_at=datetime.now(timezone.utc),
+            horizons_seconds=list(horizons),
+            initial_quote_count=len(initial_records),
+            observations=observations,
+            paper_only=True,
+        )
+        if self.core.evidence_store is not None:
+            self.core.evidence_store.record_dex_route_shadow_cycle(cycle, records)
+        return cycle
+
     async def paper_allocation(
         self,
         *,
@@ -176,8 +278,9 @@ class UniversalOpportunityService:
                 "transaction_building": False,
                 "executable_eligible": False,
                 "probe_notional_usd": DEX_ROUTE_EVIDENCE_NOTIONAL_USD,
+                "multi_horizon_shadow": True,
                 "requirements": [
-                    "quote survival evidence",
+                    "statistically sufficient quote-survival evidence",
                     "cross-venue inventory/settlement model",
                     "stablecoin conversion qualification",
                     "atomic hedge/recovery model",

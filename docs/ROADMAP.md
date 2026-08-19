@@ -54,18 +54,27 @@ Completing v0.9 means each targeted opportunity family has a canonical place in 
 - Empty provider surfaces are degraded rather than treated as successful zero-result scans.
 - Live provider diagnostics inspect public market/funding surfaces and representative visible L2, including request latency.
 
-### v0.10.1 — amount-specific DEX route evidence — current
+### v0.10.1 — amount-specific DEX route evidence — complete
 - Quote-only Velora `/prices` v6.2 integration for Ethereum BTC/ETH↔USDC route evidence.
 - $1,000 buy/sell evidence probes retain exact input/output, block number, route composition, gas estimate and request latency.
 - RFQ liquidity is excluded from the route probe.
 - Successful probes are not treated as capacity evidence.
 - Route-quoted CEX↔DEX candidates remain blocked from allocation pending inventory/settlement, stablecoin conversion, quote survival and hedge-recovery evidence.
-- Remove duplicate universal-layer OKX collection after its v0.10.0 core promotion.
+- Duplicate universal-layer OKX collection removed after v0.10.0 core promotion.
+
+### v0.10.2 — durable DEX route survival — current
+- Re-quote the exact original source amount at 1/5/15/30/60-second horizons.
+- Record survival/disappearance, directionally adverse route-price movement, route changes, block advance, gas change and request latency.
+- Persist successful initial/verification route records and route-shadow cycles in the existing append-only SQLite/PostgreSQL evidence ledger.
+- Run core CEX and DEX route shadow concurrently in production.
+- DEX route-provider failure cannot poison a successful core CEX worker cycle.
+- Expose route-shadow cycle and summary API surfaces.
+- Continue to claim neither capacity nor execution authority from route-survival evidence.
 
 ### Next v0.10 evidence work
-1. Persist amount-specific DEX route observations and build multi-horizon route-survival/price-decay evidence.
-2. Probe multiple notionals and infer capacity only from a conservative, observed quote-size frontier.
-3. Qualify stablecoin conversion paths jointly with DEX route comparisons.
+1. Accumulate enough route-shadow cycles to quantify survival by horizon and directional adverse-price tails.
+2. Add multiple evidence notionals and infer a conservative quote-size frontier only from observed amount-specific routes.
+3. Jointly qualify stablecoin conversion and gas economics at each route size.
 4. Add cross-venue inventory/settlement and hedge-recovery models before CEX↔DEX can enter paper allocation.
 5. Add authoritative bridge quote evidence only when a reliable supported source exists.
 6. Add option L2 and hedge-aware execution economics before options can enter allocation.
