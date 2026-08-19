@@ -29,6 +29,11 @@ class UnifiedPaperCandidate(BaseModel):
     source_return_metric: str
     source_return_value: float
     exposure_kind: ExposureKind = "market_neutral"
+    source_observed_at: datetime | None = None
+    instrument_symbol: str | None = None
+    instrument_market_kind: str | None = None
+    entry_reference_price: float | None = Field(default=None, gt=0)
+    modeled_roundtrip_cost_return: float | None = Field(default=None, ge=0)
     conflict_keys: list[str] = Field(default_factory=list)
     evidence_id: str | None = None
     opportunity_id: str | None = None
@@ -53,6 +58,11 @@ class UnifiedPaperAllocation(BaseModel):
     source_return_metric: str
     source_return_value: float
     exposure_kind: ExposureKind = "market_neutral"
+    source_observed_at: datetime | None = None
+    instrument_symbol: str | None = None
+    instrument_market_kind: str | None = None
+    entry_reference_price: float | None = Field(default=None, gt=0)
+    modeled_roundtrip_cost_return: float | None = Field(default=None, ge=0)
     evidence_id: str | None = None
     opportunity_id: str | None = None
     capacity_claimed: bool = False
@@ -127,6 +137,7 @@ def _core_candidates(
             source_return_metric="net_annualized_return",
             source_return_value=tier.net_annualized_return,
             exposure_kind="market_neutral",
+            source_observed_at=opportunity.observed_at,
             conflict_keys=sorted(set(conflict_keys)),
             opportunity_id=opportunity.id,
             capacity_reference_usd=execution.estimated_capacity_notional_usd,
@@ -219,6 +230,11 @@ class UnifiedPaperAllocatorService:
                     source_return_metric="forward_ci_health_haircut_net_return",
                     source_return_value=item.expected_net_return,
                     exposure_kind=exposure,
+                    source_observed_at=item.observed_at,
+                    instrument_symbol=item.symbol,
+                    instrument_market_kind=item.market_kind.value,
+                    entry_reference_price=item.entry_reference_price,
+                    modeled_roundtrip_cost_return=item.estimated_cost_return,
                     conflict_keys=[
                         *item.conflict_keys,
                         f"venue-symbol:{item.venue}:{item.symbol}",
@@ -307,6 +323,11 @@ class UnifiedPaperAllocatorService:
                 source_return_metric=item.source_return_metric,
                 source_return_value=item.source_return_value,
                 exposure_kind=item.exposure_kind,
+                source_observed_at=item.source_observed_at,
+                instrument_symbol=item.instrument_symbol,
+                instrument_market_kind=item.instrument_market_kind,
+                entry_reference_price=item.entry_reference_price,
+                modeled_roundtrip_cost_return=item.modeled_roundtrip_cost_return,
                 evidence_id=item.evidence_id,
                 opportunity_id=item.opportunity_id,
                 capacity_claimed=False,
