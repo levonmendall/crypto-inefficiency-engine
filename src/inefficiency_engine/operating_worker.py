@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import signal
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from inefficiency_engine import __version__
 from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
@@ -32,6 +33,7 @@ class OperatingBundleResult:
     operating_cycle: object | None
     errors: dict[str, str]
     nav_usd: float
+    fallback_snapshot_recorded: bool = False
 
 
 async def run_operating_bundle_once(
@@ -40,12 +42,18 @@ async def run_operating_bundle_once(
     allocation_certification: AllocationForwardCertificationService,
     operating_certification: OperatingCertificationService,
 ) -> OperatingBundleResult:
-    """Run the three operating subsystems without allowing one to block the next.
+    """Run operating subsystems without allowing one failure to freeze accounting.
 
     Early evidence collection can legitimately fail closed in one subsystem. A
     failure in allocator certification must not prevent the canonical portfolio
     from attempting its own paper cycle, and neither failure may prevent the
     mechanism-status classifier from recording what is currently blocking it.
+
+    If the portfolio cycle itself fails before it can write a snapshot, persist
+    the unchanged canonical account state with a fresh observation timestamp.
+    That keeps the NAV ledger visibly alive without inventing marks, trades, or
+    profits. The heartbeat remains degraded/error so stale market accounting is
+    never mistaken for successful portfolio operation.
     """
 
     current = portfolio.ledger.current_state()
@@ -54,6 +62,7 @@ async def run_operating_bundle_once(
     allocation_cycle: object | None = None
     portfolio_cycle: object | None = None
     operating_cycle: object | None = None
+    fallback_snapshot_recorded = False
 
     try:
         allocation_cycle = await allocation_certification.run_cycle(total_capital_usd=capital_usd)
@@ -64,6 +73,12 @@ async def run_operating_bundle_once(
         portfolio_cycle = await portfolio.run_cycle()
     except Exception as exc:
         errors["portfolio_error_type"] = type(exc).__name__
+        try:
+            fallback = portfolio.ledger.current_state(observed_at=datetime.now(timezone.utc))
+            portfolio.ledger.record_snapshot(fallback)
+            fallback_snapshot_recorded = True
+        except Exception as snapshot_exc:
+            errors["portfolio_fallback_snapshot_error_type"] = type(snapshot_exc).__name__
 
     latest = portfolio.ledger.latest_snapshot()
     nav_usd = max(1.0, latest.nav_usd if latest is not None else current.nav_usd)
@@ -79,6 +94,7 @@ async def run_operating_bundle_once(
         operating_cycle=operating_cycle,
         errors=errors,
         nav_usd=nav_usd,
+        fallback_snapshot_recorded=fallback_snapshot_recorded,
     )
 
 
@@ -146,6 +162,7 @@ async def run_portfolio_operating_loop(
             "portfolio_snapshot_observed_at": (
                 latest.observed_at.isoformat() if latest is not None else None
             ),
+            "fallback_snapshot_recorded": result.fallback_snapshot_recorded,
             "allocation_certification_cycle_id": getattr(result.allocation_cycle, "cycle_id", None),
             "portfolio_cycle_id": getattr(result.portfolio_cycle, "cycle_id", None),
             "operating_certification_cycle_id": getattr(result.operating_cycle, "cycle_id", None),
