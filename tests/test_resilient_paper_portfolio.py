@@ -13,11 +13,14 @@ class FakeCore:
     def __init__(self, snapshots):
         self.snapshots = list(snapshots)
 
-    async def collect_live_executability(self):
+    async def collect_live_evidence(self):
         next_item = self.snapshots.pop(0)
         if isinstance(next_item, Exception):
             raise next_item
         return next_item
+
+    async def collect_live_executability(self):
+        return await self.collect_live_evidence()
 
 
 class FakeAllocator:

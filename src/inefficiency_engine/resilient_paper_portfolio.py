@@ -14,10 +14,11 @@ from inefficiency_engine.portfolio_integrity import PortfolioIntegrityLedger, Po
 class OperationallyResilientPaperPortfolioService(CanonicalPaperPortfolioService):
     """Canonical portfolio cycle with failure containment and valuation provenance.
 
-    The canonical accounting/event schema remains unchanged. Operational
-    integrity is recorded separately. One mechanism-family failure cannot erase
-    valid opportunities, and no new capital can deploy while an existing position
-    lacks a defensible current mark or post-horizon settlement quote.
+    Canonical accounting only requires fresh point-in-time market quotes to value
+    and settle existing positions. It deliberately avoids the broad all-opportunity
+    L2 executability fanout: paper promotion fetches bounded L2 only after a
+    candidate has already cleared statistical qualification. This keeps accounting
+    live without weakening any deployment gate.
     """
 
     def __init__(self, core, allocator, store):
@@ -47,7 +48,13 @@ class OperationallyResilientPaperPortfolioService(CanonicalPaperPortfolioService
     async def run_cycle(self) -> CanonicalPaperPortfolioCycle:
         self.ledger.ensure_genesis()
         previous_integrity = self.integrity.latest()
-        snapshot = await self.core.collect_live_executability()
+
+        # The production failure presented as advancing fallback account timestamps
+        # while market evidence stayed frozen. The broad executability scan fans L2
+        # requests across every discovered opportunity and belongs to research, not
+        # liveness-critical accounting. Persist the complete public quote surface
+        # first; candidate-level L2 remains a mandatory, bounded promotion gate.
+        snapshot = await self.core.collect_live_evidence()
         quote_index = self._quote_index(snapshot)
         state = self.ledger.current_state(observed_at=snapshot.completed_at)
         prior_evidence_times = self._latest_position_evidence_times()
