@@ -1,111 +1,94 @@
 # Roadmap
 
-## Milestone 1 — Discovery core — complete
-- Canonical quote/funding models
-- Public Hyperliquid and Coinbase adapters
-- Funding-dispersion and spot/perp-basis detectors
-- Conservative screening hurdle
-- Paper-only execution boundary
+## Paper V1 — complete
 
-## Milestone 2 — Point-in-time evidence — foundation complete
-- Append-only SQLite/PostgreSQL observation store
-- Provider health and source timestamps
-- Opportunity/order-book/executability snapshots
-- Lineage hashes and exact analysis configuration
-- Deterministic replay harness
+The paper-first Crypto Inefficiency Engine has reached its V1 definition of done.
 
-## Milestone 3 — Executability and economic realism — core complete
-- L2 depth/VWAP/slippage
-- Exact-base paired-leg sizing
-- Capital tiers and capacity frontier
-- Freshness/skew gates
-- Explicit venue fees, collateral and borrow economics
-- Conservative latency and hedge-recovery fallbacks
+Its objective is to continuously search accessible crypto markets for structural inefficiencies, reconstruct conservative net economics after observable costs and risk, learn which apparent edges survive market contact, and allocate **paper capital only** to independently qualified opportunities.
 
-## Milestone 4 — v0.9 Universal Opportunity Graph / broader alpha — complete
-- v0.9.0 canonical graph, detector registry and common ranking
-- v0.9.1 Bybit/Kraken breadth, dated-futures basis and CEX↔CEX spot dislocation
-- v0.9.2 stablecoin, DEX-pool, bridge, solver/liquidation, options and paper-allocation research surfaces
+### Foundation — complete
+- Canonical asset, venue and instrument identity.
+- Strategy-neutral market/opportunity graph and detector registry.
+- Public provider registry with fail-closed provider diagnostics.
+- Append-only SQLite/PostgreSQL point-in-time evidence and lineage hashes.
+- Deterministic replay.
+- Visible-L2 depth, VWAP/slippage, exact paired-leg sizing and capacity frontiers.
+- Explicit fees, financing/borrow, collateral opportunity cost, latency and hedge-recovery economics.
+- Multi-horizon shadow evidence and statistically gated empirical calibration.
 
-## v0.10 — Evidence maturation — active
+### Core CEX opportunity families — paper allocatable
+- Funding dispersion.
+- Spot/perpetual basis.
+- Dated-futures basis.
+- CEX spot dislocation when required short-borrow economics are available.
 
-### v0.10.0 — public adapter registry / OKX promotion — complete
-- Central public adapter registry for quotes, funding, L2 routing and provider attribution.
-- OKX promoted into core discovery/qualification/shadow/learning.
-- Empty public surfaces fail closed and live diagnostics are exposed.
+These families use the common CEX executability pipeline and cannot allocate capital unless their exact capital tier passes current economics and qualification gates.
 
-### v0.10.1 — amount-specific DEX route evidence — complete
-- Quote-only Velora BTC/ETH↔USDC routes.
-- Exact amounts, route composition, block/gas/latency lineage.
-- No capacity or execution authority.
+### CEX↔DEX evidence maturation — complete for paper promotion
+- Amount-specific quote-only DEX routes.
+- Exact-source multi-horizon route re-quotes.
+- $1k/$5k/$10k/$25k route frontiers and independent tier evidence.
+- Fresh observed USD/USDC/USDT conversion paths.
+- Amount-specific Coinbase stablecoin L2 depth and two-hop reconstruction.
+- Same-notional DEX route + conversion depth + CEX hedge economics.
+- Append-only fully costed composite-edge shadow history.
+- Independent route/frontier statistics with Wilson confidence gates.
+- Independent stablecoin conversion-depth survival and tail statistics.
+- Direct composite net-edge survival statistics, including p95 deterioration and low-tail retained edge.
+- Explicit pre-funded paper inventory requirements.
+- No synchronous bridge/deposit/withdrawal assumption during a qualifying opportunity.
+- Independent CEX hedge-recovery venue and recovery reserve.
+- Final statistically haircutted capture edge before paper allocation eligibility.
 
-### v0.10.2 — durable DEX route survival — complete
-- Exact-source re-quotes at 1/5/15/30/60-second horizons.
-- Durable survival/adverse-price/route-change/gas/latency evidence.
-- DEX evidence failures isolated from core CEX worker success.
+### Strategy-neutral paper allocator — complete
+The unified allocator compares independently qualified core CEX and CEX↔DEX opportunities using conservative expected return on reserved capital for the **current deployment**. It does not pretend that a fast arbitrage edge can be continuously annualized.
 
-### v0.10.3 — multi-notional DEX route frontier — complete
-- Sequential $1k/$5k/$10k/$25k probes by default.
-- Conservative contiguous acceptable quote frontier.
-- Durable evidence with `capacity_claimed=false`.
+The allocator enforces:
+- total paper-capital limits;
+- venue concentration;
+- asset concentration;
+- shared instrument/route conflicts;
+- explicit two-leg capital reservation;
+- cash as a valid outcome.
 
-### v0.10.4 — explicit DEX/CEX quote-currency conversion — complete
-- Fresh observed conversion path required for USDC DEX vs USD/USDT CEX comparisons.
-- Direct/two-hop conversion paths, directional normalization, spread embedded once, depeg risk charged separately.
-- Missing/stale conversion evidence fails closed.
+Allocation never authorizes execution.
 
-### v0.10.5 — amount-specific stablecoin conversion depth — complete
-- Public Coinbase Exchange level-2 `USDC-USD` and `USDT-USD` books.
-- Exact source-amount visible-depth reconstruction for both directions.
-- USDC↔USDT two-hop conversions carry the actual intermediate USD amount.
-- Full fill, book freshness and multi-book timestamp skew are mandatory.
-- Per-leg effective rate, slippage, levels, timestamps and request latency are retained.
-- Read-only stablecoin depth-quote API.
-- `visible_depth_only=true`, `capacity_claimed=false`, `executable_eligible=false`.
+## Research families intentionally fail closed
 
-### same-notional CEX↔DEX composite evidence — complete
-- Each quoted DEX route tier is joined to stablecoin conversion depth and CEX hedge economics at the same economic amount.
-- DEX-sell proceeds and DEX-buy hedge proceeds use the exact directional conversion-depth output.
-- CEX taker fees, DEX gas and stablecoin depeg/risk haircuts are charged separately without double-counting conversion spread/slippage.
-- Incomplete depth/fee rows fail independently; complete rows remain research-only.
+These families remain searchable in the universal graph, but Paper V1 does **not** upgrade incomplete evidence into trading authority.
 
-### v0.10.6 — DEX statistical research qualification — complete
-- Independent DEX route cycles, not repeated horizons, define effective sample size.
-- Route survival and repeated frontier acceptance use 95% Wilson confidence intervals by default.
-- Confidence-width, minimum-effective-sample and adverse-tail-sample gates are mandatory.
-- p95 adverse route deterioration must remain below a configured ceiling.
-- Qualification is asset, direction, notional and horizon specific; evidence at one capital tier cannot certify another tier.
-- A live same-notional composite row can become `research_qualified=true` only after both current economics and historical statistical gates pass.
-- Research qualification still has `capacity_claimed=false`, `allocation_eligible=false` and `executable_eligible=false`.
+### DEX↔DEX — research only
+Blocked until independent pool-specific, route-specific executable depth can be observed and shadowed rather than inferred from pool-liquidity proxies.
 
-### v0.10.7 — independent larger-tier DEX shadow evidence — complete
-- $5k/$10k/$25k DEX routes accumulate their own multi-horizon survival and adverse-deterioration evidence.
-- Exact original source amounts are re-quoted at 1/5/15/30/60-second horizons.
-- Verification concurrency is bounded and large-tier collection is periodic rather than part of every core cycle.
-- Larger-tier failures remain isolated from core CEX and frequent $1k DEX evidence collection.
+### Stablecoin dislocation — research only
+Amount-specific conversion depth and stability evidence exist, but a market-neutral redemption/convergence path is not modeled. Paper V1 will not promote directional peg speculation as arbitrage.
 
-### v0.10.8 — persisted composite CEX↔DEX edge survival — current
-- Persist fully reconstructed CEX↔DEX evidence rather than relying on route-only history as a proxy for economic edge survival.
-- Key observations by asset, route direction, notional, CEX venue/symbol and quote-currency path.
-- Re-price the complete route + stablecoin conversion depth + CEX hedge + fees + gas + risk-haircut economics at multiple horizons.
-- Record net-edge change, adverse deterioration, retained-edge fraction, disappearance and survival above the configured research hurdle.
-- Keep composite evidence append-only, paper-only, non-allocating and non-executable.
-- Stagger composite shadow collection away from the larger-tier/frontier cadence to avoid burst-loading public route APIs.
+### Cross-chain — research only
+Blocked until a fresh authoritative bridge-quote source provides amount-specific fees, fill time and settlement-risk evidence that can be persisted and statistically evaluated.
 
-### Next v0.10 evidence work
-1. Build cross-venue inventory/settlement state and explicit atomic hedge/recovery models before CEX↔DEX can enter paper allocation.
-2. Add stablecoin conversion-depth shadow/persistence evidence and effective sample gates.
-3. Add composite-edge statistical qualification directly from persisted net-edge survival history.
-4. Add authoritative bridge quote evidence only when a reliable supported source exists.
-5. Add option L2 and hedge-aware execution economics before options can enter allocation.
-6. Add authoritative liquidation/solver feeds before those families can enter allocation.
+### Solver — research only
+Blocked until an authoritative auction/capacity/settlement feed is connected. A typed capability interface exists; synthetic solver capacity does not create allocation authority.
 
-## Milestone 6 — Tiny-capital controlled execution — blocked
-Separate service, credentials, explicit authorization, hard caps, paired-leg hedge recovery, concentration limits, dead-man switch and kill switch. Remains blocked until accumulated shadow evidence is statistically convincing and live execution is separately authorized.
+### Liquidation/backstop — research only
+Blocked until authoritative liquidation capacity, expiry, cost and recovery evidence are available.
 
-## Milestone 7 — Machine-paid intelligence API
-- API keys and usage metering
-- Per-query pricing
-- Bot/agent endpoints
-- Optional machine-payment gateway
-- Never expose private positions or proprietary execution timing
+### Option relative value — research only
+Public option-surface discovery exists. Paper promotion remains blocked pending option L2, fee economics, delta hedge construction, vega/gamma risk and paired capacity evidence.
+
+## Post-V1 work
+
+### Evidence accumulation / production proof
+The deployed worker must accumulate enough independent observations for statistical gates to pass at the asset, direction and notional tiers where real opportunities occur. A family being architecturally promotable does not imply current live evidence has already reached its sample thresholds.
+
+### Broader venue and strategy maturation
+Additional public CEX/DEX venues can be promoted through the common adapter/evidence contracts. Research-only families should be promoted only when their missing authoritative evidence becomes available; thresholds must not be weakened simply to generate candidates.
+
+### Tiny-capital controlled execution — intentionally blocked
+Real-money execution is **not part of Paper V1**. Any future live executor must be a separate service with separate explicit authorization, credentials, hard capital caps, paired-leg recovery, concentration controls, dead-man/kill switches and production evidence proving the relevant strategy statistically convincing.
+
+### Machine-paid intelligence API — optional commercialization
+- API keys and usage metering.
+- Per-query pricing.
+- Bot/agent endpoints.
+- Optional machine-payment gateway.
+- Never expose private positions or proprietary execution timing.
