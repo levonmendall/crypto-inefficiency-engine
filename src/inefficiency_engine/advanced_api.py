@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
+from inefficiency_engine import __version__
 from inefficiency_engine.cex_dex_composite_statistics import CompositeEdgeStatisticalService
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_operations import (
@@ -10,6 +11,7 @@ from inefficiency_engine.cex_dex_operations import (
 )
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeLedger
+from inefficiency_engine.completion import paper_v1_status
 from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.service import OpportunityService
@@ -54,6 +56,10 @@ def build_advanced_router(
     def require_store() -> None:
         if evidence_store is None:
             raise HTTPException(status_code=503, detail="evidence persistence is not configured")
+
+    @router.get("/v1/system/capabilities")
+    def system_capabilities():
+        return paper_v1_status(__version__).model_dump(mode="json")
 
     @router.get("/v1/cex-dex/composite-shadow/summary")
     def cex_dex_composite_shadow_summary():
