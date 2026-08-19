@@ -8,11 +8,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from pydantic import BaseModel, Field
-from sqlalchemy import Column, Index, Integer, MetaData, String, Table, Text, insert, select
+from sqlalchemy import Boolean, Column, Index, Integer, MetaData, String, Table, Text, insert, select
 
 from inefficiency_engine.evidence import EvidenceStore, ScanSnapshot
 from inefficiency_engine.models import MarketKind, MarketQuote
-from inefficiency_engine.unified_allocation import UnifiedPaperAllocation, UnifiedPaperAllocationPlan, UnifiedPaperAllocatorService
+from inefficiency_engine.unified_allocation import UnifiedPaperAllocation, UnifiedPaperAllocatorService
 
 
 SettlementStatus = Literal["settled"]
@@ -108,7 +108,7 @@ class AllocationCertificationLedger:
             Column("cohort_key", Text, nullable=False),
             Column("plan_observed_at", Text, nullable=False),
             Column("due_at", Text),
-            Column("settlement_supported", String(5), nullable=False),
+            Column("settlement_supported", Boolean, nullable=False),
             Column("payload_json", Text, nullable=False),
             Column("lineage_hash", String(64), nullable=False),
         )
@@ -129,6 +129,10 @@ class AllocationCertificationLedger:
         Index("ix_allocation_outcome_strategy_asset", self.outcomes_table.c.strategy, self.outcomes_table.c.asset)
         metadata.create_all(store.engine)
 
+    def _completed_trial_ids(self) -> set[str]:
+        with self.store.engine.connect() as db:
+            return set(db.execute(select(self.outcomes_table.c.trial_id)).scalars())
+
     def record_trial(self, trial: PaperAllocationTrial) -> str:
         raw, lineage = _payload(trial)
         with self.store.engine.begin() as db:
@@ -145,7 +149,7 @@ class AllocationCertificationLedger:
                     "cohort_key": trial.cohort_key,
                     "plan_observed_at": trial.plan_observed_at.isoformat(),
                     "due_at": trial.due_at.isoformat() if trial.due_at is not None else None,
-                    "settlement_supported": "true" if trial.settlement_supported else "false",
+                    "settlement_supported": trial.settlement_supported,
                     "payload_json": raw,
                     "lineage_hash": lineage,
                 })
@@ -171,29 +175,27 @@ class AllocationCertificationLedger:
 
     def pending_supported_trials(self, *, now: datetime | None = None) -> list[PaperAllocationTrial]:
         now = now or _now()
+        completed = self._completed_trial_ids()
         with self.store.engine.connect() as db:
             payloads = list(db.execute(
                 select(self.trials.c.payload_json)
-                .where(self.trials.c.settlement_supported == "true")
+                .where(self.trials.c.settlement_supported.is_(True))
                 .where(self.trials.c.due_at.is_not(None))
                 .where(self.trials.c.due_at <= now.isoformat())
                 .order_by(self.trials.c.id)
             ).scalars())
-            completed = set(db.execute(select(self.outcomes_table.c.trial_id)).scalars())
         rows = [PaperAllocationTrial.model_validate_json(payload) for payload in payloads]
         return [row for row in rows if row.trial_id not in completed]
 
-    def has_open_supported_cohort(self, cohort_key: str, *, now: datetime) -> bool:
+    def has_unsettled_supported_cohort(self, cohort_key: str) -> bool:
+        completed = self._completed_trial_ids()
         with self.store.engine.connect() as db:
-            trials = list(db.execute(
-                select(self.trials.c.trial_id, self.trials.c.due_at)
+            ids = list(db.execute(
+                select(self.trials.c.trial_id)
                 .where(self.trials.c.cohort_key == cohort_key)
-                .where(self.trials.c.settlement_supported == "true")
-                .where(self.trials.c.due_at.is_not(None))
-                .where(self.trials.c.due_at > now.isoformat())
-            ))
-            completed = set(db.execute(select(self.outcomes_table.c.trial_id)).scalars())
-        return any(trial_id not in completed for trial_id, _ in trials)
+                .where(self.trials.c.settlement_supported.is_(True))
+            ).scalars())
+        return any(trial_id not in completed for trial_id in ids)
 
     def trials_all(self) -> list[PaperAllocationTrial]:
         with self.store.engine.connect() as db:
@@ -238,22 +240,15 @@ class AllocationCertificationLedger:
 class AllocationForwardCertificationService:
     """Forward certification of the unified allocator's actual paper decisions.
 
-    V2.4 settles only spot directional-long alpha because a later public spot
-    price plus the point-in-time modeled round-trip cost forms an honest early
-    forward return reconstruction. Perpetual shorts require realized funding;
-    market-neutral families require family-specific two-leg settlement evidence.
-    Those decisions are persisted but excluded from realized-P&L statistics until
-    their authoritative settlement adapters exist.
+    V2.4 settles only spot directional-long alpha. Perpetual shorts require
+    realized funding accrual; market-neutral families require family-specific
+    multi-leg settlement. Unsupported decisions remain visible but cannot enter
+    realized-profit statistics.
     """
 
     SETTLEMENT_METHOD = "spot_mid_forward_minus_point_in_time_roundtrip_cost"
 
-    def __init__(
-        self,
-        core,
-        allocator: UnifiedPaperAllocatorService,
-        store: EvidenceStore,
-    ):
+    def __init__(self, core, allocator: UnifiedPaperAllocatorService, store: EvidenceStore):
         self.core = core
         self.allocator = allocator
         self.store = store
@@ -289,9 +284,9 @@ class AllocationForwardCertificationService:
             and allocation.modeled_roundtrip_cost_return is not None
             and allocation.modeled_holding_hours is not None
         )
-        blocker = None
         due_at = None
         method = None
+        blocker = None
         if supported:
             due_at = source_time + timedelta(hours=allocation.modeled_holding_hours or 0.0)
             method = cls.SETTLEMENT_METHOD
@@ -327,10 +322,10 @@ class AllocationForwardCertificationService:
 
     @staticmethod
     def _quote_index(snapshot: ScanSnapshot) -> dict[tuple[str, str, str, str], MarketQuote]:
-        rows: dict[tuple[str, str, str, str], MarketQuote] = {}
-        for quote in snapshot.market_quotes:
-            rows[(quote.venue, quote.asset.upper(), quote.market_kind.value, quote.symbol)] = quote
-        return rows
+        return {
+            (quote.venue, quote.asset.upper(), quote.market_kind.value, quote.symbol): quote
+            for quote in snapshot.market_quotes
+        }
 
     def _settle_trial(
         self,
@@ -355,11 +350,7 @@ class AllocationForwardCertificationService:
         realized_net = gross - trial.modeled_roundtrip_cost_return
         realized_profit = trial.notional_usd * realized_net
         error = realized_profit - trial.predicted_profit_usd
-        capture = (
-            realized_profit / trial.predicted_profit_usd
-            if trial.predicted_profit_usd > 0
-            else None
-        )
+        capture = realized_profit / trial.predicted_profit_usd if trial.predicted_profit_usd > 0 else None
         return PaperAllocationOutcome(
             trial_id=trial.trial_id,
             candidate_id=trial.candidate_id,
@@ -395,10 +386,7 @@ class AllocationForwardCertificationService:
         recorded = supported = unsupported = 0
         for allocation in plan.allocations:
             trial = self.trial_from_allocation(allocation, plan_observed_at=plan.observed_at)
-            if trial.settlement_supported and self.ledger.has_open_supported_cohort(
-                trial.cohort_key,
-                now=plan.observed_at,
-            ):
+            if trial.settlement_supported and self.ledger.has_unsettled_supported_cohort(trial.cohort_key):
                 continue
             self.ledger.record_trial(trial)
             recorded += 1
