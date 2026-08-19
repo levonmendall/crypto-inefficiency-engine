@@ -9,13 +9,14 @@ from inefficiency_engine.bounded_alpha_factory import (
     BoundedExpandedAlphaFactoryService as ExpandedAlphaFactoryService,
 )
 from inefficiency_engine.canonical_allocator import CanonicalPortfolioAllocatorService
+from inefficiency_engine.canonical_worker import run_canonical_portfolio_loop
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeShadowService
+from inefficiency_engine.certification_worker import run_certification_loop
 from inefficiency_engine.dex_tier_shadow import DexTierShadowService
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.operating_certification import OperatingCertificationService
-from inefficiency_engine.operating_worker import run_portfolio_operating_loop
 from inefficiency_engine.resilient_paper_portfolio import OperationallyResilientPaperPortfolioService
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
@@ -37,7 +38,7 @@ def _stop_event() -> asyncio.Event:
 
 
 async def run_research_child(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
-    """Run broad shadow research on its own event loop/process."""
+    """Run broad shadow research on its own event loop."""
 
     stop = _stop_event()
     universal = UniversalOpportunityService(service)
@@ -71,15 +72,13 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
 
 
 async def run_portfolio_child(service: OpportunityService, store: EvidenceStore) -> int:
-    """Run canonical accounting on the isolated portfolio event loop.
+    """Run only canonical accounting on the isolated portfolio event loop.
 
-    Broad research/certification keeps the full unified allocator. The canonical
-    accounting hot path uses a settlement-compatible allocator that consumes the
-    executable scan already persisted by the portfolio cycle and considers only
-    alpha positions the canonical ledger can actually settle. This removes CEX↔DEX
-    and multi-leg structural provider work from a path where those families could
-    only be skipped anyway. Alpha L2 promotion consumes the scan's point-in-time
-    books first and any fallback provider request is bounded.
+    The canonical thread is now certification-free. It scans the market, evaluates
+    only settlement-compatible alpha allocations, advances the persistent account,
+    and publishes the canonical heartbeat. Full forward/mechanism certification is
+    delegated to a separate thread so certification/provider stalls cannot make the
+    Render worker fail.
     """
 
     stop = _stop_event()
@@ -87,12 +86,6 @@ async def run_portfolio_child(service: OpportunityService, store: EvidenceStore)
     composite_service = CexDexCompositeEvidenceService(service, universal=universal)
     alpha_factory = ExpandedAlphaFactoryService(service, store)
     promotion = CexDexPaperPromotionService(service, composite_service, store)
-
-    # Full mechanism surface remains available to forward certification.
-    unified = UnifiedPaperAllocatorService(service, promotion, alpha_factory)
-    allocation_certification = AllocationForwardCertificationService(service, unified, store)
-
-    # Canonical accounting only evaluates families it can settle today.
     canonical_allocator = CanonicalPortfolioAllocatorService(
         service,
         promotion,
@@ -103,6 +96,24 @@ async def run_portfolio_child(service: OpportunityService, store: EvidenceStore)
         canonical_allocator,
         store,
     )
+    return await run_canonical_portfolio_loop(
+        service,
+        store,
+        portfolio=portfolio,
+        stop_event=stop,
+    )
+
+
+async def run_certification_child(service: OpportunityService, store: EvidenceStore) -> int:
+    """Run the complete evidence-driven certification surface independently."""
+
+    stop = _stop_event()
+    universal = UniversalOpportunityService(service)
+    composite_service = CexDexCompositeEvidenceService(service, universal=universal)
+    alpha_factory = ExpandedAlphaFactoryService(service, store)
+    promotion = CexDexPaperPromotionService(service, composite_service, store)
+    unified = UnifiedPaperAllocatorService(service, promotion, alpha_factory)
+    allocation_certification = AllocationForwardCertificationService(service, unified, store)
     operating_certification = OperatingCertificationService(
         service,
         store,
@@ -110,11 +121,9 @@ async def run_portfolio_child(service: OpportunityService, store: EvidenceStore)
         allocation_certification,
         version=__version__,
     )
-
-    return await run_portfolio_operating_loop(
+    return await run_certification_loop(
         service,
         store,
-        portfolio=portfolio,
         allocation_certification=allocation_certification,
         operating_certification=operating_certification,
         stop_event=stop,
