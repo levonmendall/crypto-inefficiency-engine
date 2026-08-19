@@ -22,15 +22,16 @@
 - Explicit venue fees, collateral and borrow economics
 - Conservative latency and hedge-recovery fallbacks
 
-## Milestone 4 — Universal opportunity graph / broader alpha — in progress
-### v0.9.0 complete
+## Milestone 4 — v0.9 Universal Opportunity Graph / broader alpha — complete
+
+### v0.9.0 — graph foundation — complete
 - Canonical asset/venue/instrument identities
 - Provider-symbol aliases
 - Economic-equivalence graph edges
 - Detector registry
 - Common qualified-opportunity ranking surface
 
-### v0.9.1 complete
+### v0.9.1 — CEX breadth — complete
 - Bybit public spot/perpetual/dated-futures market data
 - Kraken public USD spot depth
 - Contract-specific dated-future identity
@@ -41,21 +42,29 @@
 - Opportunity-scoped provider-failure attribution
 - CEX spot short remains fail-closed without borrow/inventory economics
 
-### Next breadth
-1. Stablecoin identity and conversion-risk model so USD/USDC/USDT relationships can be compared explicitly rather than assumed equivalent.
-2. Additional direct CEX/perpetual venues behind the same adapter contract.
-3. DEX pool and token/chain identity graph.
-4. CEX↔DEX and DEX↔DEX route evaluation.
-5. Cross-chain liquidity/bridge costs and settlement risk.
-6. Liquidation/backstop and solver opportunity interfaces.
-7. Options/volatility-relative-value graph.
-8. Portfolio capital allocator only after multiple independent strategy families have sufficient evidence.
+### v0.9.2 — universal alpha graph completion — complete
+- Stablecoin USD/USDC/USDT identity and conversion edges with spread/depeg risk haircuts
+- Public OKX spot/perpetual/funding adapter for additional venue discovery
+- Chain-token and DEX-pool identity using public DexScreener pool discovery
+- CEX↔DEX and DEX↔DEX research candidate generation
+- DEX liquidity is explicitly a discovery proxy; exact executable swap depth remains blocked
+- Cross-chain bridge quote/cost/settlement-risk model and graph capability edges
+- Liquidation/backstop and solver typed opportunity interfaces with authoritative-capacity gates
+- Public Deribit options surface ingestion and volatility-relative-value anomaly discovery
+- Options remain non-executable until option L2, fee, delta/vega hedge and paired-capacity models exist
+- Deterministic paper capital allocator over already-qualified CEX opportunities only
+- Allocator enforces capital, venue, asset, capacity and shared-instrument conflict constraints
+- Cash/no allocation remains valid and allocator has no execution authority
+- Universal read-only API surfaces for graph, candidates, stablecoin conversion, interfaces and paper allocation
+
+### v0.9 evidence boundary
+Completing v0.9 means every originally targeted opportunity family now has a canonical place in the graph and a fail-closed path to future execution evidence. It does **not** mean every family is executable. DEX route depth, bridge quotes, solver/liquidation capacity and option hedging intentionally remain blocked until authoritative evidence is available.
 
 ## Milestone 5 — Shadow evidence runtime — v0.7 complete
 - Durable worker/PostgreSQL topology
 - Multi-horizon 1/5/15/30/60s observation
 - Failure causes and segmented survival
-- Provider degradation fail-closed, now scoped to dependent venues
+- Provider degradation fail-closed, scoped to dependent venues
 
 ## v0.8 — Empirical fill/latency modeling — complete
 - L2 request latency measurement
@@ -66,6 +75,14 @@
 - Effective independent sample size
 - Wilson confidence intervals and confidence-width gates
 - Conservative fixed fallbacks whenever empirical gates fail
+
+## Next major phase
+1. Accumulate and inspect live shadow evidence across the broadened CEX strategy set.
+2. Replace DEX discovery proxies with exact route-specific on-chain/aggregator quote evidence.
+3. Add authoritative bridge quote source only when credentials/terms permit reliable production access.
+4. Add option L2 and hedge-aware execution economics before options can enter capital allocation.
+5. Add authoritative liquidation/solver feeds before those families can enter allocation.
+6. Promote additional strategy families into the allocator only after their own evidence gates are satisfied.
 
 ## Milestone 6 — Tiny-capital controlled execution — blocked
 Separate service, credentials, explicit authorization, hard caps, paired-leg hedge recovery, concentration limits, dead-man switch and kill switch. Remains blocked until accumulated shadow evidence is statistically convincing and live execution is separately authorized.

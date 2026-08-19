@@ -55,6 +55,8 @@ class Settings:
     bybit_spot_taker_fee_bps: float = 10.0
     bybit_derivatives_taker_fee_bps: float = 5.5
     kraken_spot_taker_fee_bps: float = 80.0
+    okx_spot_taker_fee_bps: float = 10.0
+    okx_derivatives_taker_fee_bps: float = 5.0
     spot_collateral_fraction: float = 1.0
     perp_collateral_fraction: float = 1.0
     collateral_opportunity_cost_annual: float = 0.04
@@ -81,6 +83,15 @@ class Settings:
     worker_error_backoff_seconds: float = 15.0
     worker_heartbeat_stale_seconds: float = 180.0
     capital_tiers_usd: tuple[float, ...] = (1000.0, 10000.0, 25000.0, 50000.0, 100000.0)
+    stablecoin_depeg_risk_multiplier: float = 1.5
+    stablecoin_conversion_risk_floor_bps: float = 2.0
+    stablecoin_dislocation_min_edge_bps: float = 8.0
+    dex_dislocation_min_edge_bps: float = 12.0
+    dex_liquidity_risk_floor_bps: float = 8.0
+    option_relative_value_min_iv_points: float = 8.0
+    allocator_max_venue_fraction: float = 0.50
+    allocator_max_asset_fraction: float = 0.50
+    allocator_max_allocations: int = 10
     evidence_db_path: str | None = None
 
     @classmethod
@@ -106,6 +117,8 @@ class Settings:
             bybit_spot_taker_fee_bps=_float("CIE_BYBIT_SPOT_TAKER_FEE_BPS", 10.0),
             bybit_derivatives_taker_fee_bps=_float("CIE_BYBIT_DERIVATIVES_TAKER_FEE_BPS", 5.5),
             kraken_spot_taker_fee_bps=_float("CIE_KRAKEN_SPOT_TAKER_FEE_BPS", 80.0),
+            okx_spot_taker_fee_bps=_float("CIE_OKX_SPOT_TAKER_FEE_BPS", 10.0),
+            okx_derivatives_taker_fee_bps=_float("CIE_OKX_DERIVATIVES_TAKER_FEE_BPS", 5.0),
             spot_collateral_fraction=_float("CIE_SPOT_COLLATERAL_FRACTION", 1.0),
             perp_collateral_fraction=_float("CIE_PERP_COLLATERAL_FRACTION", 1.0),
             collateral_opportunity_cost_annual=_float("CIE_COLLATERAL_OPPORTUNITY_COST_ANNUAL", 0.04),
@@ -132,5 +145,14 @@ class Settings:
             worker_error_backoff_seconds=_float("CIE_WORKER_ERROR_BACKOFF_SECONDS", 15.0),
             worker_heartbeat_stale_seconds=_float("CIE_WORKER_HEARTBEAT_STALE_SECONDS", 180.0),
             capital_tiers_usd=_float_tuple("CIE_CAPITAL_TIERS_USD", (1000.0, 10000.0, 25000.0, 50000.0, 100000.0)),
+            stablecoin_depeg_risk_multiplier=_float("CIE_STABLECOIN_DEPEG_RISK_MULTIPLIER", 1.5),
+            stablecoin_conversion_risk_floor_bps=_float("CIE_STABLECOIN_CONVERSION_RISK_FLOOR_BPS", 2.0),
+            stablecoin_dislocation_min_edge_bps=_float("CIE_STABLECOIN_DISLOCATION_MIN_EDGE_BPS", 8.0),
+            dex_dislocation_min_edge_bps=_float("CIE_DEX_DISLOCATION_MIN_EDGE_BPS", 12.0),
+            dex_liquidity_risk_floor_bps=_float("CIE_DEX_LIQUIDITY_RISK_FLOOR_BPS", 8.0),
+            option_relative_value_min_iv_points=_float("CIE_OPTION_RELATIVE_VALUE_MIN_IV_POINTS", 8.0),
+            allocator_max_venue_fraction=_float("CIE_ALLOCATOR_MAX_VENUE_FRACTION", 0.50),
+            allocator_max_asset_fraction=_float("CIE_ALLOCATOR_MAX_ASSET_FRACTION", 0.50),
+            allocator_max_allocations=_int("CIE_ALLOCATOR_MAX_ALLOCATIONS", 10),
             evidence_db_path=os.getenv("CIE_EVIDENCE_DB_PATH") or None,
         )
