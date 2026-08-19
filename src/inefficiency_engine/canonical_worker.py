@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+
+from inefficiency_engine.evidence import EvidenceStore
+from inefficiency_engine.operating_worker import PORTFOLIO_STAGE_TIMEOUT_SECONDS, PORTFOLIO_WORKER_ID
+from inefficiency_engine.portfolio_integrity import PortfolioIntegritySnapshot
+from inefficiency_engine.resilient_paper_portfolio import OperationallyResilientPaperPortfolioService
+from inefficiency_engine.service import OpportunityService
+
+
+async def _interruptible_wait(seconds: float, stop_event: asyncio.Event) -> None:
+    if seconds <= 0 or stop_event.is_set():
+        return
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=seconds)
+    except TimeoutError:
+        return
+
+
+async def run_canonical_portfolio_loop(
+    service: OpportunityService,
+    store: EvidenceStore,
+    *,
+    portfolio: OperationallyResilientPaperPortfolioService,
+    stop_event: asyncio.Event,
+    interval_seconds: float | None = None,
+    max_cycles: int | None = None,
+) -> int:
+    """Advance only the canonical account on the liveness-critical portfolio thread.
+
+    Forward allocation and mechanism certification deliberately do not run here.
+    A provider-heavy certification stall must never hold the canonical heartbeat
+    open long enough for the process watchdog to kill the Render worker.
+    """
+
+    interval = (
+        max(60.0, float(interval_seconds))
+        if interval_seconds is not None
+        else max(60.0, service.settings.shadow_cycle_interval_seconds * 10.0)
+    )
+    portfolio.ledger.ensure_genesis()
+    if portfolio.ledger.latest_snapshot() is None:
+        portfolio.ledger.record_snapshot(portfolio.ledger.current_state())
+    latest_account = portfolio.ledger.latest_snapshot()
+    if latest_account is not None:
+        portfolio.integrity.ensure_initial(latest_account)
+
+    attempted = 0
+    while not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
+        attempted += 1
+        store.record_worker_heartbeat(
+            worker_id=PORTFOLIO_WORKER_ID,
+            state="running",
+            detail={
+                "cycle_attempt": attempted,
+                "portfolio_cycle_interval_seconds": interval,
+                "stage": "canonical_accounting_only",
+                "certification_decoupled": True,
+                "paper_only": True,
+            },
+        )
+
+        error_type: str | None = None
+        cycle = None
+        fallback_snapshot_recorded = False
+        try:
+            cycle = await asyncio.wait_for(
+                portfolio.run_cycle(),
+                timeout=PORTFOLIO_STAGE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            error_type = type(exc).__name__
+            try:
+                previous_integrity = portfolio.integrity.latest()
+                fallback = portfolio.ledger.current_state(observed_at=datetime.now(timezone.utc))
+                portfolio.ledger.record_snapshot(fallback)
+                valuation_status = "cash_only" if fallback.open_position_count == 0 else "stale"
+                portfolio.integrity.record(PortfolioIntegritySnapshot(
+                    observed_at=fallback.observed_at,
+                    account_snapshot_at=fallback.observed_at,
+                    market_evidence_at=(
+                        previous_integrity.market_evidence_at if previous_integrity is not None else None
+                    ),
+                    valuation_status=valuation_status,
+                    cycle_status="failed",
+                    fallback_snapshot=True,
+                    cycle_error_type=error_type,
+                    stale_position_count=fallback.open_position_count,
+                    open_position_count=fallback.open_position_count,
+                    allocation_family_failures=(
+                        list(previous_integrity.allocation_family_failures)
+                        if previous_integrity is not None else []
+                    ),
+                    market_snapshot_id=(
+                        previous_integrity.market_snapshot_id if previous_integrity is not None else None
+                    ),
+                ))
+                fallback_snapshot_recorded = True
+            except Exception:
+                pass
+
+        latest = portfolio.ledger.latest_snapshot()
+        integrity = portfolio.integrity.latest()
+        degraded_reason = None
+        if error_type is None and integrity is not None and integrity.cycle_status == "degraded":
+            degraded_reason = (
+                integrity.cycle_error_type
+                or ("family_failure" if integrity.allocation_family_failures else None)
+                or ("stale_valuation" if integrity.stale_position_count else None)
+                or "PortfolioCycleDegraded"
+            )
+        state = "error" if error_type else ("degraded" if degraded_reason else "success")
+        store.record_worker_heartbeat(
+            worker_id=PORTFOLIO_WORKER_ID,
+            state=state,
+            cycle_id=getattr(cycle, "cycle_id", None),
+            error_type=error_type or degraded_reason,
+            detail={
+                "cycle_attempt": attempted,
+                "portfolio_cycle_interval_seconds": interval,
+                "stage": "canonical_accounting_only",
+                "certification_decoupled": True,
+                "portfolio_snapshot_observed_at": (
+                    latest.observed_at.isoformat() if latest is not None else None
+                ),
+                "market_evidence_observed_at": (
+                    integrity.market_evidence_at.isoformat()
+                    if integrity is not None and integrity.market_evidence_at is not None else None
+                ),
+                "portfolio_valuation_status": integrity.valuation_status if integrity is not None else None,
+                "portfolio_cycle_status": integrity.cycle_status if integrity is not None else None,
+                "portfolio_allocation_family_failures": (
+                    list(integrity.allocation_family_failures) if integrity is not None else []
+                ),
+                "fallback_snapshot_recorded": fallback_snapshot_recorded,
+                "paper_only": True,
+            },
+        )
+
+        if not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
+            await _interruptible_wait(interval, stop_event)
+
+    store.record_worker_heartbeat(
+        worker_id=PORTFOLIO_WORKER_ID,
+        state="stopped" if stop_event.is_set() else "completed",
+        detail={"cycles_attempted": attempted, "certification_decoupled": True, "paper_only": True},
+    )
+    return attempted
