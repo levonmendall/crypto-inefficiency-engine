@@ -18,6 +18,7 @@ TierShadowRunner = Callable[[], Awaitable[object]]
 CompositeShadowRunner = Callable[[], Awaitable[object]]
 StablecoinShadowRunner = Callable[[], Awaitable[object]]
 AlphaRunner = Callable[[], Awaitable[object]]
+AllocationCertificationRunner = Callable[[], Awaitable[object]]
 FrontierRunner = Callable[[], Awaitable[list[object]]]
 
 
@@ -61,6 +62,10 @@ def _quarter_staggered_due(attempted: int, every_cycles: int) -> bool:
     return _offset_due(attempted, every_cycles, max(1, every_cycles // 4))
 
 
+def _third_staggered_due(attempted: int, every_cycles: int) -> bool:
+    return _offset_due(attempted, every_cycles, max(1, every_cycles // 3))
+
+
 def _three_quarter_staggered_due(attempted: int, every_cycles: int) -> bool:
     return _offset_due(attempted, every_cycles, max(1, (3 * every_cycles) // 4))
 
@@ -82,6 +87,8 @@ async def run_shadow_worker(
     stablecoin_shadow_every_cycles: int = 10,
     alpha_runner: AlphaRunner | None = None,
     alpha_every_cycles: int = 10,
+    allocation_certification_runner: AllocationCertificationRunner | None = None,
+    allocation_certification_every_cycles: int = 10,
     frontier_runner: FrontierRunner | None = None,
     frontier_every_cycles: int = 10,
 ) -> WorkerRunStats:
@@ -93,6 +100,7 @@ async def run_shadow_worker(
     composite_shadow_every_cycles = max(1, composite_shadow_every_cycles)
     stablecoin_shadow_every_cycles = max(1, stablecoin_shadow_every_cycles)
     alpha_every_cycles = max(1, alpha_every_cycles)
+    allocation_certification_every_cycles = max(1, allocation_certification_every_cycles)
     store.record_worker_heartbeat(worker_id=worker_id, state="starting", detail={"paper_only": True, "backend": store.backend})
     while not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
         attempted += 1
@@ -104,6 +112,10 @@ async def run_shadow_worker(
         run_stablecoin_shadow = stablecoin_shadow_runner is not None and _quarter_staggered_due(
             attempted, stablecoin_shadow_every_cycles
         )
+        run_allocation_certification = (
+            allocation_certification_runner is not None
+            and _third_staggered_due(attempted, allocation_certification_every_cycles)
+        )
         run_alpha = alpha_runner is not None and _three_quarter_staggered_due(attempted, alpha_every_cycles)
         store.record_worker_heartbeat(
             worker_id=worker_id,
@@ -114,6 +126,7 @@ async def run_shadow_worker(
                 "dex_tier_shadow_due": run_tier_shadow,
                 "cex_dex_composite_shadow_due": run_composite_shadow,
                 "stablecoin_depth_shadow_due": run_stablecoin_shadow,
+                "allocation_forward_certification_due": run_allocation_certification,
                 "alpha_forward_evidence_due": run_alpha,
             },
         )
@@ -124,6 +137,7 @@ async def run_shadow_worker(
         composite_index = None
         stablecoin_index = None
         alpha_index = None
+        allocation_index = None
         frontier_index = None
         if route_shadow_runner is not None:
             route_index = len(tasks)
@@ -137,6 +151,9 @@ async def run_shadow_worker(
         if run_stablecoin_shadow and stablecoin_shadow_runner is not None:
             stablecoin_index = len(tasks)
             tasks.append(stablecoin_shadow_runner())
+        if run_allocation_certification and allocation_certification_runner is not None:
+            allocation_index = len(tasks)
+            tasks.append(allocation_certification_runner())
         if run_alpha and alpha_runner is not None:
             alpha_index = len(tasks)
             tasks.append(alpha_runner())
@@ -149,6 +166,7 @@ async def run_shadow_worker(
         tier_cycle = results[tier_index] if tier_index is not None else None
         composite_cycle = results[composite_index] if composite_index is not None else None
         stablecoin_cycle = results[stablecoin_index] if stablecoin_index is not None else None
+        allocation_cycle = results[allocation_index] if allocation_index is not None else None
         alpha_cycle = results[alpha_index] if alpha_index is not None else None
         frontier_result = results[frontier_index] if frontier_index is not None else None
 
@@ -171,6 +189,10 @@ async def run_shadow_worker(
                 detail["stablecoin_depth_shadow_error_type"] = type(stablecoin_cycle).__name__
             elif stablecoin_cycle is not None:
                 detail["stablecoin_depth_shadow_completed"] = True
+            if isinstance(allocation_cycle, BaseException):
+                detail["allocation_forward_certification_error_type"] = type(allocation_cycle).__name__
+            elif allocation_cycle is not None:
+                detail["allocation_forward_certification_completed"] = True
             if isinstance(alpha_cycle, BaseException):
                 detail["alpha_forward_evidence_error_type"] = type(alpha_cycle).__name__
             elif alpha_cycle is not None:
@@ -240,6 +262,15 @@ async def run_shadow_worker(
             detail["stablecoin_depth_survived_count"] = sum(
                 1 for obs in stablecoin_observations if getattr(obs, "survived", False)
             )
+        if isinstance(allocation_cycle, BaseException):
+            detail["allocation_forward_certification_error_type"] = type(allocation_cycle).__name__
+        elif allocation_cycle is not None:
+            detail["allocation_forward_certification_cycle_id"] = getattr(allocation_cycle, "cycle_id", None)
+            detail["allocation_trials_recorded"] = getattr(allocation_cycle, "trials_recorded", 0)
+            detail["allocation_supported_trials_recorded"] = getattr(
+                allocation_cycle, "supported_trials_recorded", 0
+            )
+            detail["allocation_outcomes_matured"] = getattr(allocation_cycle, "outcomes_matured", 0)
         if isinstance(alpha_cycle, BaseException):
             detail["alpha_forward_evidence_error_type"] = type(alpha_cycle).__name__
         elif alpha_cycle is not None:
@@ -272,12 +303,15 @@ async def run_shadow_worker(
 
 
 async def run_forever(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
+    from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
     from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
+    from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
     from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeShadowService
     from inefficiency_engine.dex_tier_shadow import DexTierShadowService
     from inefficiency_engine.expanded_alpha_factory import ExpandedAlphaFactoryService
     from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
     from inefficiency_engine.stablecoin_depth_shadow import StablecoinDepthShadowService
+    from inefficiency_engine.unified_allocation import UnifiedPaperAllocatorService
     from inefficiency_engine.universal_service import UniversalOpportunityService
 
     stop_event = asyncio.Event()
@@ -289,8 +323,9 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
             pass
     universal = UniversalOpportunityService(service)
     tier_shadow = DexTierShadowService(service, evidence_store=store)
+    composite_service = CexDexCompositeEvidenceService(service, universal=universal)
     composite_shadow = CexDexCompositeEdgeShadowService(
-        CexDexCompositeEvidenceService(service, universal=universal),
+        composite_service,
         evidence_store=store,
     )
     stablecoin_shadow = StablecoinDepthShadowService(
@@ -298,6 +333,9 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
         evidence_store=store,
     )
     alpha_factory = ExpandedAlphaFactoryService(service, store)
+    promotion = CexDexPaperPromotionService(service, composite_service, store)
+    unified = UnifiedPaperAllocatorService(service, promotion, alpha_factory)
+    allocation_certification = AllocationForwardCertificationService(service, unified, store)
     return await run_shadow_worker(
         service,
         store,
@@ -309,6 +347,10 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
         composite_shadow_every_cycles=10,
         stablecoin_shadow_runner=stablecoin_shadow.run_cycle,
         stablecoin_shadow_every_cycles=10,
+        allocation_certification_runner=allocation_certification.run_cycle,
+        allocation_certification_every_cycles=max(
+            1, int(getattr(service.settings, "allocation_certification_every_cycles", 10))
+        ),
         alpha_runner=alpha_factory.run_evidence_cycle,
         alpha_every_cycles=service.settings.alpha_evidence_every_cycles,
         frontier_runner=universal.probe_dex_route_size_frontiers,
