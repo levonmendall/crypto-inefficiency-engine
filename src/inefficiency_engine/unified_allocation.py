@@ -15,9 +15,12 @@ if TYPE_CHECKING:
     from inefficiency_engine.alpha_factory import AlphaFactoryService
 
 
+CandidateFamily = Literal["core_cex", "cex_dex", "alpha"]
+
+
 class UnifiedPaperCandidate(BaseModel):
     candidate_id: str
-    family: Literal["core_cex", "cex_dex", "alpha"]
+    family: CandidateFamily
     strategy: str
     asset: str
     venues: list[str]
@@ -70,6 +73,16 @@ class UnifiedPaperAllocation(BaseModel):
     paper_only: bool = True
 
 
+class UnifiedCandidateBatch(BaseModel):
+    observed_at: datetime
+    candidates: list[UnifiedPaperCandidate] = Field(default_factory=list)
+    attempted_families: list[CandidateFamily] = Field(default_factory=list)
+    available_families: list[CandidateFamily] = Field(default_factory=list)
+    family_failures: dict[str, str] = Field(default_factory=dict)
+    degraded: bool = False
+    paper_only: bool = True
+
+
 class UnifiedPaperAllocationPlan(BaseModel):
     observed_at: datetime
     rank_basis: str = "conservative_expected_return_on_reserved_capital_per_current_deployment"
@@ -82,9 +95,20 @@ class UnifiedPaperAllocationPlan(BaseModel):
     allocations: list[UnifiedPaperAllocation] = Field(default_factory=list)
     skipped: list[dict[str, object]] = Field(default_factory=list)
     portfolio_risk_budget: PortfolioRiskBudget | None = None
+    attempted_families: list[str] = Field(default_factory=list)
+    available_families: list[str] = Field(default_factory=list)
+    family_failures: dict[str, str] = Field(default_factory=dict)
+    degraded: bool = False
     authorizes_execution: bool = False
     live_execution_eligible: bool = False
     paper_only: bool = True
+
+
+def _error_label(exc: Exception) -> str:
+    message = str(exc).strip().replace("\n", " ")
+    if len(message) > 180:
+        message = message[:177] + "..."
+    return type(exc).__name__ if not message else f"{type(exc).__name__}: {message}"
 
 
 def _core_candidates(
@@ -161,90 +185,124 @@ class UnifiedPaperAllocatorService:
         self.alpha_factory = alpha_factory
         self.settings = core.settings
 
-    async def candidates(self, *, total_capital_usd: float) -> list[UnifiedPaperCandidate]:
+    async def candidate_batch(self, *, total_capital_usd: float) -> UnifiedCandidateBatch:
+        """Collect candidate families independently and fail closed per family.
+
+        One degraded provider or research family must never erase valid candidates
+        from unrelated families. A failed family contributes zero candidates and
+        an explicit failure reason. Surviving families continue through the same
+        risk and capital-allocation gates.
+        """
+
         if total_capital_usd <= 0:
             raise ValueError("total_capital_usd must be positive")
-        snapshot = await self.core.collect_live_executability()
-        rows = _core_candidates(snapshot.opportunities, snapshot.executability)
 
-        cex_dex_probe = await self.cex_dex.live_qualification(
-            paper_inventory_usd_per_side=total_capital_usd / 2.0
-        )
-        for item in cex_dex_probe.qualifications:
-            if not item.paper_allocation_eligible:
-                continue
-            capital = item.paper_capital_required_usd
-            profit = item.target_notional_usd * item.conservative_capture_edge_bps / 10_000.0
-            deployment_return = profit / capital
-            rows.append(UnifiedPaperCandidate(
-                candidate_id=f"cex-dex:{item.composite_key}",
-                family="cex_dex",
-                strategy="cex_dex",
-                asset=item.asset,
-                venues=[item.cex_venue, item.dex_venue],
-                capital_required_usd=capital,
-                notional_usd_per_leg=item.target_notional_usd,
-                expected_profit_usd_per_deployment=profit,
-                expected_return_on_reserved_capital=deployment_return,
-                modeled_holding_hours=None,
-                source_return_metric="conservative_capture_edge_bps",
-                source_return_value=item.conservative_capture_edge_bps,
-                exposure_kind="market_neutral",
-                conflict_keys=[
-                    f"cex:{item.cex_venue}:{item.cex_symbol}",
-                    f"venue-symbol:{item.cex_venue}:{item.cex_symbol}",
-                    f"dex:ethereum:{item.asset}:{item.route_direction}",
-                ],
-                evidence_id=item.evidence_id,
-                capacity_reference_usd=None,
-                capacity_claimed=False,
-                allocation_eligible=True,
-                executable_eligible=False,
-                paper_only=True,
-            ))
-
+        attempted: list[CandidateFamily] = ["core_cex", "cex_dex"]
         if self.alpha_factory is not None:
-            alpha_rows = await self.alpha_factory.promoted_candidates(
-                snapshot,
-                total_capital_usd=total_capital_usd,
+            attempted.append("alpha")
+        available: list[CandidateFamily] = []
+        failures: dict[str, str] = {}
+        rows: list[UnifiedPaperCandidate] = []
+        snapshot = None
+        observed_at = datetime.now(timezone.utc)
+
+        try:
+            snapshot = await self.core.collect_live_executability()
+            observed_at = snapshot.completed_at
+            rows.extend(_core_candidates(snapshot.opportunities, snapshot.executability))
+            available.append("core_cex")
+        except Exception as exc:
+            failures["core_cex"] = _error_label(exc)
+
+        try:
+            cex_dex_probe = await self.cex_dex.live_qualification(
+                paper_inventory_usd_per_side=total_capital_usd / 2.0
             )
-            for item in alpha_rows:
-                capital = item.capital_required_usd
-                deployment_return = item.expected_profit_usd / capital
-                exposure: ExposureKind = (
-                    "directional_long" if item.direction == "long"
-                    else "directional_short" if item.direction == "short"
-                    else "market_neutral"
-                )
+            for item in cex_dex_probe.qualifications:
+                if not item.paper_allocation_eligible:
+                    continue
+                capital = item.paper_capital_required_usd
+                profit = item.target_notional_usd * item.conservative_capture_edge_bps / 10_000.0
+                deployment_return = profit / capital
                 rows.append(UnifiedPaperCandidate(
-                    candidate_id=item.candidate_id,
-                    family="alpha",
-                    strategy=item.strategy_id,
+                    candidate_id=f"cex-dex:{item.composite_key}",
+                    family="cex_dex",
+                    strategy="cex_dex",
                     asset=item.asset,
-                    venues=[item.venue],
+                    venues=[item.cex_venue, item.dex_venue],
                     capital_required_usd=capital,
-                    notional_usd_per_leg=item.notional_usd,
-                    expected_profit_usd_per_deployment=item.expected_profit_usd,
-                    expected_return_on_reserved_capital=max(0.0, deployment_return),
-                    modeled_holding_hours=item.horizon_hours,
-                    source_return_metric="forward_ci_health_haircut_net_return",
-                    source_return_value=item.expected_net_return,
-                    exposure_kind=exposure,
-                    source_observed_at=item.observed_at,
-                    instrument_symbol=item.symbol,
-                    instrument_market_kind=item.market_kind.value,
-                    entry_reference_price=item.entry_reference_price,
-                    modeled_roundtrip_cost_return=item.estimated_cost_return,
+                    notional_usd_per_leg=item.target_notional_usd,
+                    expected_profit_usd_per_deployment=profit,
+                    expected_return_on_reserved_capital=deployment_return,
+                    modeled_holding_hours=None,
+                    source_return_metric="conservative_capture_edge_bps",
+                    source_return_value=item.conservative_capture_edge_bps,
+                    exposure_kind="market_neutral",
                     conflict_keys=[
-                        *item.conflict_keys,
-                        f"venue-symbol:{item.venue}:{item.symbol}",
+                        f"cex:{item.cex_venue}:{item.cex_symbol}",
+                        f"venue-symbol:{item.cex_venue}:{item.cex_symbol}",
+                        f"dex:ethereum:{item.asset}:{item.route_direction}",
                     ],
+                    evidence_id=item.evidence_id,
                     capacity_reference_usd=None,
                     capacity_claimed=False,
                     allocation_eligible=True,
                     executable_eligible=False,
                     paper_only=True,
                 ))
+            available.append("cex_dex")
+        except Exception as exc:
+            failures["cex_dex"] = _error_label(exc)
+
+        if self.alpha_factory is not None:
+            if snapshot is None:
+                failures["alpha"] = "market_snapshot_unavailable: core market/evidence collection failed closed"
+            else:
+                try:
+                    alpha_rows = await self.alpha_factory.promoted_candidates(
+                        snapshot,
+                        total_capital_usd=total_capital_usd,
+                    )
+                    for item in alpha_rows:
+                        capital = item.capital_required_usd
+                        deployment_return = item.expected_profit_usd / capital
+                        exposure: ExposureKind = (
+                            "directional_long" if item.direction == "long"
+                            else "directional_short" if item.direction == "short"
+                            else "market_neutral"
+                        )
+                        rows.append(UnifiedPaperCandidate(
+                            candidate_id=item.candidate_id,
+                            family="alpha",
+                            strategy=item.strategy_id,
+                            asset=item.asset,
+                            venues=[item.venue],
+                            capital_required_usd=capital,
+                            notional_usd_per_leg=item.notional_usd,
+                            expected_profit_usd_per_deployment=item.expected_profit_usd,
+                            expected_return_on_reserved_capital=max(0.0, deployment_return),
+                            modeled_holding_hours=item.horizon_hours,
+                            source_return_metric="forward_ci_health_haircut_net_return",
+                            source_return_value=item.expected_net_return,
+                            exposure_kind=exposure,
+                            source_observed_at=item.observed_at,
+                            instrument_symbol=item.symbol,
+                            instrument_market_kind=item.market_kind.value,
+                            entry_reference_price=item.entry_reference_price,
+                            modeled_roundtrip_cost_return=item.estimated_cost_return,
+                            conflict_keys=[
+                                *item.conflict_keys,
+                                f"venue-symbol:{item.venue}:{item.symbol}",
+                            ],
+                            capacity_reference_usd=None,
+                            capacity_claimed=False,
+                            allocation_eligible=True,
+                            executable_eligible=False,
+                            paper_only=True,
+                        ))
+                    available.append("alpha")
+                except Exception as exc:
+                    failures["alpha"] = _error_label(exc)
 
         rows.sort(
             key=lambda item: (
@@ -254,7 +312,18 @@ class UnifiedPaperAllocatorService:
             ),
             reverse=True,
         )
-        return rows
+        return UnifiedCandidateBatch(
+            observed_at=observed_at,
+            candidates=rows,
+            attempted_families=attempted,
+            available_families=available,
+            family_failures=failures,
+            degraded=bool(failures),
+            paper_only=True,
+        )
+
+    async def candidates(self, *, total_capital_usd: float) -> list[UnifiedPaperCandidate]:
+        return (await self.candidate_batch(total_capital_usd=total_capital_usd)).candidates
 
     async def allocate(
         self,
@@ -272,7 +341,8 @@ class UnifiedPaperAllocatorService:
         if not 0 < venue_fraction <= 1 or not 0 < asset_fraction <= 1 or allocation_limit <= 0:
             raise ValueError("invalid allocation constraints")
 
-        candidates = await self.candidates(total_capital_usd=total_capital_usd)
+        batch = await self.candidate_batch(total_capital_usd=total_capital_usd)
+        candidates = batch.candidates
         venue_cap = total_capital_usd * venue_fraction
         asset_cap = total_capital_usd * asset_fraction
         venue_used: dict[str, float] = defaultdict(float)
@@ -357,6 +427,10 @@ class UnifiedPaperAllocatorService:
             allocations=allocations,
             skipped=skipped,
             portfolio_risk_budget=risk_overlay.snapshot(),
+            attempted_families=list(batch.attempted_families),
+            available_families=list(batch.available_families),
+            family_failures=dict(batch.family_failures),
+            degraded=batch.degraded,
             authorizes_execution=False,
             live_execution_eligible=False,
             paper_only=True,
