@@ -16,6 +16,12 @@ def _build_integrity_dashboard_html() -> str:
     html = DASHBOARD_HTML
     html = _replace_once(
         html,
+        "async function getJSON(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`${url}: HTTP ${r.status}`);return r.json()}",
+        "async function getJSON(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`${url}: HTTP ${r.status}`);return r.json()}\n"
+        "async function safeJSON(url,fallback){try{return await getJSON(url)}catch(e){return {...fallback,__error:e.message}}}",
+    )
+    html = _replace_once(
+        html,
         '<div id="updated" class="muted" style="margin-top:9px">Awaiting portfolio data…</div>',
         '<div id="updated" class="muted" style="margin-top:9px">Awaiting portfolio data…</div>'
         '<div id="valuationDetail" class="muted" style="margin-top:5px;font-size:12px">Awaiting valuation provenance…</div>',
@@ -36,7 +42,7 @@ def _build_integrity_dashboard_html() -> str:
     html = _replace_once(
         html,
         "getJSON('/v3/portfolio/canonical'),getJSON('/v3/portfolio/performance'),getJSON('/v3/portfolio/positions'),getJSON('/v3/portfolio/trades?limit=20'),getJSON('/v3/portfolio/history?limit=500'),getJSON('/v3/portfolio/skips?limit=20'),getJSON('/v3/portfolio/attribution'),getJSON('/v3/operations/mechanisms'),getJSON('/v3/operations/action-queue')",
-        "getJSON('/v3/portfolio/canonical'),getJSON('/v3/portfolio/performance'),getJSON('/v3/portfolio/runtime-status'),getJSON('/v3/portfolio/positions'),getJSON('/v3/portfolio/trades?limit=20'),getJSON('/v3/portfolio/history?limit=500'),getJSON('/v3/portfolio/skips?limit=20'),getJSON('/v3/portfolio/attribution'),getJSON('/v3/operations/mechanisms'),getJSON('/v3/operations/action-queue')",
+        "getJSON('/v3/portfolio/canonical'),getJSON('/v3/portfolio/performance'),getJSON('/v3/portfolio/runtime-status'),safeJSON('/v3/portfolio/positions',{positions:[]}),safeJSON('/v3/portfolio/trades?limit=20',{trades:[]}),safeJSON('/v3/portfolio/history?limit=500',{count:0,snapshots:[]}),safeJSON('/v3/portfolio/skips?limit=20',{skips:[]}),safeJSON('/v3/portfolio/attribution',{pnl_by_mechanism_usd:{},pnl_by_strategy_usd:{}}),safeJSON('/v3/operations/mechanisms',{mechanisms:[]}),safeJSON('/v3/operations/action-queue',{actions:[]})",
     )
     html = _replace_once(
         html,
@@ -46,7 +52,8 @@ def _build_integrity_dashboard_html() -> str:
         "    const runtimeLabel=runtime.operational?(runtime.degraded?'Operational · degraded':'Operational'):'Attention';$('runtimeStatus').textContent=runtimeLabel;$('runtimeStatus').style.color=runtime.operational?(runtime.degraded?'#facc15':'#4ade80'):'#fb7185';\n"
         "    const valuation=runtime.valuation_status||'unavailable';const valuationLabel=valuation==='cash_only'?'Cash-only · exact':valuation.replaceAll('_',' ');$('valuationStatus').textContent=valuationLabel;$('valuationStatus').style.color=(valuation==='cash_only'||(valuation==='fresh'&&runtime.valuation_fresh))?'#4ade80':(valuation==='partial'?'#facc15':'#fb7185');\n"
         "    const familyFailures=runtime.allocation_family_failures||[];$('familyStatus').textContent=familyFailures.length?`${familyFailures.length} degraded`:'Healthy';$('familyStatus').style.color=familyFailures.length?'#facc15':'#4ade80';\n"
-        "    const cycleLabel=(runtime.cycle_status||'unknown').replaceAll('_',' ');const fallback=runtime.fallback_snapshot?' · fallback accounting snapshot':'';const stale=runtime.stale_position_count?` · ${runtime.stale_position_count} stale position mark(s)`:'';$('valuationDetail').textContent=`Cycle ${cycleLabel}${fallback}${stale}`;",
+        "    const cycleLabel=(runtime.cycle_status||'unknown').replaceAll('_',' ');const fallback=runtime.fallback_snapshot?' · fallback accounting snapshot':'';const stale=runtime.stale_position_count?` · ${runtime.stale_position_count} stale position mark(s)`:'';$('valuationDetail').textContent=`Cycle ${cycleLabel}${fallback}${stale}`;\n"
+        "    const partial=[positions,trades,history,skips,attribution,mechanisms,queue].filter(x=>x&&x.__error).map(x=>x.__error);if(partial.length){$('error').textContent=`Partial dashboard data unavailable: ${partial.join(' · ')}`;$('error').classList.add('show')}",
     )
     html = _replace_once(
         html,
