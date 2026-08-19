@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import inefficiency_engine.cli as cli
+import inefficiency_engine.threaded_worker as threaded_worker
 import inefficiency_engine.worker_children as worker_children
 
 
@@ -39,13 +40,46 @@ if loaded:
     assert result.returncode == 0, result.stderr or result.stdout
 
 
-def test_render_worker_command_uses_single_process_operating_runtime():
+def test_render_worker_command_uses_thread_isolated_runtime():
     source = inspect.getsource(cli.main)
 
-    assert "from inefficiency_engine.operating_worker import run_forever" in source
-    assert "asyncio.run(run_forever(service, store))" in source
+    assert "from inefficiency_engine.threaded_worker import run_threaded_worker" in source
+    assert "asyncio.run(run_threaded_worker(service, store))" in source
     assert "supervise_worker_processes" not in source
-    assert "worker_supervisor" not in source
+    assert "from inefficiency_engine.operating_worker import run_forever" not in source
+
+
+@pytest.mark.asyncio
+async def test_threaded_runtime_starts_daemon_research_thread_and_runs_portfolio_on_main_loop(monkeypatch):
+    observed: dict[str, object] = {}
+
+    class FakeThread:
+        def __init__(self, *, target, name, daemon):
+            observed["target"] = target
+            observed["name"] = name
+            observed["daemon"] = daemon
+
+        def start(self):
+            observed["started"] = True
+
+    async def fake_portfolio(service, store):
+        observed["portfolio_service"] = service
+        observed["portfolio_store"] = store
+        return 3
+
+    monkeypatch.setattr(threaded_worker.threading, "Thread", FakeThread)
+    monkeypatch.setattr(threaded_worker, "run_portfolio_child", fake_portfolio)
+
+    service = object()
+    store = object()
+    stats = await threaded_worker.run_threaded_worker(service, store)  # type: ignore[arg-type]
+
+    assert observed["started"] is True
+    assert observed["daemon"] is True
+    assert observed["name"] == "shadow-research-thread"
+    assert observed["portfolio_service"] is service
+    assert observed["portfolio_store"] is store
+    assert stats.cycles_attempted == 3
 
 
 @pytest.mark.asyncio
