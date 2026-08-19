@@ -3,16 +3,19 @@ from __future__ import annotations
 import asyncio
 import signal
 
-from inefficiency_engine import __version__
-from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeShadowService
 from inefficiency_engine.dex_tier_shadow import DexTierShadowService
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.expanded_alpha_factory import ExpandedAlphaFactoryService
-from inefficiency_engine.operating_certification import OperatingCertificationService
 from inefficiency_engine.operating_worker import run_portfolio_operating_loop
+from inefficiency_engine.portfolio_stage_isolation import (
+    IsolatedAllocationCertificationProxy,
+    IsolatedAllocatorProxy,
+    IsolatedOperatingCertificationProxy,
+    IsolatedOpportunityCoreProxy,
+)
 from inefficiency_engine.resilient_paper_portfolio import OperationallyResilientPaperPortfolioService
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
@@ -68,7 +71,13 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
 
 
 async def run_portfolio_child(service: OpportunityService, store: EvidenceStore) -> int:
-    """Run canonical accounting/certification on a separate event loop/process."""
+    """Run canonical accounting with provider-heavy stages in disposable processes.
+
+    The portfolio child itself is long-lived and responsive. Live market scans,
+    unified allocation, and both certification passes execute in shorter-lived
+    subprocesses with hard OS-level deadlines, so synchronous provider/library
+    stalls cannot freeze canonical accounting or defeat asyncio cancellation.
+    """
 
     stop = _stop_event()
     universal = UniversalOpportunityService(service)
@@ -76,20 +85,22 @@ async def run_portfolio_child(service: OpportunityService, store: EvidenceStore)
     alpha_factory = ExpandedAlphaFactoryService(service, store)
     promotion = CexDexPaperPromotionService(service, composite_service, store)
     unified = UnifiedPaperAllocatorService(service, promotion, alpha_factory)
-    allocation_certification = AllocationForwardCertificationService(service, unified, store)
-    portfolio = OperationallyResilientPaperPortfolioService(service, unified, store)
-    operating_certification = OperatingCertificationService(
-        service,
+
+    isolated_core = IsolatedOpportunityCoreProxy(service, store)
+    isolated_allocator = IsolatedAllocatorProxy(unified)
+    portfolio = OperationallyResilientPaperPortfolioService(
+        isolated_core,
+        isolated_allocator,
         store,
-        alpha_factory,
-        allocation_certification,
-        version=__version__,
     )
+    allocation_certification = IsolatedAllocationCertificationProxy()
+    operating_certification = IsolatedOperatingCertificationProxy()
+
     return await run_portfolio_operating_loop(
         service,
         store,
         portfolio=portfolio,
-        allocation_certification=allocation_certification,
-        operating_certification=operating_certification,
+        allocation_certification=allocation_certification,  # type: ignore[arg-type]
+        operating_certification=operating_certification,  # type: ignore[arg-type]
         stop_event=stop,
     )
