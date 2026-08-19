@@ -18,6 +18,10 @@ def test_render_blueprint_defines_durable_shadow_topology():
     assert api["type"] == "web"
     assert api["healthCheckPath"] == "/health"
 
+    expected_build = "python -m pip install --retries 20 --timeout 120 ."
+    assert worker["buildCommand"] == expected_build
+    assert api["buildCommand"] == expected_build
+
     database = databases["cie-evidence"]
     assert database["plan"] != "free"
     assert database["ipAllowList"] == []
