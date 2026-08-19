@@ -41,11 +41,11 @@ if loaded:
 
 def test_render_worker_command_uses_single_process_operating_runtime():
     source = inspect.getsource(cli.main)
-    worker_block = source.split('if args.command == "worker":', 1)[1].split("service, store = _service()", 1)[0]
 
-    assert "run_forever" in worker_block
-    assert "supervise_worker_processes" not in worker_block
-    assert "worker_supervisor" not in worker_block
+    assert "from inefficiency_engine.operating_worker import run_forever" in source
+    assert "asyncio.run(run_forever(service, store))" in source
+    assert "supervise_worker_processes" not in source
+    assert "worker_supervisor" not in source
 
 
 @pytest.mark.asyncio
