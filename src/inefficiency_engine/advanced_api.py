@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from inefficiency_engine import __version__
+from inefficiency_engine.alpha_factory import AlphaFactoryService
 from inefficiency_engine.cex_dex_composite_statistics import CompositeEdgeStatisticalService
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_operations import (
@@ -51,7 +52,12 @@ def build_advanced_router(
         if evidence_store is not None
         else None
     )
-    unified = UnifiedPaperAllocatorService(service, promotion) if promotion is not None else None
+    alpha_factory = AlphaFactoryService(service, evidence_store) if evidence_store is not None else None
+    unified = (
+        UnifiedPaperAllocatorService(service, promotion, alpha_factory)
+        if promotion is not None
+        else None
+    )
 
     def require_store() -> None:
         if evidence_store is None:
@@ -59,7 +65,92 @@ def build_advanced_router(
 
     @router.get("/v1/system/capabilities")
     def system_capabilities():
-        return paper_v1_status(__version__).model_dump(mode="json")
+        status = paper_v1_status(__version__).model_dump(mode="json")
+        status["universal_alpha_factory_available"] = alpha_factory is not None
+        status["predictive_alpha_live_execution_available"] = False
+        return status
+
+    @router.get("/v2/alpha/strategies")
+    def alpha_strategies():
+        require_store()
+        assert alpha_factory is not None
+        return {
+            "paper_only": True,
+            "allocation_authority": False,
+            "live_execution_authority": False,
+            "strategies": [item.model_dump(mode="json") for item in alpha_factory.manifests()],
+        }
+
+    @router.get("/v2/alpha/evidence/summary")
+    def alpha_evidence_summary():
+        require_store()
+        assert alpha_factory is not None
+        return alpha_factory.ledger.summary()
+
+    @router.post("/v2/alpha/evidence/cycle")
+    async def alpha_evidence_cycle(capital_usd: float = 100000.0):
+        require_store()
+        if capital_usd <= 0:
+            raise HTTPException(status_code=400, detail="capital_usd must be positive")
+        assert alpha_factory is not None
+        try:
+            cycle = await alpha_factory.run_evidence_cycle(total_capital_usd=capital_usd)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"alpha forward-evidence cycle failed: {type(exc).__name__}",
+            ) from exc
+        return cycle.model_dump(mode="json")
+
+    @router.get("/v2/alpha/qualifications/live")
+    async def alpha_qualifications_live(capital_usd: float = 100000.0):
+        require_store()
+        if capital_usd <= 0:
+            raise HTTPException(status_code=400, detail="capital_usd must be positive")
+        assert alpha_factory is not None
+        try:
+            snapshot = await service.collect_live_evidence()
+            candidates = alpha_factory.discover(snapshot, total_capital_usd=capital_usd)
+            rows = [
+                {
+                    "candidate": candidate.model_dump(mode="json"),
+                    "qualification": alpha_factory.qualification(candidate).model_dump(mode="json"),
+                }
+                for candidate in candidates
+            ]
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"alpha qualification failed: {type(exc).__name__}",
+            ) from exc
+        return {
+            "paper_only": True,
+            "live_execution_authority": False,
+            "count": len(rows),
+            "rows": rows,
+        }
+
+    @router.get("/v2/alpha/promoted/live")
+    async def alpha_promoted_live(capital_usd: float = 100000.0):
+        require_store()
+        if capital_usd <= 0:
+            raise HTTPException(status_code=400, detail="capital_usd must be positive")
+        assert alpha_factory is not None
+        try:
+            snapshot = await service.collect_live_executability()
+            rows = await alpha_factory.promoted_candidates(snapshot, total_capital_usd=capital_usd)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"alpha promotion failed: {type(exc).__name__}",
+            ) from exc
+        return {
+            "paper_only": True,
+            "allocation_authority": True,
+            "execution_authority": False,
+            "count": len(rows),
+            "candidates": [item.model_dump(mode="json") for item in rows],
+        }
 
     @router.get("/v1/cex-dex/composite-shadow/summary")
     def cex_dex_composite_shadow_summary():
