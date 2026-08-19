@@ -16,6 +16,7 @@ SleepFn = Callable[[float], Awaitable[None]]
 RouteShadowRunner = Callable[[], Awaitable[object]]
 TierShadowRunner = Callable[[], Awaitable[object]]
 CompositeShadowRunner = Callable[[], Awaitable[object]]
+StablecoinShadowRunner = Callable[[], Awaitable[object]]
 FrontierRunner = Callable[[], Awaitable[list[object]]]
 
 
@@ -45,10 +46,18 @@ async def _interruptible_sleep(seconds: float, stop_event: asyncio.Event, sleep:
             task.result()
 
 
-def _staggered_due(attempted: int, every_cycles: int) -> bool:
+def _offset_due(attempted: int, every_cycles: int, offset: int) -> bool:
     every_cycles = max(1, every_cycles)
-    offset = max(1, every_cycles // 2)
+    offset = max(1, min(every_cycles, offset))
     return (attempted - offset) % every_cycles == 0
+
+
+def _staggered_due(attempted: int, every_cycles: int) -> bool:
+    return _offset_due(attempted, every_cycles, max(1, every_cycles // 2))
+
+
+def _quarter_staggered_due(attempted: int, every_cycles: int) -> bool:
+    return _offset_due(attempted, every_cycles, max(1, every_cycles // 4))
 
 
 async def run_shadow_worker(
@@ -64,6 +73,8 @@ async def run_shadow_worker(
     tier_shadow_every_cycles: int = 10,
     composite_shadow_runner: CompositeShadowRunner | None = None,
     composite_shadow_every_cycles: int = 10,
+    stablecoin_shadow_runner: StablecoinShadowRunner | None = None,
+    stablecoin_shadow_every_cycles: int = 10,
     frontier_runner: FrontierRunner | None = None,
     frontier_every_cycles: int = 10,
 ) -> WorkerRunStats:
@@ -73,6 +84,7 @@ async def run_shadow_worker(
     frontier_every_cycles = max(1, frontier_every_cycles)
     tier_shadow_every_cycles = max(1, tier_shadow_every_cycles)
     composite_shadow_every_cycles = max(1, composite_shadow_every_cycles)
+    stablecoin_shadow_every_cycles = max(1, stablecoin_shadow_every_cycles)
     store.record_worker_heartbeat(worker_id=worker_id, state="starting", detail={"paper_only": True, "backend": store.backend})
     while not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
         attempted += 1
@@ -80,6 +92,9 @@ async def run_shadow_worker(
         run_tier_shadow = tier_shadow_runner is not None and attempted % tier_shadow_every_cycles == 0
         run_composite_shadow = composite_shadow_runner is not None and _staggered_due(
             attempted, composite_shadow_every_cycles
+        )
+        run_stablecoin_shadow = stablecoin_shadow_runner is not None and _quarter_staggered_due(
+            attempted, stablecoin_shadow_every_cycles
         )
         store.record_worker_heartbeat(
             worker_id=worker_id,
@@ -89,6 +104,7 @@ async def run_shadow_worker(
                 "dex_frontier_probe_due": run_frontier,
                 "dex_tier_shadow_due": run_tier_shadow,
                 "cex_dex_composite_shadow_due": run_composite_shadow,
+                "stablecoin_depth_shadow_due": run_stablecoin_shadow,
             },
         )
 
@@ -96,6 +112,7 @@ async def run_shadow_worker(
         route_index = None
         tier_index = None
         composite_index = None
+        stablecoin_index = None
         frontier_index = None
         if route_shadow_runner is not None:
             route_index = len(tasks)
@@ -106,6 +123,9 @@ async def run_shadow_worker(
         if run_composite_shadow and composite_shadow_runner is not None:
             composite_index = len(tasks)
             tasks.append(composite_shadow_runner())
+        if run_stablecoin_shadow and stablecoin_shadow_runner is not None:
+            stablecoin_index = len(tasks)
+            tasks.append(stablecoin_shadow_runner())
         if run_frontier and frontier_runner is not None:
             frontier_index = len(tasks)
             tasks.append(frontier_runner())
@@ -114,6 +134,7 @@ async def run_shadow_worker(
         route_cycle = results[route_index] if route_index is not None else None
         tier_cycle = results[tier_index] if tier_index is not None else None
         composite_cycle = results[composite_index] if composite_index is not None else None
+        stablecoin_cycle = results[stablecoin_index] if stablecoin_index is not None else None
         frontier_result = results[frontier_index] if frontier_index is not None else None
 
         if isinstance(core_cycle, BaseException):
@@ -131,6 +152,10 @@ async def run_shadow_worker(
                 detail["cex_dex_composite_shadow_error_type"] = type(composite_cycle).__name__
             elif composite_cycle is not None:
                 detail["cex_dex_composite_shadow_completed"] = True
+            if isinstance(stablecoin_cycle, BaseException):
+                detail["stablecoin_depth_shadow_error_type"] = type(stablecoin_cycle).__name__
+            elif stablecoin_cycle is not None:
+                detail["stablecoin_depth_shadow_completed"] = True
             if isinstance(frontier_result, BaseException):
                 detail["dex_route_frontier_error_type"] = type(frontier_result).__name__
             elif frontier_result is not None:
@@ -186,6 +211,16 @@ async def run_shadow_worker(
             detail["cex_dex_composite_hurdle_survived_count"] = sum(
                 1 for obs in composite_observations if getattr(obs, "hurdle_survived", False)
             )
+        if isinstance(stablecoin_cycle, BaseException):
+            detail["stablecoin_depth_shadow_error_type"] = type(stablecoin_cycle).__name__
+        elif stablecoin_cycle is not None:
+            stablecoin_observations = getattr(stablecoin_cycle, "observations", [])
+            detail["stablecoin_depth_shadow_cycle_id"] = getattr(stablecoin_cycle, "cycle_id", None)
+            detail["stablecoin_depth_initial_quote_count"] = getattr(stablecoin_cycle, "initial_quote_count", 0)
+            detail["stablecoin_depth_observation_count"] = len(stablecoin_observations)
+            detail["stablecoin_depth_survived_count"] = sum(
+                1 for obs in stablecoin_observations if getattr(obs, "survived", False)
+            )
         if isinstance(frontier_result, BaseException):
             detail["dex_route_frontier_error_type"] = type(frontier_result).__name__
         elif frontier_result is not None:
@@ -214,6 +249,8 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
     from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
     from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeShadowService
     from inefficiency_engine.dex_tier_shadow import DexTierShadowService
+    from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
+    from inefficiency_engine.stablecoin_depth_shadow import StablecoinDepthShadowService
     from inefficiency_engine.universal_service import UniversalOpportunityService
 
     stop_event = asyncio.Event()
@@ -229,6 +266,10 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
         CexDexCompositeEvidenceService(service, universal=universal),
         evidence_store=store,
     )
+    stablecoin_shadow = StablecoinDepthShadowService(
+        StablecoinConversionDepthService(service.settings),
+        evidence_store=store,
+    )
     return await run_shadow_worker(
         service,
         store,
@@ -238,6 +279,8 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
         tier_shadow_every_cycles=service.settings.dex_route_tier_shadow_every_cycles,
         composite_shadow_runner=composite_shadow.run_cycle,
         composite_shadow_every_cycles=10,
+        stablecoin_shadow_runner=stablecoin_shadow.run_cycle,
+        stablecoin_shadow_every_cycles=10,
         frontier_runner=universal.probe_dex_route_size_frontiers,
         frontier_every_cycles=service.settings.dex_route_frontier_every_cycles,
     )
