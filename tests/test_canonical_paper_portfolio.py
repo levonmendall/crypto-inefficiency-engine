@@ -27,26 +27,31 @@ class FakeAllocator:
 
     async def allocate(self, *, total_capital_usd: float):
         self.capital_requests.append(total_capital_usd)
-        return self.plans.pop(0)
+        next_item = self.plans.pop(0)
+        if isinstance(next_item, Exception):
+            raise next_item
+        return next_item
 
 
-def _snapshot(at: datetime, price: float) -> ScanSnapshot:
-    quote = MarketQuote(
-        venue="Coinbase",
-        asset="BTC",
-        market_kind=MarketKind.SPOT,
-        symbol="BTC-USD",
-        mid=price,
-        observed_at=at,
-        source="test",
-    )
+def _snapshot(at: datetime, price: float, *, include_quote: bool = True) -> ScanSnapshot:
+    quotes = []
+    if include_quote:
+        quotes.append(MarketQuote(
+            venue="Coinbase",
+            asset="BTC",
+            market_kind=MarketKind.SPOT,
+            symbol="BTC-USD",
+            mid=price,
+            observed_at=at,
+            source="test",
+        ))
     return ScanSnapshot(
         scan_id=f"scan-{int(at.timestamp())}",
         started_at=at,
         completed_at=at,
         providers=[],
         funding_quotes=[],
-        market_quotes=[quote],
+        market_quotes=quotes,
         opportunities=[],
         order_books=[],
         executability=[],
@@ -80,7 +85,13 @@ def _allocation(at: datetime) -> UnifiedPaperAllocation:
     )
 
 
-def _plan(at: datetime, allocations) -> UnifiedPaperAllocationPlan:
+def _plan(
+    at: datetime,
+    allocations,
+    *,
+    degraded: bool = False,
+    family_failures: dict[str, str] | None = None,
+) -> UnifiedPaperAllocationPlan:
     allocated = sum(item.capital_required_usd for item in allocations)
     return UnifiedPaperAllocationPlan(
         observed_at=at,
@@ -92,6 +103,10 @@ def _plan(at: datetime, allocations) -> UnifiedPaperAllocationPlan:
         candidate_count=len(allocations),
         allocations=list(allocations),
         skipped=[],
+        attempted_families=["core_cex", "cex_dex", "alpha"],
+        available_families=["core_cex", "alpha"],
+        family_failures=family_failures or {},
+        degraded=degraded,
         authorizes_execution=False,
         live_execution_eligible=False,
         paper_only=True,
@@ -111,6 +126,8 @@ def test_genesis_is_exactly_250k_and_is_not_reset(tmp_path):
     assert state.cash_usd == 250_000.0
     assert state.nav_usd == 250_000.0
     assert state.total_return == 0.0
+    assert state.valuation_status == "cash_only"
+    assert state.cycle_status == "accounting_only"
 
 
 @pytest.mark.asyncio
@@ -131,16 +148,22 @@ async def test_supported_spot_alpha_position_compounds_back_into_cash(tmp_path):
     first = await service.run_cycle()
     opened = service.ledger.latest_snapshot()
     assert first.opened_position_count == 1
+    assert first.degraded is False
+    assert first.valuation_status == "fresh"
     assert opened is not None
     assert opened.cash_usd == 240_000.0
     assert opened.reserved_capital_usd == 10_000.0
     assert opened.unrealized_pnl_usd == -10.0
     assert opened.nav_usd == 249_990.0
     assert opened.open_position_count == 1
+    assert opened.valuation_status == "fresh"
+    assert opened.cycle_status == "success"
+    assert opened.market_evidence_observed_at == t0
 
     second = await service.run_cycle()
     closed = service.ledger.latest_snapshot()
     assert second.closed_position_count == 1
+    assert second.valuation_status == "cash_only"
     assert closed is not None
     assert closed.open_position_count == 0
     assert closed.closed_trade_count == 1
@@ -151,7 +174,89 @@ async def test_supported_spot_alpha_position_compounds_back_into_cash(tmp_path):
     assert closed.total_return == pytest.approx(990.0 / 250_000.0)
     assert closed.pnl_by_mechanism_usd["alpha"] == pytest.approx(990.0)
     assert closed.pnl_by_strategy_usd["time_series_momentum_v1"] == pytest.approx(990.0)
+    assert closed.valuation_status == "cash_only"
+    assert closed.cycle_status == "success"
     assert len(service.ledger.trade_history()) == 1
+
+
+@pytest.mark.asyncio
+async def test_allocator_exception_after_fresh_market_scan_does_not_discard_accounting_snapshot(tmp_path):
+    t0 = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
+    store = EvidenceStore(tmp_path / "portfolio.sqlite3")
+    service = CanonicalPaperPortfolioService(
+        FakeCore([_snapshot(t0, 100.0)]),
+        FakeAllocator([RuntimeError("allocator exploded")]),
+        store,
+    )
+
+    cycle = await service.run_cycle()
+    latest = service.ledger.latest_snapshot()
+    assert latest is not None
+    assert latest.observed_at == t0
+    assert latest.market_evidence_observed_at == t0
+    assert latest.nav_usd == 250000.0
+    assert latest.valuation_status == "cash_only"
+    assert latest.cycle_status == "degraded"
+    assert latest.cycle_error_type == "RuntimeError"
+    assert cycle.degraded is True
+    assert cycle.allocation_error_type == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_family_failure_is_visible_without_blocking_supported_allocation(tmp_path):
+    t0 = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
+    store = EvidenceStore(tmp_path / "portfolio.sqlite3")
+    plan = _plan(
+        t0,
+        [_allocation(t0)],
+        degraded=True,
+        family_failures={"cex_dex": "ConnectionError: provider unavailable"},
+    )
+    service = CanonicalPaperPortfolioService(
+        FakeCore([_snapshot(t0, 100.0)]),
+        FakeAllocator([plan]),
+        store,
+    )
+
+    cycle = await service.run_cycle()
+    latest = service.ledger.latest_snapshot()
+    assert latest is not None
+    assert cycle.opened_position_count == 1
+    assert cycle.degraded is True
+    assert cycle.allocation_family_failures == {"cex_dex": "ConnectionError: provider unavailable"}
+    assert latest.cycle_status == "degraded"
+    assert latest.valuation_status == "fresh"
+    assert latest.allocation_family_failures == cycle.allocation_family_failures
+
+
+@pytest.mark.asyncio
+async def test_missing_quote_marks_snapshot_stale_instead_of_implying_fresh_valuation(tmp_path):
+    t0 = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(minutes=30)
+    store = EvidenceStore(tmp_path / "portfolio.sqlite3")
+    allocator = FakeAllocator([
+        _plan(t0, [_allocation(t0)]),
+        _plan(t1, []),
+    ])
+    service = CanonicalPaperPortfolioService(
+        FakeCore([_snapshot(t0, 100.0), _snapshot(t1, 100.0, include_quote=False)]),
+        allocator,
+        store,
+    )
+
+    await service.run_cycle()
+    cycle = await service.run_cycle()
+    latest = service.ledger.latest_snapshot()
+    assert latest is not None
+    assert latest.observed_at == t1
+    assert latest.market_evidence_observed_at == t1
+    assert latest.open_position_count == 1
+    assert latest.stale_position_count == 1
+    assert latest.valuation_status == "stale"
+    assert latest.cycle_status == "degraded"
+    assert latest.positions[0].valuation_observed_at == t0
+    assert cycle.degraded is True
+    assert cycle.stale_position_count == 1
 
 
 def test_unsupported_multi_leg_allocation_stays_fail_closed():
