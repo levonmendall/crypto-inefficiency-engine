@@ -2,7 +2,7 @@ from inefficiency_engine.api import app
 
 
 def test_advanced_paper_evidence_and_allocator_routes_are_registered():
-    paths = {route.path for route in app.routes}
+    paths = set(app.openapi()["paths"])
     expected = {
         "/v1/cex-dex/composite-shadow/summary",
         "/v1/cex-dex/composite-statistical/live",
