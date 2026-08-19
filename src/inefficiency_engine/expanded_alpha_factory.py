@@ -9,6 +9,13 @@ from typing import Protocol
 
 from sqlalchemy import select
 
+from inefficiency_engine.alpha_coverage_strategies import (
+    CrossSectionalRelativeValueStrategy,
+    EventDrivenStrategy,
+    EventLedger,
+    EventObservation,
+    MicrostructureImbalanceStrategy,
+)
 from inefficiency_engine.alpha_extensions import (
     FundamentalFactorLedger,
     FundamentalFactorObservation,
@@ -36,6 +43,10 @@ class FundamentalObservationProvider(Protocol):
     async def collect(self) -> list[FundamentalFactorObservation]: ...
 
 
+class EventObservationProvider(Protocol):
+    async def collect(self) -> list[EventObservation]: ...
+
+
 class _ExpandedSettingsView:
     """Forward-compatible defaults for post-V2.0 alpha families and controls."""
 
@@ -53,9 +64,28 @@ class _ExpandedSettingsView:
         "alpha_factor_forecast_shrinkage": 0.25,
         "alpha_factor_horizon_hours": 24.0,
         "alpha_factor_lookback_hours": 24.0 * 14.0,
-        # V2.2 adaptive health controls. These are deliberately conservative and
-        # can only reduce/revoke paper allocation authority already earned by the
-        # forward statistical gate.
+        # V3 active coverage-closure alpha families.
+        "alpha_cross_sectional_lookback_hours": 48.0,
+        "alpha_cross_sectional_horizon_hours": 12.0,
+        "alpha_cross_sectional_min_assets": 3,
+        "alpha_cross_sectional_min_abs_z": 0.75,
+        "alpha_cross_sectional_forecast_shrinkage": 0.20,
+        "alpha_cross_sectional_max_expected_return": 0.03,
+        "alpha_cross_sectional_max_candidates": 6,
+        "alpha_microstructure_horizon_hours": 0.25,
+        "alpha_microstructure_lookback_hours": 6.0,
+        "alpha_microstructure_depth_levels": 5,
+        "alpha_microstructure_min_abs_imbalance": 0.20,
+        "alpha_microstructure_return_scale": 0.012,
+        "alpha_microstructure_max_expected_return": 0.006,
+        "alpha_microstructure_max_candidates": 6,
+        "alpha_event_horizon_hours": 12.0,
+        "alpha_event_max_age_hours": 24.0,
+        "alpha_event_min_abs_surprise": 0.30,
+        "alpha_event_return_scale": 0.04,
+        "alpha_event_forecast_shrinkage": 0.25,
+        "alpha_event_max_expected_return": 0.04,
+        # Adaptive health controls. These remain strictly subtractive.
         "alpha_health_recent_window": 12,
         "alpha_health_min_recent_samples": 8,
         "alpha_health_min_recent_mean_return": 0.00025,
@@ -80,10 +110,9 @@ class _ExpandedSettingsView:
 class ExpandedAlphaFactoryService(AlphaFactoryService):
     """Multi-family alpha factory with independent evidence and adaptive sizing.
 
-    Discovery can be broad. Paper promotion remains forward-only and requires the
-    base statistical and fresh-L2 gates. V2.2 adds a second, strictly subtractive
-    health gate: recent decay, poor forecast capture, drawdown or losing streaks
-    can shrink or revoke paper capital but can never create authority.
+    Discovery is intentionally broad. Paper promotion remains forward-only and
+    requires the base statistical and fresh-L2 gates. Recent health can only
+    reduce or revoke paper capital; no research source can manufacture authority.
     """
 
     def __init__(
@@ -92,15 +121,21 @@ class ExpandedAlphaFactoryService(AlphaFactoryService):
         store: EvidenceStore,
         *,
         fundamental_provider: FundamentalObservationProvider | None = None,
+        event_provider: EventObservationProvider | None = None,
     ):
         self.fundamental_ledger = FundamentalFactorLedger(store)
+        self.event_ledger = EventLedger(store)
         registry = AlphaStrategyRegistry([
             TimeSeriesMomentumStrategy(),
             MeanReversionStrategy(),
             OnChainFundamentalStrategy(self.fundamental_ledger),
+            CrossSectionalRelativeValueStrategy(),
+            MicrostructureImbalanceStrategy(),
+            EventDrivenStrategy(self.event_ledger),
         ])
         super().__init__(core, store, registry=registry)
         self.fundamental_provider = fundamental_provider
+        self.event_provider = event_provider
         self._expanded_settings = _ExpandedSettingsView(self.settings)
         self.risk_controller = AlphaRiskController(self._expanded_settings)
 
@@ -120,6 +155,12 @@ class ExpandedAlphaFactoryService(AlphaFactoryService):
 
     def fundamental_summary(self) -> dict[str, object]:
         return self.fundamental_ledger.summary()
+
+    def record_event_observation(self, observation: EventObservation) -> str:
+        return self.event_ledger.record(observation)
+
+    def event_summary(self) -> dict[str, object]:
+        return self.event_ledger.summary()
 
     @staticmethod
     def _independent_outcomes(outcomes: list[AlphaForwardOutcome]) -> list[AlphaForwardOutcome]:
@@ -151,11 +192,12 @@ class ExpandedAlphaFactoryService(AlphaFactoryService):
                 .where(events.c.strategy_id == candidate.strategy_id)
                 .where(events.c.asset == candidate.asset)
                 .where(events.c.direction == candidate.direction)
-                .where(events.c.due_at > now.isoformat())
             ))
             completed = set(db.execute(
                 select(events.c.signal_id).where(events.c.event_type == "outcome")
             ).scalars())
+        # An unresolved matured signal also blocks a new overlapping cohort. Missing
+        # settlement data must not silently increase effective sample size.
         return any(signal_id not in completed for signal_id, _ in signals)
 
     def qualification(self, candidate: AlphaCandidate) -> AlphaQualification:
@@ -263,14 +305,23 @@ class ExpandedAlphaFactoryService(AlphaFactoryService):
         try:
             observations = await self.fundamental_provider.collect()
         except Exception:
-            # A factor provider is evidence-only; failure cannot poison existing
-            # market evidence or another alpha family.
             return
         for observation in observations:
             self.fundamental_ledger.record(observation)
 
+    async def _refresh_events(self) -> None:
+        if self.event_provider is None:
+            return
+        try:
+            observations = await self.event_provider.collect()
+        except Exception:
+            return
+        for observation in observations:
+            self.event_ledger.record(observation)
+
     async def run_evidence_cycle(self, *, total_capital_usd: float | None = None) -> AlphaEvidenceCycle:
         await self._refresh_fundamentals()
+        await self._refresh_events()
         total_capital_usd = total_capital_usd or self.settings.alpha_research_capital_usd
         snapshot = await self.core.collect_live_evidence()
         matured = 0
