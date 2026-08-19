@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
+from inefficiency_engine.alpha_coverage_strategies import EventLedger
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.research_mechanisms import (
     CapitalLocationResearchService,
@@ -19,10 +20,17 @@ def build_research_mechanisms_router(*, evidence_store: EvidenceStore | None, se
     volatility_service = VolatilityResearchService(evidence_store) if evidence_store is not None else None
     distress_service = DistressResearchService(evidence_store) if evidence_store is not None else None
     location_service = CapitalLocationResearchService(evidence_store) if evidence_store is not None else None
+    event_ledger = EventLedger(evidence_store) if evidence_store is not None else None
 
     def require_store() -> None:
         if evidence_store is None:
             raise HTTPException(status_code=503, detail="evidence persistence is not configured")
+
+    @router.get("/v3/research/events/summary")
+    def event_summary():
+        require_store()
+        assert event_ledger is not None
+        return event_ledger.summary()
 
     @router.get("/v3/research/yield/summary")
     def yield_summary():
