@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import signal
 
+from inefficiency_engine import __version__
 from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
@@ -91,6 +92,7 @@ async def run_portfolio_child(service: OpportunityService, store: EvidenceStore)
         store,
         alpha_factory,
         allocation_certification,
+        version=__version__,
     )
 
     return await run_portfolio_operating_loop(
