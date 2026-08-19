@@ -6,8 +6,9 @@ import json
 
 from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import build_evidence_store
-from inefficiency_engine.operating_worker import run_forever
 from inefficiency_engine.service import OpportunityService
+from inefficiency_engine.worker_children import run_portfolio_child, run_research_child
+from inefficiency_engine.worker_supervisor import supervise_worker_processes
 
 
 def _service() -> tuple[OpportunityService, object | None]:
@@ -29,7 +30,8 @@ def main() -> None:
         "command",
         choices=[
             "demo", "live", "executability", "diagnose-live",
-            "shadow-once", "shadow-loop", "worker", "worker-health",
+            "shadow-once", "shadow-loop", "worker", "research-worker",
+            "portfolio-worker", "worker-health",
         ],
     )
     args = parser.parse_args()
@@ -51,8 +53,17 @@ def main() -> None:
     elif args.command == "worker":
         if store is None:
             raise RuntimeError("worker requires CIE_DATABASE_URL/DATABASE_URL or CIE_EVIDENCE_DB_PATH")
-        stats = asyncio.run(run_forever(service, store))
+        asyncio.run(supervise_worker_processes(store))
+        return
+    elif args.command == "research-worker":
+        if store is None:
+            raise RuntimeError("research worker requires evidence persistence")
+        stats = asyncio.run(run_research_child(service, store))
         payload = stats.__dict__
+    elif args.command == "portfolio-worker":
+        if store is None:
+            raise RuntimeError("portfolio worker requires evidence persistence")
+        payload = {"cycles_attempted": asyncio.run(run_portfolio_child(service, store))}
     else:
         if store is None:
             raise RuntimeError("worker health requires evidence persistence")
