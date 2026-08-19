@@ -6,17 +6,17 @@ import threading
 import time
 from datetime import datetime, timezone
 
+from inefficiency_engine.certification_worker import CERTIFICATION_WORKER_ID
 from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import EvidenceStore, build_evidence_store
-from inefficiency_engine.operating_worker import (
-    ALLOCATION_CERTIFICATION_TIMEOUT_SECONDS,
-    OPERATING_CERTIFICATION_TIMEOUT_SECONDS,
-    PORTFOLIO_STAGE_TIMEOUT_SECONDS,
-    PORTFOLIO_WORKER_ID,
-)
+from inefficiency_engine.operating_worker import PORTFOLIO_STAGE_TIMEOUT_SECONDS, PORTFOLIO_WORKER_ID
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.worker import WorkerRunStats
-from inefficiency_engine.worker_children import run_portfolio_child, run_research_child
+from inefficiency_engine.worker_children import (
+    run_certification_child,
+    run_portfolio_child,
+    run_research_child,
+)
 from inefficiency_engine.worker_supervisor import (
     record_portfolio_watchdog_fallback,
     recover_stale_portfolio_on_supervisor_startup,
@@ -27,6 +27,7 @@ RESEARCH_THREAD_WORKER_ID = "shadow-research-thread"
 THREAD_SUPERVISOR_WORKER_ID = "cie-thread-supervisor"
 PORTFOLIO_THREAD_NAME = "canonical-portfolio-thread"
 RESEARCH_THREAD_NAME = "shadow-research-thread"
+CERTIFICATION_THREAD_NAME = "mechanism-certification-thread"
 THREAD_SUPERVISOR_POLL_SECONDS = 15.0
 PORTFOLIO_THREAD_STARTUP_GRACE_SECONDS = 90.0
 PORTFOLIO_THREAD_WATCHDOG_BUFFER_SECONDS = 60.0
@@ -109,6 +110,25 @@ def _portfolio_thread_entry() -> None:
             time.sleep(backoff)
 
 
+def _certification_thread_entry() -> None:
+    while True:
+        store: EvidenceStore | None = None
+        backoff = 5.0
+        try:
+            settings, store, service = _thread_runtime()
+            backoff = max(1.0, float(settings.worker_error_backoff_seconds))
+            asyncio.run(run_certification_child(service, store))
+            raise RuntimeError("certification child returned unexpectedly")
+        except BaseException as exc:
+            _record_thread_error(
+                store,
+                worker_id=CERTIFICATION_WORKER_ID,
+                exc=exc,
+                thread_name=CERTIFICATION_THREAD_NAME,
+            )
+            time.sleep(backoff)
+
+
 def _daemon_thread(*, target, name: str) -> threading.Thread:
     return threading.Thread(target=target, name=name, daemon=True)
 
@@ -118,12 +138,9 @@ def _portfolio_cycle_interval_seconds(settings: Settings) -> float:
 
 
 def _portfolio_running_watchdog_seconds() -> float:
-    return (
-        PORTFOLIO_STAGE_TIMEOUT_SECONDS
-        + ALLOCATION_CERTIFICATION_TIMEOUT_SECONDS
-        + OPERATING_CERTIFICATION_TIMEOUT_SECONDS
-        + PORTFOLIO_THREAD_WATCHDOG_BUFFER_SECONDS
-    )
+    # Certification no longer runs on the canonical thread. The watchdog now
+    # reflects only the canonical portfolio stage plus a scheduling margin.
+    return PORTFOLIO_STAGE_TIMEOUT_SECONDS + PORTFOLIO_THREAD_WATCHDOG_BUFFER_SECONDS
 
 
 def _portfolio_idle_watchdog_seconds(settings: Settings) -> float:
@@ -156,7 +173,7 @@ def _portfolio_watchdog_reason(
         timeout = _portfolio_running_watchdog_seconds()
         if heartbeat_age > timeout:
             return (
-                "canonical portfolio cycle exceeded its combined bounded stage budget",
+                "canonical portfolio cycle exceeded its accounting-only bounded stage budget",
                 heartbeat_age,
                 timeout,
             )
@@ -178,13 +195,11 @@ async def run_threaded_worker(
     stop_event: asyncio.Event | None = None,
     supervisor_poll_seconds: float = THREAD_SUPERVISOR_POLL_SECONDS,
 ) -> WorkerRunStats:
-    """Run heavy loops on daemon threads while the provider-free main thread supervises.
+    """Run research, accounting, and certification on independent daemon threads.
 
-    Python cannot safely kill a synchronously wedged thread. The portfolio and
-    research event loops therefore run as daemon threads. If canonical accounting
-    stops advancing, the main thread records a truthful fail-closed snapshot and
-    raises so the service manager restarts the one worker process, clearing the
-    wedged thread without returning to the previous multi-process memory footprint.
+    The main thread remains provider-free and supervises canonical accounting only.
+    Research and mechanism certification are important but non-authoritative for
+    account liveness; a stall in either must never make the Render worker fail.
     """
 
     resolved_settings = settings or Settings.from_env()
@@ -210,9 +225,15 @@ async def run_threaded_worker(
         target=_portfolio_thread_entry,
         name=PORTFOLIO_THREAD_NAME,
     )
+    certification_thread = _daemon_thread(
+        target=_certification_thread_entry,
+        name=CERTIFICATION_THREAD_NAME,
+    )
     research_thread.start()
     portfolio_thread.start()
+    certification_thread.start()
     research_restart_count = 0
+    certification_restart_count = 0
 
     store.record_worker_heartbeat(
         worker_id=THREAD_SUPERVISOR_WORKER_ID,
@@ -223,6 +244,8 @@ async def run_threaded_worker(
             "main_thread_provider_free": True,
             "research_thread_isolated": True,
             "portfolio_thread_isolated": True,
+            "certification_thread_isolated": True,
+            "canonical_liveness_excludes_certification": True,
             "startup_recovered_stale_portfolio": startup_recovered_stale,
             "portfolio_running_watchdog_seconds": _portfolio_running_watchdog_seconds(),
             "portfolio_idle_watchdog_seconds": _portfolio_idle_watchdog_seconds(resolved_settings),
@@ -248,6 +271,14 @@ async def run_threaded_worker(
                     name=RESEARCH_THREAD_NAME,
                 )
                 research_thread.start()
+
+            if not certification_thread.is_alive():
+                certification_restart_count += 1
+                certification_thread = _daemon_thread(
+                    target=_certification_thread_entry,
+                    name=CERTIFICATION_THREAD_NAME,
+                )
+                certification_thread.start()
 
             reason, heartbeat_age, watchdog_seconds = _portfolio_watchdog_reason(
                 store,
@@ -281,6 +312,7 @@ async def run_threaded_worker(
                 )
                 raise PortfolioThreadWatchdogError(reason)
 
+            certification_heartbeat = store.latest_worker_heartbeat(CERTIFICATION_WORKER_ID)
             store.record_worker_heartbeat(
                 worker_id=THREAD_SUPERVISOR_WORKER_ID,
                 state="running",
@@ -290,7 +322,17 @@ async def run_threaded_worker(
                     "main_thread_provider_free": True,
                     "research_thread_isolated": True,
                     "portfolio_thread_isolated": True,
+                    "certification_thread_isolated": True,
+                    "canonical_liveness_excludes_certification": True,
                     "research_restart_count": research_restart_count,
+                    "certification_restart_count": certification_restart_count,
+                    "certification_state": (
+                        certification_heartbeat.state if certification_heartbeat is not None else None
+                    ),
+                    "certification_observed_at": (
+                        certification_heartbeat.observed_at.isoformat()
+                        if certification_heartbeat is not None else None
+                    ),
                     "portfolio_heartbeat_age_seconds": heartbeat_age,
                     "portfolio_watchdog_seconds": watchdog_seconds,
                 },
@@ -311,6 +353,7 @@ async def run_threaded_worker(
                     "paper_only": True,
                     "one_process": True,
                     "research_restart_count": research_restart_count,
+                    "certification_restart_count": certification_restart_count,
                 },
             )
 
