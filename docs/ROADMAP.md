@@ -71,7 +71,7 @@ Completing v0.9 means each targeted opportunity family has a canonical place in 
 - Expose route-shadow cycle and summary API surfaces.
 - Continue to claim neither capacity nor execution authority from route-survival evidence.
 
-### v0.10.3 — multi-notional DEX route frontier — current
+### v0.10.3 — multi-notional DEX route frontier — complete
 - Periodically probe $1k/$5k/$10k/$25k routes for BTC/ETH in both buy and sell directions by default.
 - Probe tiers sequentially to avoid burst-loading the public quote API.
 - Compare larger tiers with the smallest successful baseline using directional route-price deterioration.
@@ -82,14 +82,25 @@ Completing v0.9 means each targeted opportunity family has a canonical place in 
 - Default production cadence is one frontier probe every 10 core worker cycles.
 - `capacity_claimed=false`; quote-size evidence does not promote DEX routes into allocation or execution.
 
+### v0.10.4 — explicit DEX/CEX quote-currency conversion — current
+- Require a fresh observed quote-currency conversion path before comparing a USDC DEX route with USD/USDT CEX spot.
+- Support direct conversion and two-hop stablecoin paths through USD.
+- Convert DEX-sell proceeds USDC→CEX quote and CEX hedge proceeds CEX quote→USDC for DEX buys.
+- Use observed bid/ask in the conversion rate so market spread is embedded once, not double-counted.
+- Apply depeg/risk haircuts from each conversion edge separately.
+- Reject missing or stale conversion paths fail-closed.
+- Record the exact conversion path, rate, spread reference, risk haircuts and timestamps in candidate evidence.
+- Conversion execution depth/capacity remains unqualified, so DEX candidates remain excluded from allocation and execution.
+
 ### Next v0.10 evidence work
-1. Accumulate sufficient route-shadow and multi-notional frontier evidence to estimate survival and adverse-price tails by asset/direction/size.
-2. Jointly qualify USDC↔USD/stablecoin conversion and gas economics at each route size.
-3. Add cross-venue inventory/settlement and hedge-recovery models before CEX↔DEX can enter paper allocation.
-4. Require statistical confidence/effective-sample gates before any observed quote-size frontier can influence capital decisions.
-5. Add authoritative bridge quote evidence only when a reliable supported source exists.
-6. Add option L2 and hedge-aware execution economics before options can enter allocation.
-7. Add authoritative liquidation/solver feeds before those families can enter allocation.
+1. Persist conversion-normalized cross-venue route economics alongside route-shadow/frontier evidence.
+2. Accumulate sufficient route-shadow/frontier evidence to estimate survival and adverse-price tails by asset/direction/size.
+3. Add stablecoin conversion depth and amount-specific conversion quote evidence at each DEX route size.
+4. Add cross-venue inventory/settlement and hedge-recovery models before CEX↔DEX can enter paper allocation.
+5. Require statistical confidence/effective-sample gates before any DEX evidence can influence capital decisions.
+6. Add authoritative bridge quote evidence only when a reliable supported source exists.
+7. Add option L2 and hedge-aware execution economics before options can enter allocation.
+8. Add authoritative liquidation/solver feeds before those families can enter allocation.
 
 ## Milestone 6 — Tiny-capital controlled execution — blocked
 Separate service, credentials, explicit authorization, hard caps, paired-leg hedge recovery, concentration limits, dead-man switch and kill switch. Remains blocked until accumulated shadow evidence is statistically convincing and live execution is separately authorized.

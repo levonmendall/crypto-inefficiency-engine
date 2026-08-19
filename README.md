@@ -32,19 +32,27 @@ A **paper-first, fail-closed** engine for discovering structural crypto-market i
 
 ### v0.10.3 — multi-notional DEX route frontier
 
-v0.10.3 adds periodic **quote-size evidence**, not deployable-capacity authority:
-
 - default route-size probes at $1k / $5k / $10k / $25k for BTC and ETH in both buy/sell directions;
-- probes are sequential and run once every 10 worker cycles by default to keep public API load modest;
-- compare each larger tier with the smallest successful baseline route using directional route-price deterioration;
+- probes are sequential and run once every 10 worker cycles by default;
+- larger tiers are compared with the smallest successful baseline using directional route-price deterioration;
 - default acceptable deterioration limit is 25 bps;
-- expose both the largest successful quoted tier and the stricter `largest_contiguous_acceptable_tier_usd`;
-- an intermediate failure permanently breaks the contiguous frontier, even if a larger tier later returns a quote;
-- persist every frontier in the append-only evidence ledger with lineage;
-- expose `POST /v1/dex/route-frontier/probe` and `GET /v1/dex/route-frontier/summary`;
-- `capacity_claimed=false`, `executable_eligible=false`, and the paper allocator remains CEX-qualified-only.
+- an intermediate failed/unacceptable tier permanently breaks the contiguous acceptable frontier;
+- frontiers are durable but retain `capacity_claimed=false` and `executable_eligible=false`.
 
-The next DEX promotion gate is to combine accumulated survival statistics and multi-notional route evidence with explicit stablecoin conversion, gas economics, inventory/settlement, and hedge-recovery models. Until then the frontier is evidence about what was quotable, not what can safely be deployed.
+### v0.10.4 — explicit DEX/CEX quote-currency conversion
+
+v0.10.4 removes the remaining implicit stablecoin-parity assumption from route comparisons:
+
+- a USDC-denominated DEX route can only be compared with a USD/USDT CEX spot quote when a fresh observed conversion path exists;
+- direct USDC↔USD conversion is used when available, while USDC↔USDT may use a two-hop path through USD;
+- DEX-sell economics convert USDC proceeds into the CEX quote currency; DEX-buy economics convert CEX hedge proceeds back into USDC;
+- observed conversion bid/ask is embedded in the normalization rate, so market spread is not charged twice;
+- depeg/risk haircuts from every conversion leg are charged separately;
+- missing or stale conversion paths fail closed and produce no cross-currency CEX↔DEX candidate;
+- candidate evidence records the exact conversion path, rates, spread reference, risk haircut and observation timestamps;
+- conversion execution depth/capacity, inventory settlement and hedge recovery remain unqualified, so DEX candidates still cannot enter allocation.
+
+The next DEX promotion gate is statistical: combine route survival and size-frontier evidence with conversion-path freshness/depth, gas economics, cross-venue inventory/settlement and hedge recovery. Until those gates are proven, these are research economics rather than deployable capital opportunities.
 
 ## v0.9 — Universal Opportunity Graph — complete
 
@@ -56,7 +64,7 @@ v0.9 turns the project from a two-strategy engine into a strategy-agnostic crypt
 
 ## Capability is not authority
 
-The universal graph intentionally contains relationships that are searchable but not executable. A DexScreener pool is discovery metadata; a Velora price route is amount-specific quote evidence; a multi-notional frontier is repeated quote evidence. None establishes atomic inventory, settlement, recoverability, or deployable capacity. Bridge/options/solver/liquidation research likewise remains behind explicit evidence gates.
+The universal graph intentionally contains relationships that are searchable but not executable. A DexScreener pool is discovery metadata; a Velora price route is amount-specific quote evidence; a multi-notional frontier is repeated quote evidence; a stablecoin conversion path is point-in-time normalization evidence. None establishes atomic inventory, settlement, recoverability, conversion depth or deployable capacity.
 
 The paper allocator cannot promote a blocked or unqualified candidate. Cash/no allocation is valid and `authorizes_execution=false`.
 
@@ -72,7 +80,7 @@ Qualified core opportunities are followed at 1s, 5s, 15s, 30s and 60s. The engin
 
 **Universal evidence surface:**
 
-`stablecoin observations + DEX pool discovery + amount-specific DEX route quotes → multi-horizon route survival + periodic quote-size frontiers + chain/bridge capabilities + options + external solver/liquidation signals → universal graph → research candidates → explicit evidence gates`
+`stablecoin observations/conversion paths + DEX pool discovery + amount-specific DEX route quotes → multi-horizon route survival + periodic quote-size frontiers + conversion-normalized CEX↔DEX research economics + chain/bridge capabilities + options + external solver/liquidation signals → explicit evidence gates`
 
 ## Safety boundary
 
@@ -82,6 +90,7 @@ Qualified core opportunities are followed at 1s, 5s, 15s, 30s and 60s. The engin
 - Unknown venue fees fail closed in executable qualification.
 - Short spot fails closed without explicit borrow economics.
 - DEX route collection calls price quoting only; it does not build, sign or submit transactions.
+- Cross-currency DEX comparisons fail closed without fresh observed conversion evidence.
 - Successful route probes or route-size tiers do not imply deployable capacity.
 - Universal research candidates do not bypass core L2 qualification.
 - Paper allocation has no execution authority.

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -6,6 +6,8 @@ import pytest
 from inefficiency_engine.adapters.velora import VeloraPriceRouteAdapter, parse_velora_price_route
 from inefficiency_engine.dex_routes import detect_route_quoted_cex_dex
 from inefficiency_engine.models import MarketKind, MarketQuote
+from inefficiency_engine.universal import StablecoinConversionModel, build_conversion_edges
+from inefficiency_engine.universal_models import StablecoinConversionObservation
 
 
 NOW = datetime(2026, 8, 19, 1, 50, tzinfo=timezone.utc)
@@ -41,6 +43,47 @@ def price_payload(*, src_token: str, dest_token: str, src_amount: str, dest_amou
     }
 
 
+def stablecoin_model(*observations: StablecoinConversionObservation) -> StablecoinConversionModel:
+    return StablecoinConversionModel(build_conversion_edges(
+        list(observations), depeg_multiplier=1.5, risk_floor_bps=2.0,
+    ))
+
+
+def stablecoin_observation(
+    base: str,
+    quote: str,
+    *,
+    bid: float,
+    ask: float,
+    mid: float,
+    observed_at: datetime = NOW,
+) -> StablecoinConversionObservation:
+    return StablecoinConversionObservation(
+        venue="Coinbase",
+        base_currency=base,
+        quote_currency=quote,
+        symbol=f"{base}-{quote}",
+        bid=bid,
+        ask=ask,
+        mid=mid,
+        observed_at=observed_at,
+        source="test",
+    )
+
+
+def sell_route():
+    return parse_velora_price_route(
+        price_payload(
+            src_token="eth", dest_token="usdc",
+            src_amount="250000000000000000", dest_amount="1010000000",
+            src_decimals=18, dest_decimals=6,
+        ),
+        asset="ETH",
+        direction="sell_asset",
+        observed_at=NOW,
+    )
+
+
 def test_parse_velora_sell_route_preserves_amount_specific_evidence():
     quote = parse_velora_price_route(
         price_payload(
@@ -64,35 +107,93 @@ def test_parse_velora_sell_route_preserves_amount_specific_evidence():
     assert quote.executable_eligible is False
 
 
-def test_route_quote_candidate_improves_price_evidence_but_claims_no_capacity():
-    route = parse_velora_price_route(
-        price_payload(
-            src_token="eth", dest_token="usdc",
-            src_amount="250000000000000000", dest_amount="1010000000",
-            src_decimals=18, dest_decimals=6,
-        ),
-        asset="ETH",
-        direction="sell_asset",
-        observed_at=NOW,
-    )
+def test_cross_currency_route_candidate_requires_fresh_observed_conversion():
+    route = sell_route()
     cex = MarketQuote(
         venue="Coinbase", asset="ETH", market_kind=MarketKind.SPOT, symbol="ETH-USD",
         quote_currency="USD", bid=3998, ask=4000, mid=3999,
         observed_at=NOW, source="test",
     )
+
+    assert detect_route_quoted_cex_dex([cex], [route], minimum_edge_bps=10.0) == []
+
+    model = stablecoin_model(stablecoin_observation(
+        "USDC", "USD", bid=0.999, ask=1.001, mid=1.0,
+    ))
     candidates = detect_route_quoted_cex_dex(
-        [cex], [route], minimum_edge_bps=10.0, conversion_risk_floor_bps=2.0,
+        [cex], [route], conversion_model=model, minimum_edge_bps=10.0,
+        conversion_max_age_seconds=120.0,
     )
     assert len(candidates) == 1
     candidate = candidates[0]
-    assert candidate.evidence["price_evidence"] == "amount_specific_route_quote"
-    assert candidate.evidence["economic_direction"] == "buy_cex_sell_dex"
+    expected_gross = ((4040.0 * 0.999) / 4000.0 - 1.0) * 10_000.0
+    assert candidate.gross_edge_bps == pytest.approx(expected_gross)
+    assert candidate.evidence["price_evidence"] == "amount_specific_route_quote_with_observed_conversion"
+    assert candidate.evidence["conversion_source_currency"] == "USDC"
+    assert candidate.evidence["conversion_target_currency"] == "USD"
+    assert candidate.evidence["conversion_rate"] == pytest.approx(0.999)
+    assert candidate.evidence["conversion_market_spread_embedded_in_rate"] is True
+    assert candidate.evidence["conversion_spread_bps_reference"] == pytest.approx(10.0)
+    assert candidate.risk_haircut_bps == pytest.approx(2.0)
     assert candidate.capacity_usd is None
-    assert candidate.evidence["quote_notional_usd_proxy"] == 1010.0
     assert candidate.evidence["capacity_claimed"] is False
     assert candidate.executable_eligible is False
     assert "settlement" in (candidate.blocked_reason or "")
-    assert candidate.evidence["transaction_built"] is False
+
+
+def test_stale_conversion_path_fails_closed():
+    route = sell_route()
+    cex = MarketQuote(
+        venue="Coinbase", asset="ETH", market_kind=MarketKind.SPOT, symbol="ETH-USD",
+        quote_currency="USD", bid=3998, ask=4000, mid=3999,
+        observed_at=NOW, source="test",
+    )
+    stale_model = stablecoin_model(stablecoin_observation(
+        "USDC", "USD", bid=0.999, ask=1.001, mid=1.0,
+        observed_at=NOW - timedelta(seconds=300),
+    ))
+    assert detect_route_quoted_cex_dex(
+        [cex], [route], conversion_model=stale_model, minimum_edge_bps=10.0,
+        conversion_max_age_seconds=120.0,
+    ) == []
+
+
+def test_usdt_cex_buy_dex_path_uses_two_hop_conversion_back_to_usdc():
+    route = parse_velora_price_route(
+        price_payload(
+            src_token="usdc", dest_token="eth",
+            src_amount="1000000000", dest_amount="250000000000000000",
+            src_decimals=6, dest_decimals=18,
+            gas_cost_usd="4",
+        ),
+        asset="ETH",
+        direction="buy_asset",
+        observed_at=NOW,
+    )
+    cex = MarketQuote(
+        venue="OKX", asset="ETH", market_kind=MarketKind.SPOT, symbol="ETH-USDT",
+        quote_currency="USDT", bid=4050, ask=4052, mid=4051,
+        observed_at=NOW, source="test",
+    )
+    model = stablecoin_model(
+        stablecoin_observation("USDC", "USD", bid=0.999, ask=1.001, mid=1.0),
+        stablecoin_observation("USDT", "USD", bid=0.998, ask=1.000, mid=0.999),
+    )
+    candidates = detect_route_quoted_cex_dex(
+        [cex], [route], conversion_model=model, minimum_edge_bps=10.0,
+    )
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    conversion_rate = 0.998 * (1.0 / 1.001)
+    expected_gross = ((4050.0 * conversion_rate) / 4000.0 - 1.0) * 10_000.0
+    assert candidate.gross_edge_bps == pytest.approx(expected_gross)
+    assert candidate.evidence["conversion_source_currency"] == "USDT"
+    assert candidate.evidence["conversion_target_currency"] == "USDC"
+    assert candidate.evidence["conversion_rate"] == pytest.approx(conversion_rate)
+    assert len(candidate.evidence["conversion_path"]) == 2
+    # USDT at 0.999 has a 10 bps parity deviation; with the configured 1.5x
+    # multiplier that leg carries 15 bps risk, plus the 2 bps USDC floor.
+    assert candidate.risk_haircut_bps == pytest.approx(17.0)
 
 
 @pytest.mark.asyncio
