@@ -28,11 +28,44 @@ from inefficiency_engine.alpha_factory import (
     _quantile,
     _wilson_lower,
 )
-from inefficiency_engine.evidence import EvidenceStore
+from inefficiency_engine.evidence import EvidenceStore, ScanSnapshot
 
 
 class FundamentalObservationProvider(Protocol):
     async def collect(self) -> list[FundamentalFactorObservation]: ...
+
+
+class _ExpandedSettingsView:
+    """Forward-compatible defaults for V2.1 strategies.
+
+    Existing deployments can adopt the new strategy families without a config
+    migration. These values become explicit Settings fields in a later tuning
+    pass once enough forward evidence exists to justify parameter changes.
+    """
+
+    _defaults = {
+        "alpha_reversion_horizon_hours": 6.0,
+        "alpha_reversion_lookback_hours": 24.0,
+        "alpha_reversion_min_robust_z": 2.0,
+        "alpha_reversion_forecast_shrinkage": 0.20,
+        "alpha_reversion_max_expected_return": 0.03,
+        "alpha_factor_max_age_hours": 48.0,
+        "alpha_factor_min_count": 2,
+        "alpha_factor_min_abs_score": 0.35,
+        "alpha_factor_max_expected_return": 0.03,
+        "alpha_factor_return_scale": 0.02,
+        "alpha_factor_forecast_shrinkage": 0.25,
+        "alpha_factor_horizon_hours": 24.0,
+        "alpha_factor_lookback_hours": 24.0 * 14.0,
+    }
+
+    def __init__(self, base):
+        self._base = base
+
+    def __getattr__(self, name: str):
+        if name in self._defaults:
+            return self._defaults[name]
+        return getattr(self._base, name)
 
 
 class ExpandedAlphaFactoryService(AlphaFactoryService):
@@ -59,6 +92,18 @@ class ExpandedAlphaFactoryService(AlphaFactoryService):
         ])
         super().__init__(core, store, registry=registry)
         self.fundamental_provider = fundamental_provider
+        self._expanded_settings = _ExpandedSettingsView(self.settings)
+
+    def manifests(self):
+        return self.registry.manifests()
+
+    def discover(self, snapshot: ScanSnapshot, *, total_capital_usd: float) -> list[AlphaCandidate]:
+        return self.registry.discover(
+            snapshot,
+            self._history(now=snapshot.completed_at),
+            self._expanded_settings,  # type: ignore[arg-type]
+            total_capital_usd=total_capital_usd,
+        )
 
     def record_fundamental_observation(self, observation: FundamentalFactorObservation) -> str:
         return self.fundamental_ledger.record(observation)
