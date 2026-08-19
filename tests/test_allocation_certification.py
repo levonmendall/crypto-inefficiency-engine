@@ -123,3 +123,15 @@ def test_allocation_ledger_separates_supported_settlements_from_unsupported_deci
     assert summary["unsupported_trial_count"] == 1
     assert summary["settled_outcome_count"] == 0
     assert summary["realized_profit_usd_settled_trials"] == 0
+
+
+def test_matured_but_unsettled_supported_trial_still_blocks_overlapping_cohort(tmp_path):
+    store = EvidenceStore(tmp_path / "overlap.sqlite3")
+    ledger = AllocationCertificationLedger(store)
+    trial = AllocationForwardCertificationService.trial_from_allocation(allocation(), plan_observed_at=NOW)
+    trial.due_at = NOW - timedelta(minutes=1)
+    ledger.record_trial(trial)
+
+    assert ledger.has_unsettled_supported_cohort(trial.cohort_key) is True
+    pending = ledger.pending_supported_trials(now=NOW)
+    assert [row.trial_id for row in pending] == [trial.trial_id]
