@@ -73,6 +73,7 @@ def test_core_candidate_converts_annualized_return_to_one_holding_period():
     assert row.expected_profit_usd_per_deployment == pytest.approx(10000.0 * expected_return)
     assert row.modeled_holding_hours == 24.0
     assert row.source_return_metric == "net_annualized_return"
+    assert row.exposure_kind == "market_neutral"
     assert row.executable_eligible is False
 
 
@@ -121,6 +122,7 @@ class FakeAlphaFactory:
             candidate_id="alpha:sol-trend",
             strategy_id="time_series_momentum_v1",
             asset="SOL",
+            direction="long",
             venue="OKX",
             symbol="SOL-USDT",
             capital_required_usd=5000.0,
@@ -156,13 +158,16 @@ async def test_unified_allocator_compares_only_qualified_current_deployments_and
     assert plan.allocated_capital_usd == 20000.0
     assert plan.unused_cash_usd == 10000.0
     assert plan.expected_profit_usd_current_deployments > 0
+    assert plan.portfolio_risk_budget is not None
+    assert plan.portfolio_risk_budget.market_neutral_capital_usd == 20000.0
+    assert plan.portfolio_risk_budget.directional_capital_usd == 0.0
     assert plan.authorizes_execution is False
     assert plan.live_execution_eligible is False
     assert all(item.authorizes_execution is False for item in plan.allocations)
 
 
 @pytest.mark.asyncio
-async def test_unified_allocator_accepts_only_promoted_alpha_and_ranks_it_with_other_families():
+async def test_unified_allocator_accepts_only_promoted_alpha_and_tracks_directional_budget():
     service = UnifiedPaperAllocatorService(
         FakeCore(),  # type: ignore[arg-type]
         FakeCexDexPromotion(),  # type: ignore[arg-type]
@@ -171,7 +176,11 @@ async def test_unified_allocator_accepts_only_promoted_alpha_and_ranks_it_with_o
     candidates = await service.candidates(total_capital_usd=30000.0)
     assert [row.family for row in candidates] == ["alpha", "cex_dex", "core_cex"]
     assert candidates[0].strategy == "time_series_momentum_v1"
+    assert candidates[0].exposure_kind == "directional_long"
     assert candidates[0].expected_return_on_reserved_capital == pytest.approx(0.005)
     plan = await service.allocate(total_capital_usd=30000.0)
     assert any(row.family == "alpha" for row in plan.allocations)
+    assert plan.portfolio_risk_budget is not None
+    assert plan.portfolio_risk_budget.directional_long_capital_usd == 5000.0
+    assert plan.portfolio_risk_budget.directional_net_capital_usd == 5000.0
     assert all(row.authorizes_execution is False for row in plan.allocations)
