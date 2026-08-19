@@ -8,12 +8,12 @@ from datetime import datetime, timezone
 from inefficiency_engine.adapters.coinbase import CoinbaseSpotAdapter
 from inefficiency_engine.adapters.hyperliquid import HyperliquidAdapter
 from inefficiency_engine.config import Settings
-from inefficiency_engine.detectors.basis import SpotPerpBasisDetector
-from inefficiency_engine.detectors.funding import FundingDispersionDetector
+from inefficiency_engine.detectors.registry import DetectorContext, DetectorManifest, OpportunityDetectorRegistry
 from inefficiency_engine.evidence import EvidenceStore, ProviderStatus, ScanSnapshot
 from inefficiency_engine.execution import qualify_opportunity
 from inefficiency_engine.fill_model import reconstruct_partial_fill_state
 from inefficiency_engine.latency import EmpiricalLatencyResolver
+from inefficiency_engine.market_graph import MarketGraphSnapshot, build_market_graph
 from inefficiency_engine.models import (
     EmpiricalLatencyModel,
     FundingQuote,
@@ -26,6 +26,7 @@ from inefficiency_engine.models import (
     ShadowOutcome,
     Strategy,
 )
+from inefficiency_engine.ranking import RankedOpportunity, rank_qualified_opportunities
 from inefficiency_engine.risk import RiskGate
 from inefficiency_engine.shadow import (
     build_leg_attribution,
@@ -50,8 +51,7 @@ class OpportunityService:
     def __init__(self, settings: Settings | None = None, evidence_store: EvidenceStore | None = None):
         self.settings = settings or Settings.from_env()
         self.evidence_store = evidence_store
-        self.funding_detector = FundingDispersionDetector(self.settings)
-        self.basis_detector = SpotPerpBasisDetector(self.settings)
+        self.detector_registry = OpportunityDetectorRegistry.default(self.settings)
         self.risk_gate = RiskGate(self.settings)
 
     def empirical_latency_resolver(self) -> EmpiricalLatencyResolver:
@@ -74,9 +74,29 @@ class OpportunityService:
             asset=asset,
         )
 
+    def market_graph(
+        self,
+        funding_quotes: list[FundingQuote],
+        market_quotes: list[MarketQuote],
+    ) -> MarketGraphSnapshot:
+        return build_market_graph(funding_quotes, market_quotes)
+
+    def detector_manifests(self) -> list[DetectorManifest]:
+        return self.detector_registry.manifests()
+
     def analyze(self, funding_quotes: list[FundingQuote], market_quotes: list[MarketQuote]) -> list[Opportunity]:
-        candidates = self.funding_detector.detect(funding_quotes) + self.basis_detector.detect(market_quotes)
+        graph = self.market_graph(funding_quotes, market_quotes)
+        candidates = self.detector_registry.discover(
+            DetectorContext(
+                funding_quotes=funding_quotes,
+                market_quotes=market_quotes,
+                graph=graph,
+            )
+        )
         return self.risk_gate.filter(candidates)
+
+    def rank_snapshot(self, snapshot: ScanSnapshot) -> list[RankedOpportunity]:
+        return rank_qualified_opportunities(snapshot.opportunities, snapshot.executability)
 
     async def _collect_live_inputs(self):
         started_at = datetime.now(timezone.utc)
@@ -102,6 +122,10 @@ class OpportunityService:
         opportunities = self.analyze(funding_quotes, market_quotes)
         providers = [funding_status, perp_status, spot_status]
         return started_at, funding_quotes, market_quotes, opportunities, providers
+
+    async def collect_live_graph(self) -> tuple[MarketGraphSnapshot, list[ProviderStatus], list[Opportunity]]:
+        _, funding_quotes, market_quotes, opportunities, providers = await self._collect_live_inputs()
+        return self.market_graph(funding_quotes, market_quotes), providers, opportunities
 
     async def collect_live_evidence(self) -> ScanSnapshot:
         started_at, funding_quotes, market_quotes, opportunities, providers = await self._collect_live_inputs()
