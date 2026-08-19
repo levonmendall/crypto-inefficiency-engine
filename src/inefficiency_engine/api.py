@@ -100,13 +100,8 @@ async def dex_route_quotes_live():
         surface = await universal_service.collect_surface()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"DEX route quote scan failed: {type(exc).__name__}") from exc
-    return {
-        "paper_only": True,
-        "transaction_building": False,
-        "execution_authority": False,
-        "count": len(surface.dex_route_quotes),
-        "quotes": [item.model_dump(mode="json") for item in surface.dex_route_quotes],
-    }
+    return {"paper_only":True,"transaction_building":False,"execution_authority":False,
+            "count":len(surface.dex_route_quotes),"quotes":[item.model_dump(mode="json") for item in surface.dex_route_quotes]}
 
 @app.post("/v1/dex/route-shadow/cycle")
 async def dex_route_shadow_cycle():
@@ -121,6 +116,26 @@ def dex_route_shadow_summary():
     if evidence_store is None:
         raise HTTPException(status_code=503, detail="evidence persistence is not configured")
     return evidence_store.dex_route_shadow_summary()
+
+@app.post("/v1/dex/route-frontier/probe")
+async def dex_route_frontier_probe():
+    try:
+        frontiers = await universal_service.probe_dex_route_size_frontiers()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"DEX route frontier probe failed: {type(exc).__name__}") from exc
+    return {
+        "paper_only": True,
+        "capacity_claimed": False,
+        "execution_authority": False,
+        "count": len(frontiers),
+        "frontiers": [item.model_dump(mode="json") for item in frontiers],
+    }
+
+@app.get("/v1/dex/route-frontier/summary")
+def dex_route_frontier_summary():
+    if evidence_store is None:
+        raise HTTPException(status_code=503, detail="evidence persistence is not configured")
+    return evidence_store.dex_route_size_frontier_summary()
 
 @app.get("/v1/allocation/live")
 async def paper_allocation(capital_usd: float = 100000.0, max_venue_fraction: float | None = None,

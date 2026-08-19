@@ -88,6 +88,10 @@ class Settings:
     stablecoin_dislocation_min_edge_bps: float = 8.0
     dex_dislocation_min_edge_bps: float = 12.0
     dex_liquidity_risk_floor_bps: float = 8.0
+    dex_route_evidence_notional_usd: float = 1000.0
+    dex_route_frontier_notionals_usd: tuple[float, ...] = (1000.0, 5000.0, 10000.0, 25000.0)
+    dex_route_frontier_max_deterioration_bps: float = 25.0
+    dex_route_frontier_every_cycles: int = 10
     option_relative_value_min_iv_points: float = 8.0
     allocator_max_venue_fraction: float = 0.50
     allocator_max_asset_fraction: float = 0.50
@@ -150,6 +154,14 @@ class Settings:
             stablecoin_dislocation_min_edge_bps=_float("CIE_STABLECOIN_DISLOCATION_MIN_EDGE_BPS", 8.0),
             dex_dislocation_min_edge_bps=_float("CIE_DEX_DISLOCATION_MIN_EDGE_BPS", 12.0),
             dex_liquidity_risk_floor_bps=_float("CIE_DEX_LIQUIDITY_RISK_FLOOR_BPS", 8.0),
+            dex_route_evidence_notional_usd=_float("CIE_DEX_ROUTE_EVIDENCE_NOTIONAL_USD", 1000.0),
+            dex_route_frontier_notionals_usd=_float_tuple(
+                "CIE_DEX_ROUTE_FRONTIER_NOTIONALS_USD", (1000.0, 5000.0, 10000.0, 25000.0)
+            ),
+            dex_route_frontier_max_deterioration_bps=_float(
+                "CIE_DEX_ROUTE_FRONTIER_MAX_DETERIORATION_BPS", 25.0
+            ),
+            dex_route_frontier_every_cycles=max(1, _int("CIE_DEX_ROUTE_FRONTIER_EVERY_CYCLES", 10)),
             option_relative_value_min_iv_points=_float("CIE_OPTION_RELATIVE_VALUE_MIN_IV_POINTS", 8.0),
             allocator_max_venue_fraction=_float("CIE_ALLOCATOR_MAX_VENUE_FRACTION", 0.50),
             allocator_max_asset_fraction=_float("CIE_ALLOCATOR_MAX_ASSET_FRACTION", 0.50),
