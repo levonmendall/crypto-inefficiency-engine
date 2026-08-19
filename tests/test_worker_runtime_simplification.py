@@ -54,31 +54,46 @@ def test_render_worker_command_keeps_main_thread_provider_free():
 
 
 @pytest.mark.asyncio
-async def test_threaded_runtime_isolates_research_portfolio_and_certification(monkeypatch):
+async def test_threaded_runtime_bootstraps_canonical_before_single_auxiliary_thread(monkeypatch):
     observed: list[dict[str, object]] = []
     heartbeats: list[tuple[str, str]] = []
+    stop_event = asyncio.Event()
 
     class FakeThread:
         def __init__(self, *, target, name, daemon):
-            self.record = {"target": target, "name": name, "daemon": daemon}
+            self.record = {"target": target, "name": name, "daemon": daemon, "alive": True}
             observed.append(self.record)
 
         def start(self):
             self.record["started"] = True
+            if self.record["name"] == threaded_worker.RESEARCH_THREAD_NAME:
+                stop_event.set()
+
+        def is_alive(self):
+            return bool(self.record["alive"])
 
     class FakeStore:
         def record_worker_heartbeat(self, *, worker_id, state, **kwargs):
             heartbeats.append((worker_id, state))
 
+        def latest_worker_heartbeat(self, worker_id):
+            return None
+
+    async def fake_bootstrap(*args, **kwargs):
+        assert [item["name"] for item in observed] == [threaded_worker.PORTFOLIO_THREAD_NAME]
+        return SimpleNamespace(
+            state="success",
+            observed_at=datetime.now(timezone.utc),
+        )
+
     monkeypatch.setattr(threaded_worker.threading, "Thread", FakeThread)
+    monkeypatch.setattr(threaded_worker, "_wait_for_canonical_bootstrap", fake_bootstrap)
     monkeypatch.setattr(
         threaded_worker,
         "recover_stale_portfolio_on_supervisor_startup",
         lambda *args, **kwargs: False,
     )
 
-    stop_event = asyncio.Event()
-    stop_event.set()
     stats = await threaded_worker.run_threaded_worker(
         FakeStore(),  # type: ignore[arg-type]
         settings=SimpleNamespace(shadow_cycle_interval_seconds=30.0),  # type: ignore[arg-type]
@@ -86,14 +101,14 @@ async def test_threaded_runtime_isolates_research_portfolio_and_certification(mo
     )
 
     assert [item["name"] for item in observed] == [
-        threaded_worker.RESEARCH_THREAD_NAME,
         threaded_worker.PORTFOLIO_THREAD_NAME,
-        threaded_worker.CERTIFICATION_THREAD_NAME,
+        threaded_worker.RESEARCH_THREAD_NAME,
     ]
     assert all(item["daemon"] is True for item in observed)
     assert all(item["started"] is True for item in observed)
     assert stats.worker_id == threaded_worker.THREAD_SUPERVISOR_WORKER_ID
-    assert heartbeats[0] == (threaded_worker.THREAD_SUPERVISOR_WORKER_ID, "running")
+    assert heartbeats[0] == (threaded_worker.THREAD_SUPERVISOR_WORKER_ID, "starting")
+    assert (threaded_worker.THREAD_SUPERVISOR_WORKER_ID, "running") in heartbeats
     assert heartbeats[-1] == (threaded_worker.THREAD_SUPERVISOR_WORKER_ID, "stopped")
 
 
@@ -195,8 +210,20 @@ async def test_portfolio_child_contains_no_forward_certification_work(monkeypatc
     assert "OperatingCertificationService" not in source
 
 
+def test_research_auxiliary_retains_full_certification_surface_without_third_thread():
+    source = inspect.getsource(worker_children.run_research_child)
+    supervisor_source = inspect.getsource(threaded_worker.run_threaded_worker)
+
+    assert "AllocationForwardCertificationService" in source
+    assert "OperatingCertificationService" in source
+    assert "run_certification_loop" in source
+    assert "allocation_certification_runner=certification_cycle" in source
+    assert "CERTIFICATION_THREAD_NAME" not in supervisor_source
+    assert "certification_thread" not in supervisor_source
+
+
 @pytest.mark.asyncio
-async def test_certification_child_retains_full_mechanism_surface(monkeypatch):
+async def test_manual_certification_child_still_retains_full_mechanism_surface(monkeypatch):
     created: dict[str, object] = {}
 
     class FakeUniversal:
