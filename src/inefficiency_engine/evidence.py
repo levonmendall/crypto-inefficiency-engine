@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, Column, ForeignKey, Index, Integer, MetaData, String, Table, Text, create_engine, func, insert, select, text
 from sqlalchemy.engine import Engine
 
+from inefficiency_engine.dex_shadow import DexRouteQuoteRecord, DexRouteShadowCycle, summarize_route_cycles
 from inefficiency_engine.models import FundingQuote, MarketQuote, Opportunity, OpportunityExecutability, OrderBookSnapshot, ShadowCycle
 
 
@@ -71,6 +72,8 @@ class PersistedCounts:
     executability: int
     shadow_cycles: int
     worker_heartbeats: int = 0
+    dex_route_quotes: int = 0
+    dex_route_shadow_cycles: int = 0
 
 
 def evidence_location_from_env(fallback_path: str | Path | None = None) -> str | Path | None:
@@ -157,11 +160,37 @@ class EvidenceStore:
             Column("observed_at", Text, nullable=False), Column("state", Text, nullable=False), Column("cycle_id", Text), Column("scan_id", Text),
             Column("error_type", Text), Column("payload_json", Text, nullable=False), Column("lineage_hash", String(64), nullable=False),
         )
+        self.dex_route_quotes = Table(
+            "dex_route_quotes", self.metadata,
+            Column("record_id", String(64), primary_key=True),
+            Column("cycle_id", String(64), nullable=False),
+            Column("phase", Text, nullable=False),
+            Column("horizon_seconds", Text, nullable=False),
+            Column("route_signature", Text, nullable=False),
+            Column("asset", Text, nullable=False),
+            Column("direction", Text, nullable=False),
+            Column("observed_at", Text, nullable=False),
+            Column("payload_json", Text, nullable=False),
+            Column("lineage_hash", String(64), nullable=False),
+        )
+        self.dex_route_shadow_cycles = Table(
+            "dex_route_shadow_cycles", self.metadata,
+            Column("cycle_id", String(64), primary_key=True),
+            Column("started_at", Text, nullable=False),
+            Column("completed_at", Text, nullable=False),
+            Column("initial_quote_count", Integer, nullable=False),
+            Column("payload_json", Text, nullable=False),
+            Column("lineage_hash", String(64), nullable=False),
+        )
         for name, table, column in [
             ("ix_funding_scan", self.funding_quotes, "scan_id"), ("ix_market_scan", self.market_quotes, "scan_id"),
             ("ix_opportunity_scan", self.opportunities, "scan_id"), ("ix_order_book_scan", self.order_books, "scan_id"),
             ("ix_executability_scan", self.executability, "scan_id"), ("ix_shadow_completed", self.shadow_cycles, "completed_at"),
             ("ix_worker_heartbeat_observed", self.worker_heartbeats, "observed_at"), ("ix_worker_heartbeat_worker", self.worker_heartbeats, "worker_id"),
+            ("ix_dex_route_quote_cycle", self.dex_route_quotes, "cycle_id"),
+            ("ix_dex_route_quote_signature", self.dex_route_quotes, "route_signature"),
+            ("ix_dex_route_quote_observed", self.dex_route_quotes, "observed_at"),
+            ("ix_dex_route_shadow_completed", self.dex_route_shadow_cycles, "completed_at"),
         ]:
             Index(name, getattr(table.c, column))
 
@@ -247,6 +276,66 @@ class EvidenceStore:
         return {"cycle_count": len(payloads), "observation_count": len(observations), "survived_count": survived,
                 "survival_rate": survived / len(observations) if observations else None, "outcomes": outcomes}
 
+    def record_dex_route_shadow_cycle(
+        self,
+        cycle: DexRouteShadowCycle,
+        records: list[DexRouteQuoteRecord],
+    ) -> str:
+        cycle_payload = _json(cycle)
+        rows: list[dict[str, object]] = []
+        for record in records:
+            payload = _json(record)
+            rows.append({
+                "record_id": record.record_id,
+                "cycle_id": record.cycle_id,
+                "phase": record.phase,
+                "horizon_seconds": str(record.horizon_seconds),
+                "route_signature": record.route_signature,
+                "asset": record.quote.asset,
+                "direction": record.quote.direction,
+                "observed_at": record.observed_at.isoformat(),
+                "payload_json": payload,
+                "lineage_hash": hashlib.sha256(payload.encode()).hexdigest(),
+            })
+        with self.engine.begin() as db:
+            db.execute(insert(self.dex_route_shadow_cycles), {
+                "cycle_id": cycle.cycle_id,
+                "started_at": cycle.started_at.isoformat(),
+                "completed_at": cycle.completed_at.isoformat(),
+                "initial_quote_count": cycle.initial_quote_count,
+                "payload_json": cycle_payload,
+                "lineage_hash": hashlib.sha256(cycle_payload.encode()).hexdigest(),
+            })
+            if rows:
+                db.execute(insert(self.dex_route_quotes), rows)
+        return cycle.cycle_id
+
+    def load_dex_route_shadow_cycle(self, cycle_id: str) -> DexRouteShadowCycle:
+        with self.engine.connect() as db:
+            payload = db.execute(
+                select(self.dex_route_shadow_cycles.c.payload_json).where(self.dex_route_shadow_cycles.c.cycle_id == cycle_id)
+            ).scalar_one_or_none()
+        if payload is None:
+            raise KeyError(f"unknown DEX route cycle_id: {cycle_id}")
+        return DexRouteShadowCycle.model_validate_json(payload)
+
+    def load_dex_route_quote_records(self, cycle_id: str) -> list[DexRouteQuoteRecord]:
+        with self.engine.connect() as db:
+            payloads = list(db.execute(
+                select(self.dex_route_quotes.c.payload_json)
+                .where(self.dex_route_quotes.c.cycle_id == cycle_id)
+                .order_by(self.dex_route_quotes.c.observed_at, self.dex_route_quotes.c.record_id)
+            ).scalars())
+        return [DexRouteQuoteRecord.model_validate_json(payload) for payload in payloads]
+
+    def dex_route_shadow_summary(self) -> dict[str, object]:
+        with self.engine.connect() as db:
+            payloads = list(db.execute(
+                select(self.dex_route_shadow_cycles.c.payload_json).order_by(self.dex_route_shadow_cycles.c.completed_at)
+            ).scalars())
+        cycles = [DexRouteShadowCycle.model_validate_json(payload) for payload in payloads]
+        return summarize_route_cycles(cycles)
+
     def record_worker_heartbeat(self, *, worker_id: str, state: str, cycle_id: str | None = None, scan_id: str | None = None,
                                 error_type: str | None = None, detail: dict[str, object] | None = None,
                                 observed_at: datetime | None = None) -> WorkerHeartbeat:
@@ -277,8 +366,11 @@ class EvidenceStore:
                 "backend": self.backend, "database_ok": self.ping(), "heartbeat_age_seconds": age, "latest_heartbeat": latest.model_dump(mode="json")}
 
     def counts(self) -> PersistedCounts:
-        tables = [self.scans, self.provider_statuses, self.funding_quotes, self.market_quotes, self.opportunities,
-                  self.order_books, self.executability, self.shadow_cycles, self.worker_heartbeats]
+        tables = [
+            self.scans, self.provider_statuses, self.funding_quotes, self.market_quotes, self.opportunities,
+            self.order_books, self.executability, self.shadow_cycles, self.worker_heartbeats,
+            self.dex_route_quotes, self.dex_route_shadow_cycles,
+        ]
         with self.engine.connect() as db:
             values = [int(db.execute(select(func.count()).select_from(table)).scalar_one()) for table in tables]
         return PersistedCounts(*values)

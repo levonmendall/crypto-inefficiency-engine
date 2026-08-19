@@ -76,18 +76,15 @@ def parse_velora_price_route(
     dst_decimals = int(route["destDecimals"])
     src_amount = int(src_raw) / (10 ** src_decimals)
     dst_amount = int(dst_raw) / (10 ** dst_decimals)
-    if direction == "buy_asset":
-        effective_price = src_amount / dst_amount
-        quote_currency = "USDC"
-    else:
-        effective_price = dst_amount / src_amount
-        quote_currency = "USDC"
+    if src_amount <= 0 or dst_amount <= 0:
+        raise ValueError("Velora priceRoute amounts must be positive")
+    effective_price = src_amount / dst_amount if direction == "buy_asset" else dst_amount / src_amount
     return DexRouteQuote(
         provider="Velora",
         network_id=int(route.get("network") or ETHEREUM_NETWORK_ID),
         chain_id="ethereum",
         asset=asset.upper(),
-        quote_currency=quote_currency,
+        quote_currency="USDC",
         direction=direction,
         source_token=str(route.get("srcToken") or ""),
         destination_token=str(route.get("destToken") or ""),
@@ -134,34 +131,27 @@ class VeloraPriceRouteAdapter:
             if owns:
                 await client.aclose()
 
-    async def quote(
+    async def quote_raw(
         self,
         asset: str,
         direction: Literal["buy_asset", "sell_asset"],
         *,
-        notional_usd: float,
-        reference_price: float,
+        source_amount_raw: str,
     ) -> DexRouteQuote:
         asset = asset.upper()
         if asset not in {"BTC", "ETH"}:
             raise ValueError(f"Velora route evidence does not support asset {asset}")
-        if notional_usd <= 0 or reference_price <= 0:
-            raise ValueError("notional_usd and reference_price must be positive")
+        if not source_amount_raw.isdigit() or int(source_amount_raw) <= 0:
+            raise ValueError("source_amount_raw must be a positive integer string")
         asset_spec = TOKENS[asset]
         usdc = TOKENS["USDC"]
-        if direction == "buy_asset":
-            src, dest = usdc, asset_spec
-            human_amount = notional_usd
-        else:
-            src, dest = asset_spec, usdc
-            human_amount = notional_usd / reference_price
-        raw_amount = max(1, int(human_amount * (10 ** src.decimals)))
+        src, dest = (usdc, asset_spec) if direction == "buy_asset" else (asset_spec, usdc)
         payload, latency_ms = await self._get({
             "srcToken": src.address,
             "srcDecimals": src.decimals,
             "destToken": dest.address,
             "destDecimals": dest.decimals,
-            "amount": str(raw_amount),
+            "amount": source_amount_raw,
             "side": "SELL",
             "network": ETHEREUM_NETWORK_ID,
             "version": "6.2",
@@ -172,6 +162,34 @@ class VeloraPriceRouteAdapter:
             asset=asset,
             direction=direction,
             request_latency_ms=latency_ms,
+        )
+
+    async def quote(
+        self,
+        asset: str,
+        direction: Literal["buy_asset", "sell_asset"],
+        *,
+        notional_usd: float,
+        reference_price: float,
+    ) -> DexRouteQuote:
+        asset = asset.upper()
+        if notional_usd <= 0 or reference_price <= 0:
+            raise ValueError("notional_usd and reference_price must be positive")
+        asset_spec = TOKENS.get(asset)
+        if asset_spec is None:
+            raise ValueError(f"Velora route evidence does not support asset {asset}")
+        usdc = TOKENS["USDC"]
+        src = usdc if direction == "buy_asset" else asset_spec
+        human_amount = notional_usd if direction == "buy_asset" else notional_usd / reference_price
+        raw_amount = str(max(1, int(human_amount * (10 ** src.decimals))))
+        return await self.quote_raw(asset, direction, source_amount_raw=raw_amount)
+
+    async def requote(self, initial: DexRouteQuote) -> DexRouteQuote:
+        """Re-quote the exact same source amount for survival measurement."""
+        return await self.quote_raw(
+            initial.asset,
+            initial.direction,
+            source_amount_raw=initial.source_amount_raw,
         )
 
     async def quotes_for_market(

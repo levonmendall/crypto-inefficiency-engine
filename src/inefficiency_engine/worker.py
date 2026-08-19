@@ -13,6 +13,7 @@ from inefficiency_engine.service import OpportunityService
 
 
 SleepFn = Callable[[float], Awaitable[None]]
+RouteShadowRunner = Callable[[], Awaitable[object]]
 
 
 @dataclass(frozen=True)
@@ -41,9 +42,16 @@ async def _interruptible_sleep(seconds: float, stop_event: asyncio.Event, sleep:
             task.result()
 
 
-async def run_shadow_worker(service: OpportunityService, store: EvidenceStore, *, worker_id: str | None = None,
-                            stop_event: asyncio.Event | None = None, sleep: SleepFn = asyncio.sleep,
-                            max_cycles: int | None = None) -> WorkerRunStats:
+async def run_shadow_worker(
+    service: OpportunityService,
+    store: EvidenceStore,
+    *,
+    worker_id: str | None = None,
+    stop_event: asyncio.Event | None = None,
+    sleep: SleepFn = asyncio.sleep,
+    max_cycles: int | None = None,
+    route_shadow_runner: RouteShadowRunner | None = None,
+) -> WorkerRunStats:
     worker_id = worker_id or default_worker_id()
     stop_event = stop_event or asyncio.Event()
     attempted = succeeded = failed = 0
@@ -51,29 +59,75 @@ async def run_shadow_worker(service: OpportunityService, store: EvidenceStore, *
     while not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
         attempted += 1
         store.record_worker_heartbeat(worker_id=worker_id, state="running", detail={"cycle_attempt": attempted})
-        try:
-            cycle = await service.run_shadow_cycle()
-        except Exception as exc:
+
+        if route_shadow_runner is None:
+            core_result = await asyncio.gather(service.run_shadow_cycle(), return_exceptions=True)
+            core_cycle = core_result[0]
+            route_cycle = None
+        else:
+            core_cycle, route_cycle = await asyncio.gather(
+                service.run_shadow_cycle(),
+                route_shadow_runner(),
+                return_exceptions=True,
+            )
+
+        if isinstance(core_cycle, BaseException):
             failed += 1
-            store.record_worker_heartbeat(worker_id=worker_id, state="error", error_type=type(exc).__name__,
-                                          detail={"cycle_attempt": attempted, "message": str(exc)[:500]})
+            detail = {"cycle_attempt": attempted, "message": str(core_cycle)[:500]}
+            if isinstance(route_cycle, BaseException):
+                detail["dex_route_shadow_error_type"] = type(route_cycle).__name__
+            elif route_cycle is not None:
+                detail["dex_route_shadow_completed"] = True
+            store.record_worker_heartbeat(
+                worker_id=worker_id,
+                state="error",
+                error_type=type(core_cycle).__name__,
+                detail=detail,
+            )
             if max_cycles is None or attempted < max_cycles:
                 await _interruptible_sleep(service.settings.worker_error_backoff_seconds, stop_event, sleep)
             continue
+
         succeeded += 1
-        survived = sum(1 for obs in cycle.observations if obs.survived)
-        store.record_worker_heartbeat(worker_id=worker_id, state="success", cycle_id=cycle.cycle_id,
-                                      scan_id=cycle.verification_scan_id,
-                                      detail={"cycle_attempt": attempted, "observation_count": len(cycle.observations), "survived_count": survived})
+        survived = sum(1 for obs in core_cycle.observations if obs.survived)
+        detail: dict[str, object] = {
+            "cycle_attempt": attempted,
+            "observation_count": len(core_cycle.observations),
+            "survived_count": survived,
+        }
+        if isinstance(route_cycle, BaseException):
+            # DEX route evidence is a separate family and cannot poison a valid
+            # core CEX shadow cycle.
+            detail["dex_route_shadow_error_type"] = type(route_cycle).__name__
+        elif route_cycle is not None:
+            route_observations = getattr(route_cycle, "observations", [])
+            detail["dex_route_shadow_cycle_id"] = getattr(route_cycle, "cycle_id", None)
+            detail["dex_route_shadow_observation_count"] = len(route_observations)
+            detail["dex_route_shadow_survived_count"] = sum(
+                1 for obs in route_observations if getattr(obs, "survived", False)
+            )
+
+        store.record_worker_heartbeat(
+            worker_id=worker_id,
+            state="success",
+            cycle_id=core_cycle.cycle_id,
+            scan_id=core_cycle.verification_scan_id,
+            detail=detail,
+        )
         if not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
             await _interruptible_sleep(service.settings.shadow_cycle_interval_seconds, stop_event, sleep)
     final_state = "stopped" if stop_event.is_set() else "completed"
-    store.record_worker_heartbeat(worker_id=worker_id, state=final_state,
-                                  detail={"cycles_attempted": attempted, "cycles_succeeded": succeeded, "cycles_failed": failed})
+    store.record_worker_heartbeat(
+        worker_id=worker_id,
+        state=final_state,
+        detail={"cycles_attempted": attempted, "cycles_succeeded": succeeded, "cycles_failed": failed},
+    )
     return WorkerRunStats(worker_id, attempted, succeeded, failed)
 
 
 async def run_forever(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
+    from inefficiency_engine.universal_service import UniversalOpportunityService
+
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -81,4 +135,10 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
             loop.add_signal_handler(sig, stop_event.set)
         except (NotImplementedError, RuntimeError):
             pass
-    return await run_shadow_worker(service, store, stop_event=stop_event)
+    universal = UniversalOpportunityService(service)
+    return await run_shadow_worker(
+        service,
+        store,
+        stop_event=stop_event,
+        route_shadow_runner=universal.run_dex_route_shadow_cycle,
+    )
