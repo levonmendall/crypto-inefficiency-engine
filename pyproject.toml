@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-inefficiency-engine"
-version = "3.5.6"
-description = "Paper-first crypto opportunity engine with process-isolated research, provider-level timeout isolation, canonical portfolio supervision, disposable hard-timeout allocation/certification stages, persistent $250,000 compounding accounting, mobile Portfolio Command Center, canonical realized multi-leg settlement, observed funding accrual, forward-evidence health telemetry, and progressive profitability certification."
+version = "3.5.7"
+description = "Paper-first crypto opportunity engine with lean process-isolated research/portfolio workers, provider-level timeout isolation, canonical portfolio supervision, persistent $250,000 compounding accounting, mobile Portfolio Command Center, canonical realized multi-leg settlement, observed funding accrual, forward-evidence health telemetry, and progressive profitability certification."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
