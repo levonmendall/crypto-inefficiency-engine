@@ -8,7 +8,6 @@ from sqlalchemy import select
 from inefficiency_engine.canonical_paper_portfolio import (
     CANONICAL_INITIAL_CAPITAL_USD,
     CANONICAL_PORTFOLIO_ID,
-    CanonicalPaperPortfolioService,
     CanonicalPortfolioEvent,
 )
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
@@ -16,6 +15,7 @@ from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.expanded_alpha_factory import ExpandedAlphaFactoryService
 from inefficiency_engine.operating_worker import PORTFOLIO_WORKER_ID
+from inefficiency_engine.resilient_paper_portfolio import OperationallyResilientPaperPortfolioService
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.unified_allocation import UnifiedPaperAllocatorService
 from inefficiency_engine.universal_service import UniversalOpportunityService
@@ -27,16 +27,16 @@ def build_canonical_paper_portfolio_router(
     service: OpportunityService,
 ) -> APIRouter:
     router = APIRouter()
-    portfolio: CanonicalPaperPortfolioService | None = None
+    portfolio: OperationallyResilientPaperPortfolioService | None = None
     if evidence_store is not None:
         universal = UniversalOpportunityService(service)
         composite = CexDexCompositeEvidenceService(service, universal=universal)
         promotion = CexDexPaperPromotionService(service, composite, evidence_store)
         alpha_factory = ExpandedAlphaFactoryService(service, evidence_store)
         unified = UnifiedPaperAllocatorService(service, promotion, alpha_factory)
-        portfolio = CanonicalPaperPortfolioService(service, unified, evidence_store)
+        portfolio = OperationallyResilientPaperPortfolioService(service, unified, evidence_store)
 
-    def require_portfolio() -> CanonicalPaperPortfolioService:
+    def require_portfolio() -> OperationallyResilientPaperPortfolioService:
         if portfolio is None:
             raise HTTPException(status_code=503, detail="evidence persistence is not configured")
         return portfolio
@@ -61,41 +61,93 @@ def build_canonical_paper_portfolio_router(
     def canonical_portfolio_runtime_status():
         engine = require_portfolio()
         now = datetime.now(timezone.utc)
-        latest = engine.ledger.latest_snapshot()
+        account = engine.ledger.latest_snapshot()
+        integrity = engine.integrity.latest()
         heartbeat = engine.store.latest_worker_heartbeat(PORTFOLIO_WORKER_ID)
         expected_interval = max(60.0, service.settings.shadow_cycle_interval_seconds * 10.0)
         stale_after = max(600.0, expected_interval * 2.5)
-        snapshot_age = (
-            max(0.0, (now - latest.observed_at).total_seconds()) if latest is not None else None
+
+        account_age = (
+            max(0.0, (now - account.observed_at).total_seconds()) if account is not None else None
+        )
+        market_age = (
+            max(0.0, (now - integrity.market_evidence_at).total_seconds())
+            if integrity is not None and integrity.market_evidence_at is not None else None
         )
         heartbeat_age = (
             max(0.0, (now - heartbeat.observed_at).total_seconds()) if heartbeat is not None else None
         )
-        heartbeat_recent = heartbeat is not None and heartbeat_age is not None and heartbeat_age <= stale_after
-        portfolio_failed = bool(
-            heartbeat is not None
-            and heartbeat.detail.get("portfolio_error_type")
+        heartbeat_recent = bool(
+            heartbeat is not None and heartbeat_age is not None and heartbeat_age <= stale_after
         )
-        snapshot_fresh = latest is not None and snapshot_age is not None and snapshot_age <= stale_after
+        accounting_fresh = bool(
+            account is not None and account_age is not None and account_age <= stale_after
+        )
+        valuation_status = integrity.valuation_status if integrity is not None else "unavailable"
+        valuation_fresh = bool(
+            integrity is not None
+            and (
+                valuation_status == "cash_only"
+                or (
+                    valuation_status == "fresh"
+                    and market_age is not None
+                    and market_age <= stale_after
+                )
+            )
+        )
+        cycle_failed = bool(integrity is not None and integrity.cycle_status == "failed")
         operational = bool(
             heartbeat_recent
             and heartbeat is not None
             and heartbeat.state not in {"error", "stopped"}
-            and not portfolio_failed
-            and snapshot_fresh
+            and accounting_fresh
+            and valuation_fresh
+            and not cycle_failed
         )
+        degraded = bool(
+            (heartbeat is not None and heartbeat.state == "degraded")
+            or (integrity is not None and integrity.cycle_status == "degraded")
+            or (account is not None and not valuation_fresh)
+        )
+
         return {
             "portfolio_id": CANONICAL_PORTFOLIO_ID,
             "paper_only": True,
             "operational": operational,
-            "degraded": bool(heartbeat is not None and heartbeat.state == "degraded"),
+            "degraded": degraded,
             "expected_cycle_interval_seconds": expected_interval,
             "stale_after_seconds": stale_after,
-            "snapshot_fresh": snapshot_fresh,
-            "snapshot_age_seconds": snapshot_age,
-            "latest_snapshot_observed_at": latest.observed_at if latest is not None else None,
+            "snapshot_fresh": accounting_fresh,
+            "accounting_snapshot_fresh": accounting_fresh,
+            "snapshot_age_seconds": account_age,
+            "latest_snapshot_observed_at": account.observed_at if account is not None else None,
+            "valuation_status": valuation_status,
+            "valuation_fresh": valuation_fresh,
+            "market_evidence_observed_at": (
+                integrity.market_evidence_at if integrity is not None else None
+            ),
+            "market_evidence_age_seconds": market_age,
+            "cycle_status": integrity.cycle_status if integrity is not None else None,
+            "fallback_snapshot": integrity.fallback_snapshot if integrity is not None else False,
+            "cycle_error_type": integrity.cycle_error_type if integrity is not None else None,
+            "stale_position_count": integrity.stale_position_count if integrity is not None else None,
+            "allocation_family_failures": (
+                list(integrity.allocation_family_failures) if integrity is not None else []
+            ),
+            "market_snapshot_id": integrity.market_snapshot_id if integrity is not None else None,
             "heartbeat_age_seconds": heartbeat_age,
             "heartbeat": heartbeat.model_dump(mode="json") if heartbeat is not None else None,
+        }
+
+    @router.get("/v3/portfolio/integrity/history")
+    def canonical_portfolio_integrity_history(limit: int = 100):
+        engine = require_portfolio()
+        rows = engine.integrity.history(limit=limit)
+        return {
+            "portfolio_id": CANONICAL_PORTFOLIO_ID,
+            "paper_only": True,
+            "count": len(rows),
+            "integrity": [row.model_dump(mode="json") for row in rows],
         }
 
     @router.get("/v3/portfolio/performance")
@@ -176,9 +228,11 @@ def build_canonical_paper_portfolio_router(
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"canonical paper portfolio cycle failed: {type(exc).__name__}") from exc
         latest = engine.ledger.latest_snapshot()
+        integrity = engine.integrity.latest()
         return {
             "cycle": cycle.model_dump(mode="json"),
             "portfolio": latest.model_dump(mode="json") if latest is not None else None,
+            "integrity": integrity.model_dump(mode="json") if integrity is not None else None,
         }
 
     return router
