@@ -19,6 +19,8 @@ from inefficiency_engine.unified_allocation import UnifiedPaperAllocation, Unifi
 CANONICAL_PORTFOLIO_ID = "crypto-opportunity-engine-paper-portfolio"
 CANONICAL_INITIAL_CAPITAL_USD = 250_000.0
 PortfolioEventType = Literal["genesis", "open", "mark", "close", "skip"]
+ValuationStatus = Literal["cash_only", "fresh", "partial", "stale", "unavailable"]
+PortfolioCycleStatus = Literal["accounting_only", "success", "degraded", "failed"]
 
 
 def _now() -> datetime:
@@ -75,6 +77,7 @@ class CanonicalPaperPosition(BaseModel):
     notional_usd: float = Field(gt=0)
     entry_reference_price: float = Field(gt=0)
     current_reference_price: float = Field(gt=0)
+    valuation_observed_at: datetime | None = None
     modeled_roundtrip_cost_return: float = Field(ge=0)
     unrealized_pnl_usd: float
     paper_only: bool = True
@@ -83,6 +86,13 @@ class CanonicalPaperPosition(BaseModel):
 class CanonicalPaperPortfolioSnapshot(BaseModel):
     portfolio_id: str = CANONICAL_PORTFOLIO_ID
     observed_at: datetime
+    market_evidence_observed_at: datetime | None = None
+    valuation_status: ValuationStatus = "unavailable"
+    cycle_status: PortfolioCycleStatus = "accounting_only"
+    fallback_snapshot: bool = False
+    cycle_error_type: str | None = None
+    allocation_family_failures: dict[str, str] = Field(default_factory=dict)
+    stale_position_count: int = Field(default=0, ge=0)
     initial_capital_usd: float = CANONICAL_INITIAL_CAPITAL_USD
     cash_usd: float
     reserved_capital_usd: float = Field(ge=0)
@@ -110,9 +120,15 @@ class CanonicalPaperPortfolioCycle(BaseModel):
     opened_position_count: int = Field(ge=0)
     closed_position_count: int = Field(ge=0)
     marked_position_count: int = Field(ge=0)
+    stale_position_count: int = Field(default=0, ge=0)
     skipped_allocation_count: int = Field(ge=0)
     nav_usd: float
     cash_usd: float
+    valuation_status: ValuationStatus = "unavailable"
+    degraded: bool = False
+    allocation_error_type: str | None = None
+    allocation_family_failures: dict[str, str] = Field(default_factory=dict)
+    market_snapshot_id: str | None = None
     paper_only: bool = True
 
 
@@ -327,6 +343,7 @@ class CanonicalPaperPortfolioLedger:
                 notional_usd=event.notional_usd,
                 entry_reference_price=event.entry_reference_price,
                 current_reference_price=current,
+                valuation_observed_at=mark.observed_at,
                 modeled_roundtrip_cost_return=event.modeled_roundtrip_cost_return,
                 unrealized_pnl_usd=pnl,
             ))
@@ -337,8 +354,12 @@ class CanonicalPaperPortfolioLedger:
         peak = max(historical_peak, nav)
         drawdown = max(0.0, (peak - nav) / peak) if peak > 0 else 0.0
         max_drawdown = max(historical_max_dd, drawdown)
+        valuation_status: ValuationStatus = "cash_only" if not positions else "stale"
         return CanonicalPaperPortfolioSnapshot(
             observed_at=observed_at or _now(),
+            valuation_status=valuation_status,
+            cycle_status="accounting_only",
+            stale_position_count=len(positions),
             cash_usd=cash,
             reserved_capital_usd=reserved,
             unrealized_pnl_usd=unrealized,
@@ -361,10 +382,11 @@ class CanonicalPaperPortfolioLedger:
 class CanonicalPaperPortfolioService:
     """Compounding paper account driven only by already-qualified allocator decisions.
 
-    V3.2 opens only positions whose forward settlement is currently defensible:
-    spot directional-long alpha with an exact venue/symbol entry reference and a
-    known point-in-time round-trip cost model. Unsupported allocator choices are
-    recorded as skips rather than turned into fictional portfolio P&L.
+    The portfolio opens only positions whose forward settlement is currently
+    defensible: spot directional-long alpha with an exact venue/symbol entry
+    reference and a known point-in-time round-trip cost model. Unsupported or
+    degraded opportunity families remain fail-closed without freezing accounting
+    for the rest of the portfolio.
     """
 
     def __init__(
@@ -475,11 +497,12 @@ class CanonicalPaperPortfolioService:
         snapshot = await self.core.collect_live_executability()
         quote_index = self._quote_index(snapshot)
         state = self.ledger.current_state(observed_at=snapshot.completed_at)
-        closed = marked = opened = skipped = 0
+        closed = marked = opened = skipped = stale_positions = 0
 
         for position in state.positions:
             quote = self._quote_for(position, quote_index)
             if quote is None:
+                stale_positions += 1
                 continue
             if position.due_at <= snapshot.completed_at:
                 self.ledger.record_event(self._close_event(position, quote, observed_at=snapshot.completed_at))
@@ -491,17 +514,83 @@ class CanonicalPaperPortfolioService:
         after_close = self.ledger.current_state(observed_at=snapshot.completed_at)
         cash_available = max(0.0, after_close.cash_usd)
         open_keys = {self._position_key(position) for position in after_close.positions}
+        allocation_error_type: str | None = None
+        allocation_family_failures: dict[str, str] = {}
+        plan_degraded = False
+
         if cash_available > 0:
-            plan = await self.allocator.allocate(total_capital_usd=cash_available)
-            remaining_cash = cash_available
-            for allocation in plan.allocations:
-                supported, reason = self._support_reason(allocation)
-                venue = allocation.venues[0] if allocation.venues else None
-                symbol = allocation.instrument_symbol
-                if not supported:
+            try:
+                plan = await self.allocator.allocate(total_capital_usd=cash_available)
+            except Exception as exc:
+                allocation_error_type = type(exc).__name__
+                plan = None
+
+            if plan is not None:
+                allocation_family_failures = dict(getattr(plan, "family_failures", {}) or {})
+                plan_degraded = bool(getattr(plan, "degraded", False))
+                remaining_cash = cash_available
+                for allocation in plan.allocations:
+                    supported, reason = self._support_reason(allocation)
+                    venue = allocation.venues[0] if allocation.venues else None
+                    symbol = allocation.instrument_symbol
+                    if not supported:
+                        self.ledger.record_event(CanonicalPortfolioEvent(
+                            event_type="skip",
+                            observed_at=plan.observed_at,
+                            candidate_id=allocation.candidate_id,
+                            family=allocation.family,
+                            strategy=allocation.strategy,
+                            asset=allocation.asset,
+                            venue=venue,
+                            symbol=symbol,
+                            market_kind=allocation.instrument_market_kind,
+                            exposure_kind=allocation.exposure_kind,
+                            reason=reason,
+                        ))
+                        skipped += 1
+                        continue
+                    assert venue is not None and symbol is not None
+                    if (venue, symbol) in open_keys:
+                        self.ledger.record_event(CanonicalPortfolioEvent(
+                            event_type="skip",
+                            observed_at=plan.observed_at,
+                            candidate_id=allocation.candidate_id,
+                            family=allocation.family,
+                            strategy=allocation.strategy,
+                            asset=allocation.asset,
+                            venue=venue,
+                            symbol=symbol,
+                            market_kind=allocation.instrument_market_kind,
+                            exposure_kind=allocation.exposure_kind,
+                            reason="canonical portfolio already has an open position in this venue/symbol",
+                        ))
+                        skipped += 1
+                        continue
+                    capital = allocation.capital_required_usd
+                    if capital > remaining_cash + 1e-9:
+                        self.ledger.record_event(CanonicalPortfolioEvent(
+                            event_type="skip",
+                            observed_at=plan.observed_at,
+                            candidate_id=allocation.candidate_id,
+                            family=allocation.family,
+                            strategy=allocation.strategy,
+                            asset=allocation.asset,
+                            venue=venue,
+                            symbol=symbol,
+                            reason="insufficient canonical paper cash after existing open positions",
+                        ))
+                        skipped += 1
+                        continue
+                    assert allocation.entry_reference_price is not None
+                    assert allocation.modeled_roundtrip_cost_return is not None
+                    assert allocation.modeled_holding_hours is not None
+                    position_id = uuid.uuid4().hex
+                    due_at = (allocation.source_observed_at or plan.observed_at) + timedelta(hours=allocation.modeled_holding_hours)
+                    initial_unrealized = -allocation.notional_usd_per_leg * allocation.modeled_roundtrip_cost_return
                     self.ledger.record_event(CanonicalPortfolioEvent(
-                        event_type="skip",
+                        event_type="open",
                         observed_at=plan.observed_at,
+                        position_id=position_id,
                         candidate_id=allocation.candidate_id,
                         family=allocation.family,
                         strategy=allocation.strategy,
@@ -510,90 +599,65 @@ class CanonicalPaperPortfolioService:
                         symbol=symbol,
                         market_kind=allocation.instrument_market_kind,
                         exposure_kind=allocation.exposure_kind,
-                        reason=reason,
+                        cash_delta_usd=-capital,
+                        capital_reserved_usd=capital,
+                        notional_usd=allocation.notional_usd_per_leg,
+                        entry_reference_price=allocation.entry_reference_price,
+                        reference_price=allocation.entry_reference_price,
+                        due_at=due_at,
+                        modeled_roundtrip_cost_return=allocation.modeled_roundtrip_cost_return,
+                        unrealized_pnl_usd=initial_unrealized,
+                        reason="qualified allocator decision opened in canonical paper portfolio",
+                        details={
+                            "expected_profit_usd": allocation.expected_profit_usd_per_deployment,
+                            "expected_return_on_reserved_capital": allocation.expected_return_on_reserved_capital,
+                            "source_return_metric": allocation.source_return_metric,
+                            "source_return_value": allocation.source_return_value,
+                        },
                     ))
-                    skipped += 1
-                    continue
-                assert venue is not None and symbol is not None
-                if (venue, symbol) in open_keys:
-                    self.ledger.record_event(CanonicalPortfolioEvent(
-                        event_type="skip",
-                        observed_at=plan.observed_at,
-                        candidate_id=allocation.candidate_id,
-                        family=allocation.family,
-                        strategy=allocation.strategy,
-                        asset=allocation.asset,
-                        venue=venue,
-                        symbol=symbol,
-                        market_kind=allocation.instrument_market_kind,
-                        exposure_kind=allocation.exposure_kind,
-                        reason="canonical portfolio already has an open position in this venue/symbol",
-                    ))
-                    skipped += 1
-                    continue
-                capital = allocation.capital_required_usd
-                if capital > remaining_cash + 1e-9:
-                    self.ledger.record_event(CanonicalPortfolioEvent(
-                        event_type="skip",
-                        observed_at=plan.observed_at,
-                        candidate_id=allocation.candidate_id,
-                        family=allocation.family,
-                        strategy=allocation.strategy,
-                        asset=allocation.asset,
-                        venue=venue,
-                        symbol=symbol,
-                        reason="insufficient canonical paper cash after existing open positions",
-                    ))
-                    skipped += 1
-                    continue
-                assert allocation.entry_reference_price is not None
-                assert allocation.modeled_roundtrip_cost_return is not None
-                assert allocation.modeled_holding_hours is not None
-                position_id = uuid.uuid4().hex
-                due_at = (allocation.source_observed_at or plan.observed_at) + timedelta(hours=allocation.modeled_holding_hours)
-                initial_unrealized = -allocation.notional_usd_per_leg * allocation.modeled_roundtrip_cost_return
-                self.ledger.record_event(CanonicalPortfolioEvent(
-                    event_type="open",
-                    observed_at=plan.observed_at,
-                    position_id=position_id,
-                    candidate_id=allocation.candidate_id,
-                    family=allocation.family,
-                    strategy=allocation.strategy,
-                    asset=allocation.asset,
-                    venue=venue,
-                    symbol=symbol,
-                    market_kind=allocation.instrument_market_kind,
-                    exposure_kind=allocation.exposure_kind,
-                    cash_delta_usd=-capital,
-                    capital_reserved_usd=capital,
-                    notional_usd=allocation.notional_usd_per_leg,
-                    entry_reference_price=allocation.entry_reference_price,
-                    reference_price=allocation.entry_reference_price,
-                    due_at=due_at,
-                    modeled_roundtrip_cost_return=allocation.modeled_roundtrip_cost_return,
-                    unrealized_pnl_usd=initial_unrealized,
-                    reason="qualified allocator decision opened in canonical paper portfolio",
-                    details={
-                        "expected_profit_usd": allocation.expected_profit_usd_per_deployment,
-                        "expected_return_on_reserved_capital": allocation.expected_return_on_reserved_capital,
-                        "source_return_metric": allocation.source_return_metric,
-                        "source_return_value": allocation.source_return_value,
-                    },
-                ))
-                remaining_cash -= capital
-                open_keys.add((venue, symbol))
-                opened += 1
+                    remaining_cash -= capital
+                    open_keys.add((venue, symbol))
+                    opened += 1
 
         final_state = self.ledger.current_state(observed_at=snapshot.completed_at)
+        if final_state.open_position_count == 0:
+            valuation_status: ValuationStatus = "cash_only"
+        elif stale_positions == 0:
+            valuation_status = "fresh"
+        elif stale_positions < final_state.open_position_count:
+            valuation_status = "partial"
+        else:
+            valuation_status = "stale"
+        degraded = bool(
+            stale_positions
+            or allocation_error_type
+            or allocation_family_failures
+            or plan_degraded
+        )
+        final_state = final_state.model_copy(update={
+            "market_evidence_observed_at": snapshot.completed_at,
+            "valuation_status": valuation_status,
+            "cycle_status": "degraded" if degraded else "success",
+            "fallback_snapshot": False,
+            "cycle_error_type": allocation_error_type,
+            "allocation_family_failures": allocation_family_failures,
+            "stale_position_count": stale_positions,
+        })
         self.ledger.record_snapshot(final_state)
         return CanonicalPaperPortfolioCycle(
             observed_at=snapshot.completed_at,
             opened_position_count=opened,
             closed_position_count=closed,
             marked_position_count=marked,
+            stale_position_count=stale_positions,
             skipped_allocation_count=skipped,
             nav_usd=final_state.nav_usd,
             cash_usd=final_state.cash_usd,
+            valuation_status=valuation_status,
+            degraded=degraded,
+            allocation_error_type=allocation_error_type,
+            allocation_family_failures=allocation_family_failures,
+            market_snapshot_id=snapshot.scan_id,
         )
 
     def performance_summary(self) -> dict[str, object]:
@@ -627,6 +691,13 @@ class CanonicalPaperPortfolioService:
             "positive_snapshot_rate": sum(value > 0 for value in returns) / len(returns) if returns else None,
             "pnl_by_mechanism_usd": latest.pnl_by_mechanism_usd,
             "pnl_by_strategy_usd": latest.pnl_by_strategy_usd,
+            "market_evidence_observed_at": latest.market_evidence_observed_at,
+            "valuation_status": latest.valuation_status,
+            "cycle_status": latest.cycle_status,
+            "fallback_snapshot": latest.fallback_snapshot,
+            "cycle_error_type": latest.cycle_error_type,
+            "allocation_family_failures": latest.allocation_family_failures,
+            "stale_position_count": latest.stale_position_count,
             "paper_only": True,
             "live_execution_authority": False,
         }
