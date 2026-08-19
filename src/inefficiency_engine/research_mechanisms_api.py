@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 from inefficiency_engine import __version__
 from inefficiency_engine.alpha_coverage_strategies import EventLedger
 from inefficiency_engine.canonical_paper_portfolio_api import build_canonical_paper_portfolio_router
-from inefficiency_engine.dashboard import build_dashboard_router
+from inefficiency_engine.dashboard_integrity import build_dashboard_router
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.operating_certification_api import build_operating_certification_router
 from inefficiency_engine.research_mechanisms import (
@@ -93,6 +93,7 @@ def build_research_mechanisms_router(*, evidence_store: EvidenceStore | None, se
         return {
             "paper_only": True,
             "allocation_authority": False,
+            "execution_authority": False,
             "count": len(rows),
             "candidates": [row.model_dump(mode="json") for row in rows],
         }
