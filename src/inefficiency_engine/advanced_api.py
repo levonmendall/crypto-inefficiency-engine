@@ -3,7 +3,6 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from inefficiency_engine import __version__
-from inefficiency_engine.alpha_factory import AlphaFactoryService
 from inefficiency_engine.cex_dex_composite_statistics import CompositeEdgeStatisticalService
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_operations import (
@@ -15,6 +14,7 @@ from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeLedger
 from inefficiency_engine.completion import paper_v1_status
 from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import EvidenceStore
+from inefficiency_engine.expanded_alpha_factory import ExpandedAlphaFactoryService
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
 from inefficiency_engine.stablecoin_depth_shadow import (
@@ -52,7 +52,7 @@ def build_advanced_router(
         if evidence_store is not None
         else None
     )
-    alpha_factory = AlphaFactoryService(service, evidence_store) if evidence_store is not None else None
+    alpha_factory = ExpandedAlphaFactoryService(service, evidence_store) if evidence_store is not None else None
     unified = (
         UnifiedPaperAllocatorService(service, promotion, alpha_factory)
         if promotion is not None
@@ -68,6 +68,7 @@ def build_advanced_router(
         status = paper_v1_status(__version__).model_dump(mode="json")
         status["universal_alpha_factory_available"] = alpha_factory is not None
         status["predictive_alpha_live_execution_available"] = False
+        status["predictive_alpha_strategy_count"] = len(alpha_factory.manifests()) if alpha_factory is not None else 0
         return status
 
     @router.get("/v2/alpha/strategies")
@@ -86,6 +87,12 @@ def build_advanced_router(
         require_store()
         assert alpha_factory is not None
         return alpha_factory.ledger.summary()
+
+    @router.get("/v2/alpha/fundamentals/summary")
+    def alpha_fundamental_summary():
+        require_store()
+        assert alpha_factory is not None
+        return alpha_factory.fundamental_summary()
 
     @router.post("/v2/alpha/evidence/cycle")
     async def alpha_evidence_cycle(capital_usd: float = 100000.0):
