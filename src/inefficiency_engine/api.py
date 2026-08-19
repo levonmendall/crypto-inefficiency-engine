@@ -94,6 +94,20 @@ async def stablecoins_live():
             "observations":[item.model_dump(mode="json") for item in surface.conversion_observations],
             "conversion_edges":[item.model_dump(mode="json") for item in surface.conversion_edges]}
 
+@app.get("/v1/dex/route-quotes/live")
+async def dex_route_quotes_live():
+    try:
+        surface = await universal_service.collect_surface()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"DEX route quote scan failed: {type(exc).__name__}") from exc
+    return {
+        "paper_only": True,
+        "transaction_building": False,
+        "execution_authority": False,
+        "count": len(surface.dex_route_quotes),
+        "quotes": [item.model_dump(mode="json") for item in surface.dex_route_quotes],
+    }
+
 @app.get("/v1/allocation/live")
 async def paper_allocation(capital_usd: float = 100000.0, max_venue_fraction: float | None = None,
                            max_asset_fraction: float | None = None, max_allocations: int | None = None):
