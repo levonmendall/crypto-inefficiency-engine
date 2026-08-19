@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
+from inefficiency_engine import __version__
 from inefficiency_engine.alpha_coverage_strategies import EventLedger
 from inefficiency_engine.evidence import EvidenceStore
+from inefficiency_engine.operating_certification_api import build_operating_certification_router
 from inefficiency_engine.research_mechanisms import (
     CapitalLocationResearchService,
     DistressResearchService,
@@ -131,4 +133,9 @@ def build_research_mechanisms_router(*, evidence_store: EvidenceStore | None, se
             "simulations": [row.model_dump(mode="json") for row in rows],
         }
 
+    router.include_router(build_operating_certification_router(
+        version=__version__,
+        evidence_store=evidence_store,
+        service=service,
+    ))
     return router
