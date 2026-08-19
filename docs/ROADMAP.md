@@ -54,7 +54,7 @@
 - Direct/two-hop conversion paths, directional normalization, spread embedded once, depeg risk charged separately.
 - Missing/stale conversion evidence fails closed.
 
-### v0.10.5 — amount-specific stablecoin conversion depth — current
+### v0.10.5 — amount-specific stablecoin conversion depth — complete
 - Public Coinbase Exchange level-2 `USDC-USD` and `USDT-USD` books.
 - Exact source-amount visible-depth reconstruction for both directions.
 - USDC↔USDT two-hop conversions carry the actual intermediate USD amount.
@@ -63,15 +63,29 @@
 - Read-only stablecoin depth-quote API.
 - `visible_depth_only=true`, `capacity_claimed=false`, `executable_eligible=false`.
 
+### same-notional CEX↔DEX composite evidence — complete
+- Each quoted DEX route tier is joined to stablecoin conversion depth and CEX hedge economics at the same economic amount.
+- DEX-sell proceeds and DEX-buy hedge proceeds use the exact directional conversion-depth output.
+- CEX taker fees, DEX gas and stablecoin depeg/risk haircuts are charged separately without double-counting conversion spread/slippage.
+- Incomplete depth/fee rows fail independently; complete rows remain research-only.
+
+### v0.10.6 — DEX statistical research qualification — current
+- Independent DEX route cycles, not repeated horizons, define effective sample size.
+- Route survival and repeated frontier acceptance use 95% Wilson confidence intervals by default.
+- Confidence-width, minimum-effective-sample and adverse-tail-sample gates are mandatory.
+- p95 adverse route deterioration must remain below a configured ceiling.
+- Qualification is asset, direction, notional and horizon specific; evidence at one capital tier cannot certify another tier.
+- A live same-notional composite row can become `research_qualified=true` only after both current economics and historical statistical gates pass.
+- Research qualification still has `capacity_claimed=false`, `allocation_eligible=false` and `executable_eligible=false`.
+
 ### Next v0.10 evidence work
-1. Join DEX route-size points with amount-specific stablecoin conversion-depth quotes at the **same notional**.
-2. Persist conversion-depth observations and build conversion survival/size evidence rather than relying on one live quote.
-3. Include gas and conversion-depth economics in a unified CEX↔DEX evidence object.
-4. Add cross-venue inventory/settlement and hedge-recovery models before CEX↔DEX can enter paper allocation.
-5. Require statistical confidence/effective-sample gates before any DEX evidence can influence capital decisions.
-6. Add authoritative bridge quote evidence only when a reliable supported source exists.
-7. Add option L2 and hedge-aware execution economics before options can enter allocation.
-8. Add authoritative liquidation/solver feeds before those families can enter allocation.
+1. Extend multi-horizon route shadowing across the larger $5k/$10k/$25k frontier tiers so those tiers can accumulate their own independent statistical evidence.
+2. Persist composite CEX↔DEX observations so net-edge survival can be calibrated directly rather than combining current economics with route-only history.
+3. Build cross-venue inventory/settlement state and explicit atomic hedge/recovery models before CEX↔DEX can enter paper allocation.
+4. Add stablecoin conversion-depth shadow/persistence evidence and effective sample gates.
+5. Add authoritative bridge quote evidence only when a reliable supported source exists.
+6. Add option L2 and hedge-aware execution economics before options can enter allocation.
+7. Add authoritative liquidation/solver feeds before those families can enter allocation.
 
 ## Milestone 6 — Tiny-capital controlled execution — blocked
 Separate service, credentials, explicit authorization, hard caps, paired-leg hedge recovery, concentration limits, dead-man switch and kill switch. Remains blocked until accumulated shadow evidence is statistically convincing and live execution is separately authorized.

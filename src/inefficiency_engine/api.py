@@ -3,7 +3,9 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 
 from inefficiency_engine import __version__
+from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.config import Settings
+from inefficiency_engine.dex_statistics import DexStatisticalQualificationService
 from inefficiency_engine.evidence import build_evidence_store
 from inefficiency_engine.replay import replay_scan
 from inefficiency_engine.service import OpportunityService
@@ -17,6 +19,20 @@ app = FastAPI(title="Crypto Inefficiency Engine", version=__version__)
 service = OpportunityService(settings=settings, evidence_store=evidence_store)
 universal_service = UniversalOpportunityService(service)
 conversion_depth_service = StablecoinConversionDepthService(settings)
+cex_dex_composite_service = CexDexCompositeEvidenceService(
+    service,
+    universal=universal_service,
+    conversion_depth=conversion_depth_service,
+)
+dex_statistical_service = (
+    DexStatisticalQualificationService(
+        evidence_store,
+        settings,
+        composite_service=cex_dex_composite_service,
+    )
+    if evidence_store is not None
+    else None
+)
 
 @app.get("/health")
 def health():
@@ -145,6 +161,42 @@ def dex_route_frontier_summary():
     if evidence_store is None:
         raise HTTPException(status_code=503, detail="evidence persistence is not configured")
     return evidence_store.dex_route_size_frontier_summary()
+
+@app.get("/v1/cex-dex/composite/live")
+async def cex_dex_composite_live():
+    try:
+        probe = await cex_dex_composite_service.probe()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"CEX DEX composite evidence failed: {type(exc).__name__}") from exc
+    return probe.model_dump(mode="json")
+
+@app.get("/v1/dex/statistical-model")
+def dex_statistical_model(asset: str, direction: str, target_notional_usd: float = 1000.0):
+    if dex_statistical_service is None:
+        raise HTTPException(status_code=503, detail="evidence persistence is not configured")
+    if direction not in {"buy_asset", "sell_asset"}:
+        raise HTTPException(status_code=400, detail="direction must be buy_asset or sell_asset")
+    if target_notional_usd <= 0:
+        raise HTTPException(status_code=400, detail="target_notional_usd must be positive")
+    try:
+        model = dex_statistical_service.model(
+            asset=asset,
+            direction=direction,
+            target_notional_usd=target_notional_usd,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"DEX statistical model failed: {type(exc).__name__}") from exc
+    return model.model_dump(mode="json")
+
+@app.get("/v1/cex-dex/research-qualification/live")
+async def cex_dex_research_qualification_live():
+    if dex_statistical_service is None:
+        raise HTTPException(status_code=503, detail="evidence persistence is not configured")
+    try:
+        probe = await dex_statistical_service.live_composite_qualification()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"CEX DEX research qualification failed: {type(exc).__name__}") from exc
+    return probe.model_dump(mode="json")
 
 @app.get("/v1/allocation/live")
 async def paper_allocation(capital_usd: float = 100000.0, max_venue_fraction: float | None = None,

@@ -93,8 +93,10 @@ def _stablecoin_to_usd(stablecoin: str, amount: float, book: OrderBookSnapshot) 
 
 
 def _usd_to_stablecoin(stablecoin: str, amount_usd: float, book: OrderBookSnapshot) -> StablecoinConversionDepthLeg:
+    # USD is the quote-currency budget. estimate_market_order walks asks by
+    # notional and returns the purchased stablecoin quantity as base_quantity.
     estimate = estimate_market_order(book, TradeSide.BUY, amount_usd)
-    output = estimate.filled_base_quantity
+    output = estimate.base_quantity
     best_rate = 1.0 / estimate.best_price
     effective_rate = output / amount_usd
     slippage = max(0.0, (best_rate - effective_rate) / best_rate * 10_000.0)
