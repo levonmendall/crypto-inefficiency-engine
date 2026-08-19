@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 
 from inefficiency_engine import __version__
+from inefficiency_engine.advanced_api import build_advanced_router
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.config import Settings
 from inefficiency_engine.dex_statistics import DexStatisticalQualificationService
@@ -33,6 +34,13 @@ dex_statistical_service = (
     if evidence_store is not None
     else None
 )
+app.include_router(build_advanced_router(
+    settings=settings,
+    evidence_store=evidence_store,
+    service=service,
+    composite_service=cex_dex_composite_service,
+    conversion_depth_service=conversion_depth_service,
+))
 
 @app.get("/health")
 def health():
