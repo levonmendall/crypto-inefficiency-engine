@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-inefficiency-engine"
-version = "2.4.0"
-description = "Paper-first crypto opportunity engine with forward allocation certification, adaptive alpha health, and cross-strategy portfolio risk controls."
+version = "2.5.0"
+description = "Paper-first crypto opportunity engine with profit-mechanism coverage, forward allocation certification, adaptive alpha health, and portfolio risk controls."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
