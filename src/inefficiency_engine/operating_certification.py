@@ -5,11 +5,11 @@ import json
 import statistics
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
-from sqlalchemy import Column, Index, Integer, MetaData, String, Text, insert, select
+from sqlalchemy import Column, Index, Integer, MetaData, String, Table, Text, insert, select
 
 from inefficiency_engine.alpha_factory import AlphaForwardOutcome, _mean_lower, _wilson_lower
 from inefficiency_engine.allocation_certification import AllocationForwardCertificationService, PaperAllocationOutcome
@@ -33,7 +33,6 @@ OperatingState = Literal[
     "certifying",
     "certified",
 ]
-
 
 _ALPHA_MECHANISM_FAMILIES: dict[str, str] = {
     "trend_momentum": "directional_time_series",
@@ -166,7 +165,7 @@ class OperatingCertificationLedger:
     def summary(self) -> dict[str, object]:
         latest = self.latest()
         with self.store.engine.connect() as db:
-            count = int(db.execute(select(self.snapshots.c.id)).fetchall().__len__())
+            count = len(list(db.execute(select(self.snapshots.c.id)).scalars()))
         return {
             "snapshot_count": count,
             "latest": latest.model_dump(mode="json") if latest is not None else None,
@@ -175,9 +174,7 @@ class OperatingCertificationLedger:
         }
 
 
-def _independent_family_outcomes(
-    alpha_factory: ExpandedAlphaFactoryService,
-) -> dict[str, list[AlphaForwardOutcome]]:
+def _independent_family_outcomes(alpha_factory: ExpandedAlphaFactoryService) -> dict[str, list[AlphaForwardOutcome]]:
     grouped: dict[tuple[str, str, str], list[AlphaForwardOutcome]] = defaultdict(list)
     for outcome in alpha_factory.ledger.outcomes():
         grouped[(outcome.strategy_id, outcome.asset, outcome.direction)].append(outcome)
@@ -191,9 +188,7 @@ def _independent_family_outcomes(
 def _family_signal_counts(alpha_factory: ExpandedAlphaFactoryService) -> dict[str, int]:
     table = alpha_factory.ledger.events
     with alpha_factory.store.engine.connect() as db:
-        rows = list(db.execute(
-            select(table.c.family, table.c.event_type).order_by(table.c.id)
-        ))
+        rows = list(db.execute(select(table.c.family, table.c.event_type).order_by(table.c.id)))
     counts: dict[str, int] = defaultdict(int)
     for family, event_type in rows:
         if event_type == "signal":
@@ -216,20 +211,19 @@ def _forward_stats(rows: list[AlphaForwardOutcome]) -> dict[str, float | int | N
 def _allocator_family_stats(
     rows: list[PaperAllocationOutcome],
     strategy_to_family: dict[str, str],
-) -> dict[str, dict[str, float | int | bool | None]]:
+) -> dict[str, dict[str, float | int | None]]:
     grouped: dict[str, list[PaperAllocationOutcome]] = defaultdict(list)
     for row in rows:
         family = strategy_to_family.get(row.strategy)
         if family is not None:
             grouped[family].append(row)
-    result: dict[str, dict[str, float | int | bool | None]] = {}
+    result: dict[str, dict[str, float | int | None]] = {}
     for family, outcomes in grouped.items():
         values = [row.realized_net_return for row in outcomes]
-        profits = [row.realized_profit_usd for row in outcomes]
         positives = sum(value > 0 for value in values)
         result[family] = {
             "count": len(outcomes),
-            "realized_profit": sum(profits),
+            "realized_profit": sum(row.realized_profit_usd for row in outcomes),
             "mean_lower": _mean_lower(values),
             "hit_lower": _wilson_lower(positives, len(values)),
         }
@@ -237,12 +231,7 @@ def _allocator_family_stats(
 
 
 class OperatingCertificationService:
-    """Interprets durable evidence into mechanism-level operating state.
-
-    The service has no allocation or execution authority. It is intentionally
-    conservative: code availability is never treated as profitability evidence,
-    and missing authoritative data is kept distinct from observed bad economics.
-    """
+    """Interpret durable evidence without creating allocation or execution authority."""
 
     def __init__(
         self,
@@ -325,9 +314,10 @@ class OperatingCertificationService:
         current_candidate_count: int,
         qualified_count: int,
         promoted_count: int,
-        allocator: dict[str, float | int | bool | None] | None,
+        allocator: dict[str, float | int | None] | None,
         provider_ready: bool,
     ) -> tuple[OperatingState, str, str, bool]:
+        del family
         count = int(forward.get("count") or 0)
         mean = forward.get("mean")
         mean_lower = forward.get("mean_lower")
@@ -407,6 +397,30 @@ class OperatingCertificationService:
             False,
         )
 
+    @staticmethod
+    def _base_status(
+        coverage: ProfitMechanismCoverage,
+        *,
+        state: OperatingState,
+        provider_ready: bool,
+        reason: str,
+        next_action: str,
+        authoritative_count: int = 0,
+        economic_candidate_count: int = 0,
+    ) -> MechanismOperatingStatus:
+        return MechanismOperatingStatus(
+            mechanism_id=coverage.mechanism_id,
+            name=coverage.name,
+            state=state,
+            stage=coverage.stage,
+            provider_ready=provider_ready,
+            authoritative_observation_count=authoritative_count,
+            economic_candidate_count=economic_candidate_count,
+            primary_reason=reason,
+            next_action=next_action,
+            blockers=list(coverage.blockers),
+        )
+
     async def run_cycle(self, *, total_capital_usd: float = 100000.0) -> OperatingCertificationCycle:
         if total_capital_usd <= 0:
             raise ValueError("total_capital_usd must be positive")
@@ -417,10 +431,7 @@ class OperatingCertificationService:
         qualifications = {candidate.candidate_id: self.alpha_factory.qualification(candidate) for candidate in candidates}
         promotion_error: str | None = None
         try:
-            promoted = await self.alpha_factory.promoted_candidates(
-                live_snapshot,
-                total_capital_usd=total_capital_usd,
-            )
+            promoted = await self.alpha_factory.promoted_candidates(live_snapshot, total_capital_usd=total_capital_usd)
         except Exception as exc:
             promoted = []
             promotion_error = type(exc).__name__
@@ -447,17 +458,15 @@ class OperatingCertificationService:
 
         family_outcomes = _independent_family_outcomes(self.alpha_factory)
         family_forward = {family: _forward_stats(rows) for family, rows in family_outcomes.items()}
-        family_signal_counts = _family_signal_counts(self.alpha_factory)
+        signal_counts = _family_signal_counts(self.alpha_factory)
         strategy_to_family = {manifest.strategy_id: manifest.family for manifest in self.alpha_factory.manifests()}
-        allocator_stats = _allocator_family_stats(
-            self.allocation_certification.ledger.outcomes(),
-            strategy_to_family,
-        )
-        candidates_by_family: dict[str, list[object]] = defaultdict(list)
+        allocator_stats = _allocator_family_stats(self.allocation_certification.ledger.outcomes(), strategy_to_family)
+
+        candidates_by_family: dict[str, int] = defaultdict(int)
         qualified_by_family: dict[str, int] = defaultdict(int)
         promoted_by_family: dict[str, int] = defaultdict(int)
         for candidate in candidates:
-            candidates_by_family[candidate.family].append(candidate)
+            candidates_by_family[candidate.family] += 1
             if qualifications[candidate.candidate_id].statistically_qualified:
                 qualified_by_family[candidate.family] += 1
         for candidate in promoted:
@@ -476,30 +485,36 @@ class OperatingCertificationService:
                 provider_ready = market_provider_ready
                 if coverage.mechanism_id == "microstructure":
                     provider_ready = provider_ready and l2_provider_ready
-                if coverage.mechanism_id == "fundamental_onchain":
+                elif coverage.mechanism_id == "fundamental_onchain":
                     provider_ready = int(fundamental_summary.get("authoritative_count", 0)) > 0
-                if coverage.mechanism_id == "event_driven":
+                elif coverage.mechanism_id == "event_driven":
                     provider_ready = int(event_summary.get("authoritative_count", 0)) > 0
-                forward = family_forward.get(family, {"count": 0, "mean": None, "mean_lower": None, "hit_rate": None, "hit_lower": None})
+
+                forward = family_forward.get(family, {
+                    "count": 0,
+                    "mean": None,
+                    "mean_lower": None,
+                    "hit_rate": None,
+                    "hit_lower": None,
+                })
                 allocator = allocator_stats.get(family)
                 state, reason, next_action, certified = self._alpha_state(
                     coverage,
                     family,
-                    signal_count=family_signal_counts.get(family, 0),
+                    signal_count=signal_counts.get(family, 0),
                     forward=forward,
-                    current_candidate_count=len(candidates_by_family.get(family, [])),
+                    current_candidate_count=candidates_by_family.get(family, 0),
                     qualified_count=qualified_by_family.get(family, 0),
                     promoted_count=promoted_by_family.get(family, 0),
                     allocator=allocator,
                     provider_ready=provider_ready,
                 )
-                auth_count = 0
                 if coverage.mechanism_id == "fundamental_onchain":
-                    auth_count = int(fundamental_summary.get("authoritative_count", 0))
+                    authoritative_count = int(fundamental_summary.get("authoritative_count", 0))
                 elif coverage.mechanism_id == "event_driven":
-                    auth_count = int(event_summary.get("authoritative_count", 0))
+                    authoritative_count = int(event_summary.get("authoritative_count", 0))
                 else:
-                    auth_count = diagnostic.market_quote_count
+                    authoritative_count = diagnostic.market_quote_count
                 blockers = list(coverage.blockers)
                 if promotion_error and qualified_by_family.get(family, 0) > 0:
                     blockers.append(f"current promotion probe failed: {promotion_error}")
@@ -509,10 +524,10 @@ class OperatingCertificationService:
                     state=state,
                     stage=coverage.stage,
                     provider_ready=provider_ready,
-                    authoritative_observation_count=auth_count,
-                    forward_signal_count=family_signal_counts.get(family, 0),
+                    authoritative_observation_count=authoritative_count,
+                    forward_signal_count=signal_counts.get(family, 0),
                     independent_forward_outcome_count=int(forward.get("count") or 0),
-                    current_candidate_count=len(candidates_by_family.get(family, [])),
+                    current_candidate_count=candidates_by_family.get(family, 0),
                     current_statistically_qualified_count=qualified_by_family.get(family, 0),
                     current_promoted_count=promoted_by_family.get(family, 0),
                     settled_allocator_outcome_count=int((allocator or {}).get("count") or 0),
@@ -531,122 +546,108 @@ class OperatingCertificationService:
                 continue
 
             if coverage.mechanism_id == "yield":
+                auth = int(yield_summary.get("authoritative_count", 0))
                 best = max((row.conservative_net_apy for row in yield_candidates), default=None)
                 state, reason, next_action = self._research_state(
                     coverage,
-                    authoritative_count=int(yield_summary.get("authoritative_count", 0)),
+                    authoritative_count=auth,
                     economic_candidate_count=len(yield_candidates),
                     best_economics=best,
                     next_evidence_action="accumulate realized-yield, exit-liquidity, and protocol-loss forward outcomes",
                 )
-                statuses.append(MechanismOperatingStatus(
-                    mechanism_id=coverage.mechanism_id,
-                    name=coverage.name,
+                statuses.append(self._base_status(
+                    coverage,
                     state=state,
-                    stage=coverage.stage,
-                    provider_ready=int(yield_summary.get("authoritative_count", 0)) > 0,
-                    authoritative_observation_count=int(yield_summary.get("authoritative_count", 0)),
-                    economic_candidate_count=len(yield_candidates),
-                    primary_reason=reason,
+                    provider_ready=auth > 0,
+                    reason=reason,
                     next_action=next_action,
-                    blockers=list(coverage.blockers),
+                    authoritative_count=auth,
+                    economic_candidate_count=len(yield_candidates),
                 ))
                 continue
 
             if coverage.mechanism_id == "volatility":
+                auth = int(volatility_summary.get("authoritative_count", 0))
                 state, reason, next_action = self._research_state(
                     coverage,
-                    authoritative_count=int(volatility_summary.get("authoritative_count", 0)),
+                    authoritative_count=auth,
                     economic_candidate_count=0,
                     best_economics=None,
                     next_evidence_action="collect executable option L2 and forward delta-hedge outcomes before statistical promotion",
                 )
-                statuses.append(MechanismOperatingStatus(
-                    mechanism_id=coverage.mechanism_id,
-                    name=coverage.name,
+                statuses.append(self._base_status(
+                    coverage,
                     state=state,
-                    stage=coverage.stage,
-                    provider_ready=int(volatility_summary.get("authoritative_count", 0)) > 0,
-                    authoritative_observation_count=int(volatility_summary.get("authoritative_count", 0)),
-                    primary_reason=reason,
+                    provider_ready=auth > 0,
+                    reason=reason,
                     next_action=next_action,
-                    blockers=list(coverage.blockers),
+                    authoritative_count=auth,
                 ))
                 continue
 
             if coverage.mechanism_id == "liquidation_distress":
+                auth = int(distress_summary.get("authoritative_count", 0))
                 best = max((row.conservative_return_on_capacity for row in distress_candidates), default=None)
                 state, reason, next_action = self._research_state(
                     coverage,
-                    authoritative_count=int(distress_summary.get("authoritative_count", 0)),
+                    authoritative_count=auth,
                     economic_candidate_count=len(distress_candidates),
                     best_economics=best,
                     next_evidence_action="accumulate independent capture, selection, settlement, and recovery outcomes",
                 )
-                statuses.append(MechanismOperatingStatus(
-                    mechanism_id=coverage.mechanism_id,
-                    name=coverage.name,
+                statuses.append(self._base_status(
+                    coverage,
                     state=state,
-                    stage=coverage.stage,
-                    provider_ready=int(distress_summary.get("authoritative_count", 0)) > 0,
-                    authoritative_observation_count=int(distress_summary.get("authoritative_count", 0)),
-                    economic_candidate_count=len(distress_candidates),
-                    primary_reason=reason,
+                    provider_ready=auth > 0,
+                    reason=reason,
                     next_action=next_action,
-                    blockers=list(coverage.blockers),
+                    authoritative_count=auth,
+                    economic_candidate_count=len(distress_candidates),
                 ))
                 continue
 
             if coverage.mechanism_id == "liquidity_provision":
-                provider_ready = l2_provider_ready
-                state: OperatingState = "collecting" if provider_ready else "provider_gap"
                 reason = (
                     "public L2 exists, but empirical maker queue/fill/adverse-selection outcomes are still missing"
-                    if provider_ready
+                    if l2_provider_ready
                     else "no usable public L2 is currently available for maker research"
                 )
-                statuses.append(MechanismOperatingStatus(
-                    mechanism_id=coverage.mechanism_id,
-                    name=coverage.name,
-                    state=state,
-                    stage=coverage.stage,
-                    provider_ready=provider_ready,
-                    authoritative_observation_count=book_ok,
-                    primary_reason=reason,
+                statuses.append(self._base_status(
+                    coverage,
+                    state="collecting" if l2_provider_ready else "provider_gap",
+                    provider_ready=l2_provider_ready,
+                    reason=reason,
                     next_action="collect empirical maker queue, fill, post-fill adverse-selection, and inventory outcomes without assuming fills",
-                    blockers=list(coverage.blockers),
+                    authoritative_count=book_ok,
                 ))
                 continue
 
             if coverage.mechanism_id == "capital_location_settlement":
-                state = "collecting"
                 reason = (
                     "positive opportunity history exists and capital-location recommendations can be forward evaluated"
                     if location_plan.historical_opportunity_count > 0
                     else "insufficient persisted positive opportunity history for forward capital-location evaluation"
                 )
-                statuses.append(MechanismOperatingStatus(
-                    mechanism_id=coverage.mechanism_id,
-                    name=coverage.name,
-                    state=state,
-                    stage=coverage.stage,
+                statuses.append(self._base_status(
+                    coverage,
+                    state="collecting",
                     provider_ready=True,
-                    authoritative_observation_count=location_plan.historical_opportunity_count,
-                    economic_candidate_count=len(location_plan.recommendations),
-                    primary_reason=reason,
+                    reason=reason,
                     next_action="compare recommended reserve locations with future opportunity incidence and transfer-cost/latency evidence",
-                    blockers=list(coverage.blockers),
+                    authoritative_count=location_plan.historical_opportunity_count,
+                    economic_candidate_count=len(location_plan.recommendations),
                 ))
                 continue
 
-            if coverage.mechanism_id == "price_discrepancy":
-                provider_ready = diagnostic.market_quote_count >= 2
-            elif coverage.mechanism_id == "carry":
-                provider_ready = funding_provider_ready and diagnostic.market_quote_count > 0
-            else:
-                provider_ready = coverage.authoritative_data_available
+            provider_ready = (
+                diagnostic.market_quote_count >= 2
+                if coverage.mechanism_id == "price_discrepancy"
+                else funding_provider_ready and diagnostic.market_quote_count > 0
+                if coverage.mechanism_id == "carry"
+                else coverage.authoritative_data_available
+            )
             if not provider_ready:
-                state = "provider_gap"
+                state: OperatingState = "provider_gap"
                 reason = "required public market evidence is not currently available"
                 next_action = "restore the required public market/funding provider surface"
             elif coverage.paper_allocation_available and not coverage.profitability_certification_available:
@@ -657,22 +658,18 @@ class OperatingCertificationService:
                 state = "collecting"
                 reason = "evidence is operating but profitability certification is not yet complete"
                 next_action = "continue forward evidence accumulation"
-            statuses.append(MechanismOperatingStatus(
-                mechanism_id=coverage.mechanism_id,
-                name=coverage.name,
+            statuses.append(self._base_status(
+                coverage,
                 state=state,
-                stage=coverage.stage,
                 provider_ready=provider_ready,
-                authoritative_observation_count=(diagnostic.market_quote_count + diagnostic.funding_quote_count),
-                primary_reason=reason,
+                reason=reason,
                 next_action=next_action,
-                blockers=list(coverage.blockers),
+                authoritative_count=diagnostic.market_quote_count + diagnostic.funding_quote_count,
             ))
 
-        observed_at = live_snapshot.completed_at
         blocked_states = {"statistical_failure", "execution_blocked", "settlement_blocked"}
         snapshot = OperatingCertificationSnapshot(
-            observed_at=observed_at,
+            observed_at=live_snapshot.completed_at,
             version=self.version,
             public_market_provider_healthy=diagnostic.healthy,
             public_market_surface_count=len(diagnostic.surfaces),
@@ -694,9 +691,9 @@ class OperatingCertificationService:
         )
         self.ledger.record(snapshot)
         return OperatingCertificationCycle(
-            observed_at=observed_at,
+            observed_at=snapshot.observed_at,
             snapshot_id=snapshot.snapshot_id,
-            mechanism_count=len(statuses),
+            mechanism_count=snapshot.mechanism_count,
             certified_count=snapshot.certified_count,
             provider_gap_count=snapshot.provider_gap_count,
             poor_economics_count=snapshot.poor_economics_count,
