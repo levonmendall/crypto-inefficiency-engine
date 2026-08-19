@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 
 from inefficiency_engine import __version__
 from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
-from inefficiency_engine.canonical_paper_portfolio import CanonicalPaperPortfolioService
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeShadowService
@@ -15,6 +14,8 @@ from inefficiency_engine.dex_tier_shadow import DexTierShadowService
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.expanded_alpha_factory import ExpandedAlphaFactoryService
 from inefficiency_engine.operating_certification import OperatingCertificationService
+from inefficiency_engine.portfolio_integrity import PortfolioIntegritySnapshot
+from inefficiency_engine.resilient_paper_portfolio import OperationallyResilientPaperPortfolioService
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
 from inefficiency_engine.stablecoin_depth_shadow import StablecoinDepthShadowService
@@ -38,23 +39,11 @@ class OperatingBundleResult:
 
 async def run_operating_bundle_once(
     *,
-    portfolio: CanonicalPaperPortfolioService,
+    portfolio: OperationallyResilientPaperPortfolioService,
     allocation_certification: AllocationForwardCertificationService,
     operating_certification: OperatingCertificationService,
 ) -> OperatingBundleResult:
-    """Run operating subsystems without allowing one failure to freeze accounting.
-
-    Early evidence collection can legitimately fail closed in one subsystem. A
-    failure in allocator certification must not prevent the canonical portfolio
-    from attempting its own paper cycle, and neither failure may prevent the
-    mechanism-status classifier from recording what is currently blocking it.
-
-    If the portfolio cycle itself fails before it can write a snapshot, persist
-    the unchanged canonical account state with a fresh observation timestamp.
-    That keeps the NAV ledger visibly alive without inventing marks, trades, or
-    profits. The heartbeat remains degraded/error so stale market accounting is
-    never mistaken for successful portfolio operation.
-    """
+    """Run operating subsystems without letting one failure freeze the account."""
 
     current = portfolio.ledger.current_state()
     capital_usd = max(1.0, current.nav_usd)
@@ -71,11 +60,44 @@ async def run_operating_bundle_once(
 
     try:
         portfolio_cycle = await portfolio.run_cycle()
+        integrity = portfolio.integrity.latest()
+        if integrity is not None and integrity.cycle_status == "degraded":
+            if integrity.cycle_error_type:
+                reason = integrity.cycle_error_type
+            elif integrity.allocation_family_failures:
+                reason = "family_failure"
+            elif integrity.stale_position_count:
+                reason = "stale_valuation"
+            else:
+                reason = "PortfolioCycleDegraded"
+            errors["portfolio_cycle_degraded"] = reason
     except Exception as exc:
         errors["portfolio_error_type"] = type(exc).__name__
         try:
+            previous_integrity = portfolio.integrity.latest()
             fallback = portfolio.ledger.current_state(observed_at=datetime.now(timezone.utc))
             portfolio.ledger.record_snapshot(fallback)
+            valuation_status = "cash_only" if fallback.open_position_count == 0 else "stale"
+            portfolio.integrity.record(PortfolioIntegritySnapshot(
+                observed_at=fallback.observed_at,
+                account_snapshot_at=fallback.observed_at,
+                market_evidence_at=(
+                    previous_integrity.market_evidence_at if previous_integrity is not None else None
+                ),
+                valuation_status=valuation_status,
+                cycle_status="failed",
+                fallback_snapshot=True,
+                cycle_error_type=type(exc).__name__,
+                stale_position_count=fallback.open_position_count,
+                open_position_count=fallback.open_position_count,
+                allocation_family_failures=(
+                    list(previous_integrity.allocation_family_failures)
+                    if previous_integrity is not None else []
+                ),
+                market_snapshot_id=(
+                    previous_integrity.market_snapshot_id if previous_integrity is not None else None
+                ),
+            ))
             fallback_snapshot_recorded = True
         except Exception as snapshot_exc:
             errors["portfolio_fallback_snapshot_error_type"] = type(snapshot_exc).__name__
@@ -111,7 +133,7 @@ async def run_portfolio_operating_loop(
     service: OpportunityService,
     store: EvidenceStore,
     *,
-    portfolio: CanonicalPaperPortfolioService,
+    portfolio: OperationallyResilientPaperPortfolioService,
     allocation_certification: AllocationForwardCertificationService,
     operating_certification: OperatingCertificationService,
     stop_event: asyncio.Event,
@@ -128,6 +150,9 @@ async def run_portfolio_operating_loop(
     portfolio.ledger.ensure_genesis()
     if portfolio.ledger.latest_snapshot() is None:
         portfolio.ledger.record_snapshot(portfolio.ledger.current_state())
+    latest_account = portfolio.ledger.latest_snapshot()
+    if latest_account is not None:
+        portfolio.integrity.ensure_initial(latest_account)
 
     attempted = 0
     while not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
@@ -151,16 +176,30 @@ async def run_portfolio_operating_loop(
         state = "error" if portfolio_failed else ("degraded" if result.errors else "success")
         error_type = (
             result.errors.get("portfolio_error_type")
+            or result.errors.get("portfolio_cycle_degraded")
             or result.errors.get("allocation_certification_error_type")
             or result.errors.get("operating_certification_error_type")
         )
         latest = portfolio.ledger.latest_snapshot()
+        integrity = portfolio.integrity.latest()
         detail: dict[str, object] = {
             "cycle_attempt": attempted,
             "portfolio_cycle_interval_seconds": interval,
             "portfolio_nav_usd": result.nav_usd,
             "portfolio_snapshot_observed_at": (
                 latest.observed_at.isoformat() if latest is not None else None
+            ),
+            "market_evidence_observed_at": (
+                integrity.market_evidence_at.isoformat()
+                if integrity is not None and integrity.market_evidence_at is not None else None
+            ),
+            "portfolio_valuation_status": integrity.valuation_status if integrity is not None else None,
+            "portfolio_cycle_status": integrity.cycle_status if integrity is not None else None,
+            "portfolio_stale_position_count": (
+                integrity.stale_position_count if integrity is not None else None
+            ),
+            "portfolio_allocation_family_failures": (
+                list(integrity.allocation_family_failures) if integrity is not None else []
             ),
             "fallback_snapshot_recorded": result.fallback_snapshot_recorded,
             "allocation_certification_cycle_id": getattr(result.allocation_cycle, "cycle_id", None),
@@ -189,12 +228,7 @@ async def run_portfolio_operating_loop(
 
 
 async def run_forever(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
-    """Production paper worker with independent portfolio and research loops.
-
-    The canonical account begins exactly once with $250,000. Portfolio state is
-    durable and append-only; deploys/restarts recover the existing account rather
-    than recreating capital. Unsupported settlement paths remain fail-closed.
-    """
+    """Production paper worker with independent portfolio and research loops."""
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -219,7 +253,7 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
     promotion = CexDexPaperPromotionService(service, composite_service, store)
     unified = UnifiedPaperAllocatorService(service, promotion, alpha_factory)
     allocation_certification = AllocationForwardCertificationService(service, unified, store)
-    portfolio = CanonicalPaperPortfolioService(service, unified, store)
+    portfolio = OperationallyResilientPaperPortfolioService(service, unified, store)
     operating_certification = OperatingCertificationService(
         service,
         store,
