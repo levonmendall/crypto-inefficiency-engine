@@ -53,19 +53,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # v3.5.8 deliberately returns Render to one Python application process.
-    # Provider/order-book calls are now independently time-bounded at the adapter
-    # boundary, so the multi-process supervisor introduced to survive unbounded
-    # providers adds more memory pressure than protection on a 512 MB worker.
-    # `run_forever` keeps research and canonical portfolio as independent asyncio
-    # tasks while sharing one service/import graph and one process memory image.
+    # v3.5.9 keeps Render to one Python process while restoring a hard event-loop
+    # boundary: canonical portfolio accounting stays on the main thread and broad
+    # shadow research runs on a daemon thread with its own asyncio loop. This keeps
+    # memory materially below the multi-process topology without allowing a
+    # synchronous research/provider stall to starve portfolio timeouts.
     if args.command == "worker":
         service, store = _service()
         if store is None:
             raise RuntimeError("worker requires CIE_DATABASE_URL/DATABASE_URL or CIE_EVIDENCE_DB_PATH")
-        from inefficiency_engine.operating_worker import run_forever
+        from inefficiency_engine.threaded_worker import run_threaded_worker
 
-        asyncio.run(run_forever(service, store))
+        asyncio.run(run_threaded_worker(service, store))
         return
 
     service, store = _service()
