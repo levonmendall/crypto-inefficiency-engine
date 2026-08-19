@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.models import Opportunity, OpportunityExecutability
+from inefficiency_engine.portfolio_risk import ExposureKind, PortfolioRiskBudget, PortfolioRiskOverlay
 from inefficiency_engine.service import OpportunityService
 
 if TYPE_CHECKING:
@@ -27,6 +28,7 @@ class UnifiedPaperCandidate(BaseModel):
     modeled_holding_hours: float | None = Field(default=None, gt=0)
     source_return_metric: str
     source_return_value: float
+    exposure_kind: ExposureKind = "market_neutral"
     conflict_keys: list[str] = Field(default_factory=list)
     evidence_id: str | None = None
     opportunity_id: str | None = None
@@ -50,6 +52,7 @@ class UnifiedPaperAllocation(BaseModel):
     modeled_holding_hours: float | None = None
     source_return_metric: str
     source_return_value: float
+    exposure_kind: ExposureKind = "market_neutral"
     evidence_id: str | None = None
     opportunity_id: str | None = None
     capacity_claimed: bool = False
@@ -68,6 +71,7 @@ class UnifiedPaperAllocationPlan(BaseModel):
     candidate_count: int = Field(ge=0)
     allocations: list[UnifiedPaperAllocation] = Field(default_factory=list)
     skipped: list[dict[str, object]] = Field(default_factory=list)
+    portfolio_risk_budget: PortfolioRiskBudget | None = None
     authorizes_execution: bool = False
     live_execution_eligible: bool = False
     paper_only: bool = True
@@ -122,6 +126,7 @@ def _core_candidates(
             modeled_holding_hours=opportunity.holding_hours,
             source_return_metric="net_annualized_return",
             source_return_value=tier.net_annualized_return,
+            exposure_kind="market_neutral",
             conflict_keys=sorted(set(conflict_keys)),
             opportunity_id=opportunity.id,
             capacity_reference_usd=execution.estimated_capacity_notional_usd,
@@ -173,6 +178,7 @@ class UnifiedPaperAllocatorService:
                 modeled_holding_hours=None,
                 source_return_metric="conservative_capture_edge_bps",
                 source_return_value=item.conservative_capture_edge_bps,
+                exposure_kind="market_neutral",
                 conflict_keys=[
                     f"cex:{item.cex_venue}:{item.cex_symbol}",
                     f"venue-symbol:{item.cex_venue}:{item.cex_symbol}",
@@ -194,6 +200,11 @@ class UnifiedPaperAllocatorService:
             for item in alpha_rows:
                 capital = item.capital_required_usd
                 deployment_return = item.expected_profit_usd / capital
+                exposure: ExposureKind = (
+                    "directional_long" if item.direction == "long"
+                    else "directional_short" if item.direction == "short"
+                    else "market_neutral"
+                )
                 rows.append(UnifiedPaperCandidate(
                     candidate_id=item.candidate_id,
                     family="alpha",
@@ -205,8 +216,9 @@ class UnifiedPaperAllocatorService:
                     expected_profit_usd_per_deployment=item.expected_profit_usd,
                     expected_return_on_reserved_capital=max(0.0, deployment_return),
                     modeled_holding_hours=item.horizon_hours,
-                    source_return_metric="forward_ci_haircut_net_return",
+                    source_return_metric="forward_ci_health_haircut_net_return",
                     source_return_value=item.expected_net_return,
+                    exposure_kind=exposure,
                     conflict_keys=[
                         *item.conflict_keys,
                         f"venue-symbol:{item.venue}:{item.symbol}",
@@ -250,6 +262,7 @@ class UnifiedPaperAllocatorService:
         venue_used: dict[str, float] = defaultdict(float)
         asset_used: dict[str, float] = defaultdict(float)
         used_conflicts: set[str] = set()
+        risk_overlay = PortfolioRiskOverlay(self.settings, total_capital_usd=total_capital_usd)
         allocated = 0.0
         allocations: list[UnifiedPaperAllocation] = []
         skipped: list[dict[str, object]] = []
@@ -272,6 +285,13 @@ class UnifiedPaperAllocatorService:
             if asset_used[item.asset] + capital > asset_cap + 1e-9:
                 skipped.append({"candidate_id": item.candidate_id, "reason": "asset concentration cap"})
                 continue
+            risk_decision = risk_overlay.decision(item)
+            if not risk_decision.accepted:
+                skipped.append({
+                    "candidate_id": item.candidate_id,
+                    "reason": risk_decision.reason or "portfolio risk budget",
+                })
+                continue
 
             allocations.append(UnifiedPaperAllocation(
                 candidate_id=item.candidate_id,
@@ -286,12 +306,14 @@ class UnifiedPaperAllocatorService:
                 modeled_holding_hours=item.modeled_holding_hours,
                 source_return_metric=item.source_return_metric,
                 source_return_value=item.source_return_value,
+                exposure_kind=item.exposure_kind,
                 evidence_id=item.evidence_id,
                 opportunity_id=item.opportunity_id,
                 capacity_claimed=False,
                 authorizes_execution=False,
                 paper_only=True,
             ))
+            risk_overlay.register(item)
             allocated += capital
             asset_used[item.asset] += capital
             for venue in item.venues:
@@ -313,6 +335,7 @@ class UnifiedPaperAllocatorService:
             candidate_count=len(candidates),
             allocations=allocations,
             skipped=skipped,
+            portfolio_risk_budget=risk_overlay.snapshot(),
             authorizes_execution=False,
             live_execution_eligible=False,
             paper_only=True,
