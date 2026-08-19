@@ -1,76 +1,126 @@
 # Crypto Inefficiency Engine
 
-A **paper-first, fail-closed** engine for discovering structural crypto-market inefficiencies, comparing them on conservative capital-adjusted economics, and learning which apparent edges survive market contact. It does not place live orders or require trading keys.
+A **strategy-agnostic, paper-first, fail-closed** engine for continuously discovering structural crypto-market inefficiencies, reconstructing conservative net economics, learning which apparent edges survive market contact, and allocating simulated capital only when the evidence supports it.
 
-## v0.10 — Evidence maturation
+It does **not** place live orders, hold private keys, require trading credentials, or claim live-money authority.
 
-### v0.10.0 — public-adapter registry and live diagnostics
-- one public CEX adapter registry owns quote/funding collection, visible-L2 routing and provider→venue attribution;
-- OKX is promoted into core discovery, qualification, shadow and empirical learning;
-- zero-item public surfaces fail closed;
-- `cie diagnose-live` and `GET /v1/providers/diagnostic` expose read-only diagnostics.
+## Paper V1 objective
 
-### v0.10.1 — amount-specific DEX route evidence
-- quote-only Velora `/prices` v6.2 adapter for Ethereum BTC/ETH↔USDC;
-- exact input/output, route composition, block, gas estimate and request latency;
-- no transaction build/sign/submit path and no capacity claim.
+> Continuously search the accessible crypto economy for mispriced risk, determine the true conservative return after observable costs and execution risks, learn which inefficiencies are genuinely capturable, and allocate paper capital only to the best independently qualified opportunities.
 
-### v0.10.2 — durable DEX route survival
-- exact-source re-quotes at 1/5/15/30/60 seconds;
-- durable route survival, adverse-price, route-change, gas and latency evidence;
-- DEX failures cannot poison successful core CEX shadow cycles.
+The engine has no loyalty to one strategy. Funding dispersion, basis, CEX dislocations and CEX↔DEX compete through common capital-allocation constraints. Research-only opportunity families remain searchable but cannot bypass their own missing evidence gates.
 
-### v0.10.3 — multi-notional DEX route frontier
-- sequential $1k/$5k/$10k/$25k quote probes by default;
-- contiguous acceptable frontier with directional deterioration limits;
-- larger successful quotes cannot rescue an intermediate failed/unacceptable tier;
-- `capacity_claimed=false`, `executable_eligible=false`.
+## V1 architecture
 
-### v0.10.4 — explicit DEX/CEX quote-currency conversion
-- USDC DEX routes can only be compared with USD/USDT CEX prices through fresh observed conversion paths;
-- direct and two-hop stablecoin paths are supported;
-- observed bid/ask is embedded once in the conversion rate and depeg/risk haircuts are charged separately;
-- missing/stale conversion paths fail closed.
+`public market adapters`
 
-### v0.10.5 — amount-specific stablecoin conversion depth
+→ `canonical assets / venues / instruments`
 
-v0.10.5 adds a stronger conversion-evidence layer using public Coinbase Exchange level-2 books for `USDC-USD` and `USDT-USD`:
+→ `strategy-neutral opportunity graph + detector registry`
 
-- `USDC/USDT → USD` walks visible bids by the exact source-stablecoin quantity;
-- `USD → USDC/USDT` walks visible asks by the exact USD input;
-- `USDC ↔ USDT` executes a two-hop reconstruction through USD and feeds the **actual first-leg USD output** into the second leg;
-- full visible-depth fill is mandatory; insufficient depth fails closed;
-- book freshness and two-book timestamp skew are mandatory;
-- effective conversion rate, best-rate reference, slippage, levels consumed, book timestamps and measured public-book latency are retained per leg;
-- raw evidence is exposed at `GET /v1/stablecoins/depth-quote?source=USDC&target=USD&amount=1000`;
-- depth quotes remain `visible_depth_only=true`, `capacity_claimed=false`, `executable_eligible=false` and have no allocation authority.
+→ `explicit economic costs and risk haircuts`
 
-Top-of-book conversion edges continue to support broad universal discovery. Amount-specific depth quotes are intentionally separate until route-size evidence and conversion-depth evidence can be joined at the same notional with statistical confidence gates.
+→ `visible-L2 / amount-specific execution evidence`
 
-## Capability is not authority
+→ `capacity and current-deployment economics`
 
-A searchable market relationship is not executable authority. DEX route quotes, route-size frontiers and stablecoin depth reconstructions are evidence surfaces only. They do not establish atomic inventory, settlement, hedge recovery or deployable capacity, and they cannot enter the paper allocator unless explicitly promoted through later evidence gates.
+→ `multi-horizon shadow evidence`
 
-## Current architecture
+→ `statistical qualification`
 
-**Executable-evidence core:**
+→ `strategy-neutral paper allocator`
 
-`public CEX adapter registry → canonical CEX graph → detector registry → visible-L2 qualification → capacity → ranking → paper allocation → multi-horizon shadow → empirical learning`
+→ `append-only history + replay + read-only API`
 
-**Universal evidence surface:**
+Cash is a valid allocation outcome.
 
-`stablecoin top-of-book graph + amount-specific stablecoin L2 depth + DEX pool discovery + amount-specific DEX routes → route survival + route-size frontiers + conversion-normalized CEX↔DEX research economics → explicit evidence gates`
+## Paper-allocatable opportunity families
 
-## Safety boundary
+### Funding dispersion
+Compares economically equivalent perpetual positions across venues and models funding, fees, collateral, liquidity, latency and hedge recovery.
+
+### Spot/perpetual basis
+Pairs exact spot and perpetual instruments and requires matched visible depth, explicit fees and current qualification.
+
+### Dated-futures basis
+Uses expiry-specific canonical futures identity, quote-currency matching and paired visible-L2 qualification.
+
+### CEX spot dislocation
+Compares same-quote spot markets. Any trade requiring a short spot leg fails closed unless borrow economics are explicitly available.
+
+### CEX↔DEX
+This family has the strongest evidence stack in V1:
+
+- exact amount-specific DEX routes;
+- $1k/$5k/$10k/$25k route frontiers;
+- exact-source multi-horizon re-quotes;
+- stablecoin USD/USDC/USDT conversion normalization;
+- amount-specific stablecoin L2 depth;
+- same-notional CEX hedge economics;
+- explicit CEX fees, DEX gas and stablecoin risk haircuts;
+- persisted fully costed composite-edge survival;
+- independent route/frontier statistical gates;
+- independent conversion-depth statistical gates;
+- direct net-edge survival statistics;
+- pre-funded paper inventory requirements;
+- no synchronous bridge/deposit/withdrawal assumption;
+- independent hedge-recovery venue and recovery reserve;
+- final statistically haircutted capture edge.
+
+Only after all required layers pass can a CEX↔DEX candidate become **paper-allocation eligible**. It still cannot authorize execution.
+
+## Strategy-neutral paper allocation
+
+The unified allocator compares independently qualified families using:
+
+> **conservative expected return on reserved capital for the current deployment**
+
+For core carry opportunities, annualized return is converted back into the return expected over the modeled holding period. For CEX↔DEX, the allocator uses the statistically haircutted one-deployment capture edge. It deliberately does **not** pretend a fast arbitrage can be continuously annualized.
+
+The allocator enforces total capital, venue concentration, asset concentration, shared instrument/route conflicts, explicit two-leg capital reservation, and a maximum allocation count.
+
+## Research-only families
+
+The universal graph also searches or represents the following families, but V1 keeps them fail-closed until the missing evidence is authoritative:
+
+- **DEX↔DEX:** pool discovery exists; independent pool-specific executable route depth does not.
+- **Stablecoin dislocations:** exact conversion depth/statistics exist; a market-neutral redemption/convergence path is not yet qualified.
+- **Cross-chain liquidity:** typed bridge economics exist; an authoritative amount-specific bridge quote/fill/settlement source is not connected.
+- **Solver opportunities:** typed external-signal contract exists; authoritative auction/capacity/settlement evidence is not connected.
+- **Liquidation/backstop:** typed external-signal contract exists; authoritative capacity/expiry/recovery evidence is not connected.
+- **Option relative value:** public Deribit surface discovery exists; option L2, fees, delta hedge, vega/gamma risk and paired capacity are not yet qualified.
+
+A research candidate is never upgraded simply because it looks profitable.
+
+## Evidence and learning
+
+The durable worker continuously gathers point-in-time evidence where supported:
+
+- provider health and source timestamps;
+- market/funding quotes and order books;
+- executability snapshots and capacity tiers;
+- core multi-horizon shadow observations;
+- DEX route survival and larger-tier route evidence;
+- stablecoin conversion-depth survival;
+- fully reconstructed CEX↔DEX composite-edge survival;
+- worker heartbeats and lineage hashes.
+
+Statistical qualification uses independent effective samples, confidence intervals and adverse-tail evidence. Conservative fixed assumptions remain in force when evidence is insufficient.
+
+## Safety and authority boundary
 
 - `paper_only=true` is enforced.
-- No private keys, custody, deposits, withdrawals, transaction building, signing or live order placement.
-- Stale/incomplete evidence fails closed.
-- Unknown venue fees and required borrow fail closed.
-- Cross-currency DEX comparisons fail closed without fresh observed conversion evidence.
-- Stablecoin depth quotes fail closed unless the entire requested source amount fills in visible public depth.
-- Successful route or conversion probes do not imply deployable capacity.
-- Paper allocation has no live execution authority.
+- No private keys or custody.
+- No deposits or withdrawals.
+- No transaction building or signing.
+- No live order submission.
+- No live-balance assumption.
+- No capacity claim from a public quote alone.
+- Stale or incomplete evidence fails closed.
+- Unknown required costs fail closed.
+- Paper allocation never authorizes execution.
+
+Any future tiny-capital live executor must be a **separate explicitly authorized service** with separate credentials, hard limits, paired-leg recovery, concentration controls, dead-man/kill switches and convincing production evidence.
 
 ## Quick start
 
@@ -84,21 +134,45 @@ cie diagnose-live
 uvicorn inefficiency_engine.api:app --reload
 ```
 
-Useful read-only/paper endpoints include:
+## Useful read-only / paper endpoints
 
+Core and universal discovery:
 - `GET /health`
 - `GET /v1/providers/diagnostic`
 - `GET /v1/opportunities/live`
 - `GET /v1/executability/live`
+- `GET /v1/opportunities/ranked/live`
+- `GET /v1/universal/graph/live`
 - `GET /v1/universal/candidates/live`
-- `GET /v1/stablecoins/live`
-- `GET /v1/stablecoins/depth-quote?source=USDC&target=USD&amount=1000`
+
+DEX and conversion evidence:
 - `GET /v1/dex/route-quotes/live`
 - `POST /v1/dex/route-shadow/cycle`
 - `GET /v1/dex/route-shadow/summary`
 - `POST /v1/dex/route-frontier/probe`
 - `GET /v1/dex/route-frontier/summary`
-- `GET /v1/allocation/live?capital_usd=100000`
+- `GET /v1/stablecoins/depth-quote?source=USDC&target=USD&amount=1000`
+- `POST /v1/stablecoins/depth-shadow/cycle`
+- `GET /v1/stablecoins/depth-shadow/summary`
+- `GET /v1/stablecoins/depth-statistical-model?source=USDC&target=USD&amount=1000`
+
+CEX↔DEX promotion:
+- `GET /v1/cex-dex/composite/live`
+- `GET /v1/cex-dex/composite-shadow/summary`
+- `GET /v1/cex-dex/composite-statistical/live`
+- `GET /v1/cex-dex/operational/live`
+- `GET /v1/cex-dex/paper-qualification/live`
+- `GET /v1/cex-dex/allocation/live`
+
+Unified capital allocation:
+- `GET /v1/allocation/unified/candidates/live`
+- `GET /v1/allocation/unified/live`
+
+Evidence / runtime:
+- `GET /v1/shadow/summary`
+- `GET /v1/latency/model`
+- `GET /v1/worker/health`
 - `GET /v1/evidence/counts`
+- `GET /v1/evidence/{scan_id}/replay`
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/ROADMAP.md`](docs/ROADMAP.md), and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).

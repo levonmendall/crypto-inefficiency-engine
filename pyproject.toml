@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-inefficiency-engine"
-version = "0.12.0"
-description = "Paper-first engine for discovering and ranking structural crypto market inefficiencies."
+version = "1.0.0"
+description = "Paper-first strategy-agnostic engine for discovering, qualifying, and allocating capital to structural crypto market inefficiencies."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

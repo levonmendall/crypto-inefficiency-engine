@@ -2,53 +2,140 @@
 
 ## Objective
 
-Continuously identify structural crypto-market inefficiencies and rank them by conservative expected **capital-adjusted** net return after explicit costs and risk haircuts, while preserving point-in-time evidence sufficient to test whether apparent edge was observable, executable in visible public depth, persistent and plausibly capturable.
+Continuously search accessible crypto markets for structural inefficiencies, reconstruct conservative expected net economics after explicit costs and risk, learn which apparent edges survive market contact, and allocate **paper capital only** to independently qualified opportunities.
 
-## Pipeline
+The engine is strategy-agnostic. A strategy family earns capital authority through evidence; it does not receive authority merely because a detector can describe an apparent spread.
 
-`public adapter registry -> normalization -> canonical opportunity graph -> detector registry -> economic cost model -> paired visible-L2 executability -> capacity frontier -> common ranking -> paper allocation -> multi-horizon shadow attribution -> statistically gated empirical execution-risk model -> durable evidence -> read-only API`
+## V1 pipeline
+
+`public adapters`
+
+→ `normalization / canonical identity`
+
+→ `strategy-neutral opportunity graph + detector registry`
+
+→ `current economic cost / risk reconstruction`
+
+→ `exact or visible-depth execution evidence`
+
+→ `capital requirement / capacity evidence`
+
+→ `multi-horizon shadow evidence`
+
+→ `statistical qualification`
+
+→ `family-specific paper promotion gate`
+
+→ `strategy-neutral paper allocation`
+
+→ `durable history / replay / read-only API`
 
 ## Public adapter registry
 
-v0.10 centralizes public CEX collection in `PublicAdapterRegistry`. It owns:
+`PublicAdapterRegistry` owns public CEX market/funding collection, venue-specific public L2 routing, provider-to-venue attribution and live diagnostics. Core public surfaces currently include Coinbase, Kraken, Hyperliquid, Bybit and OKX; universal surfaces add public DEX, stablecoin and option research data.
 
-- market/funding collection and provider status;
-- venue-specific public L2 routing;
-- provider-prefix to venue attribution used by shadow failure classification;
-- live provider diagnostics.
+A zero-item or failed required public surface is degraded evidence rather than a successful empty scan.
 
-`OpportunityService` no longer needs venue-specific collection/book `if/elif` branches. Adding a public venue therefore does not require a second, disconnected routing path.
+No public adapter has private-account or order-entry authority.
 
-Current core public surfaces are Coinbase USD spot, Kraken USD spot, Hyperliquid perpetual/funding, Bybit USDT spot/perpetual/dated futures, and OKX USDT spot/perpetual/funding. A zero-item surface is degraded evidence, not a healthy empty scan.
+## Canonical graph and detector layer
 
-The diagnostic path requests representative visible L2 and reports item counts, symbols, errors and observed request latency. It has no private-account or order-entry capability.
+Stable internal identities represent assets, venues and contracts; provider symbols remain aliases. Dated futures have expiry-specific identity. Quote currencies remain explicit, so USD, USDC and USDT are not silently treated as risk-free equivalents.
 
-## Canonical opportunity graph
+Core detector modules currently cover funding dispersion, spot/perpetual basis, dated-futures basis and CEX spot dislocation. The universal graph also represents CEX↔DEX, DEX↔DEX, stablecoin, cross-chain, solver, liquidation/backstop and option-relative-value relationships.
 
-Stable canonical IDs represent assets, venues and instruments. Provider symbols are aliases. Spot/perpetual contracts use stable contract keys; dated futures use expiry-specific keys. Economic-equivalence edges retain quote currency rather than assuming USD, USDC and USDT are risk-free equivalents.
+A universal relationship is **capability**, not authority.
 
-## Detector and universal layers
+## Core CEX qualification
 
-Core CEX detector modules emit the common `Opportunity` contract and pass through shared risk, economic-cost, L2, capacity, shadow and ranking machinery. Universal v0.9 models stablecoin, DEX, bridge, option, solver and liquidation relationships behind explicit evidence gates.
+Core opportunities pass through shared:
 
-Capability is not authority: research candidates cannot bypass core executable qualification or enter paper allocation unless their own evidence path is explicitly promoted.
+- explicit venue fees;
+- financing and required borrow economics;
+- collateral opportunity cost;
+- exact matching of venue/market/contract books;
+- paired visible-L2 depth and same-base sizing;
+- slippage and exit-cost modeling;
+- latency risk;
+- hedge liquidity and recovery protection;
+- capital tiers and capacity frontiers.
 
-## Economic cost model
+Unknown required fees or borrow fail closed.
 
-Executable qualification applies explicit venue taker fees, financing/borrow where required, modeled capital consumption, collateral opportunity cost, book-age risk, execution-timing risk, slippage and hedge-recovery protection. Unknown fees and required-but-unavailable borrow fail closed. OKX now uses explicit configured spot and derivative fee assumptions before it can qualify.
+## Core shadow and empirical learning
 
-## Executability and evidence
+Qualified capital tiers are shadowed at multiple horizons. The system records signal survival, paired fill state, adverse selection, depth/slippage changes, cost expansion, capacity deterioration, partial-fill state and hedge-recovery proxies.
 
-Each opportunity is qualified only against books matching exact venue, market kind and contract identity. Both legs must fill the same base quantity from visible public depth while preserving configured hedge liquidity. Public L2 is a taker visible-depth reconstruction, not proof of exchange-confirmed fills or maker queue position.
+Empirical calibration is gated by independent sample counts, tail evidence and confidence intervals. Conservative fixed assumptions remain in force when statistical evidence is insufficient.
 
-The shadow runtime follows qualified capital tiers at 1/5/15/30/60 seconds and records signal survival, adverse selection, depth/slippage change, edge/cost/capacity deterioration, partial-fill state and hedge-recovery proxies. Empirical calibration remains gated by independent samples, tail evidence and confidence intervals; fixed conservative assumptions remain when evidence is insufficient.
+## CEX↔DEX paper-promotion pipeline
 
-## Allocation and execution boundary
+CEX↔DEX is the first universal family promoted through its own full evidence path.
 
-Paper allocation consumes already-qualified opportunities and enforces total-capital, venue, asset, capacity and shared-instrument conflicts. Cash is valid. Allocation has no live execution authority.
+### 1. Amount-specific DEX routes
+Quote-only routes preserve exact source/destination amounts, route composition, block, gas and public request latency. Quotes do not imply capacity.
 
-There is no live executor. Real-money execution remains a separate future service requiring explicit authorization, credentials, hard caps, hedge-recovery controls and kill switches.
+### 2. Route survival and size frontiers
+Exact original source amounts are re-quoted at multiple horizons. Independent $1k/$5k/$10k/$25k tiers collect their own survival and adverse-deterioration evidence. A larger successful quote cannot repair an intermediate failed tier.
+
+### 3. Stablecoin conversion depth
+When CEX and DEX quote currencies differ, the exact economic amount is reconstructed through public Coinbase USDC-USD / USDT-USD L2 books. Two-hop USDC↔USDT conversion carries the actual intermediate USD amount. Insufficient depth, stale books or excessive timestamp skew fail closed.
+
+### 4. Fully costed composite economics
+Each DEX route tier is joined to its same-notional CEX hedge and required conversion-depth output. CEX taker fees, DEX gas and stablecoin risk haircuts are charged explicitly without double-counting observable conversion spread/slippage.
+
+### 5. Independent statistical evidence
+Three separate evidence layers must mature:
+
+- route/frontier survival;
+- stablecoin conversion-depth survival where conversion is required;
+- fully costed composite net-edge survival.
+
+Qualification uses independent cycles, confidence intervals, minimum effective/tail samples, adverse-deterioration ceilings and low-tail retained-edge evidence.
+
+### 6. Paper operational qualification
+The system requires explicit simulated pre-funded inventory on the correct CEX/DEX side for the route direction. A qualifying paper opportunity cannot depend on a bridge, deposit or withdrawal occurring during the opportunity. A separate CEX recovery venue and recovery reserve are required.
+
+These are paper assumptions only; they never claim live balances.
+
+### 7. Final conservative capture edge
+The allocator does not use the raw current spread. It applies the composite survival-confidence lower bound and low-tail retained-edge fraction, then caps the result at the hedge-recovery-adjusted current edge. The resulting conservative capture edge must still exceed the configured hurdle.
+
+Only then may CEX↔DEX become `paper_allocation_eligible=true`.
+
+## Strategy-neutral allocator
+
+The unified allocator compares independently qualified core CEX and CEX↔DEX opportunities on **conservative expected return on reserved capital for the current deployment**.
+
+For core opportunities, annualized return is converted back into the return expected over the model's holding period. For event-driven CEX↔DEX, the allocator uses the conservative one-deployment capture economics. This avoids falsely annualizing a short-lived edge as though it were continuously repeatable.
+
+Portfolio constraints include:
+
+- total paper capital;
+- venue concentration;
+- asset concentration;
+- shared instrument/route conflicts;
+- two-leg capital reservation;
+- allocation-count limits.
+
+Cash is valid.
+
+## Research-only families
+
+DEX↔DEX, stablecoin dislocation, cross-chain, solver, liquidation/backstop and option relative value remain graph-searchable but cannot allocate capital until their family-specific missing evidence is authoritative.
+
+The system intentionally prefers a named blocker over a fabricated capacity or execution assumption.
 
 ## Durable runtime
 
-SQLite remains the local backend. Production can use PostgreSQL through `DATABASE_URL`/`CIE_DATABASE_URL`. The worker records append-only evidence and durable heartbeats; the read-only API exposes diagnostics, evidence and shadow summaries.
+SQLite is supported locally; PostgreSQL is supported in production through `DATABASE_URL` / `CIE_DATABASE_URL`. Durable evidence includes core scans, market/funding inputs, order books, executability, shadow cycles, DEX route evidence, size frontiers, stablecoin conversion-depth shadow evidence, composite CEX↔DEX edge history and worker heartbeats.
+
+The API exposes diagnostics, evidence, statistical models, promotion status and paper allocation surfaces.
+
+## Authority boundary
+
+Paper V1 has **no live executor**.
+
+It has no private keys, custody, deposits, withdrawals, transaction building, signing, order submission or live-money authorization. Public quotes and visible depth cannot create live capacity or balance authority.
+
+Any future live executor must be a separate explicitly authorized service with separate credentials, hard capital limits, paired-leg recovery, concentration controls, dead-man/kill switches, reconciliation and production evidence that the promoted strategy is statistically convincing.
