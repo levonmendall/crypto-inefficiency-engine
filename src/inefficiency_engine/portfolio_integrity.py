@@ -35,6 +35,7 @@ class PortfolioIntegritySnapshot(BaseModel):
     fallback_snapshot: bool = False
     cycle_error_type: str | None = None
     stale_position_count: int = Field(default=0, ge=0)
+    settlement_evidence_blocked_count: int = Field(default=0, ge=0)
     open_position_count: int = Field(default=0, ge=0)
     allocation_family_failures: list[dict[str, object]] = Field(default_factory=list)
     market_snapshot_id: str | None = None
