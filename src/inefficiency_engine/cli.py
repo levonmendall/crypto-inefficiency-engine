@@ -6,8 +6,8 @@ import json
 
 from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import build_evidence_store
+from inefficiency_engine.operating_worker import run_forever
 from inefficiency_engine.service import OpportunityService
-from inefficiency_engine.worker import run_forever
 
 
 def _service() -> tuple[OpportunityService, object | None]:
