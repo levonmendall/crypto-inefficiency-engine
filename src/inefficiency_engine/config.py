@@ -92,6 +92,9 @@ class Settings:
     dex_route_frontier_notionals_usd: tuple[float, ...] = (1000.0, 5000.0, 10000.0, 25000.0)
     dex_route_frontier_max_deterioration_bps: float = 25.0
     dex_route_frontier_every_cycles: int = 10
+    dex_route_tier_shadow_notionals_usd: tuple[float, ...] = (5000.0, 10000.0, 25000.0)
+    dex_route_tier_shadow_every_cycles: int = 10
+    dex_route_tier_shadow_max_concurrency: int = 2
     dex_statistical_reference_horizon_seconds: float = 5.0
     dex_statistical_min_effective_samples: int = 30
     dex_statistical_min_tail_samples: int = 20
@@ -172,6 +175,11 @@ class Settings:
                 "CIE_DEX_ROUTE_FRONTIER_MAX_DETERIORATION_BPS", 25.0
             ),
             dex_route_frontier_every_cycles=max(1, _int("CIE_DEX_ROUTE_FRONTIER_EVERY_CYCLES", 10)),
+            dex_route_tier_shadow_notionals_usd=_float_tuple(
+                "CIE_DEX_ROUTE_TIER_SHADOW_NOTIONALS_USD", (5000.0, 10000.0, 25000.0)
+            ),
+            dex_route_tier_shadow_every_cycles=max(1, _int("CIE_DEX_ROUTE_TIER_SHADOW_EVERY_CYCLES", 10)),
+            dex_route_tier_shadow_max_concurrency=max(1, _int("CIE_DEX_ROUTE_TIER_SHADOW_MAX_CONCURRENCY", 2)),
             dex_statistical_reference_horizon_seconds=max(
                 0.0, _float("CIE_DEX_STATISTICAL_REFERENCE_HORIZON_SECONDS", 5.0)
             ),
