@@ -30,6 +30,16 @@ def health():
     return payload
 
 
+@app.get("/v1/detectors")
+def detector_registry():
+    manifests = service.detector_manifests()
+    return {
+        "count": len(manifests),
+        "paper_only": True,
+        "detectors": [item.model_dump(mode="json") for item in manifests],
+    }
+
+
 @app.get("/v1/opportunities/demo")
 def demo_opportunities():
     opportunities = service.demo_scan()
@@ -48,6 +58,21 @@ async def live_opportunities():
         "paper_only": True,
         "providers": [status.model_dump(mode="json") for status in snapshot.providers],
         "opportunities": [o.model_dump(mode="json") for o in snapshot.opportunities],
+    }
+
+
+@app.get("/v1/graph/live")
+async def live_market_graph():
+    try:
+        graph, providers, opportunities = await service.collect_live_graph()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"live graph scan failed: {type(exc).__name__}") from exc
+    return {
+        "paper_only": True,
+        "summary": graph.summary(),
+        "provider_status": [status.model_dump(mode="json") for status in providers],
+        "discovered_opportunity_count": len(opportunities),
+        "graph": graph.model_dump(mode="json"),
     }
 
 
@@ -79,6 +104,23 @@ async def live_executability():
         "latency_model": service.empirical_latency_model().model_dump(mode="json"),
         "providers": [status.model_dump(mode="json") for status in snapshot.providers],
         "executability": [item.model_dump(mode="json") for item in snapshot.executability],
+    }
+
+
+@app.get("/v1/opportunities/ranked/live")
+async def ranked_live_opportunities():
+    try:
+        snapshot = await service.collect_live_executability()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"live ranking scan failed: {type(exc).__name__}") from exc
+    ranked = service.rank_snapshot(snapshot)
+    return {
+        "scan_id": snapshot.scan_id,
+        "paper_only": True,
+        "rank_basis": "capital_adjusted_net_annualized_return",
+        "allocator_authority": False,
+        "count": len(ranked),
+        "opportunities": [item.model_dump(mode="json") for item in ranked],
     }
 
 

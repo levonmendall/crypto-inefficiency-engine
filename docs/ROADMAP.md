@@ -29,14 +29,32 @@ Future operational work: retention/export policy, historical funding ingestion, 
 - Extra hedge-liquidity reserve
 - Fail-closed short-spot borrow economics
 
-## Milestone 4 — Broader alpha graph — deferred
-- Direct exchange adapters
-- CEX/CEX spot dislocations
-- CEX/DEX and DEX/DEX routing
-- Cross-chain liquidity and stablecoin dislocations
-- Futures term structure and options relative value
+## Milestone 4 — Universal alpha graph — v0.9 foundation complete
+### v0.9.0 foundation
+- Stable canonical crypto asset IDs independent of provider symbol
+- Stable current spot/perpetual venue-instrument IDs with extensible contract keys
+- Provider symbols retained as aliases rather than primary identity
+- Venue, instrument, asset, listing, representation, and economic-equivalence graph relationships
+- Common detector context and detector registry
+- Existing funding-dispersion and spot/perp-basis strategies migrated through the registry without changing their economics
+- Graph lineage attached to discovered opportunities
+- Live graph inspection through `GET /v1/graph/live`
+- Detector manifest through `GET /v1/detectors`
+- Common ranking of already-qualified opportunities by capital-adjusted net annualized return
+- Capacity kept explicit beside ranking score
+- Ranking explicitly has no allocator or execution authority
 
-This remains secondary until the existing alpha is empirically shown to survive market contact.
+### Next breadth slices
+1. Additional direct CEX/perpetual venue adapters so funding/basis are genuinely multi-venue
+2. Dated futures identity + futures term-structure/basis detector
+3. CEX/CEX spot dislocation detector
+4. Stablecoin dislocation graph and detector
+5. DEX pool/route identity and DEX/DEX routing
+6. CEX/DEX comparison and transfer/settlement cost edges
+7. Cross-chain/bridge liquidity edges
+8. Liquidation/backstop and solver opportunity modules
+9. Options/volatility relative-value graph extensions
+10. Portfolio/capital allocator only after several independent strategies have statistically credible shadow evidence
 
 ## Milestone 5 — Shadow evidence runtime — v0.7 complete
 - Durable always-on worker and managed PostgreSQL topology
@@ -47,34 +65,23 @@ This remains secondary until the existing alpha is empirically shown to survive 
 - Explicit failure causes and segmented survival statistics
 
 ## v0.8 — Empirical fill/latency modeling — complete
-- Persist original target quantity into shadow attribution
 - Measure public L2 request round-trip latency on Coinbase and Hyperliquid
 - Preserve whole-scan latency only as an explicitly labeled historical fallback
 - Separate measured collector/data timing from hypothetical order-ack and second-leg timing
-- Expose that execution latency is not empirical while no live order path exists
-- Reconstruct per-leg visible base-depth multiples
 - Reconstruct pair/reserve fillability and visible taker fill fractions
 - Quantify asymmetric partial fills and unmatched/unhedged exposure
-- Estimate partial-fill probability and p50/p90/p95 unhedged-fraction distributions
-- Estimate p50/p90/p95 hedge-recovery-loss proxies
-- Ensure empirical recovery risk can increase, but never reduce, the fixed recovery floor
-- Build p50/p90/p95 adverse-selection distributions
-- Hierarchical empirical cohorts: strategy + venue pair + asset + capital, with controlled fallback through broader scopes
-- Resolve a separate empirical model for every evaluated capital size
-- Interval-censored interpolation between adjacent 1/5/15/30/60s horizons
-- Enforce monotone-conservative quality/risk interpolation
-- Cluster capital tiers from the same market event so correlated rows do not inflate sample size
-- Wilson confidence intervals for fill/reserve/capture/recovery probabilities
-- Gate calibration on raw count, effective independent-event count, tail-risk samples, and maximum CI width at every endpoint
-- Persist model scope, effective sample size, confidence intervals, and fallback provenance in executable output
-- Scoped inspection through `GET /v1/latency/model`
-- Explicitly abstain from maker queue-position/fill probability because current public L2 cannot establish queue position
+- Estimate partial-fill probability and p50/p90/p95 unhedged-fraction/recovery-loss distributions
+- Hierarchical per-capital empirical cohorts with conservative fallback
+- Interval-censored interpolation between adjacent shadow horizons
+- Cluster correlated capital-tier rows by independent market event
+- Wilson confidence intervals and effective-sample-size gates
 - Automatically retain the fixed conservative model whenever any empirical gate fails
+- Explicitly abstain from maker queue-position/fill probability when public data cannot prove it
 
 v0.8 is complete at the paper/shadow evidence boundary. It does not claim exchange-confirmed fills or empirical order acknowledgement latency.
 
 ## Milestone 6 — Tiny-capital controlled execution — blocked
-Separate service, credentials, explicit authorization, hard caps, paired-leg atomicity/hedge recovery, venue concentration limits, dead-man switches, and kill switch. This remains blocked until accumulated v0.8 evidence is statistically convincing and a separate live-execution decision is explicitly authorized.
+Separate service, credentials, explicit authorization, hard caps, paired-leg atomicity/hedge recovery, venue concentration limits, dead-man switches, and kill switch. This remains blocked until accumulated evidence is statistically convincing and a separate live-execution decision is explicitly authorized.
 
 ## Milestone 7 — Machine-paid intelligence API
 - API keys and usage metering
