@@ -12,6 +12,8 @@ def test_advanced_paper_evidence_allocator_and_alpha_routes_are_registered():
         "/v2/alpha/health/live",
         "/v2/alpha/promoted/live",
         "/v2/alpha/fundamentals/summary",
+        "/v2/allocation/certification/summary",
+        "/v2/allocation/certification/cycle",
         "/v1/cex-dex/composite-shadow/summary",
         "/v1/cex-dex/composite-statistical/live",
         "/v1/stablecoins/depth-shadow/cycle",
