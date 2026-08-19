@@ -60,10 +60,11 @@ async def test_threaded_runtime_puts_research_and_portfolio_on_daemon_threads(mo
 
     class FakeThread:
         def __init__(self, *, target, name, daemon):
-            observed.append({"target": target, "name": name, "daemon": daemon})
+            self.record = {"target": target, "name": name, "daemon": daemon}
+            observed.append(self.record)
 
         def start(self):
-            observed[-1]["started"] = True
+            self.record["started"] = True
 
     class FakeStore:
         def record_worker_heartbeat(self, *, worker_id, state, **kwargs):
