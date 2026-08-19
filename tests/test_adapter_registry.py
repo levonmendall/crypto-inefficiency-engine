@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -87,6 +88,18 @@ class FakeAdapter:
         return book(self.venue, market_kind, resolved, quote=quote)
 
 
+class HangingMarketAdapter(FakeAdapter):
+    async def market_quotes(self):
+        await asyncio.sleep(10)
+        return list(self._markets)
+
+
+class HangingBookAdapter(FakeAdapter):
+    async def order_book(self, asset, market_kind=MarketKind.SPOT, *, symbol=None, **kwargs):
+        await asyncio.sleep(10)
+        return await super().order_book(asset, market_kind, symbol=symbol, **kwargs)
+
+
 def registry(*, empty_coinbase: bool = False) -> PublicAdapterRegistry:
     return PublicAdapterRegistry(
         hyperliquid=FakeAdapter(
@@ -121,32 +134,8 @@ def registry(*, empty_coinbase: bool = False) -> PublicAdapterRegistry:
     )
 
 
-def test_provider_venue_maps_okx_and_existing_venues():
-    assert PublicAdapterRegistry.provider_venue("okx-v5:market:books:BTC-USDT") == "OKX"
-    assert PublicAdapterRegistry.provider_venue("hyperliquid:l2Book:BTC") == "HlPerp"
-    assert PublicAdapterRegistry.provider_venue("coinbase-exchange:ticker") == "Coinbase"
-    assert PublicAdapterRegistry.provider_venue("unknown") is None
-
-
-@pytest.mark.asyncio
-async def test_collect_inputs_promotes_okx_and_fails_closed_on_empty_surface():
-    healthy = registry()
-    funding_quotes, market_quotes, statuses = await healthy.collect_inputs()
-    assert any(item.venue == "OKX" for item in market_quotes)
-    assert any(item.venue == "OKX" for item in funding_quotes)
-    assert all(status.ok for status in statuses)
-
-    degraded = registry(empty_coinbase=True)
-    _, _, statuses = await degraded.collect_inputs()
-    coinbase = next(item for item in statuses if item.provider == "coinbase-exchange:ticker")
-    assert coinbase.ok is False
-    assert coinbase.error_type == "EmptyResult"
-
-
-@pytest.mark.asyncio
-async def test_collect_books_routes_okx_leg_through_registry():
-    adapters = registry()
-    opportunity = Opportunity(
+def okx_basis_opportunity() -> Opportunity:
+    return Opportunity(
         id="okx-test",
         strategy=Strategy.SPOT_PERP_BASIS,
         asset="BTC",
@@ -183,12 +172,80 @@ async def test_collect_books_routes_okx_leg_through_registry():
         confidence="low",
         evidence={},
     )
+
+
+def test_provider_venue_maps_okx_and_existing_venues():
+    assert PublicAdapterRegistry.provider_venue("okx-v5:market:books:BTC-USDT") == "OKX"
+    assert PublicAdapterRegistry.provider_venue("hyperliquid:l2Book:BTC") == "HlPerp"
+    assert PublicAdapterRegistry.provider_venue("coinbase-exchange:ticker") == "Coinbase"
+    assert PublicAdapterRegistry.provider_venue("unknown") is None
+
+
+@pytest.mark.asyncio
+async def test_collect_inputs_promotes_okx_and_fails_closed_on_empty_surface():
+    healthy = registry()
+    funding_quotes, market_quotes, statuses = await healthy.collect_inputs()
+    assert any(item.venue == "OKX" for item in market_quotes)
+    assert any(item.venue == "OKX" for item in funding_quotes)
+    assert all(status.ok for status in statuses)
+
+    degraded = registry(empty_coinbase=True)
+    _, _, statuses = await degraded.collect_inputs()
+    coinbase = next(item for item in statuses if item.provider == "coinbase-exchange:ticker")
+    assert coinbase.ok is False
+    assert coinbase.error_type == "EmptyResult"
+
+
+@pytest.mark.asyncio
+async def test_collect_inputs_times_out_one_surface_without_blocking_other_venues():
+    adapters = registry()
+    adapters.provider_surface_timeout_seconds = 0.01
+    adapters.coinbase = HangingMarketAdapter(
+        markets=[market("Coinbase", MarketKind.SPOT, "BTC-USD")],
+        venue="Coinbase",
+    )
+
+    funding_quotes, market_quotes, statuses = await adapters.collect_inputs()
+
+    coinbase = next(item for item in statuses if item.provider == "coinbase-exchange:ticker")
+    assert coinbase.ok is False
+    assert coinbase.error_type == "TimeoutError"
+    assert any(item.venue == "HlPerp" for item in market_quotes)
+    assert any(item.venue == "OKX" for item in market_quotes)
+    assert any(item.venue == "OKX" for item in funding_quotes)
+
+
+@pytest.mark.asyncio
+async def test_collect_books_routes_okx_leg_through_registry():
+    adapters = registry()
+    opportunity = okx_basis_opportunity()
     books, statuses = await adapters.collect_books_for_opportunities([opportunity])
     assert len(books) == 2
     assert {item.market_kind for item in books} == {MarketKind.SPOT, MarketKind.PERPETUAL}
     assert all(item.venue == "OKX" for item in books)
     assert all(status.ok for status in statuses)
     assert all(item.request_latency_ms == 12.5 for item in books)
+
+
+@pytest.mark.asyncio
+async def test_collect_books_times_out_one_venue_without_blocking_scan_completion():
+    adapters = registry()
+    adapters.order_book_timeout_seconds = 0.01
+    adapters.okx = HangingBookAdapter(
+        markets=[
+            market("OKX", MarketKind.SPOT, "BTC-USDT", quote="USDT"),
+            market("OKX", MarketKind.PERPETUAL, "BTC-USDT-SWAP", quote="USDT"),
+        ],
+        fundings=[funding("OKX", "BTC-USDT-SWAP", quote="USDT")],
+        venue="OKX",
+    )
+
+    books, statuses = await adapters.collect_books_for_opportunities([okx_basis_opportunity()])
+
+    assert books == []
+    assert len(statuses) == 2
+    assert all(status.ok is False for status in statuses)
+    assert all(status.error_type == "TimeoutError" for status in statuses)
 
 
 @pytest.mark.asyncio
