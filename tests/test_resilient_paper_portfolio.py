@@ -33,7 +33,13 @@ class FakeAllocator:
         return next_item
 
 
-def snapshot(at: datetime, price: float = 100.0, *, include_quote: bool = True) -> ScanSnapshot:
+def snapshot(
+    at: datetime,
+    price: float = 100.0,
+    *,
+    include_quote: bool = True,
+    quote_at: datetime | None = None,
+) -> ScanSnapshot:
     quotes = []
     if include_quote:
         quotes.append(MarketQuote(
@@ -42,7 +48,7 @@ def snapshot(at: datetime, price: float = 100.0, *, include_quote: bool = True) 
             market_kind=MarketKind.SPOT,
             symbol="BTC-USD",
             mid=price,
-            observed_at=at,
+            observed_at=quote_at or at,
             source="test",
         ))
     return ScanSnapshot(
@@ -127,6 +133,7 @@ async def test_healthy_cycle_records_fresh_integrity_and_opens_supported_positio
     assert integrity.cycle_status == "success"
     assert integrity.market_evidence_at == t0
     assert integrity.stale_position_count == 0
+    assert integrity.settlement_evidence_blocked_count == 0
     assert integrity.allocation_family_failures == []
 
 
@@ -179,6 +186,43 @@ async def test_stale_open_position_blocks_new_deployment_and_is_explicit(tmp_pat
     assert integrity.cycle_status == "degraded"
     assert integrity.cycle_error_type == "StaleOpenPositionValuation"
     assert integrity.stale_position_count == 1
+    assert integrity.settlement_evidence_blocked_count == 0
+
+
+@pytest.mark.asyncio
+async def test_scan_completion_after_horizon_cannot_settle_with_pre_horizon_quote(tmp_path):
+    t0 = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
+    due = t0 + timedelta(hours=1)
+    scan_completed = due + timedelta(minutes=5)
+    pre_horizon_quote = due - timedelta(seconds=1)
+    store = EvidenceStore(tmp_path / "portfolio.sqlite3")
+    allocator = FakeAllocator([plan(t0, [allocation(t0)])])
+    service = OperationallyResilientPaperPortfolioService(
+        FakeCore([
+            snapshot(t0, price=100.0),
+            snapshot(scan_completed, price=110.0, quote_at=pre_horizon_quote),
+        ]),
+        allocator,
+        store,
+    )
+
+    await service.run_cycle()
+    second = await service.run_cycle()
+    account = service.ledger.latest_snapshot()
+    integrity = service.integrity.latest()
+
+    assert len(allocator.capital_requests) == 1
+    assert second.closed_position_count == 0
+    assert account is not None and account.open_position_count == 1
+    assert account.closed_trade_count == 0
+    assert service.ledger.trade_history() == []
+    assert integrity is not None
+    assert integrity.valuation_status == "stale"
+    assert integrity.cycle_status == "degraded"
+    assert integrity.cycle_error_type == "SettlementEvidencePreHorizon"
+    assert integrity.stale_position_count == 1
+    assert integrity.settlement_evidence_blocked_count == 1
+    assert integrity.market_evidence_at == t0
 
 
 @pytest.mark.asyncio
