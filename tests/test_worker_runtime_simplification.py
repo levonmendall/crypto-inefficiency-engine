@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 import subprocess
 import sys
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import inefficiency_engine.cli as cli
 import inefficiency_engine.worker_children as worker_children
 
 
@@ -35,6 +37,15 @@ if loaded:
         check=False,
     )
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_render_worker_command_uses_single_process_operating_runtime():
+    source = inspect.getsource(cli.main)
+    worker_block = source.split('if args.command == "worker":', 1)[1].split("service, store = _service()", 1)[0]
+
+    assert "run_forever" in worker_block
+    assert "supervise_worker_processes" not in worker_block
+    assert "worker_supervisor" not in worker_block
 
 
 @pytest.mark.asyncio
