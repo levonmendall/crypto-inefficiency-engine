@@ -1,0 +1,416 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import statistics
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Literal
+
+from pydantic import BaseModel, Field
+from sqlalchemy import Column, Index, Integer, MetaData, String, Table, Text, insert, select
+
+from inefficiency_engine.evidence import EvidenceStore, ScanSnapshot
+from inefficiency_engine.models import MarketKind, MarketQuote
+from inefficiency_engine.unified_allocation import UnifiedPaperAllocation, UnifiedPaperAllocationPlan, UnifiedPaperAllocatorService
+
+
+SettlementStatus = Literal["settled"]
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _payload(value: BaseModel) -> tuple[str, str]:
+    raw = json.dumps(value.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return raw, hashlib.sha256(raw.encode()).hexdigest()
+
+
+class PaperAllocationTrial(BaseModel):
+    trial_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    plan_observed_at: datetime
+    candidate_id: str
+    family: str
+    strategy: str
+    asset: str
+    venues: list[str]
+    exposure_kind: str
+    capital_required_usd: float = Field(gt=0)
+    notional_usd: float = Field(gt=0)
+    predicted_profit_usd: float = Field(ge=0)
+    predicted_return_on_reserved_capital: float = Field(ge=0)
+    source_observed_at: datetime | None = None
+    due_at: datetime | None = None
+    instrument_symbol: str | None = None
+    instrument_market_kind: str | None = None
+    entry_reference_price: float | None = Field(default=None, gt=0)
+    modeled_roundtrip_cost_return: float | None = Field(default=None, ge=0)
+    settlement_supported: bool = False
+    settlement_method: str | None = None
+    settlement_blocker: str | None = None
+    cohort_key: str
+    recorded_at: datetime = Field(default_factory=_now)
+    live_execution_authority: bool = False
+    paper_only: bool = True
+
+
+class PaperAllocationOutcome(BaseModel):
+    outcome_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    trial_id: str
+    candidate_id: str
+    family: str
+    strategy: str
+    asset: str
+    matured_at: datetime
+    due_at: datetime
+    entry_reference_price: float = Field(gt=0)
+    exit_reference_price: float = Field(gt=0)
+    realized_gross_return: float
+    realized_net_return: float
+    realized_profit_usd: float
+    predicted_profit_usd: float = Field(ge=0)
+    prediction_error_usd: float
+    profit_capture_ratio: float | None = None
+    profitable: bool
+    settlement_status: SettlementStatus = "settled"
+    settlement_method: str
+    live_execution_authority: bool = False
+    paper_only: bool = True
+
+
+class AllocationCertificationCycle(BaseModel):
+    cycle_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    observed_at: datetime
+    plan_allocation_count: int = Field(ge=0)
+    trials_recorded: int = Field(ge=0)
+    supported_trials_recorded: int = Field(ge=0)
+    unsupported_trials_recorded: int = Field(ge=0)
+    outcomes_matured: int = Field(ge=0)
+    paper_only: bool = True
+
+
+class AllocationCertificationLedger:
+    """Append-only allocator-decision and forward-outcome evidence."""
+
+    def __init__(self, store: EvidenceStore):
+        self.store = store
+        metadata = MetaData()
+        self.trials = Table(
+            "allocation_forward_trials",
+            metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("trial_id", String(64), nullable=False, unique=True),
+            Column("candidate_id", Text, nullable=False),
+            Column("family", Text, nullable=False),
+            Column("strategy", Text, nullable=False),
+            Column("asset", Text, nullable=False),
+            Column("cohort_key", Text, nullable=False),
+            Column("plan_observed_at", Text, nullable=False),
+            Column("due_at", Text),
+            Column("settlement_supported", String(5), nullable=False),
+            Column("payload_json", Text, nullable=False),
+            Column("lineage_hash", String(64), nullable=False),
+        )
+        self.outcomes_table = Table(
+            "allocation_forward_outcomes",
+            metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("outcome_id", String(64), nullable=False, unique=True),
+            Column("trial_id", String(64), nullable=False, unique=True),
+            Column("strategy", Text, nullable=False),
+            Column("asset", Text, nullable=False),
+            Column("matured_at", Text, nullable=False),
+            Column("payload_json", Text, nullable=False),
+            Column("lineage_hash", String(64), nullable=False),
+        )
+        Index("ix_allocation_trial_due", self.trials.c.due_at)
+        Index("ix_allocation_trial_cohort", self.trials.c.cohort_key)
+        Index("ix_allocation_outcome_strategy_asset", self.outcomes_table.c.strategy, self.outcomes_table.c.asset)
+        metadata.create_all(store.engine)
+
+    def record_trial(self, trial: PaperAllocationTrial) -> str:
+        raw, lineage = _payload(trial)
+        with self.store.engine.begin() as db:
+            existing = db.execute(
+                select(self.trials.c.trial_id).where(self.trials.c.trial_id == trial.trial_id)
+            ).scalar_one_or_none()
+            if existing is None:
+                db.execute(insert(self.trials), {
+                    "trial_id": trial.trial_id,
+                    "candidate_id": trial.candidate_id,
+                    "family": trial.family,
+                    "strategy": trial.strategy,
+                    "asset": trial.asset,
+                    "cohort_key": trial.cohort_key,
+                    "plan_observed_at": trial.plan_observed_at.isoformat(),
+                    "due_at": trial.due_at.isoformat() if trial.due_at is not None else None,
+                    "settlement_supported": "true" if trial.settlement_supported else "false",
+                    "payload_json": raw,
+                    "lineage_hash": lineage,
+                })
+        return trial.trial_id
+
+    def record_outcome(self, outcome: PaperAllocationOutcome) -> str:
+        raw, lineage = _payload(outcome)
+        with self.store.engine.begin() as db:
+            existing = db.execute(
+                select(self.outcomes_table.c.trial_id).where(self.outcomes_table.c.trial_id == outcome.trial_id)
+            ).scalar_one_or_none()
+            if existing is None:
+                db.execute(insert(self.outcomes_table), {
+                    "outcome_id": outcome.outcome_id,
+                    "trial_id": outcome.trial_id,
+                    "strategy": outcome.strategy,
+                    "asset": outcome.asset,
+                    "matured_at": outcome.matured_at.isoformat(),
+                    "payload_json": raw,
+                    "lineage_hash": lineage,
+                })
+        return outcome.outcome_id
+
+    def pending_supported_trials(self, *, now: datetime | None = None) -> list[PaperAllocationTrial]:
+        now = now or _now()
+        with self.store.engine.connect() as db:
+            payloads = list(db.execute(
+                select(self.trials.c.payload_json)
+                .where(self.trials.c.settlement_supported == "true")
+                .where(self.trials.c.due_at.is_not(None))
+                .where(self.trials.c.due_at <= now.isoformat())
+                .order_by(self.trials.c.id)
+            ).scalars())
+            completed = set(db.execute(select(self.outcomes_table.c.trial_id)).scalars())
+        rows = [PaperAllocationTrial.model_validate_json(payload) for payload in payloads]
+        return [row for row in rows if row.trial_id not in completed]
+
+    def has_open_supported_cohort(self, cohort_key: str, *, now: datetime) -> bool:
+        with self.store.engine.connect() as db:
+            trials = list(db.execute(
+                select(self.trials.c.trial_id, self.trials.c.due_at)
+                .where(self.trials.c.cohort_key == cohort_key)
+                .where(self.trials.c.settlement_supported == "true")
+                .where(self.trials.c.due_at.is_not(None))
+                .where(self.trials.c.due_at > now.isoformat())
+            ))
+            completed = set(db.execute(select(self.outcomes_table.c.trial_id)).scalars())
+        return any(trial_id not in completed for trial_id, _ in trials)
+
+    def trials_all(self) -> list[PaperAllocationTrial]:
+        with self.store.engine.connect() as db:
+            payloads = list(db.execute(select(self.trials.c.payload_json).order_by(self.trials.c.id)).scalars())
+        return [PaperAllocationTrial.model_validate_json(payload) for payload in payloads]
+
+    def outcomes(self) -> list[PaperAllocationOutcome]:
+        with self.store.engine.connect() as db:
+            payloads = list(db.execute(
+                select(self.outcomes_table.c.payload_json).order_by(self.outcomes_table.c.id)
+            ).scalars())
+        return [PaperAllocationOutcome.model_validate_json(payload) for payload in payloads]
+
+    def summary(self) -> dict[str, object]:
+        trials = self.trials_all()
+        outcomes = self.outcomes()
+        supported = [row for row in trials if row.settlement_supported]
+        realized_profit = sum(row.realized_profit_usd for row in outcomes)
+        predicted_profit = sum(row.predicted_profit_usd for row in outcomes)
+        errors = [row.prediction_error_usd for row in outcomes]
+        capture = [row.profit_capture_ratio for row in outcomes if row.profit_capture_ratio is not None]
+        return {
+            "trial_count": len(trials),
+            "supported_trial_count": len(supported),
+            "unsupported_trial_count": len(trials) - len(supported),
+            "settled_outcome_count": len(outcomes),
+            "pending_supported_count": max(0, len(supported) - len(outcomes)),
+            "settlement_coverage_fraction": len(supported) / len(trials) if trials else None,
+            "predicted_profit_usd_settled_trials": predicted_profit,
+            "realized_profit_usd_settled_trials": realized_profit,
+            "profit_capture_ratio_aggregate": realized_profit / predicted_profit if predicted_profit > 0 else None,
+            "median_trial_profit_capture_ratio": statistics.median(capture) if capture else None,
+            "mean_prediction_error_usd": statistics.fmean(errors) if errors else None,
+            "profitable_trial_rate": (
+                sum(row.profitable for row in outcomes) / len(outcomes) if outcomes else None
+            ),
+            "live_execution_authority": False,
+            "paper_only": True,
+        }
+
+
+class AllocationForwardCertificationService:
+    """Forward certification of the unified allocator's actual paper decisions.
+
+    V2.4 settles only spot directional-long alpha because a later public spot
+    price plus the point-in-time modeled round-trip cost forms an honest early
+    forward return reconstruction. Perpetual shorts require realized funding;
+    market-neutral families require family-specific two-leg settlement evidence.
+    Those decisions are persisted but excluded from realized-P&L statistics until
+    their authoritative settlement adapters exist.
+    """
+
+    SETTLEMENT_METHOD = "spot_mid_forward_minus_point_in_time_roundtrip_cost"
+
+    def __init__(
+        self,
+        core,
+        allocator: UnifiedPaperAllocatorService,
+        store: EvidenceStore,
+    ):
+        self.core = core
+        self.allocator = allocator
+        self.store = store
+        self.ledger = AllocationCertificationLedger(store)
+
+    @staticmethod
+    def _cohort_key(allocation: UnifiedPaperAllocation) -> str:
+        venue = allocation.venues[0] if allocation.venues else "unknown"
+        return "|".join([
+            allocation.family,
+            allocation.strategy,
+            allocation.asset,
+            allocation.exposure_kind,
+            venue,
+            allocation.instrument_symbol or "unknown",
+        ])
+
+    @classmethod
+    def trial_from_allocation(
+        cls,
+        allocation: UnifiedPaperAllocation,
+        *,
+        plan_observed_at: datetime,
+    ) -> PaperAllocationTrial:
+        source_time = allocation.source_observed_at or plan_observed_at
+        supported = bool(
+            allocation.family == "alpha"
+            and allocation.exposure_kind == "directional_long"
+            and allocation.instrument_market_kind == MarketKind.SPOT.value
+            and len(allocation.venues) == 1
+            and allocation.instrument_symbol
+            and allocation.entry_reference_price is not None
+            and allocation.modeled_roundtrip_cost_return is not None
+            and allocation.modeled_holding_hours is not None
+        )
+        blocker = None
+        due_at = None
+        method = None
+        if supported:
+            due_at = source_time + timedelta(hours=allocation.modeled_holding_hours or 0.0)
+            method = cls.SETTLEMENT_METHOD
+        elif allocation.family == "alpha" and allocation.exposure_kind == "directional_short":
+            blocker = "perpetual directional settlement requires realized funding accrual evidence"
+        elif allocation.family == "alpha":
+            blocker = "directional alpha settlement metadata is incomplete or unsupported"
+        else:
+            blocker = "market-neutral allocation requires family-specific multi-leg settlement evidence"
+        return PaperAllocationTrial(
+            plan_observed_at=plan_observed_at,
+            candidate_id=allocation.candidate_id,
+            family=allocation.family,
+            strategy=allocation.strategy,
+            asset=allocation.asset,
+            venues=allocation.venues,
+            exposure_kind=allocation.exposure_kind,
+            capital_required_usd=allocation.capital_required_usd,
+            notional_usd=allocation.notional_usd_per_leg,
+            predicted_profit_usd=allocation.expected_profit_usd_per_deployment,
+            predicted_return_on_reserved_capital=allocation.expected_return_on_reserved_capital,
+            source_observed_at=source_time,
+            due_at=due_at,
+            instrument_symbol=allocation.instrument_symbol,
+            instrument_market_kind=allocation.instrument_market_kind,
+            entry_reference_price=allocation.entry_reference_price,
+            modeled_roundtrip_cost_return=allocation.modeled_roundtrip_cost_return,
+            settlement_supported=supported,
+            settlement_method=method,
+            settlement_blocker=blocker,
+            cohort_key=cls._cohort_key(allocation),
+        )
+
+    @staticmethod
+    def _quote_index(snapshot: ScanSnapshot) -> dict[tuple[str, str, str, str], MarketQuote]:
+        rows: dict[tuple[str, str, str, str], MarketQuote] = {}
+        for quote in snapshot.market_quotes:
+            rows[(quote.venue, quote.asset.upper(), quote.market_kind.value, quote.symbol)] = quote
+        return rows
+
+    def _settle_trial(
+        self,
+        trial: PaperAllocationTrial,
+        snapshot: ScanSnapshot,
+    ) -> PaperAllocationOutcome | None:
+        if not trial.settlement_supported or trial.due_at is None:
+            return None
+        if trial.entry_reference_price is None or trial.modeled_roundtrip_cost_return is None:
+            return None
+        if not trial.venues or trial.instrument_symbol is None or trial.instrument_market_kind is None:
+            return None
+        quote = self._quote_index(snapshot).get((
+            trial.venues[0],
+            trial.asset.upper(),
+            trial.instrument_market_kind,
+            trial.instrument_symbol,
+        ))
+        if quote is None or quote.mid <= 0:
+            return None
+        gross = quote.mid / trial.entry_reference_price - 1.0
+        realized_net = gross - trial.modeled_roundtrip_cost_return
+        realized_profit = trial.notional_usd * realized_net
+        error = realized_profit - trial.predicted_profit_usd
+        capture = (
+            realized_profit / trial.predicted_profit_usd
+            if trial.predicted_profit_usd > 0
+            else None
+        )
+        return PaperAllocationOutcome(
+            trial_id=trial.trial_id,
+            candidate_id=trial.candidate_id,
+            family=trial.family,
+            strategy=trial.strategy,
+            asset=trial.asset,
+            matured_at=snapshot.completed_at,
+            due_at=trial.due_at,
+            entry_reference_price=trial.entry_reference_price,
+            exit_reference_price=quote.mid,
+            realized_gross_return=gross,
+            realized_net_return=realized_net,
+            realized_profit_usd=realized_profit,
+            predicted_profit_usd=trial.predicted_profit_usd,
+            prediction_error_usd=error,
+            profit_capture_ratio=capture,
+            profitable=realized_profit > 0,
+            settlement_method=trial.settlement_method or self.SETTLEMENT_METHOD,
+        )
+
+    async def run_cycle(self, *, total_capital_usd: float = 100000.0) -> AllocationCertificationCycle:
+        if total_capital_usd <= 0:
+            raise ValueError("total_capital_usd must be positive")
+        snapshot = await self.core.collect_live_evidence()
+        matured = 0
+        for trial in self.ledger.pending_supported_trials(now=snapshot.completed_at):
+            outcome = self._settle_trial(trial, snapshot)
+            if outcome is not None:
+                self.ledger.record_outcome(outcome)
+                matured += 1
+
+        plan = await self.allocator.allocate(total_capital_usd=total_capital_usd)
+        recorded = supported = unsupported = 0
+        for allocation in plan.allocations:
+            trial = self.trial_from_allocation(allocation, plan_observed_at=plan.observed_at)
+            if trial.settlement_supported and self.ledger.has_open_supported_cohort(
+                trial.cohort_key,
+                now=plan.observed_at,
+            ):
+                continue
+            self.ledger.record_trial(trial)
+            recorded += 1
+            if trial.settlement_supported:
+                supported += 1
+            else:
+                unsupported += 1
+        return AllocationCertificationCycle(
+            observed_at=plan.observed_at,
+            plan_allocation_count=len(plan.allocations),
+            trials_recorded=recorded,
+            supported_trials_recorded=supported,
+            unsupported_trials_recorded=unsupported,
+            outcomes_matured=matured,
+        )
