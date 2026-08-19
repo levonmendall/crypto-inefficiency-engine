@@ -8,43 +8,55 @@ from datetime import datetime, timezone
 
 from inefficiency_engine.certification_worker import CERTIFICATION_WORKER_ID
 from inefficiency_engine.config import Settings
-from inefficiency_engine.evidence import EvidenceStore, build_evidence_store
+from inefficiency_engine.evidence import EvidenceStore, WorkerHeartbeat, build_evidence_store
 from inefficiency_engine.operating_worker import PORTFOLIO_STAGE_TIMEOUT_SECONDS, PORTFOLIO_WORKER_ID
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.worker import WorkerRunStats
-from inefficiency_engine.worker_children import (
-    run_certification_child,
-    run_portfolio_child,
-    run_research_child,
-)
+from inefficiency_engine.worker_children import RESEARCH_WORKER_ID, run_portfolio_child, run_research_child
 from inefficiency_engine.worker_supervisor import (
     record_portfolio_watchdog_fallback,
     recover_stale_portfolio_on_supervisor_startup,
 )
 
 
-RESEARCH_THREAD_WORKER_ID = "shadow-research-thread"
 THREAD_SUPERVISOR_WORKER_ID = "cie-thread-supervisor"
 PORTFOLIO_THREAD_NAME = "canonical-portfolio-thread"
-RESEARCH_THREAD_NAME = "shadow-research-thread"
-CERTIFICATION_THREAD_NAME = "mechanism-certification-thread"
+RESEARCH_THREAD_NAME = "research-certification-auxiliary-thread"
 THREAD_SUPERVISOR_POLL_SECONDS = 15.0
 PORTFOLIO_THREAD_STARTUP_GRACE_SECONDS = 90.0
 PORTFOLIO_THREAD_WATCHDOG_BUFFER_SECONDS = 60.0
+PORTFOLIO_BOOTSTRAP_TIMEOUT_SECONDS = 180.0
+PORTFOLIO_BOOTSTRAP_POLL_SECONDS = 2.0
 
 
 class PortfolioThreadWatchdogError(RuntimeError):
     """Raised when the canonical portfolio thread can no longer prove liveness."""
 
 
-def _thread_runtime() -> tuple[Settings, EvidenceStore, OpportunityService]:
+def _thread_runtime(
+    *,
+    worker_id: str,
+    thread_name: str,
+) -> tuple[Settings, EvidenceStore, OpportunityService]:
+    """Build one thread-local runtime and publish liveness before heavy service init."""
+
     settings = Settings.from_env()
     store = build_evidence_store(settings.evidence_db_path)
     if store is None:
         raise RuntimeError(
             "thread worker requires CIE_DATABASE_URL/DATABASE_URL or CIE_EVIDENCE_DB_PATH"
         )
-    return settings, store, OpportunityService(settings=settings, evidence_store=store)
+    store.record_worker_heartbeat(
+        worker_id=worker_id,
+        state="starting",
+        detail={
+            "thread_name": thread_name,
+            "runtime_initializing": True,
+            "paper_only": True,
+        },
+    )
+    service = OpportunityService(settings=settings, evidence_store=store)
+    return settings, store, service
 
 
 def _record_thread_error(
@@ -77,14 +89,17 @@ def _research_thread_entry() -> None:
         store: EvidenceStore | None = None
         backoff = 5.0
         try:
-            settings, store, service = _thread_runtime()
+            settings, store, service = _thread_runtime(
+                worker_id=RESEARCH_WORKER_ID,
+                thread_name=RESEARCH_THREAD_NAME,
+            )
             backoff = max(1.0, float(settings.worker_error_backoff_seconds))
             asyncio.run(run_research_child(service, store))
-            raise RuntimeError("research child returned unexpectedly")
+            raise RuntimeError("research/certification auxiliary child returned unexpectedly")
         except BaseException as exc:
             _record_thread_error(
                 store,
-                worker_id=RESEARCH_THREAD_WORKER_ID,
+                worker_id=RESEARCH_WORKER_ID,
                 exc=exc,
                 thread_name=RESEARCH_THREAD_NAME,
             )
@@ -96,7 +111,10 @@ def _portfolio_thread_entry() -> None:
         store: EvidenceStore | None = None
         backoff = 5.0
         try:
-            settings, store, service = _thread_runtime()
+            settings, store, service = _thread_runtime(
+                worker_id=PORTFOLIO_WORKER_ID,
+                thread_name=PORTFOLIO_THREAD_NAME,
+            )
             backoff = max(1.0, float(settings.worker_error_backoff_seconds))
             asyncio.run(run_portfolio_child(service, store))
             raise RuntimeError("portfolio child returned unexpectedly")
@@ -110,25 +128,6 @@ def _portfolio_thread_entry() -> None:
             time.sleep(backoff)
 
 
-def _certification_thread_entry() -> None:
-    while True:
-        store: EvidenceStore | None = None
-        backoff = 5.0
-        try:
-            settings, store, service = _thread_runtime()
-            backoff = max(1.0, float(settings.worker_error_backoff_seconds))
-            asyncio.run(run_certification_child(service, store))
-            raise RuntimeError("certification child returned unexpectedly")
-        except BaseException as exc:
-            _record_thread_error(
-                store,
-                worker_id=CERTIFICATION_WORKER_ID,
-                exc=exc,
-                thread_name=CERTIFICATION_THREAD_NAME,
-            )
-            time.sleep(backoff)
-
-
 def _daemon_thread(*, target, name: str) -> threading.Thread:
     return threading.Thread(target=target, name=name, daemon=True)
 
@@ -138,8 +137,6 @@ def _portfolio_cycle_interval_seconds(settings: Settings) -> float:
 
 
 def _portfolio_running_watchdog_seconds() -> float:
-    # Certification no longer runs on the canonical thread. The watchdog now
-    # reflects only the canonical portfolio stage plus a scheduling margin.
     return PORTFOLIO_STAGE_TIMEOUT_SECONDS + PORTFOLIO_THREAD_WATCHDOG_BUFFER_SECONDS
 
 
@@ -188,6 +185,41 @@ def _portfolio_watchdog_reason(
     return None, heartbeat_age, timeout
 
 
+async def _wait_for_canonical_bootstrap(
+    store: EvidenceStore,
+    *,
+    portfolio_thread: threading.Thread,
+    supervisor_started_at: datetime,
+    stop_event: asyncio.Event,
+    timeout_seconds: float = PORTFOLIO_BOOTSTRAP_TIMEOUT_SECONDS,
+    poll_seconds: float = PORTFOLIO_BOOTSTRAP_POLL_SECONDS,
+) -> WorkerHeartbeat | None:
+    """Wait for one bounded canonical cycle before starting provider-heavy auxiliary work."""
+
+    deadline = asyncio.get_running_loop().time() + max(1.0, float(timeout_seconds))
+    terminal_states = {"success", "degraded", "error"}
+    while not stop_event.is_set():
+        if not portfolio_thread.is_alive():
+            return None
+        heartbeat = store.latest_worker_heartbeat(PORTFOLIO_WORKER_ID)
+        if (
+            heartbeat is not None
+            and heartbeat.observed_at >= supervisor_started_at
+            and heartbeat.state in terminal_states
+        ):
+            return heartbeat
+        if asyncio.get_running_loop().time() >= deadline:
+            return None
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=max(0.1, float(poll_seconds)),
+            )
+        except TimeoutError:
+            pass
+    return None
+
+
 async def run_threaded_worker(
     store: EvidenceStore,
     *,
@@ -195,11 +227,14 @@ async def run_threaded_worker(
     stop_event: asyncio.Event | None = None,
     supervisor_poll_seconds: float = THREAD_SUPERVISOR_POLL_SECONDS,
 ) -> WorkerRunStats:
-    """Run research, accounting, and certification on independent daemon threads.
+    """Run canonical accounting first, then one non-authoritative auxiliary domain.
 
-    The main thread remains provider-free and supervises canonical accounting only.
-    Research and mechanism certification are important but non-authoritative for
-    account liveness; a stall in either must never make the Render worker fail.
+    Production showed that starting three independent provider/service graphs at once
+    could fail the Render worker during deployment before canonical accounting proved
+    liveness. The worker now starts only the canonical thread, waits for one bounded
+    account cycle, and only then starts a single research/certification auxiliary
+    thread. The main thread remains provider-free and supervises canonical accounting
+    only.
     """
 
     resolved_settings = settings or Settings.from_env()
@@ -217,23 +252,72 @@ async def run_threaded_worker(
         except (NotImplementedError, RuntimeError):
             pass
 
-    research_thread = _daemon_thread(
-        target=_research_thread_entry,
-        name=RESEARCH_THREAD_NAME,
-    )
     portfolio_thread = _daemon_thread(
         target=_portfolio_thread_entry,
         name=PORTFOLIO_THREAD_NAME,
     )
-    certification_thread = _daemon_thread(
-        target=_certification_thread_entry,
-        name=CERTIFICATION_THREAD_NAME,
+    portfolio_thread.start()
+    research_thread: threading.Thread | None = None
+    research_restart_count = 0
+
+    store.record_worker_heartbeat(
+        worker_id=THREAD_SUPERVISOR_WORKER_ID,
+        state="starting",
+        detail={
+            "paper_only": True,
+            "one_process": True,
+            "main_thread_provider_free": True,
+            "canonical_first_bootstrap": True,
+            "portfolio_thread_isolated": True,
+            "auxiliary_thread_deferred": True,
+            "startup_recovered_stale_portfolio": startup_recovered_stale,
+            "portfolio_running_watchdog_seconds": _portfolio_running_watchdog_seconds(),
+            "portfolio_idle_watchdog_seconds": _portfolio_idle_watchdog_seconds(resolved_settings),
+        },
+    )
+
+    bootstrap = await _wait_for_canonical_bootstrap(
+        store,
+        portfolio_thread=portfolio_thread,
+        supervisor_started_at=supervisor_started_at,
+        stop_event=stop_event,
+    )
+    if stop_event.is_set():
+        store.record_worker_heartbeat(
+            worker_id=THREAD_SUPERVISOR_WORKER_ID,
+            state="stopped",
+            detail={"paper_only": True, "one_process": True, "canonical_first_bootstrap": True},
+        )
+        return WorkerRunStats(THREAD_SUPERVISOR_WORKER_ID, 0, 0, 0)
+    if bootstrap is None:
+        record_portfolio_watchdog_fallback(
+            store,
+            error_type="PortfolioBootstrapTimeout",
+            detail={
+                "thread_name": PORTFOLIO_THREAD_NAME,
+                "bootstrap_timeout_seconds": PORTFOLIO_BOOTSTRAP_TIMEOUT_SECONDS,
+            },
+        )
+        store.record_worker_heartbeat(
+            worker_id=THREAD_SUPERVISOR_WORKER_ID,
+            state="error",
+            error_type="PortfolioBootstrapTimeout",
+            detail={
+                "paper_only": True,
+                "one_process": True,
+                "canonical_first_bootstrap": True,
+                "restart_required": True,
+            },
+        )
+        raise PortfolioThreadWatchdogError(
+            "canonical portfolio did not complete a bounded bootstrap cycle"
+        )
+
+    research_thread = _daemon_thread(
+        target=_research_thread_entry,
+        name=RESEARCH_THREAD_NAME,
     )
     research_thread.start()
-    portfolio_thread.start()
-    certification_thread.start()
-    research_restart_count = 0
-    certification_restart_count = 0
 
     store.record_worker_heartbeat(
         worker_id=THREAD_SUPERVISOR_WORKER_ID,
@@ -242,10 +326,12 @@ async def run_threaded_worker(
             "paper_only": True,
             "one_process": True,
             "main_thread_provider_free": True,
-            "research_thread_isolated": True,
+            "canonical_first_bootstrap": True,
+            "canonical_bootstrap_state": bootstrap.state,
+            "canonical_bootstrap_observed_at": bootstrap.observed_at.isoformat(),
             "portfolio_thread_isolated": True,
-            "certification_thread_isolated": True,
-            "canonical_liveness_excludes_certification": True,
+            "research_certification_auxiliary_thread": True,
+            "canonical_liveness_excludes_auxiliary": True,
             "startup_recovered_stale_portfolio": startup_recovered_stale,
             "portfolio_running_watchdog_seconds": _portfolio_running_watchdog_seconds(),
             "portfolio_idle_watchdog_seconds": _portfolio_idle_watchdog_seconds(resolved_settings),
@@ -264,21 +350,13 @@ async def run_threaded_worker(
                     "canonical portfolio thread exited unexpectedly"
                 )
 
-            if not research_thread.is_alive():
+            if research_thread is not None and not research_thread.is_alive():
                 research_restart_count += 1
                 research_thread = _daemon_thread(
                     target=_research_thread_entry,
                     name=RESEARCH_THREAD_NAME,
                 )
                 research_thread.start()
-
-            if not certification_thread.is_alive():
-                certification_restart_count += 1
-                certification_thread = _daemon_thread(
-                    target=_certification_thread_entry,
-                    name=CERTIFICATION_THREAD_NAME,
-                )
-                certification_thread.start()
 
             reason, heartbeat_age, watchdog_seconds = _portfolio_watchdog_reason(
                 store,
@@ -312,6 +390,7 @@ async def run_threaded_worker(
                 )
                 raise PortfolioThreadWatchdogError(reason)
 
+            auxiliary_heartbeat = store.latest_worker_heartbeat(RESEARCH_WORKER_ID)
             certification_heartbeat = store.latest_worker_heartbeat(CERTIFICATION_WORKER_ID)
             store.record_worker_heartbeat(
                 worker_id=THREAD_SUPERVISOR_WORKER_ID,
@@ -320,12 +399,18 @@ async def run_threaded_worker(
                     "paper_only": True,
                     "one_process": True,
                     "main_thread_provider_free": True,
-                    "research_thread_isolated": True,
+                    "canonical_first_bootstrap": True,
                     "portfolio_thread_isolated": True,
-                    "certification_thread_isolated": True,
-                    "canonical_liveness_excludes_certification": True,
+                    "research_certification_auxiliary_thread": True,
+                    "canonical_liveness_excludes_auxiliary": True,
                     "research_restart_count": research_restart_count,
-                    "certification_restart_count": certification_restart_count,
+                    "auxiliary_state": (
+                        auxiliary_heartbeat.state if auxiliary_heartbeat is not None else None
+                    ),
+                    "auxiliary_observed_at": (
+                        auxiliary_heartbeat.observed_at.isoformat()
+                        if auxiliary_heartbeat is not None else None
+                    ),
                     "certification_state": (
                         certification_heartbeat.state if certification_heartbeat is not None else None
                     ),
@@ -353,7 +438,6 @@ async def run_threaded_worker(
                     "paper_only": True,
                     "one_process": True,
                     "research_restart_count": research_restart_count,
-                    "certification_restart_count": certification_restart_count,
                 },
             )
 
