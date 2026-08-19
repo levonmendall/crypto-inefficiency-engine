@@ -139,7 +139,7 @@ def test_portfolio_watchdog_distinguishes_running_budget_from_normal_idle_cadenc
 
 
 @pytest.mark.asyncio
-async def test_portfolio_child_uses_direct_bounded_services_without_stage_proxies(monkeypatch):
+async def test_portfolio_child_keeps_full_certification_allocator_off_canonical_hot_path(monkeypatch):
     created: dict[str, object] = {}
 
     class FakeUniversal:
@@ -162,6 +162,10 @@ async def test_portfolio_child_uses_direct_bounded_services_without_stage_proxie
         def __init__(self, service, promotion, alpha):
             created["allocator"] = self
 
+    class FakeCanonicalAllocator:
+        def __init__(self, service, promotion, alpha):
+            created["canonical_allocator"] = self
+
     class FakePortfolio:
         def __init__(self, service, allocator, store):
             created["portfolio"] = self
@@ -171,6 +175,7 @@ async def test_portfolio_child_uses_direct_bounded_services_without_stage_proxie
     class FakeAllocationCertification:
         def __init__(self, service, allocator, store):
             created["allocation_certification"] = self
+            created["certification_allocator"] = allocator
 
     class FakeOperatingCertification:
         def __init__(self, service, store, alpha, allocation_certification, *, version):
@@ -188,6 +193,7 @@ async def test_portfolio_child_uses_direct_bounded_services_without_stage_proxie
     monkeypatch.setattr(worker_children, "ExpandedAlphaFactoryService", FakeAlpha)
     monkeypatch.setattr(worker_children, "CexDexPaperPromotionService", FakePromotion)
     monkeypatch.setattr(worker_children, "UnifiedPaperAllocatorService", FakeAllocator)
+    monkeypatch.setattr(worker_children, "CanonicalPortfolioAllocatorService", FakeCanonicalAllocator)
     monkeypatch.setattr(worker_children, "OperationallyResilientPaperPortfolioService", FakePortfolio)
     monkeypatch.setattr(worker_children, "AllocationForwardCertificationService", FakeAllocationCertification)
     monkeypatch.setattr(worker_children, "OperatingCertificationService", FakeOperatingCertification)
@@ -200,7 +206,9 @@ async def test_portfolio_child_uses_direct_bounded_services_without_stage_proxie
 
     assert attempted == 1
     assert created["portfolio_service"] is service
-    assert created["portfolio_allocator"] is created["allocator"]
+    assert created["portfolio_allocator"] is created["canonical_allocator"]
+    assert created["certification_allocator"] is created["allocator"]
+    assert created["portfolio_allocator"] is not created["certification_allocator"]
     assert created["loop_portfolio"] is created["portfolio"]
     assert created["loop_allocation_certification"] is created["allocation_certification"]
     assert created["loop_operating_certification"] is created["operating_certification"]
