@@ -44,16 +44,11 @@ async def run_operating_bundle_once(
 ) -> OperatingBundleResult:
     """Run operating subsystems without allowing one failure to freeze accounting.
 
-    Early evidence collection can legitimately fail closed in one subsystem. A
-    failure in allocator certification must not prevent the canonical portfolio
-    from attempting its own paper cycle, and neither failure may prevent the
-    mechanism-status classifier from recording what is currently blocking it.
-
-    If the portfolio cycle itself fails before it can write a snapshot, persist
-    the unchanged canonical account state with a fresh observation timestamp.
-    That keeps the NAV ledger visibly alive without inventing marks, trades, or
-    profits. The heartbeat remains degraded/error so stale market accounting is
-    never mistaken for successful portfolio operation.
+    Family/provider degradation is explicit and subtractive: it can remove a
+    candidate family from the allocator, but it cannot suppress unrelated
+    families or erase truthful accounting. If the portfolio cannot obtain the
+    market snapshot needed to value open positions, a fallback snapshot carries
+    forward account state while explicitly marking valuation as stale/failed.
     """
 
     current = portfolio.ledger.current_state()
@@ -71,10 +66,33 @@ async def run_operating_bundle_once(
 
     try:
         portfolio_cycle = await portfolio.run_cycle()
+        if bool(getattr(portfolio_cycle, "degraded", False)):
+            degraded_reason = (
+                getattr(portfolio_cycle, "allocation_error_type", None)
+                or ("family_failure" if getattr(portfolio_cycle, "allocation_family_failures", None) else None)
+                or ("stale_valuation" if getattr(portfolio_cycle, "stale_position_count", 0) else None)
+                or "PortfolioCycleDegraded"
+            )
+            errors["portfolio_cycle_degraded"] = str(degraded_reason)
     except Exception as exc:
         errors["portfolio_error_type"] = type(exc).__name__
         try:
+            previous = portfolio.ledger.latest_snapshot()
             fallback = portfolio.ledger.current_state(observed_at=datetime.now(timezone.utc))
+            valuation_status = "cash_only" if fallback.open_position_count == 0 else "stale"
+            fallback = fallback.model_copy(update={
+                "market_evidence_observed_at": (
+                    previous.market_evidence_observed_at if previous is not None else None
+                ),
+                "valuation_status": valuation_status,
+                "cycle_status": "failed",
+                "fallback_snapshot": True,
+                "cycle_error_type": type(exc).__name__,
+                "allocation_family_failures": (
+                    dict(previous.allocation_family_failures) if previous is not None else {}
+                ),
+                "stale_position_count": fallback.open_position_count,
+            })
             portfolio.ledger.record_snapshot(fallback)
             fallback_snapshot_recorded = True
         except Exception as snapshot_exc:
@@ -151,6 +169,7 @@ async def run_portfolio_operating_loop(
         state = "error" if portfolio_failed else ("degraded" if result.errors else "success")
         error_type = (
             result.errors.get("portfolio_error_type")
+            or result.errors.get("portfolio_cycle_degraded")
             or result.errors.get("allocation_certification_error_type")
             or result.errors.get("operating_certification_error_type")
         )
@@ -161,6 +180,17 @@ async def run_portfolio_operating_loop(
             "portfolio_nav_usd": result.nav_usd,
             "portfolio_snapshot_observed_at": (
                 latest.observed_at.isoformat() if latest is not None else None
+            ),
+            "market_evidence_observed_at": (
+                latest.market_evidence_observed_at.isoformat()
+                if latest is not None and latest.market_evidence_observed_at is not None
+                else None
+            ),
+            "portfolio_valuation_status": latest.valuation_status if latest is not None else None,
+            "portfolio_cycle_status": latest.cycle_status if latest is not None else None,
+            "portfolio_stale_position_count": latest.stale_position_count if latest is not None else None,
+            "portfolio_allocation_family_failures": (
+                dict(latest.allocation_family_failures) if latest is not None else {}
             ),
             "fallback_snapshot_recorded": result.fallback_snapshot_recorded,
             "allocation_certification_cycle_id": getattr(result.allocation_cycle, "cycle_id", None),
