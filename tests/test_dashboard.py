@@ -19,6 +19,8 @@ def test_dashboard_is_available_at_root_and_dashboard_path():
         assert "/v3/operations/mechanisms" in response.text
         assert "Opportunity families" in response.text
         assert "valuationStatus" in response.text
+        assert "settlement_evidence_blocked_count" in response.text
+        assert "awaiting post-horizon settlement evidence" in response.text
         assert "Account freshness and market-valuation freshness tracked separately" in response.text
 
 
