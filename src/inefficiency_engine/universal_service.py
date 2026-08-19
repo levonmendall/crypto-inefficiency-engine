@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from inefficiency_engine.adapters.universal_public import CoinbaseStablecoinAdapter, DeribitOptionsAdapter, DexScreenerAdapter
 from inefficiency_engine.adapters.velora import VeloraPriceRouteAdapter
 from inefficiency_engine.allocation import AllocationConstraintSet, AllocationPlan, allocate_qualified_opportunities
+from inefficiency_engine.dex_frontier import DexRouteSizeFrontier, build_size_frontier
 from inefficiency_engine.dex_routes import DexRouteQuote, detect_route_quoted_cex_dex
 from inefficiency_engine.dex_shadow import (
     DexRouteQuoteRecord,
@@ -31,7 +32,6 @@ from inefficiency_engine.universal_models import (
 )
 
 
-DEX_ROUTE_EVIDENCE_NOTIONAL_USD = 1000.0
 SleepFn = Callable[[float], Awaitable[None]]
 
 
@@ -74,8 +74,49 @@ class UniversalOpportunityService:
         reference_prices = self._reference_prices(evidence.market_quotes)
         return await self.velora.quotes_for_market(
             reference_prices,
-            notional_usd=DEX_ROUTE_EVIDENCE_NOTIONAL_USD,
+            notional_usd=self.settings.dex_route_evidence_notional_usd,
         )
+
+    async def probe_dex_route_size_frontiers(
+        self,
+        *,
+        notionals_usd: tuple[float, ...] | None = None,
+    ) -> list[DexRouteSizeFrontier]:
+        tiers = tuple(sorted(set(notionals_usd or self.settings.dex_route_frontier_notionals_usd)))
+        if not tiers or any(value <= 0 for value in tiers):
+            raise ValueError("DEX route frontier notionals must be positive")
+        evidence = await self.core.collect_live_evidence()
+        reference_prices = self._reference_prices(evidence.market_quotes)
+        frontiers: list[DexRouteSizeFrontier] = []
+        for asset in ("BTC", "ETH"):
+            reference = reference_prices.get(asset)
+            if reference is None or reference <= 0:
+                continue
+            for direction in ("buy_asset", "sell_asset"):
+                results: list[tuple[float, DexRouteQuote | None, str | None]] = []
+                # Intentionally sequential to keep the periodic public API probe
+                # modest and avoid turning an evidence study into a burst load.
+                for target in tiers:
+                    try:
+                        quote = await self.velora.quote(
+                            asset,
+                            direction,
+                            notional_usd=target,
+                            reference_price=reference,
+                        )
+                        results.append((target, quote, None))
+                    except Exception as exc:
+                        results.append((target, None, type(exc).__name__))
+                frontiers.append(build_size_frontier(
+                    asset=asset,
+                    direction=direction,
+                    reference_price=reference,
+                    quote_results=results,
+                    deterioration_limit_bps=self.settings.dex_route_frontier_max_deterioration_bps,
+                ))
+        if self.core.evidence_store is not None:
+            self.core.evidence_store.record_dex_route_size_frontiers(frontiers)
+        return frontiers
 
     async def collect_surface(self) -> UniversalSurfaceSnapshot:
         stablecoins = CoinbaseStablecoinAdapter()
@@ -104,7 +145,10 @@ class UniversalOpportunityService:
         reference_prices = self._reference_prices(evidence.market_quotes)
         route_task = asyncio.create_task(capture(
             "velora-market:prices:v6.2",
-            self.velora.quotes_for_market(reference_prices, notional_usd=DEX_ROUTE_EVIDENCE_NOTIONAL_USD),
+            self.velora.quotes_for_market(
+                reference_prices,
+                notional_usd=self.settings.dex_route_evidence_notional_usd,
+            ),
             [],
         ))
 
@@ -277,8 +321,10 @@ class UniversalOpportunityService:
                 "amount_specific": True,
                 "transaction_building": False,
                 "executable_eligible": False,
-                "probe_notional_usd": DEX_ROUTE_EVIDENCE_NOTIONAL_USD,
+                "probe_notional_usd": self.settings.dex_route_evidence_notional_usd,
                 "multi_horizon_shadow": True,
+                "multi_notional_frontier": True,
+                "capacity_claimed": False,
                 "requirements": [
                     "statistically sufficient quote-survival evidence",
                     "cross-venue inventory/settlement model",

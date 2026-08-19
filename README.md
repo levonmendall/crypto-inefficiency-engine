@@ -15,7 +15,7 @@ A **paper-first, fail-closed** engine for discovering structural crypto-market i
 ### v0.10.1 — amount-specific DEX route evidence
 
 - quote-only Velora Market API `/prices` v6.2 adapter for Ethereum BTC/ETH↔USDC;
-- BTC/ETH buy and sell probes at a $1,000 evidence notional;
+- BTC/ETH buy and sell probes at a configurable $1,000 default evidence notional;
 - exact source/destination amounts, block number, route exchanges, gas estimate when supplied and request latency are retained;
 - RFQ liquidity is excluded;
 - a successful quote is **not** treated as capacity evidence;
@@ -23,17 +23,28 @@ A **paper-first, fail-closed** engine for discovering structural crypto-market i
 
 ### v0.10.2 — durable DEX route survival
 
-v0.10.2 turns one-time DEX route observations into longitudinal evidence:
-
 - re-quote the exact original source amount at 1/5/15/30/60-second horizons;
-- record whether the quote survives, directionally adverse price movement, route-composition change, block advance, gas-cost change and request latency;
-- persist every successful initial/verification route and each route-shadow cycle in the same append-only SQLite/PostgreSQL evidence ledger as the CEX study;
-- expose `POST /v1/dex/route-shadow/cycle` and `GET /v1/dex/route-shadow/summary`;
+- record quote survival/disappearance, directionally adverse price movement, route-composition change, block advance, gas-cost change and request latency;
+- persist successful initial/verification routes and route-shadow cycles in the same append-only SQLite/PostgreSQL evidence ledger as the CEX study;
 - production worker runs CEX shadow and DEX route shadow concurrently;
-- DEX provider failure is scoped to DEX evidence and cannot invalidate a successful core CEX shadow cycle;
-- route-shadow evidence still claims no capacity and builds/submits no transaction.
+- DEX provider failures are scoped to DEX evidence and cannot invalidate a successful core CEX shadow cycle;
+- route-shadow evidence claims no capacity and builds/submits no transaction.
 
-The next promotion gate is statistical evidence: repeated quote survival and adverse-price behavior must be credible before a multi-notional capacity frontier or any allocation eligibility is considered.
+### v0.10.3 — multi-notional DEX route frontier
+
+v0.10.3 adds periodic **quote-size evidence**, not deployable-capacity authority:
+
+- default route-size probes at $1k / $5k / $10k / $25k for BTC and ETH in both buy/sell directions;
+- probes are sequential and run once every 10 worker cycles by default to keep public API load modest;
+- compare each larger tier with the smallest successful baseline route using directional route-price deterioration;
+- default acceptable deterioration limit is 25 bps;
+- expose both the largest successful quoted tier and the stricter `largest_contiguous_acceptable_tier_usd`;
+- an intermediate failure permanently breaks the contiguous frontier, even if a larger tier later returns a quote;
+- persist every frontier in the append-only evidence ledger with lineage;
+- expose `POST /v1/dex/route-frontier/probe` and `GET /v1/dex/route-frontier/summary`;
+- `capacity_claimed=false`, `executable_eligible=false`, and the paper allocator remains CEX-qualified-only.
+
+The next DEX promotion gate is to combine accumulated survival statistics and multi-notional route evidence with explicit stablecoin conversion, gas economics, inventory/settlement, and hedge-recovery models. Until then the frontier is evidence about what was quotable, not what can safely be deployed.
 
 ## v0.9 — Universal Opportunity Graph — complete
 
@@ -45,7 +56,7 @@ v0.9 turns the project from a two-strategy engine into a strategy-agnostic crypt
 
 ## Capability is not authority
 
-The universal graph intentionally contains relationships that are searchable but not executable. A DexScreener pool is discovery metadata; a Velora price route is amount-specific quote evidence; neither establishes inventory, settlement, recoverability or capacity. Bridge/options/solver/liquidation research likewise remains behind explicit evidence gates.
+The universal graph intentionally contains relationships that are searchable but not executable. A DexScreener pool is discovery metadata; a Velora price route is amount-specific quote evidence; a multi-notional frontier is repeated quote evidence. None establishes atomic inventory, settlement, recoverability, or deployable capacity. Bridge/options/solver/liquidation research likewise remains behind explicit evidence gates.
 
 The paper allocator cannot promote a blocked or unqualified candidate. Cash/no allocation is valid and `authorizes_execution=false`.
 
@@ -61,7 +72,7 @@ Qualified core opportunities are followed at 1s, 5s, 15s, 30s and 60s. The engin
 
 **Universal evidence surface:**
 
-`stablecoin observations + DEX pool discovery + amount-specific DEX route quotes → route-survival evidence + chain/bridge capabilities + options + external solver/liquidation signals → universal graph → research candidates → explicit evidence gates`
+`stablecoin observations + DEX pool discovery + amount-specific DEX route quotes → multi-horizon route survival + periodic quote-size frontiers + chain/bridge capabilities + options + external solver/liquidation signals → universal graph → research candidates → explicit evidence gates`
 
 ## Safety boundary
 
@@ -71,7 +82,7 @@ Qualified core opportunities are followed at 1s, 5s, 15s, 30s and 60s. The engin
 - Unknown venue fees fail closed in executable qualification.
 - Short spot fails closed without explicit borrow economics.
 - DEX route collection calls price quoting only; it does not build, sign or submit transactions.
-- Successful route probes do not imply capacity.
+- Successful route probes or route-size tiers do not imply deployable capacity.
 - Universal research candidates do not bypass core L2 qualification.
 - Paper allocation has no execution authority.
 - Tiny-capital live execution remains separately blocked pending convincing evidence and explicit authorization.
@@ -102,6 +113,8 @@ Useful read-only/paper endpoints include:
 - `GET /v1/dex/route-quotes/live`
 - `POST /v1/dex/route-shadow/cycle`
 - `GET /v1/dex/route-shadow/summary`
+- `POST /v1/dex/route-frontier/probe`
+- `GET /v1/dex/route-frontier/summary`
 - `GET /v1/allocation/live?capital_usd=100000`
 - `GET /v1/evidence/counts`
 - `GET /v1/latency/model`

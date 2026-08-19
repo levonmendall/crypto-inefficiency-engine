@@ -14,6 +14,7 @@ from inefficiency_engine.service import OpportunityService
 
 SleepFn = Callable[[float], Awaitable[None]]
 RouteShadowRunner = Callable[[], Awaitable[object]]
+FrontierRunner = Callable[[], Awaitable[list[object]]]
 
 
 @dataclass(frozen=True)
@@ -51,33 +52,48 @@ async def run_shadow_worker(
     sleep: SleepFn = asyncio.sleep,
     max_cycles: int | None = None,
     route_shadow_runner: RouteShadowRunner | None = None,
+    frontier_runner: FrontierRunner | None = None,
+    frontier_every_cycles: int = 10,
 ) -> WorkerRunStats:
     worker_id = worker_id or default_worker_id()
     stop_event = stop_event or asyncio.Event()
     attempted = succeeded = failed = 0
+    frontier_every_cycles = max(1, frontier_every_cycles)
     store.record_worker_heartbeat(worker_id=worker_id, state="starting", detail={"paper_only": True, "backend": store.backend})
     while not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
         attempted += 1
-        store.record_worker_heartbeat(worker_id=worker_id, state="running", detail={"cycle_attempt": attempted})
+        run_frontier = frontier_runner is not None and attempted % frontier_every_cycles == 0
+        store.record_worker_heartbeat(
+            worker_id=worker_id,
+            state="running",
+            detail={"cycle_attempt": attempted, "dex_frontier_probe_due": run_frontier},
+        )
 
-        if route_shadow_runner is None:
-            core_result = await asyncio.gather(service.run_shadow_cycle(), return_exceptions=True)
-            core_cycle = core_result[0]
-            route_cycle = None
-        else:
-            core_cycle, route_cycle = await asyncio.gather(
-                service.run_shadow_cycle(),
-                route_shadow_runner(),
-                return_exceptions=True,
-            )
+        tasks: list[Awaitable[object]] = [service.run_shadow_cycle()]
+        route_index = None
+        frontier_index = None
+        if route_shadow_runner is not None:
+            route_index = len(tasks)
+            tasks.append(route_shadow_runner())
+        if run_frontier and frontier_runner is not None:
+            frontier_index = len(tasks)
+            tasks.append(frontier_runner())
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        core_cycle = results[0]
+        route_cycle = results[route_index] if route_index is not None else None
+        frontier_result = results[frontier_index] if frontier_index is not None else None
 
         if isinstance(core_cycle, BaseException):
             failed += 1
-            detail = {"cycle_attempt": attempted, "message": str(core_cycle)[:500]}
+            detail: dict[str, object] = {"cycle_attempt": attempted, "message": str(core_cycle)[:500]}
             if isinstance(route_cycle, BaseException):
                 detail["dex_route_shadow_error_type"] = type(route_cycle).__name__
             elif route_cycle is not None:
                 detail["dex_route_shadow_completed"] = True
+            if isinstance(frontier_result, BaseException):
+                detail["dex_route_frontier_error_type"] = type(frontier_result).__name__
+            elif frontier_result is not None:
+                detail["dex_route_frontier_count"] = len(frontier_result)
             store.record_worker_heartbeat(
                 worker_id=worker_id,
                 state="error",
@@ -90,14 +106,12 @@ async def run_shadow_worker(
 
         succeeded += 1
         survived = sum(1 for obs in core_cycle.observations if obs.survived)
-        detail: dict[str, object] = {
+        detail = {
             "cycle_attempt": attempted,
             "observation_count": len(core_cycle.observations),
             "survived_count": survived,
         }
         if isinstance(route_cycle, BaseException):
-            # DEX route evidence is a separate family and cannot poison a valid
-            # core CEX shadow cycle.
             detail["dex_route_shadow_error_type"] = type(route_cycle).__name__
         elif route_cycle is not None:
             route_observations = getattr(route_cycle, "observations", [])
@@ -106,6 +120,11 @@ async def run_shadow_worker(
             detail["dex_route_shadow_survived_count"] = sum(
                 1 for obs in route_observations if getattr(obs, "survived", False)
             )
+        if isinstance(frontier_result, BaseException):
+            detail["dex_route_frontier_error_type"] = type(frontier_result).__name__
+        elif frontier_result is not None:
+            detail["dex_route_frontier_count"] = len(frontier_result)
+            detail["dex_route_frontier_capacity_claimed"] = False
 
         store.record_worker_heartbeat(
             worker_id=worker_id,
@@ -141,4 +160,6 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
         store,
         stop_event=stop_event,
         route_shadow_runner=universal.run_dex_route_shadow_cycle,
+        frontier_runner=universal.probe_dex_route_size_frontiers,
+        frontier_every_cycles=service.settings.dex_route_frontier_every_cycles,
     )

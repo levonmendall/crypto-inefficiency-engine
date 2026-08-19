@@ -56,13 +56,13 @@ Completing v0.9 means each targeted opportunity family has a canonical place in 
 
 ### v0.10.1 — amount-specific DEX route evidence — complete
 - Quote-only Velora `/prices` v6.2 integration for Ethereum BTC/ETH↔USDC route evidence.
-- $1,000 buy/sell evidence probes retain exact input/output, block number, route composition, gas estimate and request latency.
+- Configurable $1,000-default buy/sell evidence probes retain exact input/output, block number, route composition, gas estimate and request latency.
 - RFQ liquidity is excluded from the route probe.
 - Successful probes are not treated as capacity evidence.
 - Route-quoted CEX↔DEX candidates remain blocked from allocation pending inventory/settlement, stablecoin conversion, quote survival and hedge-recovery evidence.
 - Duplicate universal-layer OKX collection removed after v0.10.0 core promotion.
 
-### v0.10.2 — durable DEX route survival — current
+### v0.10.2 — durable DEX route survival — complete
 - Re-quote the exact original source amount at 1/5/15/30/60-second horizons.
 - Record survival/disappearance, directionally adverse route-price movement, route changes, block advance, gas change and request latency.
 - Persist successful initial/verification route records and route-shadow cycles in the existing append-only SQLite/PostgreSQL evidence ledger.
@@ -71,11 +71,22 @@ Completing v0.9 means each targeted opportunity family has a canonical place in 
 - Expose route-shadow cycle and summary API surfaces.
 - Continue to claim neither capacity nor execution authority from route-survival evidence.
 
+### v0.10.3 — multi-notional DEX route frontier — current
+- Periodically probe $1k/$5k/$10k/$25k routes for BTC/ETH in both buy and sell directions by default.
+- Probe tiers sequentially to avoid burst-loading the public quote API.
+- Compare larger tiers with the smallest successful baseline using directional route-price deterioration.
+- Default evidence limit is 25 bps route-price deterioration.
+- Track both largest successful quoted tier and the stricter largest contiguous acceptable tier.
+- An intermediate failed/unacceptable tier breaks the contiguous frontier permanently for that probe.
+- Persist frontiers in the append-only evidence ledger and expose probe/summary API surfaces.
+- Default production cadence is one frontier probe every 10 core worker cycles.
+- `capacity_claimed=false`; quote-size evidence does not promote DEX routes into allocation or execution.
+
 ### Next v0.10 evidence work
-1. Accumulate enough route-shadow cycles to quantify survival by horizon and directional adverse-price tails.
-2. Add multiple evidence notionals and infer a conservative quote-size frontier only from observed amount-specific routes.
-3. Jointly qualify stablecoin conversion and gas economics at each route size.
-4. Add cross-venue inventory/settlement and hedge-recovery models before CEX↔DEX can enter paper allocation.
+1. Accumulate sufficient route-shadow and multi-notional frontier evidence to estimate survival and adverse-price tails by asset/direction/size.
+2. Jointly qualify USDC↔USD/stablecoin conversion and gas economics at each route size.
+3. Add cross-venue inventory/settlement and hedge-recovery models before CEX↔DEX can enter paper allocation.
+4. Require statistical confidence/effective-sample gates before any observed quote-size frontier can influence capital decisions.
 5. Add authoritative bridge quote evidence only when a reliable supported source exists.
 6. Add option L2 and hedge-aware execution economics before options can enter allocation.
 7. Add authoritative liquidation/solver feeds before those families can enter allocation.
