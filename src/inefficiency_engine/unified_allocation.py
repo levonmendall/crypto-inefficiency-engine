@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
@@ -10,10 +10,13 @@ from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.models import Opportunity, OpportunityExecutability
 from inefficiency_engine.service import OpportunityService
 
+if TYPE_CHECKING:
+    from inefficiency_engine.alpha_factory import AlphaFactoryService
+
 
 class UnifiedPaperCandidate(BaseModel):
     candidate_id: str
-    family: Literal["core_cex", "cex_dex"]
+    family: Literal["core_cex", "cex_dex", "alpha"]
     strategy: str
     asset: str
     venues: list[str]
@@ -86,8 +89,6 @@ def _core_candidates(
         ]
         if not qualified:
             continue
-        # Keep one capital choice per opportunity. Prefer the tier with the best
-        # modeled return; capacity remains explicit and is not converted to authority.
         tier = max(
             qualified,
             key=lambda item: (item.net_annualized_return, item.notional_usd_per_leg),
@@ -100,6 +101,9 @@ def _core_candidates(
         evidence_ids = opportunity.evidence.get("canonical_instrument_ids", [])
         instrument_ids = [str(value) for value in evidence_ids] if isinstance(evidence_ids, list) else []
         conflict_keys = [f"instrument:{value}" for value in instrument_ids]
+        conflict_keys.extend(
+            f"venue-symbol:{leg.venue}:{leg.symbol or leg.asset}" for leg in opportunity.legs
+        )
         if not conflict_keys:
             conflict_keys = [
                 f"leg:{leg.venue}:{leg.symbol or leg.asset}:{leg.market_kind.value}:{leg.side.value}"
@@ -118,7 +122,7 @@ def _core_candidates(
             modeled_holding_hours=opportunity.holding_hours,
             source_return_metric="net_annualized_return",
             source_return_value=tier.net_annualized_return,
-            conflict_keys=conflict_keys,
+            conflict_keys=sorted(set(conflict_keys)),
             opportunity_id=opportunity.id,
             capacity_reference_usd=execution.estimated_capacity_notional_usd,
             capacity_claimed=False,
@@ -134,9 +138,11 @@ class UnifiedPaperAllocatorService:
         self,
         core: OpportunityService,
         cex_dex: CexDexPaperPromotionService,
+        alpha_factory: "AlphaFactoryService | None" = None,
     ):
         self.core = core
         self.cex_dex = cex_dex
+        self.alpha_factory = alpha_factory
         self.settings = core.settings
 
     async def candidates(self, *, total_capital_usd: float) -> list[UnifiedPaperCandidate]:
@@ -169,6 +175,7 @@ class UnifiedPaperAllocatorService:
                 source_return_value=item.conservative_capture_edge_bps,
                 conflict_keys=[
                     f"cex:{item.cex_venue}:{item.cex_symbol}",
+                    f"venue-symbol:{item.cex_venue}:{item.cex_symbol}",
                     f"dex:ethereum:{item.asset}:{item.route_direction}",
                 ],
                 evidence_id=item.evidence_id,
@@ -178,6 +185,38 @@ class UnifiedPaperAllocatorService:
                 executable_eligible=False,
                 paper_only=True,
             ))
+
+        if self.alpha_factory is not None:
+            alpha_rows = await self.alpha_factory.promoted_candidates(
+                snapshot,
+                total_capital_usd=total_capital_usd,
+            )
+            for item in alpha_rows:
+                capital = item.capital_required_usd
+                deployment_return = item.expected_profit_usd / capital
+                rows.append(UnifiedPaperCandidate(
+                    candidate_id=item.candidate_id,
+                    family="alpha",
+                    strategy=item.strategy_id,
+                    asset=item.asset,
+                    venues=[item.venue],
+                    capital_required_usd=capital,
+                    notional_usd_per_leg=item.notional_usd,
+                    expected_profit_usd_per_deployment=item.expected_profit_usd,
+                    expected_return_on_reserved_capital=max(0.0, deployment_return),
+                    modeled_holding_hours=item.horizon_hours,
+                    source_return_metric="forward_ci_haircut_net_return",
+                    source_return_value=item.expected_net_return,
+                    conflict_keys=[
+                        *item.conflict_keys,
+                        f"venue-symbol:{item.venue}:{item.symbol}",
+                    ],
+                    capacity_reference_usd=None,
+                    capacity_claimed=False,
+                    allocation_eligible=True,
+                    executable_eligible=False,
+                    paper_only=True,
+                ))
 
         rows.sort(
             key=lambda item: (
