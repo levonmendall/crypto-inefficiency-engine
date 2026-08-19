@@ -55,7 +55,7 @@ def history(asset: str, start: float, end: float) -> list[MarketQuote]:
 
 def test_cross_sectional_relative_value_emits_forward_candidate_from_multi_asset_dispersion():
     settings = _ExpandedSettingsView(Settings(alpha_research_cost_floor_bps=5.0, alpha_min_history_points=8))
-    btc = history("BTC", 60000.0, 66000.0)
+    btc = history("BTC", 60000.0, 72000.0)
     eth = history("ETH", 3000.0, 3030.0)
     sol = history("SOL", 150.0, 138.0)
     current = [btc[-1], eth[-1], sol[-1]]
