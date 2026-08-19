@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -40,46 +42,100 @@ if loaded:
     assert result.returncode == 0, result.stderr or result.stdout
 
 
-def test_render_worker_command_uses_thread_isolated_runtime():
+def test_render_worker_command_keeps_main_thread_provider_free():
     source = inspect.getsource(cli.main)
 
+    assert "settings, store = _settings_and_store()" in source
     assert "from inefficiency_engine.threaded_worker import run_threaded_worker" in source
-    assert "asyncio.run(run_threaded_worker(service, store))" in source
+    assert "asyncio.run(run_threaded_worker(store, settings=settings))" in source
     assert "supervise_worker_processes" not in source
-    assert "from inefficiency_engine.operating_worker import run_forever" not in source
+    worker_block = source.split('if args.command == "worker":', 1)[1].split("service, store = _service()", 1)[0]
+    assert "_service()" not in worker_block
 
 
 @pytest.mark.asyncio
-async def test_threaded_runtime_starts_daemon_research_thread_and_runs_portfolio_on_main_loop(monkeypatch):
-    observed: dict[str, object] = {}
+async def test_threaded_runtime_puts_research_and_portfolio_on_daemon_threads(monkeypatch):
+    observed: list[dict[str, object]] = []
+    heartbeats: list[tuple[str, str]] = []
 
     class FakeThread:
         def __init__(self, *, target, name, daemon):
-            observed["target"] = target
-            observed["name"] = name
-            observed["daemon"] = daemon
+            self.record = {"target": target, "name": name, "daemon": daemon}
+            observed.append(self.record)
 
         def start(self):
-            observed["started"] = True
+            self.record["started"] = True
 
-    async def fake_portfolio(service, store):
-        observed["portfolio_service"] = service
-        observed["portfolio_store"] = store
-        return 3
+    class FakeStore:
+        def record_worker_heartbeat(self, *, worker_id, state, **kwargs):
+            heartbeats.append((worker_id, state))
 
     monkeypatch.setattr(threaded_worker.threading, "Thread", FakeThread)
-    monkeypatch.setattr(threaded_worker, "run_portfolio_child", fake_portfolio)
+    monkeypatch.setattr(
+        threaded_worker,
+        "recover_stale_portfolio_on_supervisor_startup",
+        lambda *args, **kwargs: False,
+    )
 
-    service = object()
-    store = object()
-    stats = await threaded_worker.run_threaded_worker(service, store)  # type: ignore[arg-type]
+    stop_event = asyncio.Event()
+    stop_event.set()
+    stats = await threaded_worker.run_threaded_worker(
+        FakeStore(),  # type: ignore[arg-type]
+        settings=SimpleNamespace(shadow_cycle_interval_seconds=30.0),  # type: ignore[arg-type]
+        stop_event=stop_event,
+    )
 
-    assert observed["started"] is True
-    assert observed["daemon"] is True
-    assert observed["name"] == "shadow-research-thread"
-    assert observed["portfolio_service"] is service
-    assert observed["portfolio_store"] is store
-    assert stats.cycles_attempted == 3
+    assert [item["name"] for item in observed] == [
+        threaded_worker.RESEARCH_THREAD_NAME,
+        threaded_worker.PORTFOLIO_THREAD_NAME,
+    ]
+    assert all(item["daemon"] is True for item in observed)
+    assert all(item["started"] is True for item in observed)
+    assert stats.worker_id == threaded_worker.THREAD_SUPERVISOR_WORKER_ID
+    assert heartbeats[0] == (threaded_worker.THREAD_SUPERVISOR_WORKER_ID, "running")
+    assert heartbeats[-1] == (threaded_worker.THREAD_SUPERVISOR_WORKER_ID, "stopped")
+
+
+def test_portfolio_watchdog_distinguishes_running_budget_from_normal_idle_cadence():
+    now = datetime.now(timezone.utc)
+    started = now - timedelta(seconds=500)
+    settings = SimpleNamespace(shadow_cycle_interval_seconds=30.0)
+
+    class FakeStore:
+        heartbeat = None
+
+        def latest_worker_heartbeat(self, worker_id):
+            assert worker_id == threaded_worker.PORTFOLIO_WORKER_ID
+            return self.heartbeat
+
+    store = FakeStore()
+    store.heartbeat = SimpleNamespace(
+        observed_at=now - timedelta(seconds=301),
+        state="running",
+    )
+    reason, age, timeout = threaded_worker._portfolio_watchdog_reason(
+        store,  # type: ignore[arg-type]
+        settings=settings,  # type: ignore[arg-type]
+        supervisor_started_at=started,
+        now=now,
+    )
+    assert reason is not None
+    assert age == pytest.approx(301.0)
+    assert timeout == pytest.approx(300.0)
+
+    store.heartbeat = SimpleNamespace(
+        observed_at=now - timedelta(seconds=350),
+        state="success",
+    )
+    reason, age, timeout = threaded_worker._portfolio_watchdog_reason(
+        store,  # type: ignore[arg-type]
+        settings=settings,  # type: ignore[arg-type]
+        supervisor_started_at=started,
+        now=now,
+    )
+    assert reason is None
+    assert age == pytest.approx(350.0)
+    assert timeout == pytest.approx(360.0)
 
 
 @pytest.mark.asyncio
