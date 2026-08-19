@@ -8,6 +8,7 @@ from inefficiency_engine.evidence import build_evidence_store
 from inefficiency_engine.replay import replay_scan
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.shadow_summary import summarize_evidence_store
+from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
 from inefficiency_engine.universal_service import UniversalOpportunityService
 
 settings = Settings.from_env()
@@ -15,6 +16,7 @@ evidence_store = build_evidence_store(settings.evidence_db_path)
 app = FastAPI(title="Crypto Inefficiency Engine", version=__version__)
 service = OpportunityService(settings=settings, evidence_store=evidence_store)
 universal_service = UniversalOpportunityService(service)
+conversion_depth_service = StablecoinConversionDepthService(settings)
 
 @app.get("/health")
 def health():
@@ -94,6 +96,18 @@ async def stablecoins_live():
             "observations":[item.model_dump(mode="json") for item in surface.conversion_observations],
             "conversion_edges":[item.model_dump(mode="json") for item in surface.conversion_edges]}
 
+@app.get("/v1/stablecoins/depth-quote")
+async def stablecoin_depth_quote(source: str, target: str, amount: float):
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="amount must be positive")
+    try:
+        quote = await conversion_depth_service.quote(source, target, amount)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"stablecoin depth quote failed: {type(exc).__name__}") from exc
+    return quote.model_dump(mode="json")
+
 @app.get("/v1/dex/route-quotes/live")
 async def dex_route_quotes_live():
     try:
@@ -123,13 +137,8 @@ async def dex_route_frontier_probe():
         frontiers = await universal_service.probe_dex_route_size_frontiers()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"DEX route frontier probe failed: {type(exc).__name__}") from exc
-    return {
-        "paper_only": True,
-        "capacity_claimed": False,
-        "execution_authority": False,
-        "count": len(frontiers),
-        "frontiers": [item.model_dump(mode="json") for item in frontiers],
-    }
+    return {"paper_only":True,"capacity_claimed":False,"execution_authority":False,"count":len(frontiers),
+            "frontiers":[item.model_dump(mode="json") for item in frontiers]}
 
 @app.get("/v1/dex/route-frontier/summary")
 def dex_route_frontier_summary():
