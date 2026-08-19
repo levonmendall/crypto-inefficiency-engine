@@ -25,6 +25,10 @@ from inefficiency_engine.models import (
 )
 
 
+DEFAULT_PROVIDER_SURFACE_TIMEOUT_SECONDS = 8.0
+DEFAULT_ORDER_BOOK_TIMEOUT_SECONDS = 8.0
+
+
 class ProviderSurfaceDiagnostic(BaseModel):
     provider: str
     venue: str | None = None
@@ -70,7 +74,10 @@ class PublicAdapterRegistry:
     """Single routing boundary for public market data and visible L2.
 
     Adapter-specific quirks live here instead of leaking into OpportunityService.
-    The registry has no order-entry or private-account capability.
+    The registry has no order-entry or private-account capability. Provider and
+    order-book fanout is independently time-bounded: a wedged venue becomes a
+    failed provider status instead of preventing the entire point-in-time scan
+    from being persisted.
     """
 
     def __init__(
@@ -81,12 +88,16 @@ class PublicAdapterRegistry:
         bybit: object | None = None,
         kraken: object | None = None,
         okx: object | None = None,
+        provider_surface_timeout_seconds: float = DEFAULT_PROVIDER_SURFACE_TIMEOUT_SECONDS,
+        order_book_timeout_seconds: float = DEFAULT_ORDER_BOOK_TIMEOUT_SECONDS,
     ):
         self.hyperliquid = hyperliquid or HyperliquidAdapter()
         self.coinbase = coinbase or CoinbaseSpotAdapter()
         self.bybit = bybit or BybitPublicAdapter()
         self.kraken = kraken or KrakenSpotAdapter()
         self.okx = okx or OKXPublicAdapter()
+        self.provider_surface_timeout_seconds = max(0.05, float(provider_surface_timeout_seconds))
+        self.order_book_timeout_seconds = max(0.05, float(order_book_timeout_seconds))
 
     @staticmethod
     def provider_venue(provider: str) -> str | None:
@@ -103,25 +114,36 @@ class PublicAdapterRegistry:
                 return venue
         return None
 
-    @staticmethod
-    async def _capture_list(provider: str, awaitable) -> tuple[list[object], ProviderStatus]:
+    async def _capture_list(self, provider: str, awaitable) -> tuple[list[object], ProviderStatus]:
         try:
-            items = list(await awaitable)
+            items = list(await asyncio.wait_for(
+                awaitable,
+                timeout=self.provider_surface_timeout_seconds,
+            ))
             if not items:
                 return [], ProviderStatus(provider=provider, ok=False, item_count=0, error_type="EmptyResult")
             return items, ProviderStatus(provider=provider, ok=True, item_count=len(items))
+        except TimeoutError:
+            return [], ProviderStatus(provider=provider, ok=False, item_count=0, error_type="TimeoutError")
         except Exception as exc:
             return [], ProviderStatus(provider=provider, ok=False, item_count=0, error_type=type(exc).__name__)
 
     async def _capture_bybit(self) -> tuple[list[MarketQuote], list[FundingQuote], ProviderStatus]:
         try:
-            market, funding = await self.bybit.market_snapshot()
+            market, funding = await asyncio.wait_for(
+                self.bybit.market_snapshot(),
+                timeout=self.provider_surface_timeout_seconds,
+            )
             ok = bool(market) and bool(funding)
             return list(market), list(funding), ProviderStatus(
                 provider="bybit-v5:market-snapshot",
                 ok=ok,
                 item_count=len(market) + len(funding),
                 error_type=None if ok else "PartialOrEmptyResult",
+            )
+        except TimeoutError:
+            return [], [], ProviderStatus(
+                provider="bybit-v5:market-snapshot", ok=False, item_count=0, error_type="TimeoutError"
             )
         except Exception as exc:
             return [], [], ProviderStatus(
@@ -210,8 +232,15 @@ class PublicAdapterRegistry:
 
         async def capture(request: BookRequest):
             try:
-                book = await request.awaitable
+                book = await asyncio.wait_for(
+                    request.awaitable,
+                    timeout=self.order_book_timeout_seconds,
+                )
                 return book, ProviderStatus(provider=request.provider, ok=True, item_count=1)
+            except TimeoutError:
+                return None, ProviderStatus(
+                    provider=request.provider, ok=False, item_count=0, error_type="TimeoutError"
+                )
             except Exception as exc:
                 return None, ProviderStatus(
                     provider=request.provider, ok=False, item_count=0, error_type=type(exc).__name__
@@ -277,7 +306,10 @@ class PublicAdapterRegistry:
             if request is None:
                 return None
             try:
-                book = await request.awaitable
+                book = await asyncio.wait_for(
+                    request.awaitable,
+                    timeout=self.order_book_timeout_seconds,
+                )
                 return OrderBookDiagnostic(
                     provider=request.provider,
                     venue=book.venue,
@@ -288,6 +320,16 @@ class PublicAdapterRegistry:
                     bid_levels=len(book.bids),
                     ask_levels=len(book.asks),
                     request_latency_ms=book.request_latency_ms,
+                )
+            except TimeoutError:
+                return OrderBookDiagnostic(
+                    provider=request.provider,
+                    venue=quote.venue,
+                    asset=quote.asset,
+                    market_kind=quote.market_kind,
+                    symbol=quote.symbol,
+                    ok=False,
+                    error_type="TimeoutError",
                 )
             except Exception as exc:
                 return OrderBookDiagnostic(
