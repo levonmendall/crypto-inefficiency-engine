@@ -76,13 +76,24 @@ Completing v0.9 means every originally targeted opportunity family now has a can
 - Wilson confidence intervals and confidence-width gates
 - Conservative fixed fallbacks whenever empirical gates fail
 
-## Next major phase
-1. Accumulate and inspect live shadow evidence across the broadened CEX strategy set.
-2. Replace DEX discovery proxies with exact route-specific on-chain/aggregator quote evidence.
-3. Add authoritative bridge quote source only when credentials/terms permit reliable production access.
-4. Add option L2 and hedge-aware execution economics before options can enter capital allocation.
-5. Add authoritative liquidation/solver feeds before those families can enter allocation.
-6. Promote additional strategy families into the allocator only after their own evidence gates are satisfied.
+## v0.10 — Evidence maturation — active
+
+### v0.10.0 — adapter registry / OKX core promotion
+- One public-adapter registry owns quote/funding collection, visible-L2 routing and provider→venue attribution.
+- OKX spot/perpetual/funding is promoted into core discovery, qualification, shadow observation and empirical-learning eligibility.
+- Explicit OKX fee configuration is enforced in executable economics.
+- Empty provider surfaces are degraded rather than treated as successful zero-result scans.
+- Live provider diagnostics inspect public market/funding surfaces and representative visible L2, including request latency.
+- CLI/API diagnostic surfaces remain read-only and paper-only.
+
+### Next v0.10 evidence work
+1. Observe production provider diagnostics and shadow evidence across Coinbase, Kraken, Hyperliquid, Bybit and OKX.
+2. Replace DEX discovery proxies with exact route-specific quote evidence without adding signing or transaction submission.
+3. Persist DEX quote/path lineage and build a route-survival shadow study before DEX can enter allocation.
+4. Add authoritative bridge quote evidence only when a reliable supported source exists.
+5. Add option L2 and hedge-aware execution economics before options can enter capital allocation.
+6. Add authoritative liquidation/solver feeds before those families can enter allocation.
+7. Promote additional strategy families into the allocator only after their own evidence gates are satisfied.
 
 ## Milestone 6 — Tiny-capital controlled execution — blocked
 Separate service, credentials, explicit authorization, hard caps, paired-leg hedge recovery, concentration limits, dead-man switch and kill switch. Remains blocked until accumulated shadow evidence is statistically convincing and live execution is separately authorized.

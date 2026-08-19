@@ -2,45 +2,31 @@
 
 ## Objective
 
-Run paper-only market observation continuously and preserve every scan, executability decision, shadow outcome, and worker heartbeat across process restarts and deploys.
+Run paper-only market observation continuously and preserve scans, executability decisions, shadow outcomes and worker heartbeats across process restarts and deploys.
 
 ## Render topology
 
 The checked-in `render.yaml` defines:
 
 1. `cie-shadow-worker` — always-on Python background worker running `cie worker`.
-2. `cie-evidence` — private-network managed PostgreSQL database.
-3. `cie-shadow-api` — lightweight read-only FastAPI web service for health, evidence counts, replay, and shadow summaries.
+2. `cie-evidence` — managed PostgreSQL evidence store.
+3. `cie-shadow-api` — read-only FastAPI service for health, diagnostics, evidence, replay and shadow summaries.
 
-The worker and API receive the database's internal `connectionString` as `DATABASE_URL`. PostgreSQL credentials are not committed to source and are not stored in scan configuration snapshots.
-
-## Why PostgreSQL rather than a worker-local SQLite file
-
-Worker filesystems are not the canonical evidence boundary. Managed PostgreSQL lets evidence survive redeploys/restarts and allows the observational API to read the same ledger without sharing a filesystem.
-
-SQLite remains the preferred local/test backend because it requires no infrastructure and exercises the same persistence API.
-
-## Blueprint cost boundary
-
-The Blueprint uses a `starter` background worker and `basic-256mb` Postgres. These are paid resources. A background worker has no free instance type, and free Render Postgres expires after 30 days. Syncing/creating the Blueprint can therefore incur charges; committing `render.yaml` alone does not create resources.
+The worker and API receive the database connection as `DATABASE_URL`. Credentials are not committed and are not persisted in analysis configuration snapshots.
 
 ## Runtime behavior
 
-The worker:
+The worker records start/running/success/error/stopped heartbeats, backs off on transient errors and continuously performs the multi-horizon shadow study. v0.10 routes public CEX market/funding and visible-L2 requests through a single adapter registry, including OKX.
 
-- records `starting` before entering the loop;
-- records `running` before each cycle;
-- records `success` with cycle/scan IDs after a successful cycle;
-- records `error` plus exception type after a failed cycle;
-- backs off after transient errors instead of terminating;
-- handles SIGTERM/SIGINT through a stop event and records its final state.
-
-The API exposes:
+The API exposes operational checks including:
 
 - `GET /health` — process/database health;
+- `GET /v1/providers/diagnostic` — public provider surface + representative visible-L2 diagnostics;
 - `GET /v1/worker/health` — latest worker heartbeat and stale-heartbeat determination;
-- `GET /v1/evidence/counts` — durable ledger row counts;
-- `GET /v1/shadow/summary` — aggregate shadow survival evidence.
+- `GET /v1/evidence/counts` — durable ledger counts;
+- `GET /v1/shadow/summary` — aggregate shadow evidence.
+
+The diagnostic endpoint is read-only and paper-only. It reports degraded/empty public surfaces rather than treating zero data as success.
 
 ## Storage selection
 
@@ -50,11 +36,11 @@ Resolution order:
 2. `DATABASE_URL`
 3. `CIE_EVIDENCE_DB_PATH`
 
-Database URLs are resolved outside the `Settings` dataclass so credentials are not included in persisted `analysis_config` payloads.
+Database URLs are resolved outside `Settings` so credentials are excluded from persisted analysis configuration.
 
 ## Deployment gate
 
-Before syncing the Blueprint:
+Before deployment:
 
 ```bash
 pip install -e '.[dev]'
@@ -62,4 +48,15 @@ pytest
 python -m compileall -q src
 ```
 
-Do not enable live trading. This deployment exists only to collect public-data shadow evidence.
+After deployment, verify the actual running release rather than inferring deployment from a merge:
+
+```text
+GET /health
+GET /v1/providers/diagnostic
+GET /v1/worker/health
+GET /v1/evidence/counts
+```
+
+A healthy provider diagnostic should show non-empty market/funding surfaces and successful representative L2 requests for the supported public venues. Provider degradation does not authorize lowering evidence standards.
+
+Do not enable live trading. This deployment exists only to collect and evaluate public-data shadow evidence.

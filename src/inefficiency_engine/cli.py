@@ -27,7 +27,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="cie")
     parser.add_argument(
         "command",
-        choices=["demo", "live", "executability", "shadow-once", "shadow-loop", "worker", "worker-health"],
+        choices=[
+            "demo", "live", "executability", "diagnose-live",
+            "shadow-once", "shadow-loop", "worker", "worker-health",
+        ],
     )
     args = parser.parse_args()
     service, store = _service()
@@ -38,6 +41,8 @@ def main() -> None:
         payload = [o.model_dump(mode="json") for o in asyncio.run(service.live_scan())]
     elif args.command == "executability":
         payload = asyncio.run(service.collect_live_executability()).model_dump(mode="json")
+    elif args.command == "diagnose-live":
+        payload = asyncio.run(service.provider_diagnostic()).model_dump(mode="json")
     elif args.command == "shadow-once":
         payload = asyncio.run(service.run_shadow_cycle()).model_dump(mode="json")
     elif args.command == "shadow-loop":

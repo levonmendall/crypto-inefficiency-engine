@@ -64,6 +64,10 @@ def taker_fee_bps(leg: OpportunityLeg, settings: Settings) -> float:
         return settings.bybit_derivatives_taker_fee_bps
     if leg.venue == "Kraken" and leg.market_kind == MarketKind.SPOT:
         return settings.kraken_spot_taker_fee_bps
+    if leg.venue == "OKX" and leg.market_kind == MarketKind.SPOT:
+        return settings.okx_spot_taker_fee_bps
+    if leg.venue == "OKX" and leg.market_kind in {MarketKind.PERPETUAL, MarketKind.FUTURE}:
+        return settings.okx_derivatives_taker_fee_bps
     raise UnknownVenueFeeError(f"no explicit taker fee model for {leg.venue}:{leg.market_kind.value}")
 
 

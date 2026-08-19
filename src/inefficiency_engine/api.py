@@ -25,6 +25,14 @@ def health():
         payload["database_ok"] = evidence_store.ping()
     return payload
 
+@app.get("/v1/providers/diagnostic")
+async def provider_diagnostic():
+    try:
+        report = await service.provider_diagnostic()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"provider diagnostic failed: {type(exc).__name__}") from exc
+    return report.model_dump(mode="json")
+
 @app.get("/v1/detectors")
 def detector_registry():
     manifests = service.detector_manifests()
