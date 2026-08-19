@@ -68,32 +68,66 @@ def build_canonical_paper_portfolio_router(
         snapshot_age = (
             max(0.0, (now - latest.observed_at).total_seconds()) if latest is not None else None
         )
+        market_evidence_age = (
+            max(0.0, (now - latest.market_evidence_observed_at).total_seconds())
+            if latest is not None and latest.market_evidence_observed_at is not None
+            else None
+        )
         heartbeat_age = (
             max(0.0, (now - heartbeat.observed_at).total_seconds()) if heartbeat is not None else None
         )
         heartbeat_recent = heartbeat is not None and heartbeat_age is not None and heartbeat_age <= stale_after
-        portfolio_failed = bool(
-            heartbeat is not None
-            and heartbeat.detail.get("portfolio_error_type")
+        accounting_snapshot_fresh = latest is not None and snapshot_age is not None and snapshot_age <= stale_after
+        valuation_fresh = bool(
+            latest is not None
+            and (
+                latest.valuation_status == "cash_only"
+                or (
+                    latest.valuation_status == "fresh"
+                    and market_evidence_age is not None
+                    and market_evidence_age <= stale_after
+                )
+            )
         )
-        snapshot_fresh = latest is not None and snapshot_age is not None and snapshot_age <= stale_after
+        portfolio_failed = bool(
+            (heartbeat is not None and heartbeat.detail.get("portfolio_error_type"))
+            or (latest is not None and latest.cycle_status == "failed")
+        )
+        degraded = bool(
+            (heartbeat is not None and heartbeat.state == "degraded")
+            or (latest is not None and latest.cycle_status == "degraded")
+            or (latest is not None and not valuation_fresh)
+        )
         operational = bool(
             heartbeat_recent
             and heartbeat is not None
             and heartbeat.state not in {"error", "stopped"}
             and not portfolio_failed
-            and snapshot_fresh
+            and accounting_snapshot_fresh
+            and valuation_fresh
         )
         return {
             "portfolio_id": CANONICAL_PORTFOLIO_ID,
             "paper_only": True,
             "operational": operational,
-            "degraded": bool(heartbeat is not None and heartbeat.state == "degraded"),
+            "degraded": degraded,
             "expected_cycle_interval_seconds": expected_interval,
             "stale_after_seconds": stale_after,
-            "snapshot_fresh": snapshot_fresh,
+            "snapshot_fresh": accounting_snapshot_fresh,
+            "accounting_snapshot_fresh": accounting_snapshot_fresh,
             "snapshot_age_seconds": snapshot_age,
             "latest_snapshot_observed_at": latest.observed_at if latest is not None else None,
+            "valuation_status": latest.valuation_status if latest is not None else "unavailable",
+            "valuation_fresh": valuation_fresh,
+            "market_evidence_observed_at": latest.market_evidence_observed_at if latest is not None else None,
+            "market_evidence_age_seconds": market_evidence_age,
+            "cycle_status": latest.cycle_status if latest is not None else None,
+            "fallback_snapshot": latest.fallback_snapshot if latest is not None else False,
+            "cycle_error_type": latest.cycle_error_type if latest is not None else None,
+            "stale_position_count": latest.stale_position_count if latest is not None else None,
+            "allocation_family_failures": (
+                dict(latest.allocation_family_failures) if latest is not None else {}
+            ),
             "heartbeat_age_seconds": heartbeat_age,
             "heartbeat": heartbeat.model_dump(mode="json") if heartbeat is not None else None,
         }
