@@ -5,14 +5,18 @@ import json
 import statistics
 import uuid
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal
 
 from pydantic import BaseModel, Field
 from sqlalchemy import Column, Index, Integer, MetaData, String, Table, Text, insert, select
 
 from inefficiency_engine.alpha_factory import AlphaForwardOutcome, _mean_lower, _wilson_lower
-from inefficiency_engine.allocation_certification import AllocationForwardCertificationService, PaperAllocationOutcome
+from inefficiency_engine.allocation_certification import (
+    AllocationForwardCertificationService,
+    PaperAllocationOutcome,
+    PaperAllocationTrial,
+)
 from inefficiency_engine.expanded_alpha_factory import ExpandedAlphaFactoryService
 from inefficiency_engine.profit_coverage import ProfitMechanismCoverage, build_profit_coverage_summary
 from inefficiency_engine.research_mechanisms import (
@@ -43,6 +47,11 @@ _ALPHA_MECHANISM_FAMILIES: dict[str, str] = {
     "microstructure": "microstructure_orderflow",
 }
 
+_CORE_MECHANISM_STRATEGIES: dict[str, set[str]] = {
+    "price_discrepancy": {"cex_spot_dislocation", "cex_dex"},
+    "carry": {"funding_dispersion", "spot_perp_basis", "futures_basis"},
+}
+
 
 class MechanismOperatingStatus(BaseModel):
     mechanism_id: str
@@ -66,6 +75,13 @@ class MechanismOperatingStatus(BaseModel):
     allocator_mean_net_return_ci_lower: float | None = None
     allocator_profitable_rate_ci_lower: float | None = None
     profitability_certified: bool = False
+    forward_evidence_worker_healthy: bool | None = None
+    forward_evidence_persistence_healthy: bool | None = None
+    forward_evidence_last_signal_at: datetime | None = None
+    forward_evidence_last_outcome_at: datetime | None = None
+    forward_evidence_last_cycle_at: datetime | None = None
+    forward_evidence_next_expected_at: datetime | None = None
+    forward_evidence_expected_interval_seconds: float | None = Field(default=None, ge=0)
     primary_reason: str
     next_action: str
     blockers: list[str] = Field(default_factory=list)
@@ -208,6 +224,18 @@ def _forward_stats(rows: list[AlphaForwardOutcome]) -> dict[str, float | int | N
     }
 
 
+def _outcome_stats(rows: list[PaperAllocationOutcome]) -> dict[str, float | int | None]:
+    values = [row.realized_net_return for row in rows]
+    positives = sum(value > 0 for value in values)
+    return {
+        "count": len(rows),
+        "mean": statistics.fmean(values) if values else None,
+        "realized_profit": sum(row.realized_profit_usd for row in rows),
+        "mean_lower": _mean_lower(values),
+        "hit_lower": _wilson_lower(positives, len(values)),
+    }
+
+
 def _allocator_family_stats(
     rows: list[PaperAllocationOutcome],
     strategy_to_family: dict[str, str],
@@ -217,17 +245,23 @@ def _allocator_family_stats(
         family = strategy_to_family.get(row.strategy)
         if family is not None:
             grouped[family].append(row)
+    return {family: _outcome_stats(outcomes) for family, outcomes in grouped.items()}
+
+
+def _allocator_mechanism_stats(
+    rows: list[PaperAllocationOutcome],
+) -> dict[str, dict[str, float | int | None]]:
     result: dict[str, dict[str, float | int | None]] = {}
-    for family, outcomes in grouped.items():
-        values = [row.realized_net_return for row in outcomes]
-        positives = sum(value > 0 for value in values)
-        result[family] = {
-            "count": len(outcomes),
-            "realized_profit": sum(row.realized_profit_usd for row in outcomes),
-            "mean_lower": _mean_lower(values),
-            "hit_lower": _wilson_lower(positives, len(values)),
-        }
+    for mechanism_id, strategies in _CORE_MECHANISM_STRATEGIES.items():
+        result[mechanism_id] = _outcome_stats([row for row in rows if row.strategy in strategies])
     return result
+
+
+def _supported_mechanism_trial_counts(rows: list[PaperAllocationTrial]) -> dict[str, int]:
+    return {
+        mechanism_id: sum(row.settlement_supported and row.strategy in strategies for row in rows)
+        for mechanism_id, strategies in _CORE_MECHANISM_STRATEGIES.items()
+    }
 
 
 class OperatingCertificationService:
@@ -397,6 +431,152 @@ class OperatingCertificationService:
             False,
         )
 
+    def _structural_state(
+        self,
+        *,
+        provider_ready: bool,
+        supported_trial_count: int,
+        allocator: dict[str, float | int | None],
+    ) -> tuple[OperatingState, str, str, bool]:
+        if not provider_ready:
+            return (
+                "provider_gap",
+                "required public market evidence is not currently available",
+                "restore the required public market/funding provider surface",
+                False,
+            )
+        settled = int(allocator.get("count") or 0)
+        if supported_trial_count <= 0:
+            return (
+                "collecting",
+                "canonical realized multi-leg settlement is enabled and awaiting the first eligible allocator trial",
+                "keep allocation certification running; eligible structural allocations now enter the shared settlement engine",
+                False,
+            )
+        if settled < self.min_allocator_settled_trials:
+            return (
+                "certifying",
+                f"canonical realized multi-leg settlement is operating ({settled}/{self.min_allocator_settled_trials} settled outcomes)",
+                "continue exact forward settlement until the predeclared profitability cohort is complete",
+                False,
+            )
+        mean = allocator.get("mean")
+        mean_lower = allocator.get("mean_lower")
+        hit_lower = allocator.get("hit_lower")
+        realized_profit = float(allocator.get("realized_profit") or 0.0)
+        if isinstance(mean, (float, int)) and float(mean) <= 0:
+            return (
+                "poor_economics",
+                "realized allocator-level structural economics are non-positive after observed settlement and costs",
+                "continue observing without weakening economics or forcing allocation",
+                False,
+            )
+        if mean_lower is None or float(mean_lower) <= 0 or hit_lower is None or float(hit_lower) < self.min_allocator_profitable_rate_lower:
+            return (
+                "statistical_failure",
+                "realized structural returns have not cleared the conservative profitability confidence hurdle",
+                "continue independent realized settlement; do not lower the certification threshold",
+                False,
+            )
+        certified = realized_profit > 0
+        if certified:
+            return (
+                "certified",
+                "realized multi-leg allocator outcomes demonstrate statistically conservative positive paper profitability",
+                "maintain forward settlement and revoke certification automatically if realized economics degrade",
+                True,
+            )
+        return (
+            "poor_economics",
+            "settled structural cohort has not produced positive aggregate realized paper profit",
+            "continue observing without weakening economics",
+            False,
+        )
+
+    def _forward_evidence_heartbeat(self, family: str, *, now: datetime) -> dict[str, object]:
+        events = self.alpha_factory.ledger.events
+        with self.store.engine.connect() as db:
+            rows = list(db.execute(
+                select(events.c.event_type, events.c.observed_at)
+                .where(events.c.family == family)
+                .order_by(events.c.id.desc())
+                .limit(500)
+            ))
+            heartbeat_payloads = list(db.execute(
+                select(self.store.worker_heartbeats.c.payload_json)
+                .order_by(self.store.worker_heartbeats.c.id.desc())
+                .limit(200)
+            ).scalars())
+        last_signal: datetime | None = None
+        last_outcome: datetime | None = None
+        for event_type, observed_at in rows:
+            if event_type == "signal" and last_signal is None:
+                last_signal = datetime.fromisoformat(observed_at)
+            elif event_type == "outcome" and last_outcome is None:
+                last_outcome = datetime.fromisoformat(observed_at)
+            if last_signal is not None and last_outcome is not None:
+                break
+
+        worker_payload: dict[str, object] | None = None
+        for raw in heartbeat_payloads:
+            payload = json.loads(raw)
+            detail = payload.get("detail") or {}
+            if isinstance(detail, dict) and any(
+                key in detail for key in (
+                    "alpha_forward_evidence_due",
+                    "alpha_forward_evidence_cycle_id",
+                    "alpha_forward_evidence_error_type",
+                )
+            ):
+                worker_payload = payload
+                break
+
+        expected_interval = float(
+            max(1, int(getattr(self.core.settings, "alpha_evidence_every_cycles", 10)))
+            * max(1.0, float(getattr(self.core.settings, "shadow_cycle_interval_seconds", 30.0)))
+        )
+        last_cycle: datetime | None = None
+        worker_healthy: bool | None = None
+        if worker_payload is not None:
+            last_cycle = datetime.fromisoformat(str(worker_payload["observed_at"]))
+            age = max(0.0, (now - last_cycle).total_seconds())
+            detail = worker_payload.get("detail") or {}
+            alpha_error = detail.get("alpha_forward_evidence_error_type") if isinstance(detail, dict) else None
+            stale_after = max(
+                float(getattr(self.core.settings, "worker_heartbeat_stale_seconds", 180.0)),
+                expected_interval * 3.0,
+            )
+            worker_healthy = bool(
+                worker_payload.get("state") not in {"error", "stopped"}
+                and alpha_error is None
+                and age <= stale_after
+            )
+        persistence_healthy = bool(self.store.ping())
+        next_expected = last_cycle + timedelta(seconds=expected_interval) if last_cycle is not None else None
+        return {
+            "worker_healthy": worker_healthy,
+            "persistence_healthy": persistence_healthy,
+            "last_signal_at": last_signal,
+            "last_outcome_at": last_outcome,
+            "last_cycle_at": last_cycle,
+            "next_expected_at": next_expected,
+            "expected_interval_seconds": expected_interval,
+        }
+
+    @staticmethod
+    def _heartbeat_note(heartbeat: dict[str, object]) -> str:
+        worker = heartbeat.get("worker_healthy")
+        worker_text = "healthy" if worker is True else "degraded" if worker is False else "awaiting heartbeat"
+        persistence_text = "healthy" if heartbeat.get("persistence_healthy") else "degraded"
+        last = heartbeat.get("last_outcome_at") or heartbeat.get("last_signal_at")
+        last_text = "none yet" if last is None else last.strftime("%b %d %H:%M UTC")
+        next_expected = heartbeat.get("next_expected_at")
+        next_text = "awaiting first cycle" if next_expected is None else next_expected.strftime("%b %d %H:%M UTC")
+        return (
+            f" · forward collector {worker_text}; persistence {persistence_text}; "
+            f"last eligible {last_text}; next expected ~{next_text}"
+        )
+
     @staticmethod
     def _base_status(
         coverage: ProfitMechanismCoverage,
@@ -460,7 +640,12 @@ class OperatingCertificationService:
         family_forward = {family: _forward_stats(rows) for family, rows in family_outcomes.items()}
         signal_counts = _family_signal_counts(self.alpha_factory)
         strategy_to_family = {manifest.strategy_id: manifest.family for manifest in self.alpha_factory.manifests()}
-        allocator_stats = _allocator_family_stats(self.allocation_certification.ledger.outcomes(), strategy_to_family)
+        all_allocator_outcomes = self.allocation_certification.ledger.outcomes()
+        allocator_stats = _allocator_family_stats(all_allocator_outcomes, strategy_to_family)
+        mechanism_allocator_stats = _allocator_mechanism_stats(all_allocator_outcomes)
+        mechanism_supported_trials = _supported_mechanism_trial_counts(
+            self.allocation_certification.ledger.trials_all()
+        )
 
         candidates_by_family: dict[str, int] = defaultdict(int)
         qualified_by_family: dict[str, int] = defaultdict(int)
@@ -509,6 +694,8 @@ class OperatingCertificationService:
                     allocator=allocator,
                     provider_ready=provider_ready,
                 )
+                heartbeat = self._forward_evidence_heartbeat(family, now=live_snapshot.completed_at)
+                reason += self._heartbeat_note(heartbeat)
                 if coverage.mechanism_id == "fundamental_onchain":
                     authoritative_count = int(fundamental_summary.get("authoritative_count", 0))
                 elif coverage.mechanism_id == "event_driven":
@@ -539,6 +726,13 @@ class OperatingCertificationService:
                     allocator_mean_net_return_ci_lower=(allocator or {}).get("mean_lower"),
                     allocator_profitable_rate_ci_lower=(allocator or {}).get("hit_lower"),
                     profitability_certified=certified,
+                    forward_evidence_worker_healthy=heartbeat.get("worker_healthy"),
+                    forward_evidence_persistence_healthy=heartbeat.get("persistence_healthy"),
+                    forward_evidence_last_signal_at=heartbeat.get("last_signal_at"),
+                    forward_evidence_last_outcome_at=heartbeat.get("last_outcome_at"),
+                    forward_evidence_last_cycle_at=heartbeat.get("last_cycle_at"),
+                    forward_evidence_next_expected_at=heartbeat.get("next_expected_at"),
+                    forward_evidence_expected_interval_seconds=heartbeat.get("expected_interval_seconds"),
                     primary_reason=reason,
                     next_action=next_action,
                     blockers=blockers,
@@ -639,21 +833,45 @@ class OperatingCertificationService:
                 ))
                 continue
 
-            provider_ready = (
-                diagnostic.market_quote_count >= 2
-                if coverage.mechanism_id == "price_discrepancy"
-                else funding_provider_ready and diagnostic.market_quote_count > 0
-                if coverage.mechanism_id == "carry"
-                else coverage.authoritative_data_available
-            )
+            if coverage.mechanism_id in _CORE_MECHANISM_STRATEGIES:
+                provider_ready = (
+                    diagnostic.market_quote_count >= 2
+                    if coverage.mechanism_id == "price_discrepancy"
+                    else funding_provider_ready and diagnostic.market_quote_count > 0
+                )
+                allocator = mechanism_allocator_stats[coverage.mechanism_id]
+                state, reason, next_action, certified = self._structural_state(
+                    provider_ready=provider_ready,
+                    supported_trial_count=mechanism_supported_trials[coverage.mechanism_id],
+                    allocator=allocator,
+                )
+                statuses.append(MechanismOperatingStatus(
+                    mechanism_id=coverage.mechanism_id,
+                    name=coverage.name,
+                    state=state,
+                    stage="profitability_certifiable",
+                    provider_ready=provider_ready,
+                    authoritative_observation_count=diagnostic.market_quote_count + diagnostic.funding_quote_count,
+                    settled_allocator_outcome_count=int(allocator.get("count") or 0),
+                    allocator_realized_profit_usd=allocator.get("realized_profit"),
+                    allocator_mean_net_return_ci_lower=allocator.get("mean_lower"),
+                    allocator_profitable_rate_ci_lower=allocator.get("hit_lower"),
+                    profitability_certified=certified,
+                    primary_reason=reason,
+                    next_action=next_action,
+                    blockers=[
+                        blocker for blocker in coverage.blockers
+                        if "allocator-level realized settlement" not in blocker
+                        and "allocator-level realized settlement remains incomplete" not in blocker
+                    ],
+                ))
+                continue
+
+            provider_ready = coverage.authoritative_data_available
             if not provider_ready:
                 state: OperatingState = "provider_gap"
                 reason = "required public market evidence is not currently available"
-                next_action = "restore the required public market/funding provider surface"
-            elif coverage.paper_allocation_available and not coverage.profitability_certification_available:
-                state = "settlement_blocked"
-                reason = "paper allocation is available but allocator-level realized multi-leg settlement is incomplete"
-                next_action = "implement and accumulate exact multi-leg realized settlement without weakening economics"
+                next_action = "restore the required provider surface"
             else:
                 state = "collecting"
                 reason = "evidence is operating but profitability certification is not yet complete"

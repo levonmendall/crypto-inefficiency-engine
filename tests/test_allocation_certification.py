@@ -43,7 +43,7 @@ def allocation(
     )
 
 
-def test_spot_long_allocation_is_forward_settleable_but_perp_short_and_neutral_are_not():
+def test_spot_long_and_perp_short_are_forward_settleable_but_unenriched_neutral_is_not():
     spot = AllocationForwardCertificationService.trial_from_allocation(
         allocation(),
         plan_observed_at=NOW,
@@ -56,15 +56,18 @@ def test_spot_long_allocation_is_forward_settleable_but_perp_short_and_neutral_a
         allocation(exposure="directional_short", kind="perpetual"),
         plan_observed_at=NOW,
     )
-    assert short.settlement_supported is False
-    assert "funding" in (short.settlement_blocker or "")
+    assert short.settlement_supported is True
+    assert short.settlement_method == AllocationForwardCertificationService.PERP_SHORT_SETTLEMENT_METHOD
+    assert short.settlement_blocker is None
+    assert len(short.settlement_legs) == 1
+    assert short.settlement_legs[0].side == "short"
 
     neutral = AllocationForwardCertificationService.trial_from_allocation(
         allocation(exposure="market_neutral", family="core_cex"),
         plan_observed_at=NOW,
     )
     assert neutral.settlement_supported is False
-    assert "multi-leg" in (neutral.settlement_blocker or "")
+    assert "exact two-leg" in (neutral.settlement_blocker or "")
 
 
 def test_supported_trial_settles_forward_price_move_net_of_precommitted_cost(tmp_path):
