@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from inefficiency_engine import __version__
+from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
 from inefficiency_engine.cex_dex_composite_statistics import CompositeEdgeStatisticalService
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_operations import (
@@ -58,6 +59,11 @@ def build_advanced_router(
         if promotion is not None
         else None
     )
+    allocation_certification = (
+        AllocationForwardCertificationService(service, unified, evidence_store)
+        if unified is not None and evidence_store is not None
+        else None
+    )
 
     def require_store() -> None:
         if evidence_store is None:
@@ -70,6 +76,7 @@ def build_advanced_router(
         status["predictive_alpha_live_execution_available"] = False
         status["predictive_alpha_strategy_count"] = len(alpha_factory.manifests()) if alpha_factory is not None else 0
         status["adaptive_alpha_health_control_available"] = alpha_factory is not None
+        status["allocation_forward_certification_available"] = allocation_certification is not None
         return status
 
     @router.get("/v2/alpha/strategies")
@@ -181,6 +188,27 @@ def build_advanced_router(
             "count": len(rows),
             "candidates": [item.model_dump(mode="json") for item in rows],
         }
+
+    @router.get("/v2/allocation/certification/summary")
+    def allocation_certification_summary():
+        require_store()
+        assert allocation_certification is not None
+        return allocation_certification.ledger.summary()
+
+    @router.post("/v2/allocation/certification/cycle")
+    async def allocation_certification_cycle(capital_usd: float = 100000.0):
+        require_store()
+        if capital_usd <= 0:
+            raise HTTPException(status_code=400, detail="capital_usd must be positive")
+        assert allocation_certification is not None
+        try:
+            cycle = await allocation_certification.run_cycle(total_capital_usd=capital_usd)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"allocation forward certification failed: {type(exc).__name__}",
+            ) from exc
+        return cycle.model_dump(mode="json")
 
     @router.get("/v1/cex-dex/composite-shadow/summary")
     def cex_dex_composite_shadow_summary():
