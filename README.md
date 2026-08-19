@@ -2,6 +2,19 @@
 
 A **paper-first, fail-closed** engine for discovering structural crypto-market inefficiencies, comparing them on conservative capital-adjusted economics, and learning which apparent edges survive market contact. It does not place live orders or require trading keys.
 
+## v0.10 — Evidence maturation
+
+### v0.10.0 — public-adapter registry and live diagnostics
+
+v0.10 starts by turning the broadened v0.9 graph into one coherent evidence pipeline rather than adding another strategy family.
+
+- one `PublicAdapterRegistry` now owns public quote/funding collection, venue-specific visible-L2 routing and provider→venue attribution;
+- OKX spot/perpetual/funding data is promoted from universal research-only discovery into the same core discovery, L2 qualification, shadow and empirical-learning path as the existing CEX venues;
+- OKX qualification uses explicit conservative fee configuration and still fails closed on missing books, stale data or unsupported economics;
+- zero-item provider responses are treated as degraded evidence rather than successful empty scans;
+- `cie diagnose-live` and `GET /v1/providers/diagnostic` test public market/funding surfaces plus representative L2 books and report observed item counts, sample symbols, errors and measured book-request latency;
+- the registry contains no private-account or order-entry capability.
+
 ## v0.9 — Universal Opportunity Graph — complete
 
 v0.9 turns the project from a two-strategy engine into a strategy-agnostic crypto opportunity graph with explicit evidence boundaries.
@@ -53,9 +66,9 @@ Public L2 supports taker visible-depth reconstruction, not maker queue position.
 
 ## Current architecture
 
-**Executable core:**
+**Executable-evidence core:**
 
-`public CEX data → canonical CEX graph → detector registry → conservative screening → exact L2 economics → capacity → ranking → paper allocation → shadow evidence → empirical learning`
+`public CEX adapter registry → canonical CEX graph → detector registry → conservative screening → exact visible-L2 economics → capacity → ranking → paper allocation → shadow evidence → empirical learning`
 
 **Universal research surface:**
 
@@ -81,12 +94,14 @@ source .venv/bin/activate
 pip install -e '.[dev]'
 pytest
 export CIE_EVIDENCE_DB_PATH=data/cie-evidence.sqlite3
+cie diagnose-live
 uvicorn inefficiency_engine.api:app --reload
 ```
 
 Useful read-only/paper endpoints:
 
 - `GET /health`
+- `GET /v1/providers/diagnostic`
 - `GET /v1/opportunities/live`
 - `GET /v1/executability/live`
 - `GET /v1/opportunities/ranked/live`

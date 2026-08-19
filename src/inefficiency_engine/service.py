@@ -5,16 +5,13 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 
-from inefficiency_engine.adapters.bybit import BybitPublicAdapter
-from inefficiency_engine.adapters.coinbase import CoinbaseSpotAdapter
-from inefficiency_engine.adapters.hyperliquid import HyperliquidAdapter
-from inefficiency_engine.adapters.kraken import KrakenSpotAdapter
+from inefficiency_engine.adapters.registry import ProviderDiagnosticReport, PublicAdapterRegistry
 from inefficiency_engine.config import Settings
 from inefficiency_engine.detectors.registry import DetectorContext, DetectorManifest, OpportunityDetectorRegistry
 from inefficiency_engine.evidence import EvidenceStore, ProviderStatus, ScanSnapshot
 from inefficiency_engine.execution import qualify_opportunity
 from inefficiency_engine.fill_model import reconstruct_partial_fill_state
-from inefficiency_engine.instrument_identity import book_identity, normalized_contract_key
+from inefficiency_engine.instrument_identity import normalized_contract_key
 from inefficiency_engine.latency import EmpiricalLatencyResolver
 from inefficiency_engine.market_graph import MarketGraphSnapshot, build_market_graph
 from inefficiency_engine.models import (
@@ -54,25 +51,12 @@ def _opportunity_signature(opportunity: Opportunity) -> str:
     return f"{opportunity.strategy.value}:{opportunity.asset}:{legs}"
 
 
-def _provider_venue(provider: str) -> str | None:
-    lowered = provider.lower()
-    if lowered.startswith("hyperliquid:"):
-        return "HlPerp"
-    if lowered.startswith("coinbase"):
-        return "Coinbase"
-    if lowered.startswith("bybit"):
-        return "Bybit"
-    if lowered.startswith("kraken"):
-        return "Kraken"
-    return None
-
-
-def _provider_failure_affects(opportunity: Opportunity, providers: list[ProviderStatus]) -> bool:
+def _provider_failure_affects(opportunity: Opportunity, providers: list[ProviderStatus], provider_venue) -> bool:
     required_venues = {leg.venue for leg in opportunity.legs}
     for status in providers:
         if status.ok:
             continue
-        venue = _provider_venue(status.provider)
+        venue = provider_venue(status.provider)
         if venue is None or venue in required_venues:
             return True
     return False
@@ -100,9 +84,15 @@ def _books_for_opportunity(opportunity: Opportunity, books: list[OrderBookSnapsh
 
 
 class OpportunityService:
-    def __init__(self, settings: Settings | None = None, evidence_store: EvidenceStore | None = None):
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        evidence_store: EvidenceStore | None = None,
+        adapter_registry: PublicAdapterRegistry | None = None,
+    ):
         self.settings = settings or Settings.from_env()
         self.evidence_store = evidence_store
+        self.adapter_registry = adapter_registry or PublicAdapterRegistry()
         self.detector_registry = OpportunityDetectorRegistry.default(self.settings)
         self.risk_gate = RiskGate(self.settings)
 
@@ -148,52 +138,12 @@ class OpportunityService:
 
     async def _collect_live_inputs(self):
         started_at = datetime.now(timezone.utc)
-        hyperliquid = HyperliquidAdapter()
-        coinbase = CoinbaseSpotAdapter()
-        bybit = BybitPublicAdapter()
-        kraken = KrakenSpotAdapter()
-
-        async def capture(provider: str, awaitable):
-            try:
-                items = await awaitable
-                return items, ProviderStatus(provider=provider, ok=True, item_count=len(items))
-            except Exception as exc:
-                return [], ProviderStatus(provider=provider, ok=False, error_type=type(exc).__name__)
-
-        async def capture_bybit():
-            try:
-                market, funding = await bybit.market_snapshot()
-                return market, funding, ProviderStatus(
-                    provider="bybit-v5:market-snapshot", ok=True, item_count=len(market) + len(funding)
-                )
-            except Exception as exc:
-                return [], [], ProviderStatus(
-                    provider="bybit-v5:market-snapshot", ok=False, error_type=type(exc).__name__
-                )
-
-        results = await asyncio.gather(
-            capture("hyperliquid:predictedFundings", hyperliquid.funding_quotes()),
-            capture("hyperliquid:metaAndAssetCtxs", hyperliquid.market_quotes()),
-            capture("coinbase-exchange:ticker", coinbase.market_quotes()),
-            capture_bybit(),
-            capture("kraken:PreTrade", kraken.market_quotes()),
-        )
-        hyper_funding, hyper_funding_status = results[0]
-        hyper_market, hyper_market_status = results[1]
-        coinbase_market, coinbase_status = results[2]
-        bybit_market, bybit_funding, bybit_status = results[3]
-        kraken_market, kraken_status = results[4]
-        funding_quotes = [*hyper_funding, *bybit_funding]
-        market_quotes = [*hyper_market, *coinbase_market, *bybit_market, *kraken_market]
+        funding_quotes, market_quotes, providers = await self.adapter_registry.collect_inputs()
         opportunities = self.analyze(funding_quotes, market_quotes)
-        providers = [
-            hyper_funding_status,
-            hyper_market_status,
-            coinbase_status,
-            bybit_status,
-            kraken_status,
-        ]
         return started_at, funding_quotes, market_quotes, opportunities, providers
+
+    async def provider_diagnostic(self) -> ProviderDiagnosticReport:
+        return await self.adapter_registry.diagnose()
 
     async def collect_live_graph(self) -> tuple[MarketGraphSnapshot, list[ProviderStatus], list[Opportunity]]:
         _, funding_quotes, market_quotes, opportunities, providers = await self._collect_live_inputs()
@@ -226,55 +176,8 @@ class OpportunityService:
 
     async def collect_live_executability(self) -> ScanSnapshot:
         started_at, funding_quotes, market_quotes, opportunities, providers = await self._collect_live_inputs()
-        hyperliquid = HyperliquidAdapter()
-        coinbase = CoinbaseSpotAdapter()
-        bybit = BybitPublicAdapter()
-        kraken = KrakenSpotAdapter()
-
-        requests: dict[tuple[str, str, str, str], tuple[str, object]] = {}
-        for opportunity in opportunities:
-            for leg in opportunity.legs:
-                key = book_identity(leg.venue, leg.asset, leg.market_kind, leg.contract_key)
-                if key in requests:
-                    continue
-                if leg.venue == "HlPerp" and leg.market_kind == MarketKind.PERPETUAL:
-                    requests[key] = (f"hyperliquid:l2Book:{leg.asset}", hyperliquid.order_book(leg.asset))
-                elif leg.venue == "Coinbase" and leg.market_kind == MarketKind.SPOT:
-                    requests[key] = (f"coinbase-exchange:book-level2:{leg.asset}", coinbase.order_book(leg.asset))
-                elif leg.venue == "Kraken" and leg.market_kind == MarketKind.SPOT:
-                    requests[key] = (
-                        f"kraken:PreTrade:{leg.asset}",
-                        kraken.order_book(leg.asset, symbol=leg.symbol),
-                    )
-                elif leg.venue == "Bybit" and leg.symbol is not None:
-                    requests[key] = (
-                        f"bybit-v5:orderbook:{leg.symbol}",
-                        bybit.order_book(
-                            asset=leg.asset,
-                            market_kind=leg.market_kind,
-                            symbol=leg.symbol,
-                            quote_currency=leg.quote_currency,
-                            contract_key=leg.contract_key,
-                            expires_at=leg.expires_at,
-                        ),
-                    )
-
-        async def capture_book(provider: str, awaitable):
-            try:
-                book = await awaitable
-                return book, ProviderStatus(provider=provider, ok=True, item_count=1)
-            except Exception as exc:
-                return None, ProviderStatus(provider=provider, ok=False, error_type=type(exc).__name__)
-
-        order_books: list[OrderBookSnapshot] = []
-        if requests:
-            book_results = await asyncio.gather(
-                *(capture_book(provider, awaitable) for provider, awaitable in requests.values())
-            )
-            for book, status in book_results:
-                providers.append(status)
-                if book is not None:
-                    order_books.append(book)
+        order_books, book_statuses = await self.adapter_registry.collect_books_for_opportunities(opportunities)
+        providers.extend(book_statuses)
 
         qualification_time = datetime.now(timezone.utc)
         latency_resolver = self.empirical_latency_resolver()
@@ -385,7 +288,9 @@ class OpportunityService:
             for opportunity, initial_exec, target, initial_tier in candidates:
                 signature = _opportunity_signature(opportunity)
                 current = verification_ops.get(signature)
-                provider_failed = _provider_failure_affects(opportunity, verification.providers)
+                provider_failed = _provider_failure_affects(
+                    opportunity, verification.providers, self.adapter_registry.provider_venue
+                )
                 current_exec = None
                 current_tier = None
                 if current is not None:
