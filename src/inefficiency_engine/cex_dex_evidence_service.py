@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
+from typing import Protocol
 
 from pydantic import BaseModel, Field
 
@@ -11,7 +12,12 @@ from inefficiency_engine.models import MarketKind
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
 from inefficiency_engine.universal import StablecoinConversionModel, build_conversion_edges
+from inefficiency_engine.universal_models import StablecoinConversionObservation
 from inefficiency_engine.universal_service import UniversalOpportunityService
+
+
+class StablecoinObservationAdapter(Protocol):
+    async def observations(self) -> list[StablecoinConversionObservation]: ...
 
 
 class CexDexCompositeProbe(BaseModel):
@@ -34,16 +40,18 @@ class CexDexCompositeEvidenceService:
         *,
         universal: UniversalOpportunityService | None = None,
         conversion_depth: StablecoinConversionDepthService | None = None,
+        stablecoin_adapter: StablecoinObservationAdapter | None = None,
     ):
         self.core = core
         self.settings = core.settings
         self.universal = universal or UniversalOpportunityService(core)
         self.conversion_depth = conversion_depth or StablecoinConversionDepthService(self.settings)
+        self.stablecoin_adapter = stablecoin_adapter or CoinbaseStablecoinAdapter()
 
     async def probe(self) -> CexDexCompositeProbe:
         frontiers = await self.universal.probe_dex_route_size_frontiers()
         core_snapshot = await self.core.collect_live_evidence()
-        stable_rows = await CoinbaseStablecoinAdapter().observations()
+        stable_rows = await self.stablecoin_adapter.observations()
         conversion_edges = build_conversion_edges(
             stable_rows,
             depeg_multiplier=self.settings.stablecoin_depeg_risk_multiplier,
