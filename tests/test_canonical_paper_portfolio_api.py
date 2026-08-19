@@ -5,6 +5,7 @@ def test_canonical_portfolio_and_operating_routes_are_mounted():
     paths = set(app.openapi()["paths"])
     expected = {
         "/v3/portfolio/canonical",
+        "/v3/portfolio/runtime-status",
         "/v3/portfolio/performance",
         "/v3/portfolio/positions",
         "/v3/portfolio/trades",
