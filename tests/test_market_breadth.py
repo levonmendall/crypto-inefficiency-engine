@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
+from inefficiency_engine.adapters.registry import PublicAdapterRegistry
 from inefficiency_engine.config import Settings
 from inefficiency_engine.detectors.futures_basis import FuturesBasisDetector
 from inefficiency_engine.detectors.spot_dislocation import CexSpotDislocationDetector
@@ -124,5 +125,6 @@ def test_provider_failure_only_poison_opportunities_using_that_venue():
         ],
     })
     statuses = [ProviderStatus(provider="bybit-v5:market-snapshot", ok=False, error_type="TimeoutError")]
-    assert _provider_failure_affects(coinbase_hl, statuses) is False
-    assert _provider_failure_affects(bybit, statuses) is True
+    resolver = PublicAdapterRegistry.provider_venue
+    assert _provider_failure_affects(coinbase_hl, statuses, resolver) is False
+    assert _provider_failure_affects(bybit, statuses, resolver) is True
