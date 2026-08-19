@@ -88,6 +88,8 @@ class FakeCore:
         return SimpleNamespace(
             opportunities=[core_opportunity()],
             executability=[core_execution()],
+            market_quotes=[],
+            completed_at=NOW,
         )
 
 
@@ -109,6 +111,25 @@ class FakeCexDexPromotion:
         )
         blocked = SimpleNamespace(paper_allocation_eligible=False)
         return SimpleNamespace(qualifications=[qualified, blocked])
+
+
+class FakeAlphaFactory:
+    async def promoted_candidates(self, snapshot, *, total_capital_usd: float):
+        assert snapshot.completed_at == NOW
+        assert total_capital_usd > 0
+        return [SimpleNamespace(
+            candidate_id="alpha:sol-trend",
+            strategy_id="time_series_momentum_v1",
+            asset="SOL",
+            venue="OKX",
+            symbol="SOL-USDT",
+            capital_required_usd=5000.0,
+            notional_usd=5000.0,
+            expected_profit_usd=25.0,
+            expected_net_return=0.005,
+            horizon_hours=6.0,
+            conflict_keys=["alpha-instrument:OKX:SOL-USDT"],
+        )]
 
 
 @pytest.mark.asyncio
@@ -138,3 +159,19 @@ async def test_unified_allocator_compares_only_qualified_current_deployments_and
     assert plan.authorizes_execution is False
     assert plan.live_execution_eligible is False
     assert all(item.authorizes_execution is False for item in plan.allocations)
+
+
+@pytest.mark.asyncio
+async def test_unified_allocator_accepts_only_promoted_alpha_and_ranks_it_with_other_families():
+    service = UnifiedPaperAllocatorService(
+        FakeCore(),  # type: ignore[arg-type]
+        FakeCexDexPromotion(),  # type: ignore[arg-type]
+        FakeAlphaFactory(),  # type: ignore[arg-type]
+    )
+    candidates = await service.candidates(total_capital_usd=30000.0)
+    assert [row.family for row in candidates] == ["alpha", "cex_dex", "core_cex"]
+    assert candidates[0].strategy == "time_series_momentum_v1"
+    assert candidates[0].expected_return_on_reserved_capital == pytest.approx(0.005)
+    plan = await service.allocate(total_capital_usd=30000.0)
+    assert any(row.family == "alpha" for row in plan.allocations)
+    assert all(row.authorizes_execution is False for row in plan.allocations)
