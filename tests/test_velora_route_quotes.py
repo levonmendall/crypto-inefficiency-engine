@@ -71,7 +71,7 @@ def stablecoin_observation(
     )
 
 
-def sell_route() -> object:
+def sell_route():
     return parse_velora_price_route(
         price_payload(
             src_token="eth", dest_token="usdc",
@@ -191,7 +191,9 @@ def test_usdt_cex_buy_dex_path_uses_two_hop_conversion_back_to_usdc():
     assert candidate.evidence["conversion_target_currency"] == "USDC"
     assert candidate.evidence["conversion_rate"] == pytest.approx(conversion_rate)
     assert len(candidate.evidence["conversion_path"]) == 2
-    assert candidate.risk_haircut_bps == pytest.approx(4.0)
+    # USDT at 0.999 has a 10 bps parity deviation; with the configured 1.5x
+    # multiplier that leg carries 15 bps risk, plus the 2 bps USDC floor.
+    assert candidate.risk_haircut_bps == pytest.approx(17.0)
 
 
 @pytest.mark.asyncio
