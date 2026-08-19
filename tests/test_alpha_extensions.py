@@ -187,7 +187,7 @@ def test_expanded_factory_counts_only_non_overlapping_forward_outcomes(tmp_path)
     assert "insufficient independent forward samples" in qualification.blockers
 
 
-def test_expanded_factory_registers_three_alpha_families(tmp_path):
+def test_expanded_factory_registers_six_alpha_families(tmp_path):
     store = EvidenceStore(tmp_path / "registry.sqlite3")
     core = SimpleNamespace(settings=Settings())
     factory = ExpandedAlphaFactoryService(core, store)  # type: ignore[arg-type]
@@ -196,4 +196,7 @@ def test_expanded_factory_registers_three_alpha_families(tmp_path):
         "time_series_momentum_v1",
         "mean_reversion_v1",
         "onchain_fundamental_composite_v1",
+        "cross_sectional_relative_value_v1",
+        "microstructure_imbalance_v1",
+        "event_driven_surprise_v1",
     }
