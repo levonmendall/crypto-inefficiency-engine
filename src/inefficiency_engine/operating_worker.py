@@ -5,6 +5,10 @@ import signal
 
 from inefficiency_engine import __version__
 from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
+from inefficiency_engine.canonical_paper_portfolio import (
+    CANONICAL_INITIAL_CAPITAL_USD,
+    CanonicalPaperPortfolioService,
+)
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeShadowService
@@ -21,12 +25,11 @@ from inefficiency_engine.worker import WorkerRunStats, run_shadow_worker
 
 
 async def run_forever(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
-    """Production paper worker with durable operating-certification snapshots.
+    """Production paper worker with compounding portfolio and certification.
 
-    Operating certification is coupled to allocator-forward certification so every
-    certification interval both advances evidence and records a mechanism-level
-    interpretation. Any operating-certification failure propagates into worker
-    health rather than being silently ignored.
+    The canonical account begins exactly once with $250,000. Portfolio state is
+    durable and append-only; deploys/restarts recover the existing account rather
+    than recreating capital. Unsupported settlement paths remain fail-closed.
     """
 
     stop_event = asyncio.Event()
@@ -52,6 +55,7 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
     promotion = CexDexPaperPromotionService(service, composite_service, store)
     unified = UnifiedPaperAllocatorService(service, promotion, alpha_factory)
     allocation_certification = AllocationForwardCertificationService(service, unified, store)
+    portfolio = CanonicalPaperPortfolioService(service, unified, store)
     operating_certification = OperatingCertificationService(
         service,
         store,
@@ -60,10 +64,19 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
         version=__version__,
     )
 
-    async def allocation_and_operating_cycle():
-        allocation_cycle = await allocation_certification.run_cycle()
+    portfolio.ledger.ensure_genesis()
+    if portfolio.ledger.latest_snapshot() is None:
+        portfolio.ledger.record_snapshot(portfolio.ledger.current_state())
+
+    async def allocation_portfolio_and_operating_cycle():
+        current = portfolio.ledger.current_state()
+        certification_capital = max(1.0, current.nav_usd)
+        allocation_cycle = await allocation_certification.run_cycle(
+            total_capital_usd=certification_capital
+        )
+        portfolio_cycle = await portfolio.run_cycle()
         await operating_certification.run_cycle(
-            total_capital_usd=service.settings.alpha_research_capital_usd
+            total_capital_usd=max(1.0, portfolio_cycle.nav_usd)
         )
         return allocation_cycle
 
@@ -78,7 +91,7 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
         composite_shadow_every_cycles=10,
         stablecoin_shadow_runner=stablecoin_shadow.run_cycle,
         stablecoin_shadow_every_cycles=10,
-        allocation_certification_runner=allocation_and_operating_cycle,
+        allocation_certification_runner=allocation_portfolio_and_operating_cycle,
         allocation_certification_every_cycles=max(
             1, int(getattr(service.settings, "allocation_certification_every_cycles", 10))
         ),

@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 
 from inefficiency_engine import __version__
 from inefficiency_engine.alpha_coverage_strategies import EventLedger
+from inefficiency_engine.canonical_paper_portfolio_api import build_canonical_paper_portfolio_router
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.operating_certification_api import build_operating_certification_router
 from inefficiency_engine.research_mechanisms import (
@@ -135,6 +136,10 @@ def build_research_mechanisms_router(*, evidence_store: EvidenceStore | None, se
 
     router.include_router(build_operating_certification_router(
         version=__version__,
+        evidence_store=evidence_store,
+        service=service,
+    ))
+    router.include_router(build_canonical_paper_portfolio_router(
         evidence_store=evidence_store,
         service=service,
     ))
