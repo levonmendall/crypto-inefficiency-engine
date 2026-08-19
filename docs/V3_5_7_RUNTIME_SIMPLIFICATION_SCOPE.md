@@ -1,0 +1,1 @@
+V3.5.7 changes runtime resource topology only. It does not change strategy thresholds, opportunity economics, allocation sizing, canonical capital, settlement rules, provider qualification standards, or live-execution authority.
