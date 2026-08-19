@@ -131,6 +131,9 @@ def build_canonical_paper_portfolio_router(
             "fallback_snapshot": integrity.fallback_snapshot if integrity is not None else False,
             "cycle_error_type": integrity.cycle_error_type if integrity is not None else None,
             "stale_position_count": integrity.stale_position_count if integrity is not None else None,
+            "settlement_evidence_blocked_count": (
+                integrity.settlement_evidence_blocked_count if integrity is not None else 0
+            ),
             "allocation_family_failures": (
                 list(integrity.allocation_family_failures) if integrity is not None else []
             ),
