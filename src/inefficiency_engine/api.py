@@ -10,6 +10,7 @@ from inefficiency_engine.dex_statistics import DexStatisticalQualificationServic
 from inefficiency_engine.evidence import build_evidence_store
 from inefficiency_engine.profit_coverage_api import build_profit_coverage_router
 from inefficiency_engine.replay import replay_scan
+from inefficiency_engine.research_mechanisms_api import build_research_mechanisms_router
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.shadow_summary import summarize_evidence_store
 from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
@@ -43,6 +44,7 @@ app.include_router(build_advanced_router(
     conversion_depth_service=conversion_depth_service,
 ))
 app.include_router(build_profit_coverage_router(version=__version__, evidence_store=evidence_store))
+app.include_router(build_research_mechanisms_router(evidence_store=evidence_store, service=service))
 
 @app.get("/health")
 def health():
