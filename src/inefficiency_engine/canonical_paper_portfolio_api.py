@@ -79,6 +79,18 @@ def build_canonical_paper_portfolio_router(
             "trades": [row.model_dump(mode="json") for row in rows],
         }
 
+    @router.get("/v3/portfolio/skips")
+    def canonical_portfolio_skips(limit: int = 100):
+        engine = require_portfolio()
+        bounded = max(1, min(1000, int(limit)))
+        rows = [event for event in reversed(engine.ledger.events_all()) if event.event_type == "skip"][:bounded]
+        return {
+            "portfolio_id": CANONICAL_PORTFOLIO_ID,
+            "paper_only": True,
+            "count": len(rows),
+            "skips": [row.model_dump(mode="json") for row in rows],
+        }
+
     @router.get("/v3/portfolio/history")
     def canonical_portfolio_history(limit: int = 100):
         engine = require_portfolio()
