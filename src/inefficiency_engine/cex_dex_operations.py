@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from inefficiency_engine.cex_dex_evidence import CexDexCompositeEvidence
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.config import Settings
-from inefficiency_engine.models import MarketKind, MarketQuote
+from inefficiency_engine.models import MarketKind
 from inefficiency_engine.service import OpportunityService
 
 
@@ -77,19 +77,35 @@ class CexDexOperationalProbe(BaseModel):
 
 
 def inventory_policy_from_settings(settings: Settings) -> PaperInventoryPolicy:
+    # These optional settings deliberately default to zero. A deployment must make
+    # an explicit paper-capital assumption before operational qualification can pass.
     return PaperInventoryPolicy(
-        cex_asset_inventory_usd_per_venue=settings.cex_dex_paper_cex_asset_inventory_usd,
-        cex_quote_inventory_usd_per_venue=settings.cex_dex_paper_cex_quote_inventory_usd,
-        dex_asset_inventory_usd=settings.cex_dex_paper_dex_asset_inventory_usd,
-        dex_quote_inventory_usd=settings.cex_dex_paper_dex_quote_inventory_usd,
+        cex_asset_inventory_usd_per_venue=max(
+            0.0, float(getattr(settings, "cex_dex_paper_cex_asset_inventory_usd", 0.0))
+        ),
+        cex_quote_inventory_usd_per_venue=max(
+            0.0, float(getattr(settings, "cex_dex_paper_cex_quote_inventory_usd", 0.0))
+        ),
+        dex_asset_inventory_usd=max(
+            0.0, float(getattr(settings, "cex_dex_paper_dex_asset_inventory_usd", 0.0))
+        ),
+        dex_quote_inventory_usd=max(
+            0.0, float(getattr(settings, "cex_dex_paper_dex_quote_inventory_usd", 0.0))
+        ),
     )
 
 
 def hedge_policy_from_settings(settings: Settings) -> HedgeRecoveryPolicy:
     return HedgeRecoveryPolicy(
-        max_unhedged_seconds=settings.cex_dex_paper_max_unhedged_seconds,
-        reserve_buffer_bps=settings.cex_dex_paper_recovery_buffer_bps,
-        minimum_alternate_cex_venues=settings.cex_dex_paper_min_alternate_cex_venues,
+        max_unhedged_seconds=max(
+            0.001, float(getattr(settings, "cex_dex_paper_max_unhedged_seconds", 2.0))
+        ),
+        reserve_buffer_bps=max(
+            0.0, float(getattr(settings, "cex_dex_paper_recovery_buffer_bps", 25.0))
+        ),
+        minimum_alternate_cex_venues=max(
+            0, int(getattr(settings, "cex_dex_paper_min_alternate_cex_venues", 1))
+        ),
     )
 
 
