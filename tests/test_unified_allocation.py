@@ -125,6 +125,10 @@ class FakeAlphaFactory:
             direction="long",
             venue="OKX",
             symbol="SOL-USDT",
+            market_kind=MarketKind.SPOT,
+            observed_at=NOW,
+            entry_reference_price=150.0,
+            estimated_cost_return=0.001,
             capital_required_usd=5000.0,
             notional_usd=5000.0,
             expected_profit_usd=25.0,
@@ -177,8 +181,15 @@ async def test_unified_allocator_accepts_only_promoted_alpha_and_tracks_directio
     assert [row.family for row in candidates] == ["alpha", "cex_dex", "core_cex"]
     assert candidates[0].strategy == "time_series_momentum_v1"
     assert candidates[0].exposure_kind == "directional_long"
+    assert candidates[0].instrument_market_kind == "spot"
+    assert candidates[0].entry_reference_price == 150.0
+    assert candidates[0].modeled_roundtrip_cost_return == 0.001
     assert candidates[0].expected_return_on_reserved_capital == pytest.approx(0.005)
     plan = await service.allocate(total_capital_usd=30000.0)
+    alpha = next(row for row in plan.allocations if row.family == "alpha")
+    assert alpha.source_observed_at == NOW
+    assert alpha.instrument_symbol == "SOL-USDT"
+    assert alpha.instrument_market_kind == "spot"
     assert any(row.family == "alpha" for row in plan.allocations)
     assert plan.portfolio_risk_budget is not None
     assert plan.portfolio_risk_budget.directional_long_capital_usd == 5000.0
