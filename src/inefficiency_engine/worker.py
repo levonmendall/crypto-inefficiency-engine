@@ -272,10 +272,10 @@ async def run_shadow_worker(
 
 
 async def run_forever(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
-    from inefficiency_engine.alpha_factory import AlphaFactoryService
     from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
     from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeShadowService
     from inefficiency_engine.dex_tier_shadow import DexTierShadowService
+    from inefficiency_engine.expanded_alpha_factory import ExpandedAlphaFactoryService
     from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
     from inefficiency_engine.stablecoin_depth_shadow import StablecoinDepthShadowService
     from inefficiency_engine.universal_service import UniversalOpportunityService
@@ -297,7 +297,7 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
         StablecoinConversionDepthService(service.settings),
         evidence_store=store,
     )
-    alpha_factory = AlphaFactoryService(service, store)
+    alpha_factory = ExpandedAlphaFactoryService(service, store)
     return await run_shadow_worker(
         service,
         store,
