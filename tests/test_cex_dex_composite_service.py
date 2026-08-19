@@ -81,6 +81,11 @@ class FakeConversionDepth:
         return conversion_books()
 
 
+class FakePartialConversionDepth:
+    async def collect_books(self):
+        return conversion_books()[:1]
+
+
 class FakeStablecoinAdapter:
     async def observations(self):
         return [
@@ -150,5 +155,26 @@ async def test_composite_probe_isolates_depth_failure_and_sorts_complete_rows():
     assert all(item.evidence_complete for item in probe.evidence)
     assert all(item.capacity_claimed is False for item in probe.evidence)
     assert all(item.executable_eligible is False for item in probe.evidence)
+    assert probe.capacity_claimed is False
+    assert probe.executable_eligible is False
+
+
+@pytest.mark.asyncio
+async def test_composite_probe_keeps_usdc_routes_when_usdt_depth_is_unavailable():
+    service = CexDexCompositeEvidenceService(
+        FakeCore(),  # type: ignore[arg-type]
+        universal=FakeUniversal(),  # type: ignore[arg-type]
+        conversion_depth=FakePartialConversionDepth(),  # type: ignore[arg-type]
+        stablecoin_adapter=FakeStablecoinAdapter(),
+    )
+
+    probe = await service.probe()
+
+    assert probe.comparison_attempt_count == 3
+    assert probe.evidence_count == 2
+    assert probe.rejection_reasons == {"ValueError": 1}
+    assert [item.cex_venue for item in probe.evidence] == ["Kraken", "Coinbase"]
+    assert all(item.cex_quote_currency == "USD" for item in probe.evidence)
+    assert all(item.evidence_complete for item in probe.evidence)
     assert probe.capacity_claimed is False
     assert probe.executable_eligible is False

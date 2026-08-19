@@ -142,3 +142,52 @@ async def test_coinbase_stablecoin_depth_adapter_requests_public_level2_books_on
     assert len(seen) == 2
     assert {item.symbol for item in result} == {"USDC-USD", "USDT-USD"}
     assert all(item.request_latency_ms is not None for item in result)
+
+
+@pytest.mark.asyncio
+async def test_coinbase_stablecoin_depth_adapter_preserves_available_book_when_peer_fails():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/products/USDT-USD/book":
+            return httpx.Response(503, json={"message": "temporarily unavailable"}, request=request)
+        return httpx.Response(
+            200,
+            json={
+                "bids": [["0.999", "1000", "1"]],
+                "asks": [["1.001", "1000", "1"]],
+            },
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = CoinbaseStablecoinDepthAdapter(client=client)
+        result = await adapter.books()
+
+    assert [item.symbol for item in result] == ["USDC-USD"]
+    observed_at = result[0].observed_at
+    usdc_quote = quote_stablecoin_conversion_depth(
+        "USDC", "USD", 100.0, result, now=observed_at,
+    )
+    assert usdc_quote.source_currency == "USDC"
+    assert usdc_quote.target_currency == "USD"
+    with pytest.raises(ValueError, match="USDT-USD"):
+        quote_stablecoin_conversion_depth("USDT", "USD", 100.0, result, now=observed_at)
+
+
+@pytest.mark.asyncio
+async def test_coinbase_stablecoin_depth_adapter_does_not_hide_unexpected_runtime_bug():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/products/USDT-USD/book":
+            raise RuntimeError("unexpected adapter bug")
+        return httpx.Response(
+            200,
+            json={
+                "bids": [["0.999", "1000", "1"]],
+                "asks": [["1.001", "1000", "1"]],
+            },
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = CoinbaseStablecoinDepthAdapter(client=client)
+        with pytest.raises(RuntimeError, match="unexpected adapter bug"):
+            await adapter.books()
