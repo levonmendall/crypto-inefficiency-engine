@@ -69,7 +69,7 @@
 - CEX taker fees, DEX gas and stablecoin depeg/risk haircuts are charged separately without double-counting conversion spread/slippage.
 - Incomplete depth/fee rows fail independently; complete rows remain research-only.
 
-### v0.10.6 — DEX statistical research qualification — current
+### v0.10.6 — DEX statistical research qualification — complete
 - Independent DEX route cycles, not repeated horizons, define effective sample size.
 - Route survival and repeated frontier acceptance use 95% Wilson confidence intervals by default.
 - Confidence-width, minimum-effective-sample and adverse-tail-sample gates are mandatory.
@@ -78,14 +78,27 @@
 - A live same-notional composite row can become `research_qualified=true` only after both current economics and historical statistical gates pass.
 - Research qualification still has `capacity_claimed=false`, `allocation_eligible=false` and `executable_eligible=false`.
 
+### v0.10.7 — independent larger-tier DEX shadow evidence — complete
+- $5k/$10k/$25k DEX routes accumulate their own multi-horizon survival and adverse-deterioration evidence.
+- Exact original source amounts are re-quoted at 1/5/15/30/60-second horizons.
+- Verification concurrency is bounded and large-tier collection is periodic rather than part of every core cycle.
+- Larger-tier failures remain isolated from core CEX and frequent $1k DEX evidence collection.
+
+### v0.10.8 — persisted composite CEX↔DEX edge survival — current
+- Persist fully reconstructed CEX↔DEX evidence rather than relying on route-only history as a proxy for economic edge survival.
+- Key observations by asset, route direction, notional, CEX venue/symbol and quote-currency path.
+- Re-price the complete route + stablecoin conversion depth + CEX hedge + fees + gas + risk-haircut economics at multiple horizons.
+- Record net-edge change, adverse deterioration, retained-edge fraction, disappearance and survival above the configured research hurdle.
+- Keep composite evidence append-only, paper-only, non-allocating and non-executable.
+- Stagger composite shadow collection away from the larger-tier/frontier cadence to avoid burst-loading public route APIs.
+
 ### Next v0.10 evidence work
-1. Extend multi-horizon route shadowing across the larger $5k/$10k/$25k frontier tiers so those tiers can accumulate their own independent statistical evidence.
-2. Persist composite CEX↔DEX observations so net-edge survival can be calibrated directly rather than combining current economics with route-only history.
-3. Build cross-venue inventory/settlement state and explicit atomic hedge/recovery models before CEX↔DEX can enter paper allocation.
-4. Add stablecoin conversion-depth shadow/persistence evidence and effective sample gates.
-5. Add authoritative bridge quote evidence only when a reliable supported source exists.
-6. Add option L2 and hedge-aware execution economics before options can enter allocation.
-7. Add authoritative liquidation/solver feeds before those families can enter allocation.
+1. Build cross-venue inventory/settlement state and explicit atomic hedge/recovery models before CEX↔DEX can enter paper allocation.
+2. Add stablecoin conversion-depth shadow/persistence evidence and effective sample gates.
+3. Add composite-edge statistical qualification directly from persisted net-edge survival history.
+4. Add authoritative bridge quote evidence only when a reliable supported source exists.
+5. Add option L2 and hedge-aware execution economics before options can enter allocation.
+6. Add authoritative liquidation/solver feeds before those families can enter allocation.
 
 ## Milestone 6 — Tiny-capital controlled execution — blocked
 Separate service, credentials, explicit authorization, hard caps, paired-leg hedge recovery, concentration limits, dead-man switch and kill switch. Remains blocked until accumulated shadow evidence is statistically convincing and live execution is separately authorized.

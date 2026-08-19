@@ -15,6 +15,7 @@ from inefficiency_engine.service import OpportunityService
 SleepFn = Callable[[float], Awaitable[None]]
 RouteShadowRunner = Callable[[], Awaitable[object]]
 TierShadowRunner = Callable[[], Awaitable[object]]
+CompositeShadowRunner = Callable[[], Awaitable[object]]
 FrontierRunner = Callable[[], Awaitable[list[object]]]
 
 
@@ -44,6 +45,12 @@ async def _interruptible_sleep(seconds: float, stop_event: asyncio.Event, sleep:
             task.result()
 
 
+def _staggered_due(attempted: int, every_cycles: int) -> bool:
+    every_cycles = max(1, every_cycles)
+    offset = max(1, every_cycles // 2)
+    return (attempted - offset) % every_cycles == 0
+
+
 async def run_shadow_worker(
     service: OpportunityService,
     store: EvidenceStore,
@@ -55,6 +62,8 @@ async def run_shadow_worker(
     route_shadow_runner: RouteShadowRunner | None = None,
     tier_shadow_runner: TierShadowRunner | None = None,
     tier_shadow_every_cycles: int = 10,
+    composite_shadow_runner: CompositeShadowRunner | None = None,
+    composite_shadow_every_cycles: int = 10,
     frontier_runner: FrontierRunner | None = None,
     frontier_every_cycles: int = 10,
 ) -> WorkerRunStats:
@@ -63,11 +72,15 @@ async def run_shadow_worker(
     attempted = succeeded = failed = 0
     frontier_every_cycles = max(1, frontier_every_cycles)
     tier_shadow_every_cycles = max(1, tier_shadow_every_cycles)
+    composite_shadow_every_cycles = max(1, composite_shadow_every_cycles)
     store.record_worker_heartbeat(worker_id=worker_id, state="starting", detail={"paper_only": True, "backend": store.backend})
     while not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
         attempted += 1
         run_frontier = frontier_runner is not None and attempted % frontier_every_cycles == 0
         run_tier_shadow = tier_shadow_runner is not None and attempted % tier_shadow_every_cycles == 0
+        run_composite_shadow = composite_shadow_runner is not None and _staggered_due(
+            attempted, composite_shadow_every_cycles
+        )
         store.record_worker_heartbeat(
             worker_id=worker_id,
             state="running",
@@ -75,12 +88,14 @@ async def run_shadow_worker(
                 "cycle_attempt": attempted,
                 "dex_frontier_probe_due": run_frontier,
                 "dex_tier_shadow_due": run_tier_shadow,
+                "cex_dex_composite_shadow_due": run_composite_shadow,
             },
         )
 
         tasks: list[Awaitable[object]] = [service.run_shadow_cycle()]
         route_index = None
         tier_index = None
+        composite_index = None
         frontier_index = None
         if route_shadow_runner is not None:
             route_index = len(tasks)
@@ -88,6 +103,9 @@ async def run_shadow_worker(
         if run_tier_shadow and tier_shadow_runner is not None:
             tier_index = len(tasks)
             tasks.append(tier_shadow_runner())
+        if run_composite_shadow and composite_shadow_runner is not None:
+            composite_index = len(tasks)
+            tasks.append(composite_shadow_runner())
         if run_frontier and frontier_runner is not None:
             frontier_index = len(tasks)
             tasks.append(frontier_runner())
@@ -95,6 +113,7 @@ async def run_shadow_worker(
         core_cycle = results[0]
         route_cycle = results[route_index] if route_index is not None else None
         tier_cycle = results[tier_index] if tier_index is not None else None
+        composite_cycle = results[composite_index] if composite_index is not None else None
         frontier_result = results[frontier_index] if frontier_index is not None else None
 
         if isinstance(core_cycle, BaseException):
@@ -108,6 +127,10 @@ async def run_shadow_worker(
                 detail["dex_tier_shadow_error_type"] = type(tier_cycle).__name__
             elif tier_cycle is not None:
                 detail["dex_tier_shadow_completed"] = True
+            if isinstance(composite_cycle, BaseException):
+                detail["cex_dex_composite_shadow_error_type"] = type(composite_cycle).__name__
+            elif composite_cycle is not None:
+                detail["cex_dex_composite_shadow_completed"] = True
             if isinstance(frontier_result, BaseException):
                 detail["dex_route_frontier_error_type"] = type(frontier_result).__name__
             elif frontier_result is not None:
@@ -148,6 +171,21 @@ async def run_shadow_worker(
             detail["dex_tier_shadow_survived_count"] = sum(
                 1 for obs in tier_observations if getattr(obs, "survived", False)
             )
+        if isinstance(composite_cycle, BaseException):
+            detail["cex_dex_composite_shadow_error_type"] = type(composite_cycle).__name__
+        elif composite_cycle is not None:
+            composite_observations = getattr(composite_cycle, "observations", [])
+            detail["cex_dex_composite_shadow_cycle_id"] = getattr(composite_cycle, "cycle_id", None)
+            detail["cex_dex_composite_initial_evidence_count"] = getattr(
+                composite_cycle, "initial_evidence_count", 0
+            )
+            detail["cex_dex_composite_observation_count"] = len(composite_observations)
+            detail["cex_dex_composite_matched_count"] = sum(
+                1 for obs in composite_observations if getattr(obs, "survived", False)
+            )
+            detail["cex_dex_composite_hurdle_survived_count"] = sum(
+                1 for obs in composite_observations if getattr(obs, "hurdle_survived", False)
+            )
         if isinstance(frontier_result, BaseException):
             detail["dex_route_frontier_error_type"] = type(frontier_result).__name__
         elif frontier_result is not None:
@@ -173,6 +211,8 @@ async def run_shadow_worker(
 
 
 async def run_forever(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
+    from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
+    from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeShadowService
     from inefficiency_engine.dex_tier_shadow import DexTierShadowService
     from inefficiency_engine.universal_service import UniversalOpportunityService
 
@@ -185,6 +225,10 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
             pass
     universal = UniversalOpportunityService(service)
     tier_shadow = DexTierShadowService(service, evidence_store=store)
+    composite_shadow = CexDexCompositeEdgeShadowService(
+        CexDexCompositeEvidenceService(service, universal=universal),
+        evidence_store=store,
+    )
     return await run_shadow_worker(
         service,
         store,
@@ -192,6 +236,8 @@ async def run_forever(service: OpportunityService, store: EvidenceStore) -> Work
         route_shadow_runner=universal.run_dex_route_shadow_cycle,
         tier_shadow_runner=tier_shadow.run_cycle,
         tier_shadow_every_cycles=service.settings.dex_route_tier_shadow_every_cycles,
+        composite_shadow_runner=composite_shadow.run_cycle,
+        composite_shadow_every_cycles=10,
         frontier_runner=universal.probe_dex_route_size_frontiers,
         frontier_every_cycles=service.settings.dex_route_frontier_every_cycles,
     )
