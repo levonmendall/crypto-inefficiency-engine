@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from statistics import NormalDist
+from typing import TYPE_CHECKING, Callable
 
 from sqlalchemy import select
 
@@ -48,7 +49,7 @@ def _linear(lower: float | None, upper: float | None, weight: float) -> float | 
     return lower + ((upper - lower) * weight)
 
 
-def _conservative_probability(lower: float | None, upper: float | None, weight: float) -> float | None:
+def _conservative_quality(lower: float | None, upper: float | None, weight: float) -> float | None:
     value = _linear(lower, upper, weight)
     if value is None or lower is None:
         return None
@@ -66,31 +67,130 @@ def _horizon_key(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else f"{value:g}"
 
 
-def _metrics(rows: list[ShadowObservation]) -> dict[str, float | int | None]:
-    if not rows:
-        return {
-            "count": 0,
-            "adverse_count": 0,
-            "pair_fill": None,
-            "reserve_fill": None,
-            "capture": None,
-            "hedge_recovery": None,
-            "adverse_p50": None,
-            "adverse_p90": None,
-            "adverse_p95": None,
-        }
-    adverse = [
-        value
-        for row in rows
-        if (value := _pair_adverse_selection_bps(row)) is not None
+def _cluster_key(row: ShadowObservation) -> tuple[str, str]:
+    # Capital tiers from the same detected market event are correlated and do not
+    # count as independent evidence when a broader scope pools notionals.
+    return (row.initial_scan_id, row.opportunity_signature)
+
+
+def _clusters(rows: list[ShadowObservation]) -> dict[tuple[str, str], list[ShadowObservation]]:
+    grouped: dict[tuple[str, str], list[ShadowObservation]] = {}
+    for row in rows:
+        grouped.setdefault(_cluster_key(row), []).append(row)
+    return grouped
+
+
+def _wilson(successes: int, n: int, confidence: float) -> tuple[float | None, float | None]:
+    if n <= 0:
+        return None, None
+    confidence = min(0.999999, max(0.500001, confidence))
+    z = NormalDist().inv_cdf((1.0 + confidence) / 2.0)
+    phat = successes / n
+    z2 = z * z
+    denominator = 1.0 + (z2 / n)
+    center = (phat + (z2 / (2.0 * n))) / denominator
+    margin = z * ((phat * (1.0 - phat) / n + z2 / (4.0 * n * n)) ** 0.5) / denominator
+    return max(0.0, center - margin), min(1.0, center + margin)
+
+
+def _cluster_probability(
+    rows: list[ShadowObservation],
+    predicate: Callable[[ShadowObservation], bool],
+    *,
+    risk: bool,
+    confidence: float,
+) -> tuple[float | None, float | None, float | None, int]:
+    grouped = _clusters(rows)
+    if not grouped:
+        return None, None, None, 0
+    outcomes: list[bool] = []
+    for cluster_rows in grouped.values():
+        values = [bool(predicate(row)) for row in cluster_rows]
+        outcomes.append(any(values) if risk else all(values))
+    successes = sum(outcomes)
+    probability = successes / len(outcomes)
+    lower, upper = _wilson(successes, len(outcomes), confidence)
+    return probability, lower, upper, len(outcomes)
+
+
+def _cluster_numeric(
+    rows: list[ShadowObservation],
+    extractor: Callable[[ShadowObservation], float | None],
+    *,
+    risk: bool,
+) -> list[float]:
+    values: list[float] = []
+    for cluster_rows in _clusters(rows).values():
+        cluster_values = [value for row in cluster_rows if (value := extractor(row)) is not None]
+        if cluster_values:
+            values.append(max(cluster_values) if risk else min(cluster_values))
+    return values
+
+
+def _metrics(rows: list[ShadowObservation], confidence: float) -> dict[str, object]:
+    pair_fill, pair_low, pair_high, effective = _cluster_probability(
+        rows, lambda row: bool(row.pair_fillable), risk=False, confidence=confidence
+    )
+    reserve_fill, reserve_low, reserve_high, _ = _cluster_probability(
+        rows, lambda row: bool(row.pair_fillable_with_reserve), risk=False, confidence=confidence
+    )
+    capture, capture_low, capture_high, _ = _cluster_probability(
+        rows,
+        lambda row: bool(row.pair_fillable_with_reserve) and row.survived,
+        risk=False,
+        confidence=confidence,
+    )
+    recovery, recovery_low, recovery_high, _ = _cluster_probability(
+        rows, lambda row: bool(row.hedge_recovery_required), risk=True, confidence=confidence
+    )
+    partial_fill, _, _, _ = _cluster_probability(
+        rows,
+        lambda row: bool(row.partial_fill_state) if row.partial_fill_state is not None else not bool(row.pair_fillable),
+        risk=True,
+        confidence=confidence,
+    )
+
+    adverse = _cluster_numeric(rows, _pair_adverse_selection_bps, risk=True)
+    pair_fraction = _cluster_numeric(
+        rows,
+        lambda row: row.pair_fill_fraction if row.pair_fill_fraction is not None else (1.0 if row.pair_fillable else 0.0),
+        risk=False,
+    )
+    unhedged = _cluster_numeric(rows, lambda row: row.unhedged_fraction, risk=True)
+    recovery_loss = _cluster_numeric(rows, lambda row: row.hedge_recovery_loss_proxy_bps, risk=True)
+
+    widths = [
+        high - low
+        for low, high in ((pair_low, pair_high), (reserve_low, reserve_high), (capture_low, capture_high))
+        if low is not None and high is not None
     ]
     return {
         "count": len(rows),
+        "effective_count": effective,
         "adverse_count": len(adverse),
-        "pair_fill": sum(bool(row.pair_fillable) for row in rows) / len(rows),
-        "reserve_fill": sum(bool(row.pair_fillable_with_reserve) for row in rows) / len(rows),
-        "capture": sum(bool(row.pair_fillable_with_reserve) and row.survived for row in rows) / len(rows),
-        "hedge_recovery": sum(bool(row.hedge_recovery_required) for row in rows) / len(rows),
+        "recovery_loss_count": len(recovery_loss),
+        "max_ci_width": max(widths) if widths else None,
+        "pair_fill": pair_fill,
+        "pair_fill_low": pair_low,
+        "pair_fill_high": pair_high,
+        "reserve_fill": reserve_fill,
+        "reserve_fill_low": reserve_low,
+        "reserve_fill_high": reserve_high,
+        "capture": capture,
+        "capture_low": capture_low,
+        "capture_high": capture_high,
+        "hedge_recovery": recovery,
+        "hedge_recovery_low": recovery_low,
+        "hedge_recovery_high": recovery_high,
+        "partial_fill": partial_fill,
+        "pair_fraction_p10": _quantile(pair_fraction, 0.10),
+        "pair_fraction_p50": _quantile(pair_fraction, 0.50),
+        "unhedged_p50": _quantile(unhedged, 0.50),
+        "unhedged_p90": _quantile(unhedged, 0.90),
+        "unhedged_p95": _quantile(unhedged, 0.95),
+        "recovery_loss_p50": _quantile(recovery_loss, 0.50),
+        "recovery_loss_p90": _quantile(recovery_loss, 0.90),
+        "recovery_loss_p95": _quantile(recovery_loss, 0.95),
         "adverse_p50": _quantile(adverse, 0.50),
         "adverse_p90": _quantile(adverse, 0.90),
         "adverse_p95": _quantile(adverse, 0.95),
@@ -98,55 +198,74 @@ def _metrics(rows: list[ShadowObservation]) -> dict[str, float | int | None]:
 
 
 class EmpiricalLatencyResolver:
-    """Resolve a hierarchical empirical fill/latency model for a trade.
+    """Resolve the completed v0.8 empirical execution-risk model.
 
-    Scan latency is measured globally from unique verification scans. When that
-    measured latency falls between shadow checkpoints, v0.8.2 uses both adjacent
-    horizons. Probability metrics are interpolated so they can never improve as
-    time passes; adverse-selection and hedge-recovery risk can never decrease.
+    New evidence measures public L2 request round-trip latency directly. Historical
+    v0.8 evidence can fall back to whole-scan duration, but the source is explicit.
+    Because the system does not submit orders, order acknowledgement and second-leg
+    timing remain assumptions and are added to measured data latency before shadow
+    horizons are interpolated. Public L2 supports taker depth reconstruction, not
+    maker queue position; queue probability therefore remains intentionally absent.
     """
 
     def __init__(self, store: EvidenceStore | None, settings: Settings):
         self.settings = settings
         self.quantile = min(1.0, max(0.0, settings.empirical_latency_quantile))
+        self.confidence = min(0.999999, max(0.500001, settings.empirical_probability_confidence_level))
         self.observations: list[ShadowObservation] = []
         if store is not None:
             with store.engine.connect() as db:
                 payloads = list(
-                    db.execute(
-                        select(store.shadow_cycles.c.payload_json).order_by(store.shadow_cycles.c.completed_at)
-                    ).scalars()
+                    db.execute(select(store.shadow_cycles.c.payload_json).order_by(store.shadow_cycles.c.completed_at)).scalars()
                 )
             cycles = [ShadowCycle.model_validate_json(payload) for payload in payloads]
             self.observations = [observation for cycle in cycles for observation in cycle.observations]
 
-        latency_by_scan: dict[str, float] = {}
+        scan_by_id: dict[str, float] = {}
+        l2_by_id: dict[str, float] = {}
         for observation in self.observations:
             if observation.verification_scan_latency_ms is not None:
-                latency_by_scan[observation.verification_scan_id] = observation.verification_scan_latency_ms
-        self.latency_samples = list(latency_by_scan.values())
-        self.reference_latency_ms = _quantile(self.latency_samples, self.quantile)
+                scan_by_id[observation.verification_scan_id] = observation.verification_scan_latency_ms
+            if observation.verification_data_path_latency_ms is not None:
+                l2_by_id[observation.verification_scan_id] = observation.verification_data_path_latency_ms
+        self.scan_latency_samples = list(scan_by_id.values())
+        minimum_scan_samples = max(1, settings.empirical_latency_min_scan_samples)
+        if len(l2_by_id) >= minimum_scan_samples:
+            self.data_latency_samples = list(l2_by_id.values())
+            self.data_latency_source = "l2_request_roundtrip"
+        elif self.scan_latency_samples:
+            self.data_latency_samples = self.scan_latency_samples
+            self.data_latency_source = "scan_duration_fallback"
+        else:
+            self.data_latency_samples = []
+            self.data_latency_source = "unavailable"
+
+        self.collector_latency_reference_ms = _quantile(self.data_latency_samples, self.quantile)
+        self.effective_reference_ms: float | None = None
+        if self.collector_latency_reference_ms is not None:
+            self.effective_reference_ms = (
+                self.collector_latency_reference_ms
+                + max(0.0, settings.expected_order_ack_latency_ms)
+                + max(0.0, settings.expected_hedge_latency_ms)
+            )
+
         self.available_horizons = sorted({
             observation.delay_seconds
             for observation in self.observations
             if observation.delay_seconds > 0 and observation.pair_fillable is not None
         })
-
         self.reference_lower_horizon_seconds: float | None = None
         self.reference_upper_horizon_seconds: float | None = None
         self.interpolation_weight = 0.0
-        if self.reference_latency_ms is not None and self.available_horizons:
-            latency_seconds = self.reference_latency_ms / 1000.0
+        if self.effective_reference_ms is not None and self.available_horizons:
+            latency_seconds = self.effective_reference_ms / 1000.0
             first = self.available_horizons[0]
             last = self.available_horizons[-1]
             if latency_seconds <= first:
                 self.reference_lower_horizon_seconds = first
                 self.reference_upper_horizon_seconds = first
             elif latency_seconds <= last:
-                exact = next(
-                    (h for h in self.available_horizons if abs(h - latency_seconds) < 1e-12),
-                    None,
-                )
+                exact = next((h for h in self.available_horizons if abs(h - latency_seconds) < 1e-12), None)
                 if exact is not None:
                     self.reference_lower_horizon_seconds = exact
                     self.reference_upper_horizon_seconds = exact
@@ -156,7 +275,6 @@ class EmpiricalLatencyResolver:
                     self.reference_lower_horizon_seconds = lower
                     self.reference_upper_horizon_seconds = upper
                     self.interpolation_weight = (latency_seconds - lower) / (upper - lower)
-
         self.reference_horizon_seconds = self.reference_upper_horizon_seconds
 
     def resolve(
@@ -173,10 +291,9 @@ class EmpiricalLatencyResolver:
             venue_pair = _venue_pair(opportunity)
             asset = opportunity.asset
         strategy_value = strategy.value if isinstance(strategy, Strategy) else strategy
-
         lower_horizon = self.reference_lower_horizon_seconds
         upper_horizon = self.reference_upper_horizon_seconds
-        required_horizons = [] if lower_horizon is None else [lower_horizon]
+        required_horizons: list[float] = [] if lower_horizon is None else [lower_horizon]
         if upper_horizon is not None and upper_horizon != lower_horizon:
             required_horizons.append(upper_horizon)
 
@@ -211,120 +328,191 @@ class EmpiricalLatencyResolver:
                 and matches(row, dimensions)
             ]
 
-        minimum = max(1, self.settings.empirical_latency_min_samples)
+        minimum_raw = max(1, self.settings.empirical_latency_min_samples)
+        minimum_effective = max(1, self.settings.empirical_latency_min_effective_samples)
+        max_ci_width = max(0.0, self.settings.empirical_probability_max_ci_width)
         scope_candidate_counts: dict[str, int] = {}
         scope_horizon_counts: dict[str, dict[str, int]] = {}
+        scope_effective_counts: dict[str, dict[str, int]] = {}
         skipped: list[str] = []
         selected_scope = scopes[-1][0]
         selected_dimensions = scopes[-1][1]
-        selected_rows_by_horizon: dict[float, list[ShadowObservation]] = {}
+        selected_metrics: dict[float, dict[str, object]] = {}
+        scope_confidence_valid = False
 
         for name, dimensions in scopes:
-            horizon_rows = {h: rows_at(h, dimensions) for h in required_horizons}
-            horizon_counts = {_horizon_key(h): len(rows) for h, rows in horizon_rows.items()}
-            scope_horizon_counts[name] = horizon_counts
-            effective_count = min(horizon_counts.values(), default=0)
-            scope_candidate_counts[name] = effective_count
-            adverse_counts = [
-                sum(_pair_adverse_selection_bps(row) is not None for row in rows)
-                for rows in horizon_rows.values()
-            ]
-            effective_adverse = min(adverse_counts, default=0)
-            if required_horizons and effective_count >= minimum and effective_adverse >= minimum:
+            horizon_metrics = {h: _metrics(rows_at(h, dimensions), self.confidence) for h in required_horizons}
+            raw_counts = {_horizon_key(h): int(metric["count"] or 0) for h, metric in horizon_metrics.items()}
+            effective_counts = {_horizon_key(h): int(metric["effective_count"] or 0) for h, metric in horizon_metrics.items()}
+            scope_horizon_counts[name] = raw_counts
+            scope_effective_counts[name] = effective_counts
+            effective_raw = min(raw_counts.values(), default=0)
+            effective_n = min(effective_counts.values(), default=0)
+            adverse_n = min((int(metric["adverse_count"] or 0) for metric in horizon_metrics.values()), default=0)
+            recovery_n = min((int(metric["recovery_loss_count"] or 0) for metric in horizon_metrics.values()), default=0)
+            ci_width = max((float(metric["max_ci_width"] or 1.0) for metric in horizon_metrics.values()), default=1.0)
+            scope_candidate_counts[name] = effective_raw
+            valid = bool(required_horizons) and all((
+                effective_raw >= minimum_raw,
+                effective_n >= minimum_effective,
+                adverse_n >= minimum_effective,
+                recovery_n >= minimum_effective,
+                ci_width <= max_ci_width,
+            ))
+            if valid:
                 selected_scope = name
                 selected_dimensions = dimensions
-                selected_rows_by_horizon = horizon_rows
+                selected_metrics = horizon_metrics
+                scope_confidence_valid = True
                 break
             if name != "global":
-                skipped.append(f"{name}:{effective_count}")
+                skipped.append(
+                    f"{name}:raw={effective_raw},effective={effective_n},adverse={adverse_n},recovery={recovery_n},ci_width={ci_width:.4f}"
+                )
         else:
-            selected_rows_by_horizon = {
-                h: rows_at(h, scopes[-1][1]) for h in required_horizons
-            }
+            selected_metrics = {h: _metrics(rows_at(h, scopes[-1][1]), self.confidence) for h in required_horizons}
 
-        lower_rows = selected_rows_by_horizon.get(lower_horizon, []) if lower_horizon is not None else []
-        upper_rows = selected_rows_by_horizon.get(upper_horizon, []) if upper_horizon is not None else []
+        lower = selected_metrics.get(lower_horizon, {}) if lower_horizon is not None else {}
+        upper = selected_metrics.get(upper_horizon, {}) if upper_horizon is not None else {}
         if lower_horizon == upper_horizon:
-            upper_rows = lower_rows
-
-        lower_metrics = _metrics(lower_rows)
-        upper_metrics = _metrics(upper_rows)
+            upper = lower
         weight = self.interpolation_weight if lower_horizon != upper_horizon else 0.0
 
-        if lower_horizon == upper_horizon:
-            pair_fill = lower_metrics["pair_fill"]
-            reserve_fill = lower_metrics["reserve_fill"]
-            capture = lower_metrics["capture"]
-            hedge_recovery = lower_metrics["hedge_recovery"]
-            adverse_p50 = lower_metrics["adverse_p50"]
-            adverse_p90 = lower_metrics["adverse_p90"]
-            adverse_p95 = lower_metrics["adverse_p95"]
-            interpolation_mode = "single_horizon"
-        else:
-            pair_fill = _conservative_probability(lower_metrics["pair_fill"], upper_metrics["pair_fill"], weight)
-            reserve_fill = _conservative_probability(lower_metrics["reserve_fill"], upper_metrics["reserve_fill"], weight)
-            capture = _conservative_probability(lower_metrics["capture"], upper_metrics["capture"], weight)
-            hedge_recovery = _conservative_risk(lower_metrics["hedge_recovery"], upper_metrics["hedge_recovery"], weight)
-            adverse_p50 = _conservative_risk(lower_metrics["adverse_p50"], upper_metrics["adverse_p50"], weight)
-            adverse_p90 = _conservative_risk(lower_metrics["adverse_p90"], upper_metrics["adverse_p90"], weight)
-            adverse_p95 = _conservative_risk(lower_metrics["adverse_p95"], upper_metrics["adverse_p95"], weight)
-            interpolation_mode = "linear_interval"
+        def quality(name: str) -> float | None:
+            if lower_horizon == upper_horizon:
+                value = lower.get(name)
+                return float(value) if isinstance(value, (int, float)) else None
+            return _conservative_quality(
+                float(lower[name]) if isinstance(lower.get(name), (int, float)) else None,
+                float(upper[name]) if isinstance(upper.get(name), (int, float)) else None,
+                weight,
+            )
 
-        effective_count = min(
-            int(lower_metrics["count"] or 0),
-            int(upper_metrics["count"] or 0),
-        ) if required_horizons else 0
-        effective_adverse_count = min(
-            int(lower_metrics["adverse_count"] or 0),
-            int(upper_metrics["adverse_count"] or 0),
-        ) if required_horizons else 0
+        def risk(name: str) -> float | None:
+            if lower_horizon == upper_horizon:
+                value = lower.get(name)
+                return float(value) if isinstance(value, (int, float)) else None
+            return _conservative_risk(
+                float(lower[name]) if isinstance(lower.get(name), (int, float)) else None,
+                float(upper[name]) if isinstance(upper.get(name), (int, float)) else None,
+                weight,
+            )
+
+        pair_fill = quality("pair_fill")
+        pair_low = quality("pair_fill_low")
+        pair_high = quality("pair_fill_high")
+        reserve_fill = quality("reserve_fill")
+        reserve_low = quality("reserve_fill_low")
+        reserve_high = quality("reserve_fill_high")
+        capture = quality("capture")
+        capture_low = quality("capture_low")
+        capture_high = quality("capture_high")
+        hedge_recovery = risk("hedge_recovery")
+        hedge_recovery_low = risk("hedge_recovery_low")
+        hedge_recovery_high = risk("hedge_recovery_high")
+        partial_fill = risk("partial_fill")
+        pair_fraction_p10 = quality("pair_fraction_p10")
+        pair_fraction_p50 = quality("pair_fraction_p50")
+        unhedged_p50 = risk("unhedged_p50")
+        unhedged_p90 = risk("unhedged_p90")
+        unhedged_p95 = risk("unhedged_p95")
+        recovery_p50 = risk("recovery_loss_p50")
+        recovery_p90 = risk("recovery_loss_p90")
+        recovery_p95 = risk("recovery_loss_p95")
+        adverse_p50 = risk("adverse_p50")
+        adverse_p90 = risk("adverse_p90")
+        adverse_p95 = risk("adverse_p95")
+
+        effective_raw = min(int(lower.get("count") or 0), int(upper.get("count") or 0)) if required_horizons else 0
+        effective_n = min(int(lower.get("effective_count") or 0), int(upper.get("effective_count") or 0)) if required_horizons else 0
+        final_widths = [
+            high - low
+            for low, high in ((pair_low, pair_high), (reserve_low, reserve_high), (capture_low, capture_high))
+            if low is not None and high is not None
+        ]
+        final_ci_width = max(final_widths) if final_widths else None
 
         reasons: list[str] = []
         if not self.settings.empirical_latency_enabled:
             reasons.append("empirical latency model disabled by configuration")
-        if len(self.latency_samples) < max(1, self.settings.empirical_latency_min_scan_samples):
+        if len(self.data_latency_samples) < max(1, self.settings.empirical_latency_min_scan_samples):
             reasons.append(
-                f"need {self.settings.empirical_latency_min_scan_samples} unique verification-scan latency samples; have {len(self.latency_samples)}"
+                f"need {self.settings.empirical_latency_min_scan_samples} data-latency samples; have {len(self.data_latency_samples)}"
             )
         if lower_horizon is None or upper_horizon is None:
-            reasons.append("measured latency exceeds available shadow horizons or fill reconstruction is unavailable")
-        if effective_count < minimum:
-            reasons.append(f"need {minimum} fill-reconstruction cohorts at each reference horizon; have {effective_count}")
-        if effective_adverse_count < minimum:
-            reasons.append(f"need {minimum} adverse-selection samples at each reference horizon; have {effective_adverse_count}")
+            reasons.append("effective decision-to-hedge latency exceeds available shadow horizons or fill reconstruction is unavailable")
+        if not scope_confidence_valid:
+            reasons.append("no hierarchical cohort passes raw/effective sample, tail-sample, and confidence-width gates at every reference horizon")
 
         usable = not reasons
+        interpolation_mode = "single_horizon" if lower_horizon == upper_horizon else "linear_interval"
+        valid_strategy_values = {item.value for item in Strategy}
         return EmpiricalLatencyModel(
             model_scope=selected_scope,
-            scope_strategy=Strategy(strategy_value) if strategy_value in {item.value for item in Strategy} and "strategy" in selected_dimensions else None,
+            scope_strategy=Strategy(strategy_value) if strategy_value in valid_strategy_values and "strategy" in selected_dimensions else None,
             scope_venue_pair=venue_pair if "venue_pair" in selected_dimensions else None,
             scope_asset=asset if "asset" in selected_dimensions else None,
             scope_notional_usd_per_leg=notional_usd_per_leg if "capital" in selected_dimensions else None,
             scope_candidate_counts=scope_candidate_counts,
             scope_horizon_counts=scope_horizon_counts,
+            scope_effective_counts=scope_effective_counts,
             scope_fallbacks=skipped,
             latency_quantile=self.quantile,
-            scan_latency_sample_count=len(self.latency_samples),
-            cohort_sample_count=effective_count,
-            lower_horizon_sample_count=int(lower_metrics["count"] or 0),
-            upper_horizon_sample_count=int(upper_metrics["count"] or 0),
-            reference_latency_ms=self.reference_latency_ms,
+            scan_latency_sample_count=len(self.scan_latency_samples),
+            data_latency_sample_count=len(self.data_latency_samples),
+            data_latency_source=self.data_latency_source,
+            cohort_sample_count=effective_raw,
+            effective_sample_size=effective_n,
+            lower_horizon_sample_count=int(lower.get("count") or 0),
+            upper_horizon_sample_count=int(upper.get("count") or 0),
+            reference_latency_ms=self.effective_reference_ms,
+            collector_latency_reference_ms=self.collector_latency_reference_ms,
+            assumed_order_ack_latency_ms=max(0.0, self.settings.expected_order_ack_latency_ms),
+            assumed_second_leg_latency_ms=max(0.0, self.settings.expected_hedge_latency_ms),
+            effective_decision_to_hedge_latency_ms=self.effective_reference_ms,
+            execution_latency_empirical=False,
             reference_horizon_seconds=self.reference_horizon_seconds,
             reference_lower_horizon_seconds=lower_horizon,
             reference_upper_horizon_seconds=upper_horizon,
             interpolation_weight=weight,
             interpolation_mode=interpolation_mode,
-            scan_latency_p50_ms=_quantile(self.latency_samples, 0.50),
-            scan_latency_p90_ms=_quantile(self.latency_samples, 0.90),
-            scan_latency_p95_ms=_quantile(self.latency_samples, 0.95),
+            scan_latency_p50_ms=_quantile(self.scan_latency_samples, 0.50),
+            scan_latency_p90_ms=_quantile(self.scan_latency_samples, 0.90),
+            scan_latency_p95_ms=_quantile(self.scan_latency_samples, 0.95),
+            data_latency_p50_ms=_quantile(self.data_latency_samples, 0.50),
+            data_latency_p90_ms=_quantile(self.data_latency_samples, 0.90),
+            data_latency_p95_ms=_quantile(self.data_latency_samples, 0.95),
+            confidence_level=self.confidence,
+            probability_max_ci_width=final_ci_width,
+            confidence_gate_passed=scope_confidence_valid,
             pair_fill_probability=pair_fill,
+            pair_fill_ci_lower=pair_low,
+            pair_fill_ci_upper=pair_high,
             reserve_fill_probability=reserve_fill,
+            reserve_fill_ci_lower=reserve_low,
+            reserve_fill_ci_upper=reserve_high,
             capture_probability=capture,
+            capture_ci_lower=capture_low,
+            capture_ci_upper=capture_high,
             hedge_recovery_probability=hedge_recovery,
+            hedge_recovery_ci_lower=hedge_recovery_low,
+            hedge_recovery_ci_upper=hedge_recovery_high,
+            partial_fill_probability=partial_fill,
+            pair_fill_fraction_p10=pair_fraction_p10,
+            pair_fill_fraction_p50=pair_fraction_p50,
+            unhedged_fraction_p50=unhedged_p50,
+            unhedged_fraction_p90=unhedged_p90,
+            unhedged_fraction_p95=unhedged_p95,
+            hedge_recovery_loss_p50_bps=recovery_p50,
+            hedge_recovery_loss_p90_bps=recovery_p90,
+            hedge_recovery_loss_p95_bps=recovery_p95,
             adverse_selection_p50_bps=adverse_p50,
             adverse_selection_p90_bps=adverse_p90,
             adverse_selection_p95_bps=adverse_p95,
             empirical_latency_risk_bps=adverse_p95,
+            fill_model_kind="visible_l2_taker_reconstruction",
+            queue_position_supported=False,
+            maker_fill_probability=None,
             usable_for_qualification=usable,
             reason=None if usable else "; ".join(reasons),
         )

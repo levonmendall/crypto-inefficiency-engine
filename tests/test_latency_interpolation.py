@@ -23,8 +23,12 @@ VENUE_PAIR = "Coinbase|HlPerp"
 
 def cfg() -> Settings:
     return Settings(
+        expected_order_ack_latency_ms=0.0,
+        expected_hedge_latency_ms=0.0,
         empirical_latency_min_samples=3,
         empirical_latency_min_scan_samples=3,
+        empirical_latency_min_effective_samples=3,
+        empirical_probability_max_ci_width=1.0,
         empirical_latency_quantile=0.95,
     )
 
@@ -50,9 +54,10 @@ def opportunity() -> Opportunity:
 
 
 def row(index: int, *, horizon: float, fillable: bool, adverse: float, notional: float = 1000.0) -> ShadowObservation:
+    unhedged = 0.0 if fillable else 0.5
     return ShadowObservation(
         shadow_id=f"shadow-{horizon}-{index}-{notional}",
-        initial_scan_id=f"initial-{index}",
+        initial_scan_id=f"initial-{horizon}-{index}",
         verification_scan_id=f"verify-{horizon}-{index}-{notional}",
         opportunity_signature="sig",
         opportunity_id="op",
@@ -65,12 +70,19 @@ def row(index: int, *, horizon: float, fillable: bool, adverse: float, notional:
         delay_seconds=horizon,
         initial_scan_latency_ms=9000.0,
         verification_scan_latency_ms=10000.0,
+        initial_data_path_latency_ms=9000.0,
+        verification_data_path_latency_ms=10000.0,
         initial_net_annualized_return=0.20,
         initial_capacity_notional_usd=100000.0,
         survived=fillable,
         pair_fillable=fillable,
         pair_fillable_with_reserve=fillable,
         hedge_recovery_required=not fillable,
+        pair_fill_fraction=1.0 if fillable else 0.5,
+        max_leg_fill_fraction=1.0,
+        unhedged_fraction=unhedged,
+        partial_fill_state=not fillable,
+        hedge_recovery_loss_proxy_bps=unhedged * adverse,
         verification_net_annualized_return=0.18 if fillable else 0.0,
         outcome=ShadowOutcome.SURVIVED if fillable else ShadowOutcome.EXECUTABILITY_FAILED,
         venue_pair=VENUE_PAIR,
@@ -116,6 +128,7 @@ def test_latency_between_horizons_uses_conservative_interpolation(tmp_path):
     model = EmpiricalLatencyResolver(store, cfg()).resolve(opportunity(), 1000.0)
 
     assert model.usable_for_qualification is True
+    assert model.collector_latency_reference_ms == 10000.0
     assert model.reference_latency_ms == 10000.0
     assert model.reference_lower_horizon_seconds == 5.0
     assert model.reference_upper_horizon_seconds == 15.0
@@ -126,6 +139,7 @@ def test_latency_between_horizons_uses_conservative_interpolation(tmp_path):
     assert model.capture_probability == pytest.approx(2 / 3)
     assert model.adverse_selection_p95_bps == pytest.approx(9.0)
     assert model.empirical_latency_risk_bps == pytest.approx(9.0)
+    assert model.hedge_recovery_loss_p95_bps is not None
 
 
 def test_probability_cannot_improve_and_risk_cannot_fall_with_time(tmp_path):
@@ -157,6 +171,6 @@ def test_scope_requires_enough_samples_at_both_interval_endpoints(tmp_path):
 
     assert model.usable_for_qualification is True
     assert model.model_scope == "strategy+venue_pair+asset"
-    assert model.scope_fallbacks == ["strategy+venue_pair+asset+capital:1"]
+    assert model.scope_fallbacks[0].startswith("strategy+venue_pair+asset+capital:raw=1")
     assert model.lower_horizon_sample_count == 6
     assert model.upper_horizon_sample_count == 3

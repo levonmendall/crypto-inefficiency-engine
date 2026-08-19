@@ -26,16 +26,28 @@ class EconomicCostBreakdown:
     latency_model_scope: str
     latency_scope_fallbacks: list[str] = field(default_factory=list)
     latency_reference_ms: float | None = None
+    collector_latency_reference_ms: float | None = None
+    execution_latency_empirical: bool = False
     latency_reference_horizon_seconds: float | None = None
     latency_reference_lower_horizon_seconds: float | None = None
     latency_interpolation_weight: float = 0.0
     latency_interpolation_mode: str = "fixed"
     latency_sample_count: int = 0
+    latency_effective_sample_size: int = 0
+    latency_confidence_gate_passed: bool = False
     empirical_pair_fill_probability: float | None = None
+    empirical_pair_fill_ci_lower: float | None = None
     empirical_reserve_fill_probability: float | None = None
     empirical_capture_probability: float | None = None
+    empirical_capture_ci_lower: float | None = None
     empirical_hedge_recovery_probability: float | None = None
+    empirical_partial_fill_probability: float | None = None
+    empirical_unhedged_fraction_p95: float | None = None
+    empirical_hedge_recovery_loss_p95_bps: float | None = None
+    fill_model_kind: str = "visible_l2_taker_reconstruction"
+    queue_position_supported: bool = False
     hedge_recovery_buffer_bps: float = 0.0
+    hedge_recovery_buffer_source: str = "fixed"
     total_non_slippage_cost_bps: float = 0.0
     capital_required_usd: float = 0.0
     capital_multiple: float = 0.0
@@ -75,6 +87,7 @@ def economic_costs(
 ) -> EconomicCostBreakdown:
     if notional_usd_per_leg <= 0:
         raise ValueError("notional_usd_per_leg must be positive")
+
     roundtrip_fee_bps = 0.0
     financing_bps = 0.0
     capital_required = 0.0
@@ -83,44 +96,87 @@ def economic_costs(
         financing_bps += _financing_cost_bps(leg, settings, opportunity.holding_hours)
         capital_required += notional_usd_per_leg * collateral_fraction(leg, settings)
     capital_multiple = capital_required / notional_usd_per_leg
-    collateral_cost_bps = settings.collateral_opportunity_cost_annual * (opportunity.holding_hours / (24.0 * 365.0)) * 10_000.0 * capital_multiple
+    collateral_cost_bps = (
+        settings.collateral_opportunity_cost_annual
+        * (opportunity.holding_hours / (24.0 * 365.0))
+        * 10_000.0
+        * capital_multiple
+    )
 
     book_age_risk_bps = max(0.0, worst_book_age_seconds) * settings.latency_risk_bps_per_second
-    fixed_hedge_latency_risk_bps = max(0.0, settings.expected_hedge_latency_ms) / 1000.0 * settings.latency_risk_bps_per_second
+    fixed_execution_latency_ms = (
+        max(0.0, settings.expected_order_ack_latency_ms)
+        + max(0.0, settings.expected_hedge_latency_ms)
+    )
+    fixed_hedge_latency_risk_bps = fixed_execution_latency_ms / 1000.0 * settings.latency_risk_bps_per_second
+
     latency_model_source = "fixed"
     latency_model_scope = "fixed"
     latency_scope_fallbacks: list[str] = []
-    latency_reference_ms: float | None = settings.expected_hedge_latency_ms
+    latency_reference_ms: float | None = fixed_execution_latency_ms
+    collector_latency_reference_ms: float | None = None
+    execution_latency_empirical = False
     latency_reference_horizon_seconds = None
     latency_reference_lower_horizon_seconds = None
     latency_interpolation_weight = 0.0
     latency_interpolation_mode = "fixed"
     latency_sample_count = 0
+    latency_effective_sample_size = 0
+    latency_confidence_gate_passed = False
     pair_fill_probability = None
+    pair_fill_ci_lower = None
     reserve_fill_probability = None
     capture_probability = None
+    capture_ci_lower = None
     hedge_recovery_probability = None
+    partial_fill_probability = None
+    unhedged_fraction_p95 = None
+    recovery_loss_p95 = None
+    fill_model_kind = "visible_l2_taker_reconstruction"
+    queue_position_supported = False
     hedge_latency_risk_bps = fixed_hedge_latency_risk_bps
+    recovery_buffer_bps = max(0.0, settings.hedge_recovery_buffer_bps)
+    recovery_buffer_source = "fixed"
 
     if latency_model is not None and latency_model.usable_for_qualification:
         latency_model_source = "empirical_shadow"
         latency_model_scope = latency_model.model_scope
         latency_scope_fallbacks = list(latency_model.scope_fallbacks)
-        latency_reference_ms = latency_model.reference_latency_ms
+        latency_reference_ms = latency_model.effective_decision_to_hedge_latency_ms or latency_model.reference_latency_ms
+        collector_latency_reference_ms = latency_model.collector_latency_reference_ms
+        execution_latency_empirical = latency_model.execution_latency_empirical
         latency_reference_horizon_seconds = latency_model.reference_upper_horizon_seconds
         latency_reference_lower_horizon_seconds = latency_model.reference_lower_horizon_seconds
         latency_interpolation_weight = latency_model.interpolation_weight
         latency_interpolation_mode = latency_model.interpolation_mode
         latency_sample_count = latency_model.cohort_sample_count
+        latency_effective_sample_size = latency_model.effective_sample_size
+        latency_confidence_gate_passed = latency_model.confidence_gate_passed
         pair_fill_probability = latency_model.pair_fill_probability
+        pair_fill_ci_lower = latency_model.pair_fill_ci_lower
         reserve_fill_probability = latency_model.reserve_fill_probability
         capture_probability = latency_model.capture_probability
+        capture_ci_lower = latency_model.capture_ci_lower
         hedge_recovery_probability = latency_model.hedge_recovery_probability
+        partial_fill_probability = latency_model.partial_fill_probability
+        unhedged_fraction_p95 = latency_model.unhedged_fraction_p95
+        recovery_loss_p95 = latency_model.hedge_recovery_loss_p95_bps
+        fill_model_kind = latency_model.fill_model_kind
+        queue_position_supported = latency_model.queue_position_supported
         hedge_latency_risk_bps = max(0.0, latency_model.empirical_latency_risk_bps or 0.0)
+        if recovery_loss_p95 is not None:
+            recovery_buffer_bps = max(recovery_buffer_bps, max(0.0, recovery_loss_p95))
+            recovery_buffer_source = "max_fixed_empirical"
 
     latency_risk_bps = book_age_risk_bps + hedge_latency_risk_bps
     transaction_cost_bps = max(opportunity.modeled_cost_bps, roundtrip_fee_bps)
-    total = transaction_cost_bps + financing_bps + collateral_cost_bps + latency_risk_bps + settings.hedge_recovery_buffer_bps
+    total = (
+        transaction_cost_bps
+        + financing_bps
+        + collateral_cost_bps
+        + latency_risk_bps
+        + recovery_buffer_bps
+    )
     return EconomicCostBreakdown(
         screening_cost_floor_bps=opportunity.modeled_cost_bps,
         venue_roundtrip_fee_bps=roundtrip_fee_bps,
@@ -132,16 +188,28 @@ def economic_costs(
         latency_model_scope=latency_model_scope,
         latency_scope_fallbacks=latency_scope_fallbacks,
         latency_reference_ms=latency_reference_ms,
+        collector_latency_reference_ms=collector_latency_reference_ms,
+        execution_latency_empirical=execution_latency_empirical,
         latency_reference_horizon_seconds=latency_reference_horizon_seconds,
         latency_reference_lower_horizon_seconds=latency_reference_lower_horizon_seconds,
         latency_interpolation_weight=latency_interpolation_weight,
         latency_interpolation_mode=latency_interpolation_mode,
         latency_sample_count=latency_sample_count,
+        latency_effective_sample_size=latency_effective_sample_size,
+        latency_confidence_gate_passed=latency_confidence_gate_passed,
         empirical_pair_fill_probability=pair_fill_probability,
+        empirical_pair_fill_ci_lower=pair_fill_ci_lower,
         empirical_reserve_fill_probability=reserve_fill_probability,
         empirical_capture_probability=capture_probability,
+        empirical_capture_ci_lower=capture_ci_lower,
         empirical_hedge_recovery_probability=hedge_recovery_probability,
-        hedge_recovery_buffer_bps=settings.hedge_recovery_buffer_bps,
+        empirical_partial_fill_probability=partial_fill_probability,
+        empirical_unhedged_fraction_p95=unhedged_fraction_p95,
+        empirical_hedge_recovery_loss_p95_bps=recovery_loss_p95,
+        fill_model_kind=fill_model_kind,
+        queue_position_supported=queue_position_supported,
+        hedge_recovery_buffer_bps=recovery_buffer_bps,
+        hedge_recovery_buffer_source=recovery_buffer_source,
         total_non_slippage_cost_bps=total,
         capital_required_usd=capital_required,
         capital_multiple=capital_multiple,

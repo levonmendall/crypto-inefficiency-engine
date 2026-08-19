@@ -12,18 +12,38 @@ from inefficiency_engine.detectors.basis import SpotPerpBasisDetector
 from inefficiency_engine.detectors.funding import FundingDispersionDetector
 from inefficiency_engine.evidence import EvidenceStore, ProviderStatus, ScanSnapshot
 from inefficiency_engine.execution import qualify_opportunity
+from inefficiency_engine.fill_model import reconstruct_partial_fill_state
 from inefficiency_engine.latency import EmpiricalLatencyResolver
-from inefficiency_engine.models import EmpiricalLatencyModel, FundingQuote, MarketKind, MarketQuote, Opportunity, OrderBookSnapshot, ShadowCycle, ShadowObservation, ShadowOutcome, Strategy
+from inefficiency_engine.models import (
+    EmpiricalLatencyModel,
+    FundingQuote,
+    MarketKind,
+    MarketQuote,
+    Opportunity,
+    OrderBookSnapshot,
+    ShadowCycle,
+    ShadowObservation,
+    ShadowOutcome,
+    Strategy,
+)
 from inefficiency_engine.risk import RiskGate
 from inefficiency_engine.shadow import (
     build_leg_attribution,
     classify_shadow_failure,
     expected_return_bucket,
     opportunity_signature,
-    reconstruct_pair_fill_state,
     time_of_day_bucket,
     venue_pair,
 )
+
+
+def _l2_data_path_latency_ms(snapshot: ScanSnapshot) -> float | None:
+    values = [
+        book.request_latency_ms
+        for book in snapshot.order_books
+        if book.request_latency_ms is not None
+    ]
+    return max(values) if values else None
 
 
 class OpportunityService:
@@ -133,7 +153,9 @@ class OpportunityService:
 
         order_books: list[OrderBookSnapshot] = []
         if requests:
-            book_results = await asyncio.gather(*(capture_book(provider, awaitable) for provider, awaitable in requests.values()))
+            book_results = await asyncio.gather(
+                *(capture_book(provider, awaitable) for provider, awaitable in requests.values())
+            )
             for book, status in book_results:
                 providers.append(status)
                 if book is not None:
@@ -194,13 +216,13 @@ class OpportunityService:
         latency_resolver = self.empirical_latency_resolver()
         initial_by_id = {op.id: op for op in initial.opportunities}
         initial_scan_latency_ms = max(0.0, (initial.completed_at - initial.started_at).total_seconds() * 1000.0)
+        initial_data_path_latency_ms = _l2_data_path_latency_ms(initial)
 
         candidates: list[tuple[Opportunity, object, float, object]] = []
         for executability in initial.executability:
             opportunity = initial_by_id.get(executability.opportunity_id)
             if opportunity is None or executability.estimated_capacity_notional_usd <= 0:
                 continue
-
             qualified_tiers = [
                 tier for tier in executability.tiers
                 if tier.executable and tier.passes_return_hurdle
@@ -244,7 +266,10 @@ class OpportunityService:
             verification_ops = {opportunity_signature(op): op for op in verification.opportunities}
             provider_failed = any(not status.ok for status in verification.providers)
             verified_at = verification.completed_at
-            verification_scan_latency_ms = max(0.0, (verification.completed_at - verification.started_at).total_seconds() * 1000.0)
+            verification_scan_latency_ms = max(
+                0.0, (verification.completed_at - verification.started_at).total_seconds() * 1000.0
+            )
+            verification_data_path_latency_ms = _l2_data_path_latency_ms(verification)
 
             for opportunity, initial_exec, target, initial_tier in candidates:
                 signature = opportunity_signature(opportunity)
@@ -269,7 +294,7 @@ class OpportunityService:
                     verification.order_books,
                     target_quantity=target_quantity,
                 )
-                pair_fillable, pair_fillable_with_reserve, hedge_recovery_required = reconstruct_pair_fill_state(
+                fill_state = reconstruct_partial_fill_state(
                     leg_attribution,
                     reserve_ratio=self.settings.hedge_liquidity_reserve_ratio,
                 )
@@ -331,12 +356,20 @@ class OpportunityService:
                         delay_seconds=horizon,
                         initial_scan_latency_ms=initial_scan_latency_ms,
                         verification_scan_latency_ms=verification_scan_latency_ms,
+                        initial_data_path_latency_ms=initial_data_path_latency_ms,
+                        verification_data_path_latency_ms=verification_data_path_latency_ms,
                         initial_net_annualized_return=initial_tier.net_annualized_return,
                         initial_capacity_notional_usd=initial_exec.estimated_capacity_notional_usd,
                         survived=survived,
-                        pair_fillable=pair_fillable,
-                        pair_fillable_with_reserve=pair_fillable_with_reserve,
-                        hedge_recovery_required=hedge_recovery_required,
+                        pair_fillable=fill_state.pair_fillable,
+                        pair_fillable_with_reserve=fill_state.pair_fillable_with_reserve,
+                        hedge_recovery_required=fill_state.hedge_recovery_required,
+                        pair_fill_fraction=fill_state.pair_fill_fraction,
+                        max_leg_fill_fraction=fill_state.max_leg_fill_fraction,
+                        unhedged_fraction=fill_state.unhedged_fraction,
+                        partial_fill_state=fill_state.partial_fill_state,
+                        hedge_recovery_loss_proxy_bps=fill_state.recovery_loss_proxy_bps,
+                        queue_position_supported=False,
                         verification_net_annualized_return=verification_return,
                         outcome=outcome,
                         reason=reason,
@@ -345,7 +378,10 @@ class OpportunityService:
                         initial_expected_return_bucket=expected_return_bucket(initial_tier.net_annualized_return),
                         initial_gross_edge_bps_per_hour=opportunity.gross_edge_bps_per_hour,
                         verification_gross_edge_bps_per_hour=verification_gross,
-                        gross_edge_decay_bps_per_hour=(opportunity.gross_edge_bps_per_hour - verification_gross) if verification_gross is not None else None,
+                        gross_edge_decay_bps_per_hour=(
+                            opportunity.gross_edge_bps_per_hour - verification_gross
+                            if verification_gross is not None else None
+                        ),
                         initial_total_modeled_cost_bps=initial_cost,
                         verification_total_modeled_cost_bps=verification_cost,
                         cost_expansion_bps=(verification_cost - initial_cost) if verification_cost is not None else None,
@@ -353,8 +389,14 @@ class OpportunityService:
                         verification_entry_slippage_bps=verification_slippage,
                         slippage_expansion_bps=(verification_slippage - initial_slippage) if verification_slippage is not None else None,
                         verification_capacity_notional_usd=verification_capacity,
-                        capacity_deterioration_usd=(initial_exec.estimated_capacity_notional_usd - verification_capacity) if verification_capacity is not None else None,
-                        edge_decay_annualized=(initial_tier.net_annualized_return - verification_return) if verification_return is not None else None,
+                        capacity_deterioration_usd=(
+                            initial_exec.estimated_capacity_notional_usd - verification_capacity
+                            if verification_capacity is not None else None
+                        ),
+                        edge_decay_annualized=(
+                            initial_tier.net_annualized_return - verification_return
+                            if verification_return is not None else None
+                        ),
                         hedge_leg_divergence_bps=divergence,
                         failure_cause=failure_cause,
                         leg_attribution=leg_attribution,
@@ -387,7 +429,13 @@ class OpportunityService:
             FundingQuote(venue="VenueC", asset="BTC", rate=-0.0004, interval_hours=8, observed_at=now, source="demo"),
         ]
         market_quotes = [
-            MarketQuote(venue="Coinbase", asset="ETH", market_kind=MarketKind.SPOT, symbol="ETH-USD", bid=3998, ask=4002, mid=4000, observed_at=now, source="demo"),
-            MarketQuote(venue="HlPerp", asset="ETH", market_kind=MarketKind.PERPETUAL, symbol="ETH", mid=4040, observed_at=now, source="demo"),
+            MarketQuote(
+                venue="Coinbase", asset="ETH", market_kind=MarketKind.SPOT, symbol="ETH-USD",
+                bid=3998, ask=4002, mid=4000, observed_at=now, source="demo",
+            ),
+            MarketQuote(
+                venue="HlPerp", asset="ETH", market_kind=MarketKind.PERPETUAL, symbol="ETH",
+                mid=4040, observed_at=now, source="demo",
+            ),
         ]
         return self.analyze(funding_quotes, market_quotes)

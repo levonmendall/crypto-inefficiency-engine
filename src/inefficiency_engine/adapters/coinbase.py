@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any
 
 import httpx
@@ -50,7 +51,7 @@ class CoinbaseSpotAdapter:
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(
             timeout=10.0,
-            headers={"User-Agent": "crypto-inefficiency-engine/0.3", "Cache-Control": "no-cache"},
+            headers={"User-Agent": "crypto-inefficiency-engine/0.8", "Cache-Control": "no-cache"},
         )
         try:
             response = await client.get(f"{BASE_URL}{path}", params=params)
@@ -89,5 +90,9 @@ class CoinbaseSpotAdapter:
 
     async def order_book(self, asset: str) -> OrderBookSnapshot:
         symbol = f"{asset.upper()}-USD"
+        started = perf_counter()
         payload = await self._get(f"/products/{symbol}/book", params={"level": 2})
-        return parse_product_book(payload, asset=asset, symbol=symbol)
+        latency_ms = max(0.0, (perf_counter() - started) * 1000.0)
+        book = parse_product_book(payload, asset=asset, symbol=symbol)
+        book.request_latency_ms = latency_ms
+        return book
