@@ -5,13 +5,16 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 
+from inefficiency_engine.adapters.bybit import BybitPublicAdapter
 from inefficiency_engine.adapters.coinbase import CoinbaseSpotAdapter
 from inefficiency_engine.adapters.hyperliquid import HyperliquidAdapter
+from inefficiency_engine.adapters.kraken import KrakenSpotAdapter
 from inefficiency_engine.config import Settings
 from inefficiency_engine.detectors.registry import DetectorContext, DetectorManifest, OpportunityDetectorRegistry
 from inefficiency_engine.evidence import EvidenceStore, ProviderStatus, ScanSnapshot
 from inefficiency_engine.execution import qualify_opportunity
 from inefficiency_engine.fill_model import reconstruct_partial_fill_state
+from inefficiency_engine.instrument_identity import book_identity, normalized_contract_key
 from inefficiency_engine.latency import EmpiricalLatencyResolver
 from inefficiency_engine.market_graph import MarketGraphSnapshot, build_market_graph
 from inefficiency_engine.models import (
@@ -32,19 +35,68 @@ from inefficiency_engine.shadow import (
     build_leg_attribution,
     classify_shadow_failure,
     expected_return_bucket,
-    opportunity_signature,
     time_of_day_bucket,
     venue_pair,
 )
 
 
 def _l2_data_path_latency_ms(snapshot: ScanSnapshot) -> float | None:
-    values = [
-        book.request_latency_ms
-        for book in snapshot.order_books
-        if book.request_latency_ms is not None
-    ]
+    values = [book.request_latency_ms for book in snapshot.order_books if book.request_latency_ms is not None]
     return max(values) if values else None
+
+
+def _opportunity_signature(opportunity: Opportunity) -> str:
+    legs = "|".join(
+        f"{leg.venue}:{leg.asset}:{leg.market_kind.value}:"
+        f"{normalized_contract_key(leg.market_kind, leg.contract_key)}:{leg.side.value}"
+        for leg in opportunity.legs
+    )
+    return f"{opportunity.strategy.value}:{opportunity.asset}:{legs}"
+
+
+def _provider_venue(provider: str) -> str | None:
+    lowered = provider.lower()
+    if lowered.startswith("hyperliquid:"):
+        return "HlPerp"
+    if lowered.startswith("coinbase"):
+        return "Coinbase"
+    if lowered.startswith("bybit"):
+        return "Bybit"
+    if lowered.startswith("kraken"):
+        return "Kraken"
+    return None
+
+
+def _provider_failure_affects(opportunity: Opportunity, providers: list[ProviderStatus]) -> bool:
+    required_venues = {leg.venue for leg in opportunity.legs}
+    for status in providers:
+        if status.ok:
+            continue
+        venue = _provider_venue(status.provider)
+        if venue is None or venue in required_venues:
+            return True
+    return False
+
+
+def _book_matches_leg(book: OrderBookSnapshot, leg) -> bool:
+    if book.venue != leg.venue or book.asset != leg.asset or book.market_kind != leg.market_kind:
+        return False
+    if leg.symbol is not None and book.symbol != leg.symbol:
+        return False
+    if leg.contract_key is not None:
+        return normalized_contract_key(book.market_kind, book.contract_key) == normalized_contract_key(
+            leg.market_kind, leg.contract_key
+        )
+    return True
+
+
+def _books_for_opportunity(opportunity: Opportunity, books: list[OrderBookSnapshot]) -> list[OrderBookSnapshot]:
+    selected: list[OrderBookSnapshot] = []
+    for leg in opportunity.legs:
+        match = next((book for book in books if _book_matches_leg(book, leg)), None)
+        if match is not None:
+            selected.append(match)
+    return selected
 
 
 class OpportunityService:
@@ -87,11 +139,7 @@ class OpportunityService:
     def analyze(self, funding_quotes: list[FundingQuote], market_quotes: list[MarketQuote]) -> list[Opportunity]:
         graph = self.market_graph(funding_quotes, market_quotes)
         candidates = self.detector_registry.discover(
-            DetectorContext(
-                funding_quotes=funding_quotes,
-                market_quotes=market_quotes,
-                graph=graph,
-            )
+            DetectorContext(funding_quotes=funding_quotes, market_quotes=market_quotes, graph=graph)
         )
         return self.risk_gate.filter(candidates)
 
@@ -102,6 +150,8 @@ class OpportunityService:
         started_at = datetime.now(timezone.utc)
         hyperliquid = HyperliquidAdapter()
         coinbase = CoinbaseSpotAdapter()
+        bybit = BybitPublicAdapter()
+        kraken = KrakenSpotAdapter()
 
         async def capture(provider: str, awaitable):
             try:
@@ -110,17 +160,39 @@ class OpportunityService:
             except Exception as exc:
                 return [], ProviderStatus(provider=provider, ok=False, error_type=type(exc).__name__)
 
+        async def capture_bybit():
+            try:
+                market, funding = await bybit.market_snapshot()
+                return market, funding, ProviderStatus(
+                    provider="bybit-v5:market-snapshot", ok=True, item_count=len(market) + len(funding)
+                )
+            except Exception as exc:
+                return [], [], ProviderStatus(
+                    provider="bybit-v5:market-snapshot", ok=False, error_type=type(exc).__name__
+                )
+
         results = await asyncio.gather(
             capture("hyperliquid:predictedFundings", hyperliquid.funding_quotes()),
             capture("hyperliquid:metaAndAssetCtxs", hyperliquid.market_quotes()),
             capture("coinbase-exchange:ticker", coinbase.market_quotes()),
+            capture_bybit(),
+            capture("kraken:PreTrade", kraken.market_quotes()),
         )
-        funding_quotes, funding_status = results[0]
-        perp_quotes, perp_status = results[1]
-        spot_quotes, spot_status = results[2]
-        market_quotes = [*perp_quotes, *spot_quotes]
+        hyper_funding, hyper_funding_status = results[0]
+        hyper_market, hyper_market_status = results[1]
+        coinbase_market, coinbase_status = results[2]
+        bybit_market, bybit_funding, bybit_status = results[3]
+        kraken_market, kraken_status = results[4]
+        funding_quotes = [*hyper_funding, *bybit_funding]
+        market_quotes = [*hyper_market, *coinbase_market, *bybit_market, *kraken_market]
         opportunities = self.analyze(funding_quotes, market_quotes)
-        providers = [funding_status, perp_status, spot_status]
+        providers = [
+            hyper_funding_status,
+            hyper_market_status,
+            coinbase_status,
+            bybit_status,
+            kraken_status,
+        ]
         return started_at, funding_quotes, market_quotes, opportunities, providers
 
     async def collect_live_graph(self) -> tuple[MarketGraphSnapshot, list[ProviderStatus], list[Opportunity]]:
@@ -156,17 +228,36 @@ class OpportunityService:
         started_at, funding_quotes, market_quotes, opportunities, providers = await self._collect_live_inputs()
         hyperliquid = HyperliquidAdapter()
         coinbase = CoinbaseSpotAdapter()
+        bybit = BybitPublicAdapter()
+        kraken = KrakenSpotAdapter()
 
-        requests: dict[tuple[str, str, str], tuple[str, object]] = {}
+        requests: dict[tuple[str, str, str, str], tuple[str, object]] = {}
         for opportunity in opportunities:
             for leg in opportunity.legs:
-                key = (leg.venue, leg.asset, leg.market_kind.value)
+                key = book_identity(leg.venue, leg.asset, leg.market_kind, leg.contract_key)
                 if key in requests:
                     continue
                 if leg.venue == "HlPerp" and leg.market_kind == MarketKind.PERPETUAL:
                     requests[key] = (f"hyperliquid:l2Book:{leg.asset}", hyperliquid.order_book(leg.asset))
                 elif leg.venue == "Coinbase" and leg.market_kind == MarketKind.SPOT:
                     requests[key] = (f"coinbase-exchange:book-level2:{leg.asset}", coinbase.order_book(leg.asset))
+                elif leg.venue == "Kraken" and leg.market_kind == MarketKind.SPOT:
+                    requests[key] = (
+                        f"kraken:PreTrade:{leg.asset}",
+                        kraken.order_book(leg.asset, symbol=leg.symbol),
+                    )
+                elif leg.venue == "Bybit" and leg.symbol is not None:
+                    requests[key] = (
+                        f"bybit-v5:orderbook:{leg.symbol}",
+                        bybit.order_book(
+                            asset=leg.asset,
+                            market_kind=leg.market_kind,
+                            symbol=leg.symbol,
+                            quote_currency=leg.quote_currency,
+                            contract_key=leg.contract_key,
+                            expires_at=leg.expires_at,
+                        ),
+                    )
 
         async def capture_book(provider: str, awaitable):
             try:
@@ -190,7 +281,7 @@ class OpportunityService:
         executability = [
             qualify_opportunity(
                 opportunity,
-                order_books,
+                _books_for_opportunity(opportunity, order_books),
                 self.settings,
                 notionals_usd=self.settings.capital_tiers_usd,
                 now=qualification_time,
@@ -247,10 +338,7 @@ class OpportunityService:
             opportunity = initial_by_id.get(executability.opportunity_id)
             if opportunity is None or executability.estimated_capacity_notional_usd <= 0:
                 continue
-            qualified_tiers = [
-                tier for tier in executability.tiers
-                if tier.executable and tier.passes_return_hurdle
-            ]
+            qualified_tiers = [tier for tier in executability.tiers if tier.executable and tier.passes_return_hurdle]
             if qualified_tiers:
                 for tier in qualified_tiers:
                     candidates.append((opportunity, executability, tier.notional_usd_per_leg, tier))
@@ -259,7 +347,7 @@ class OpportunityService:
                 if target > 0:
                     exact = qualify_opportunity(
                         opportunity,
-                        initial.order_books,
+                        _books_for_opportunity(opportunity, initial.order_books),
                         self.settings,
                         notionals_usd=(target,),
                         now=executability.observed_at,
@@ -287,8 +375,7 @@ class OpportunityService:
             verification = await self.collect_live_executability()
             final_verification = verification
             verification_scan_ids.append(verification.scan_id)
-            verification_ops = {opportunity_signature(op): op for op in verification.opportunities}
-            provider_failed = any(not status.ok for status in verification.providers)
+            verification_ops = {_opportunity_signature(op): op for op in verification.opportunities}
             verified_at = verification.completed_at
             verification_scan_latency_ms = max(
                 0.0, (verification.completed_at - verification.started_at).total_seconds() * 1000.0
@@ -296,14 +383,15 @@ class OpportunityService:
             verification_data_path_latency_ms = _l2_data_path_latency_ms(verification)
 
             for opportunity, initial_exec, target, initial_tier in candidates:
-                signature = opportunity_signature(opportunity)
+                signature = _opportunity_signature(opportunity)
                 current = verification_ops.get(signature)
+                provider_failed = _provider_failure_affects(opportunity, verification.providers)
                 current_exec = None
                 current_tier = None
                 if current is not None:
                     current_exec = qualify_opportunity(
                         current,
-                        verification.order_books,
+                        _books_for_opportunity(current, verification.order_books),
                         self.settings,
                         notionals_usd=(target,),
                         now=verified_at,
@@ -314,8 +402,8 @@ class OpportunityService:
                 target_quantity = initial_tier.target_base_quantity
                 leg_attribution, divergence = build_leg_attribution(
                     opportunity,
-                    initial.order_books,
-                    verification.order_books,
+                    _books_for_opportunity(opportunity, initial.order_books),
+                    _books_for_opportunity(opportunity, verification.order_books),
                     target_quantity=target_quantity,
                 )
                 fill_state = reconstruct_partial_fill_state(
@@ -448,18 +536,19 @@ class OpportunityService:
     def demo_scan(self) -> list[Opportunity]:
         now = datetime.now(timezone.utc)
         funding_quotes = [
-            FundingQuote(venue="HlPerp", asset="BTC", rate=0.00002, interval_hours=1, observed_at=now, source="demo"),
+            FundingQuote(venue="HlPerp", asset="BTC", rate=0.00002, interval_hours=1, symbol="BTC", quote_currency="USD", observed_at=now, source="demo"),
             FundingQuote(venue="VenueB", asset="BTC", rate=0.0012, interval_hours=8, observed_at=now, source="demo"),
             FundingQuote(venue="VenueC", asset="BTC", rate=-0.0004, interval_hours=8, observed_at=now, source="demo"),
         ]
         market_quotes = [
             MarketQuote(
                 venue="Coinbase", asset="ETH", market_kind=MarketKind.SPOT, symbol="ETH-USD",
-                bid=3998, ask=4002, mid=4000, observed_at=now, source="demo",
+                quote_currency="USD", contract_key="spot", bid=3998, ask=4002, mid=4000,
+                observed_at=now, source="demo",
             ),
             MarketQuote(
                 venue="HlPerp", asset="ETH", market_kind=MarketKind.PERPETUAL, symbol="ETH",
-                mid=4040, observed_at=now, source="demo",
+                quote_currency="USD", contract_key="continuous", mid=4040, observed_at=now, source="demo",
             ),
         ]
         return self.analyze(funding_quotes, market_quotes)

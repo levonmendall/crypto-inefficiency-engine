@@ -27,6 +27,8 @@ class TradeSide(str, Enum):
 class Strategy(str, Enum):
     FUNDING_DISPERSION = "funding_dispersion"
     SPOT_PERP_BASIS = "spot_perp_basis"
+    FUTURES_BASIS = "futures_basis"
+    CEX_SPOT_DISLOCATION = "cex_spot_dislocation"
 
 
 class MarketQuote(BaseModel):
@@ -34,6 +36,9 @@ class MarketQuote(BaseModel):
     asset: str
     market_kind: MarketKind
     symbol: str
+    quote_currency: str | None = None
+    contract_key: str | None = None
+    expires_at: datetime | None = None
     bid: float | None = None
     ask: float | None = None
     mid: float
@@ -47,6 +52,8 @@ class MarketQuote(BaseModel):
             raise ValueError("prices must be positive finite numbers")
         if self.bid is not None and self.ask is not None and self.bid > self.ask:
             raise ValueError("bid cannot exceed ask")
+        if self.market_kind == MarketKind.FUTURE and self.expires_at is None:
+            raise ValueError("dated future quotes require expires_at")
         return self
 
 
@@ -60,6 +67,9 @@ class OrderBookSnapshot(BaseModel):
     asset: str
     market_kind: MarketKind
     symbol: str
+    quote_currency: str | None = None
+    contract_key: str | None = None
+    expires_at: datetime | None = None
     bids: list[OrderBookLevel]
     asks: list[OrderBookLevel]
     observed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -72,6 +82,8 @@ class OrderBookSnapshot(BaseModel):
             raise ValueError("order book must have both bids and asks")
         if max(level.price for level in self.bids) >= min(level.price for level in self.asks):
             raise ValueError("order book must have a positive spread")
+        if self.market_kind == MarketKind.FUTURE and self.expires_at is None:
+            raise ValueError("dated future books require expires_at")
         return self
 
 
@@ -80,6 +92,9 @@ class FundingQuote(BaseModel):
     asset: str
     rate: float
     interval_hours: float = Field(gt=0, le=24)
+    symbol: str | None = None
+    quote_currency: str | None = None
+    contract_key: str | None = "continuous"
     next_funding_time: datetime | None = None
     observed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     source: str
@@ -98,6 +113,10 @@ class OpportunityLeg(BaseModel):
     asset: str
     market_kind: MarketKind
     side: Side
+    symbol: str | None = None
+    quote_currency: str | None = None
+    contract_key: str | None = None
+    expires_at: datetime | None = None
     reference_price: float | None = None
 
 
@@ -106,6 +125,8 @@ class LegExecutionEstimate(BaseModel):
     asset: str
     market_kind: MarketKind
     trade_side: TradeSide
+    symbol: str | None = None
+    contract_key: str | None = None
     requested_base_quantity: float = Field(gt=0)
     filled_base_quantity: float = Field(gt=0)
     filled_notional_usd: float = Field(gt=0)
@@ -285,6 +306,8 @@ class ShadowLegAttribution(BaseModel):
     asset: str
     market_kind: MarketKind
     side: Side
+    symbol: str | None = None
+    contract_key: str | None = None
     initial_best_price: float | None = None
     verification_best_price: float | None = None
     adverse_selection_bps: float | None = None

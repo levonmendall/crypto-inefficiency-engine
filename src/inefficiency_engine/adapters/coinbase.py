@@ -33,6 +33,8 @@ def parse_product_book(payload: Any, *, asset: str, symbol: str) -> OrderBookSna
         asset=asset.upper(),
         market_kind=MarketKind.SPOT,
         symbol=symbol,
+        quote_currency="USD",
+        contract_key="spot",
         bids=parse_side(payload.get("bids")),
         asks=parse_side(payload.get("asks")),
         observed_at=observed_at,
@@ -51,7 +53,7 @@ class CoinbaseSpotAdapter:
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(
             timeout=10.0,
-            headers={"User-Agent": "crypto-inefficiency-engine/0.8", "Cache-Control": "no-cache"},
+            headers={"User-Agent": "crypto-inefficiency-engine/0.9", "Cache-Control": "no-cache"},
         )
         try:
             response = await client.get(f"{BASE_URL}{path}", params=params)
@@ -79,6 +81,8 @@ class CoinbaseSpotAdapter:
                     asset=asset,
                     market_kind=MarketKind.SPOT,
                     symbol=symbol,
+                    quote_currency="USD",
+                    contract_key="spot",
                     bid=bid,
                     ask=ask,
                     mid=(bid + ask) / 2.0,

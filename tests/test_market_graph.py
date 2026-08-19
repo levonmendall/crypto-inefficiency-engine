@@ -64,3 +64,36 @@ def test_provider_symbols_are_aliases_not_canonical_identity():
     instrument = graph.instruments[0]
     assert instrument.provider_symbols == {"feed-a": "ETH-USD", "feed-b": "XETHZUSD"}
     assert instrument.instrument_id == canonical_instrument_id("Venue X", "ETH", MarketKind.SPOT)
+
+
+def test_dated_futures_have_contract_specific_canonical_identity():
+    first_expiry = datetime(2026, 9, 25, 8, tzinfo=timezone.utc)
+    second_expiry = datetime(2026, 12, 25, 8, tzinfo=timezone.utc)
+    quotes = [
+        MarketQuote(
+            venue="Bybit", asset="BTC", market_kind=MarketKind.FUTURE,
+            symbol="BTCUSDT-25SEP26", quote_currency="USDT",
+            contract_key="expiry-20260925T080000Z", expires_at=first_expiry,
+            mid=101000, observed_at=NOW, source="bybit:first",
+        ),
+        MarketQuote(
+            venue="Bybit", asset="BTC", market_kind=MarketKind.FUTURE,
+            symbol="BTCUSDT-25DEC26", quote_currency="USDT",
+            contract_key="expiry-20261225T080000Z", expires_at=second_expiry,
+            mid=102000, observed_at=NOW, source="bybit:second",
+        ),
+    ]
+
+    graph = build_market_graph([], quotes)
+
+    assert len(graph.instruments) == 2
+    first_id = canonical_instrument_id(
+        "Bybit", "BTC", MarketKind.FUTURE, contract_key="expiry-20260925T080000Z"
+    )
+    second_id = canonical_instrument_id(
+        "Bybit", "BTC", MarketKind.FUTURE, contract_key="expiry-20261225T080000Z"
+    )
+    assert first_id != second_id
+    assert graph.instrument_id_for(
+        "Bybit", "BTC", MarketKind.FUTURE, "expiry-20260925T080000Z"
+    ) == first_id

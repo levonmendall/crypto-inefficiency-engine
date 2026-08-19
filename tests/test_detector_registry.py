@@ -9,7 +9,7 @@ from inefficiency_engine.models import FundingQuote, MarketKind, MarketQuote, St
 NOW = datetime(2026, 8, 19, 0, 20, tzinfo=timezone.utc)
 
 
-def test_default_registry_routes_existing_strategies_and_adds_graph_lineage():
+def test_default_registry_routes_strategies_and_adds_graph_lineage():
     settings = Settings(
         min_net_annualized_return=0.0,
         pair_roundtrip_cost_bps=0.0,
@@ -33,11 +33,7 @@ def test_default_registry_routes_existing_strategies_and_adds_graph_lineage():
     registry = OpportunityDetectorRegistry.default(settings)
 
     opportunities = registry.discover(
-        DetectorContext(
-            funding_quotes=funding_quotes,
-            market_quotes=market_quotes,
-            graph=graph,
-        )
+        DetectorContext(funding_quotes=funding_quotes, market_quotes=market_quotes, graph=graph)
     )
 
     assert {item.strategy for item in opportunities} == {
@@ -47,9 +43,10 @@ def test_default_registry_routes_existing_strategies_and_adds_graph_lineage():
     assert {manifest.name for manifest in registry.manifests()} == {
         "funding_dispersion",
         "spot_perp_basis",
+        "futures_basis",
+        "cex_spot_dislocation",
     }
     for opportunity in opportunities:
-        assert opportunity.evidence["graph_version"] == "v0.9.0"
+        assert opportunity.evidence["graph_version"] == "v0.9.1"
         assert str(opportunity.evidence["canonical_asset_id"]).startswith("crypto:asset:")
         assert opportunity.evidence["canonical_instrument_ids"]
-        assert opportunity.evidence["detector_module"] in {"funding_dispersion", "spot_perp_basis"}

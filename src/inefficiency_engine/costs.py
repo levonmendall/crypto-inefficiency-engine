@@ -58,6 +58,12 @@ def taker_fee_bps(leg: OpportunityLeg, settings: Settings) -> float:
         return settings.coinbase_spot_taker_fee_bps
     if leg.venue == "HlPerp" and leg.market_kind == MarketKind.PERPETUAL:
         return settings.hyperliquid_perp_taker_fee_bps
+    if leg.venue == "Bybit" and leg.market_kind == MarketKind.SPOT:
+        return settings.bybit_spot_taker_fee_bps
+    if leg.venue == "Bybit" and leg.market_kind in {MarketKind.PERPETUAL, MarketKind.FUTURE}:
+        return settings.bybit_derivatives_taker_fee_bps
+    if leg.venue == "Kraken" and leg.market_kind == MarketKind.SPOT:
+        return settings.kraken_spot_taker_fee_bps
     raise UnknownVenueFeeError(f"no explicit taker fee model for {leg.venue}:{leg.market_kind.value}")
 
 

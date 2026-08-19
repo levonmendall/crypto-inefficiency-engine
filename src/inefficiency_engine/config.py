@@ -41,6 +41,7 @@ class Settings:
     paper_only: bool = True
     scan_interval_seconds: float = 30.0
     default_holding_hours: float = 24.0
+    spot_dislocation_holding_hours: float = 1.0
     min_net_annualized_return: float = 0.08
     safety_buffer_bps_per_hour: float = 0.02
     pair_roundtrip_cost_bps: float = 20.0
@@ -51,13 +52,13 @@ class Settings:
     capacity_search_tolerance_usd: float = 1.0
     coinbase_spot_taker_fee_bps: float = 60.0
     hyperliquid_perp_taker_fee_bps: float = 4.5
+    bybit_spot_taker_fee_bps: float = 10.0
+    bybit_derivatives_taker_fee_bps: float = 5.5
+    kraken_spot_taker_fee_bps: float = 80.0
     spot_collateral_fraction: float = 1.0
     perp_collateral_fraction: float = 1.0
     collateral_opportunity_cost_annual: float = 0.04
     spot_short_borrow_annual: float | None = None
-    # Hypothetical execution timings. No live order/ack path exists in v0.8.
-    # Order-ack defaults to zero for backward compatibility; the existing hedge
-    # latency remains the conservative fixed execution-gap assumption.
     expected_order_ack_latency_ms: float = 0.0
     expected_hedge_latency_ms: float = 750.0
     latency_risk_bps_per_second: float = 0.5
@@ -91,6 +92,7 @@ class Settings:
             paper_only=True,
             scan_interval_seconds=_float("CIE_SCAN_INTERVAL_SECONDS", 30.0),
             default_holding_hours=_float("CIE_DEFAULT_HOLDING_HOURS", 24.0),
+            spot_dislocation_holding_hours=_float("CIE_SPOT_DISLOCATION_HOLDING_HOURS", 1.0),
             min_net_annualized_return=_float("CIE_MIN_NET_ANNUALIZED_RETURN", 0.08),
             safety_buffer_bps_per_hour=_float("CIE_SAFETY_BUFFER_BPS_PER_HOUR", 0.02),
             pair_roundtrip_cost_bps=_float("CIE_PAIR_ROUNDTRIP_COST_BPS", 20.0),
@@ -101,6 +103,9 @@ class Settings:
             capacity_search_tolerance_usd=_float("CIE_CAPACITY_SEARCH_TOLERANCE_USD", 1.0),
             coinbase_spot_taker_fee_bps=_float("CIE_COINBASE_SPOT_TAKER_FEE_BPS", 60.0),
             hyperliquid_perp_taker_fee_bps=_float("CIE_HYPERLIQUID_PERP_TAKER_FEE_BPS", 4.5),
+            bybit_spot_taker_fee_bps=_float("CIE_BYBIT_SPOT_TAKER_FEE_BPS", 10.0),
+            bybit_derivatives_taker_fee_bps=_float("CIE_BYBIT_DERIVATIVES_TAKER_FEE_BPS", 5.5),
+            kraken_spot_taker_fee_bps=_float("CIE_KRAKEN_SPOT_TAKER_FEE_BPS", 80.0),
             spot_collateral_fraction=_float("CIE_SPOT_COLLATERAL_FRACTION", 1.0),
             perp_collateral_fraction=_float("CIE_PERP_COLLATERAL_FRACTION", 1.0),
             collateral_opportunity_cost_annual=_float("CIE_COLLATERAL_OPPORTUNITY_COST_ANNUAL", 0.04),
