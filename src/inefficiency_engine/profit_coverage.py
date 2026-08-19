@@ -55,7 +55,7 @@ class ProfitCoverageSummary(BaseModel):
     version: str
     observed_at: datetime
     objective: str
-    taxonomy_version: str = "2026-08-19"
+    taxonomy_version: str = "2026-08-19-v3"
     mechanism_count: int = Field(ge=0)
     catalogued_count: int = Field(ge=0)
     decision_grade_count: int = Field(ge=0)
@@ -146,21 +146,33 @@ def canonical_profit_mechanisms(
     *,
     alpha_families: set[str] | None = None,
     fundamental_authoritative_observation_count: int = 0,
+    event_authoritative_observation_count: int = 0,
+    yield_authoritative_observation_count: int = 0,
+    option_authoritative_observation_count: int = 0,
+    distress_authoritative_observation_count: int = 0,
 ) -> list[ProfitMechanismCoverage]:
     """Canonical economic-mechanism coverage map.
 
-    A mechanism counts as decision-grade only when authoritative data, explicit
-    economics, forward testing, and a statistical gate all exist. Cataloguing a
-    mechanism or exposing a detector never counts as evaluation.
+    Decision-grade remains an evidence claim, not a code-completeness claim. V3
+    closes architecture/economics gaps broadly while provider-dependent families
+    remain below decision-grade until authoritative point-in-time observations and
+    the required forward/statistical evidence actually exist.
     """
 
     alpha_families = alpha_families or set()
-    momentum_available = "directional_time_series" in alpha_families
-    reversion_available = "directional_reversal" in alpha_families
+    momentum = "directional_time_series" in alpha_families
+    reversion = "directional_reversal" in alpha_families
     factor_registered = "onchain_fundamental" in alpha_families
+    cross_sectional = "cross_sectional_relative_value" in alpha_families
+    microstructure = "microstructure_orderflow" in alpha_families
+    event_registered = "event_driven" in alpha_families
     factor_data = factor_registered and fundamental_authoritative_observation_count > 0
+    event_data = event_registered and event_authoritative_observation_count > 0
+    yield_data = yield_authoritative_observation_count > 0
+    option_data = option_authoritative_observation_count > 0
+    distress_data = distress_authoritative_observation_count > 0
 
-    rows = [
+    return [
         _mechanism(
             mechanism_id="price_discrepancy",
             name="Price discrepancy / arbitrage",
@@ -172,6 +184,7 @@ def canonical_profit_mechanisms(
             blockers=[
                 "DEX↔DEX still lacks authoritative pool-specific executable route depth",
                 "cross-chain still lacks authoritative bridge fill-time and settlement-risk evidence",
+                "allocator-level realized settlement remains incomplete for multi-leg arbitrage families",
             ],
             authoritative_data=True,
             economics=True,
@@ -187,7 +200,8 @@ def canonical_profit_mechanisms(
             priority="critical",
             stage="paper_allocatable",
             implemented=["funding dispersion", "spot/perpetual basis", "dated-futures basis"],
-            missing=["generalized borrow/lend carry graph", "collateral-specific financing dispersion"],
+            research=["provider-neutral generalized yield/carry contract"],
+            missing=["collateral-specific financing dispersion"],
             blockers=["allocator-level realized settlement still needs exact multi-leg carry and funding accrual reconstruction"],
             authoritative_data=True,
             economics=True,
@@ -201,59 +215,85 @@ def canonical_profit_mechanisms(
             name="Yield / staking / lending",
             economic_role="Allocate capital to staking, lending, fixed-yield, LP-fee, or incentive income when risk-adjusted yield dominates alternatives.",
             priority="high",
-            stage="catalogued",
-            missing=["staking yield graph", "lending/borrow market graph", "LP fee yield", "fixed-yield markets", "incentive decay modelling"],
-            blockers=["authoritative point-in-time yield, capacity, lockup, slashing/credit/smart-contract risk and exit-cost evidence not integrated"],
+            stage="economics_modelled",
+            implemented=[
+                "provider-neutral staking/lending/fixed-yield/LP/incentive observation contract",
+                "capacity and holding-period model",
+                "entry/exit cost annualization",
+                "protocol/credit/slashing/liquidation/incentive risk haircuts",
+            ],
+            missing=["forward realized-yield cohort", "exit-liquidity outcome ledger", "protocol-loss statistical calibration"],
+            blockers=([] if yield_data else ["no authoritative commercially permitted point-in-time yield observations are currently available"]),
+            authoritative_data=yield_data,
+            economics=True,
+            forward=False,
+            statistics=False,
+            allocation=False,
+            certification=False,
         ),
         _mechanism(
             mechanism_id="liquidity_provision",
             name="Liquidity provision / market making",
             economic_role="Earn spread, maker rebates, and liquidity incentives when compensation exceeds adverse selection and inventory risk.",
             priority="high",
-            stage="catalogued",
-            missing=["maker fill simulator", "inventory-aware quoting", "adverse-selection model", "queue/priority model", "rebate economics"],
-            blockers=["requires order-placement/fill evidence and venue-specific maker economics; no execution authority exists"],
+            stage="economics_modelled",
+            implemented=[
+                "visible-L2 spread/depth economics",
+                "fill-probability input contract",
+                "maker rebate model",
+                "adverse-selection haircut",
+                "inventory penalty",
+                "queue-model qualification gate",
+            ],
+            missing=["empirical maker queue-position observations", "empirical maker fill outcomes", "inventory-policy forward cohorts"],
+            blockers=["current public execution evidence does not establish empirical maker queue priority or maker fill probability"],
+            authoritative_data=True,
+            economics=True,
+            forward=False,
+            statistics=False,
+            allocation=False,
+            certification=False,
         ),
         _mechanism(
             mechanism_id="trend_momentum",
             name="Directional trend / momentum",
             economic_role="Take directional exposure when forward expected return is positive after costs and risk.",
             priority="critical",
-            stage="profitability_certifiable" if momentum_available else "catalogued",
-            implemented=["time-series momentum"] if momentum_available else [],
+            stage="profitability_certifiable" if momentum else "catalogued",
+            implemented=["time-series momentum"] if momentum else [],
             missing=["multi-horizon trend ensemble", "cross-asset trend confirmation"],
-            blockers=["allocator certification currently settles only supported spot-long decisions; perpetual-short settlement still needs realized funding"],
-            authoritative_data=momentum_available,
-            economics=momentum_available,
-            forward=momentum_available,
-            statistics=momentum_available,
-            allocation=momentum_available,
-            certification=momentum_available,
+            blockers=["perpetual-short allocator settlement still needs realized funding accrual"],
+            authoritative_data=momentum,
+            economics=momentum,
+            forward=momentum,
+            statistics=momentum,
+            allocation=momentum,
+            certification=momentum,
         ),
         _mechanism(
             mechanism_id="mean_reversion",
             name="Mean reversion / reversal",
             economic_role="Take directional exposure when statistically abnormal displacement is expected to revert after costs.",
             priority="critical",
-            stage="profitability_certifiable" if reversion_available else "catalogued",
-            implemented=["robust median/MAD reversal"] if reversion_available else [],
+            stage="profitability_certifiable" if reversion else "catalogued",
+            implemented=["robust median/MAD reversal"] if reversion else [],
             missing=["cross-venue residual reversion", "multi-horizon reversion ensemble"],
-            blockers=["allocator certification currently settles only supported spot-long decisions; perpetual-short settlement still needs realized funding"],
-            authoritative_data=reversion_available,
-            economics=reversion_available,
-            forward=reversion_available,
-            statistics=reversion_available,
-            allocation=reversion_available,
-            certification=reversion_available,
+            blockers=["perpetual-short allocator settlement still needs realized funding accrual"],
+            authoritative_data=reversion,
+            economics=reversion,
+            forward=reversion,
+            statistics=reversion,
+            allocation=reversion,
+            certification=reversion,
         ),
         _mechanism(
             mechanism_id="fundamental_onchain",
             name="On-chain / fundamental factor alpha",
             economic_role="Predict returns from protocol usage, flows, issuance, holder behaviour, valuation, and other fundamental state variables.",
             priority="high",
-            stage="statistically_gated" if factor_data else "discoverable" if factor_registered else "catalogued",
-            implemented=["provider-neutral composite factor contract"] if factor_registered else [],
-            missing=["authoritative production factor provider"] if not factor_data else [],
+            stage="profitability_certifiable" if factor_data else "forward_testable" if factor_registered else "catalogued",
+            implemented=["provider-neutral point-in-time factor contract", "shared forward/statistical promotion"] if factor_registered else [],
+            missing=[] if factor_data else ["authoritative production factor provider"],
             blockers=[] if factor_data else ["no authoritative commercially permitted point-in-time factor observations are currently available"],
             authoritative_data=factor_data,
             economics=factor_registered,
@@ -267,21 +307,34 @@ def canonical_profit_mechanisms(
             name="Cross-sectional / statistical relative value",
             economic_role="Exploit relative expected-return differences among tokens, sectors, baskets, and statistically linked instruments.",
             priority="high",
-            stage="catalogued",
-            missing=["cross-sectional ranking", "pairs/stat-arb residual model", "sector-neutral baskets", "cointegration/lead-lag validation"],
-            blockers=["no dedicated cross-sectional forward promotion family yet"],
+            stage="profitability_certifiable" if cross_sectional else "catalogued",
+            implemented=["cross-sectional residual ranking", "robust median/MAD dispersion", "shared forward/statistical promotion"] if cross_sectional else [],
+            missing=["sector-neutral baskets", "cointegration/pairs ensemble", "dedicated multi-leg relative-value settlement"],
+            blockers=["short legs use perpetuals and still require exact funding settlement for complete allocator-level certification"],
+            authoritative_data=cross_sectional,
+            economics=cross_sectional,
+            forward=cross_sectional,
+            statistics=cross_sectional,
+            allocation=cross_sectional,
+            certification=cross_sectional,
         ),
         _mechanism(
             mechanism_id="volatility",
             name="Volatility / options risk premia",
             economic_role="Trade implied-versus-realized volatility, skew, term structure, dispersion, and option-relative value.",
             priority="high",
-            stage="discoverable",
-            research=["option relative value"],
-            missing=["volatility risk premium", "skew/term-structure strategies", "dispersion"],
-            blockers=["option L2, fees, Greeks, delta hedge economics and paired capacity are not yet authoritative"],
-            authoritative_data=False,
-            economics=False,
+            stage="economics_modelled",
+            implemented=[
+                "provider-neutral option quote/Greeks contract",
+                "near-ATM volatility surface grouping",
+                "implied-versus-realized volatility risk-premium detection",
+                "bid/ask and hedge-cost evidence fields",
+            ],
+            research=["option relative value", "volatility risk premium"],
+            missing=["authoritative option L2/capacity", "delta-hedge forward ledger", "skew/term-structure/dispersion promotion families"],
+            blockers=([] if option_data else ["no authoritative commercially permitted point-in-time option observations are currently available"]),
+            authoritative_data=option_data,
+            economics=True,
             forward=False,
             statistics=False,
             allocation=False,
@@ -292,37 +345,55 @@ def canonical_profit_mechanisms(
             name="Event-driven alpha",
             economic_role="Estimate conditional return distributions around listings, unlocks, governance, upgrades, expiries, flows, depegs, and other discrete catalysts.",
             priority="high",
-            stage="catalogued",
-            missing=["canonical event ledger", "point-in-time event taxonomy", "event-response forward cohorts", "event surprise model"],
-            blockers=["authoritative timestamped event sources and event-specific forward validation are not integrated"],
+            stage="profitability_certifiable" if event_data else "forward_testable" if event_registered else "catalogued",
+            implemented=["append-only event ledger", "known-at/event-at timestamps", "surprise/confidence model", "shared forward/statistical promotion"] if event_registered else [],
+            missing=[] if event_data else ["authoritative timestamped event provider"],
+            blockers=[] if event_data else ["no authoritative commercially permitted point-in-time event observations are currently available"],
+            authoritative_data=event_data,
+            economics=event_registered,
+            forward=event_registered,
+            statistics=event_registered,
+            allocation=event_registered,
+            certification=event_registered,
         ),
         _mechanism(
             mechanism_id="microstructure",
             name="Market microstructure / order-flow alpha",
-            economic_role="Predict short-horizon returns or capture spread from order-book imbalance, trade flow, lead-lag, queue state, and liquidation pressure.",
+            economic_role="Predict short-horizon returns from order-book imbalance, trade flow, lead-lag, queue state, and liquidation pressure.",
             priority="high",
-            stage="economics_modelled",
-            implemented=["L2 depth", "VWAP/slippage", "latency and fill modelling"],
-            missing=["order-flow imbalance alpha", "cross-venue lead-lag alpha", "queue-position model", "short-horizon adverse-selection forecast"],
-            blockers=["microstructure infrastructure exists, but no dedicated statistically promoted alpha family uses it yet"],
+            stage="profitability_certifiable" if microstructure else "economics_modelled",
+            implemented=[
+                "L2 depth", "VWAP/slippage", "latency/fill modelling", "L2 depth-imbalance alpha", "shared forward/statistical promotion"
+            ] if microstructure else ["L2 depth", "VWAP/slippage", "latency/fill modelling"],
+            missing=["trade-flow imbalance", "cross-venue lead-lag ensemble", "empirical maker queue model"],
+            blockers=["maker-specific economics remain separate and fail-closed; directional microstructure uses taker/L2 economics only"],
             authoritative_data=True,
             economics=True,
-            forward=False,
-            statistics=False,
-            allocation=False,
-            certification=False,
+            forward=microstructure,
+            statistics=microstructure,
+            allocation=microstructure,
+            certification=microstructure,
         ),
         _mechanism(
             mechanism_id="liquidation_distress",
             name="Liquidation / distress / solver opportunities",
             economic_role="Earn compensation for supplying capital or execution during liquidation, solver-auction, or distressed-flow events.",
             priority="high",
-            stage="discoverable",
-            research=["liquidation backstop", "solver opportunities"],
-            blockers=[
-                "authoritative liquidation capacity, expiry, recovery and cost evidence are required",
-                "authoritative solver auction, capacity and settlement-guarantee evidence are required",
+            stage="economics_modelled",
+            implemented=[
+                "provider-neutral liquidation/solver/backstop observation contract",
+                "capacity, reward, execution-cost and recovery-loss model",
+                "capture × settlement probability haircut",
+                "failure-state expected-loss economics",
             ],
+            missing=["independent capture-probability forward calibration", "auction/order-selection outcome ledger", "recovery settlement validation"],
+            blockers=([] if distress_data else ["no authoritative commercially permitted liquidation/solver observations are currently available"]),
+            authoritative_data=distress_data,
+            economics=True,
+            forward=False,
+            statistics=False,
+            allocation=False,
+            certification=False,
         ),
         _mechanism(
             mechanism_id="capital_location_settlement",
@@ -330,9 +401,14 @@ def canonical_profit_mechanisms(
             economic_role="Earn from having collateral, inventory, stablecoins, or bridge-ready capital pre-positioned where future opportunities are most valuable.",
             priority="high",
             stage="economics_modelled",
-            implemented=["CEX↔DEX pre-funded inventory qualification", "stablecoin conversion depth", "venue concentration controls"],
-            missing=["dynamic inventory optimizer", "chain/venue capital-location forecast", "idle-capital opportunity-cost model", "rebalancing policy"],
-            blockers=["current inventory policy is a qualification constraint, not an adaptive return-generating capital-location strategy"],
+            implemented=[
+                "CEX↔DEX pre-funded inventory qualification",
+                "stablecoin conversion depth",
+                "venue concentration controls",
+                "historical opportunity-incidence location optimizer",
+            ],
+            missing=["forward location-policy cohort", "authoritative rebalancing/withdrawal/transfer cost and latency evidence", "idle-capital opportunity-cost calibration"],
+            blockers=["location recommendations are research-only until their incremental forward value after rebalancing costs is certified"],
             authoritative_data=True,
             economics=True,
             forward=False,
@@ -341,7 +417,6 @@ def canonical_profit_mechanisms(
             certification=False,
         ),
     ]
-    return rows
 
 
 def build_profit_coverage_summary(
@@ -349,39 +424,41 @@ def build_profit_coverage_summary(
     version: str,
     alpha_families: set[str] | None = None,
     fundamental_authoritative_observation_count: int = 0,
+    event_authoritative_observation_count: int = 0,
+    yield_authoritative_observation_count: int = 0,
+    option_authoritative_observation_count: int = 0,
+    distress_authoritative_observation_count: int = 0,
 ) -> ProfitCoverageSummary:
     mechanisms = canonical_profit_mechanisms(
         alpha_families=alpha_families,
         fundamental_authoritative_observation_count=fundamental_authoritative_observation_count,
+        event_authoritative_observation_count=event_authoritative_observation_count,
+        yield_authoritative_observation_count=yield_authoritative_observation_count,
+        option_authoritative_observation_count=option_authoritative_observation_count,
+        distress_authoritative_observation_count=distress_authoritative_observation_count,
     )
     total = len(mechanisms)
-    catalogued = len(mechanisms)
     decision_grade = sum(row.decision_grade for row in mechanisms)
     paper_capable = sum(row.paper_allocation_available for row in mechanisms)
     certifiable = sum(row.profitability_certification_available for row in mechanisms)
     fully_covered = sum(row.fully_covered for row in mechanisms)
     unresolved = [row for row in mechanisms if not row.fully_covered]
     important_unresolved = [row for row in unresolved if row.priority in {"critical", "high"}]
-    failure_blockers = [
-        f"{row.mechanism_id}: {row.stage}"
-        for row in mechanisms
-        if not row.decision_grade
-    ]
+    failure_blockers = [f"{row.mechanism_id}: {row.stage}" for row in mechanisms if not row.decision_grade]
     return ProfitCoverageSummary(
         version=version,
         observed_at=datetime.now(timezone.utc),
         objective=(
-            "Track whether economically distinct crypto profit mechanisms are merely known, "
-            "or have enough authoritative economics and forward evidence to support a decision "
-            "about product success or failure."
+            "Track whether economically distinct crypto profit mechanisms are merely implemented as research, "
+            "or have enough authoritative economics and forward evidence to support a decision about product success or failure."
         ),
         mechanism_count=total,
-        catalogued_count=catalogued,
+        catalogued_count=total,
         decision_grade_count=decision_grade,
         paper_capable_count=paper_capable,
         profitability_certifiable_count=certifiable,
         fully_covered_count=fully_covered,
-        taxonomy_coverage_fraction=catalogued / total if total else 0.0,
+        taxonomy_coverage_fraction=1.0 if total else 0.0,
         decision_grade_coverage_fraction=decision_grade / total if total else 0.0,
         paper_capable_coverage_fraction=paper_capable / total if total else 0.0,
         profitability_certifiable_coverage_fraction=certifiable / total if total else 0.0,
@@ -390,10 +467,10 @@ def build_profit_coverage_summary(
         failure_conclusion_ready=not failure_blockers,
         failure_conclusion_blockers=failure_blockers,
         success_conclusion_rule=(
-            "Success does not require exhaustive coverage: one or more independent mechanisms must "
-            "demonstrate durable positive forward-certified net economics after realistic costs, "
-            "risk controls, and portfolio allocation. Failure requires materially broader decision-grade "
-            "coverage across the canonical mechanism taxonomy."
+            "Success does not require exhaustive coverage: one or more independent mechanisms must demonstrate durable "
+            "positive forward-certified net economics after realistic costs, risk controls, and portfolio allocation. "
+            "Failure requires decision-grade coverage across the canonical mechanism taxonomy; code-complete research "
+            "pipelines without authoritative evidence do not satisfy that standard."
         ),
         mechanisms=mechanisms,
         live_execution_available=False,
