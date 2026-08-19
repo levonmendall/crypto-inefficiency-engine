@@ -28,6 +28,7 @@ from inefficiency_engine.alpha_factory import (
     _quantile,
     _wilson_lower,
 )
+from inefficiency_engine.alpha_risk import AlphaRiskController, AlphaStrategyHealth
 from inefficiency_engine.evidence import EvidenceStore, ScanSnapshot
 
 
@@ -36,12 +37,7 @@ class FundamentalObservationProvider(Protocol):
 
 
 class _ExpandedSettingsView:
-    """Forward-compatible defaults for V2.1 strategies.
-
-    Existing deployments can adopt the new strategy families without a config
-    migration. These values become explicit Settings fields in a later tuning
-    pass once enough forward evidence exists to justify parameter changes.
-    """
+    """Forward-compatible defaults for post-V2.0 alpha families and controls."""
 
     _defaults = {
         "alpha_reversion_horizon_hours": 6.0,
@@ -57,6 +53,19 @@ class _ExpandedSettingsView:
         "alpha_factor_forecast_shrinkage": 0.25,
         "alpha_factor_horizon_hours": 24.0,
         "alpha_factor_lookback_hours": 24.0 * 14.0,
+        # V2.2 adaptive health controls. These are deliberately conservative and
+        # can only reduce/revoke paper allocation authority already earned by the
+        # forward statistical gate.
+        "alpha_health_recent_window": 12,
+        "alpha_health_min_recent_samples": 8,
+        "alpha_health_min_recent_mean_return": 0.00025,
+        "alpha_health_min_recent_hit_rate": 0.50,
+        "alpha_health_min_capture_ratio": 0.35,
+        "alpha_health_full_capture_ratio": 0.80,
+        "alpha_health_min_recent_to_long_ratio": 0.35,
+        "alpha_health_max_drawdown": 0.06,
+        "alpha_health_max_trailing_losses": 4,
+        "alpha_health_capital_multiplier_floor": 0.25,
     }
 
     def __init__(self, base):
@@ -69,12 +78,12 @@ class _ExpandedSettingsView:
 
 
 class ExpandedAlphaFactoryService(AlphaFactoryService):
-    """V2.1 alpha factory with multiple independent return families.
+    """Multi-family alpha factory with independent evidence and adaptive sizing.
 
-    The service keeps discovery broad but prevents overlapping forward signals
-    from masquerading as independent evidence. Fundamental observations remain
-    provider-neutral and fail closed unless they are explicitly authoritative,
-    point-in-time and commercially usable.
+    Discovery can be broad. Paper promotion remains forward-only and requires the
+    base statistical and fresh-L2 gates. V2.2 adds a second, strictly subtractive
+    health gate: recent decay, poor forecast capture, drawdown or losing streaks
+    can shrink or revoke paper capital but can never create authority.
     """
 
     def __init__(
@@ -93,6 +102,7 @@ class ExpandedAlphaFactoryService(AlphaFactoryService):
         super().__init__(core, store, registry=registry)
         self.fundamental_provider = fundamental_provider
         self._expanded_settings = _ExpandedSettingsView(self.settings)
+        self.risk_controller = AlphaRiskController(self._expanded_settings)
 
     def manifests(self):
         return self.registry.manifests()
@@ -122,6 +132,16 @@ class ExpandedAlphaFactoryService(AlphaFactoryService):
             next_independent_at = outcome.due_at
         return selected
 
+    def _outcomes_for(self, candidate: AlphaCandidate) -> list[AlphaForwardOutcome]:
+        return self._independent_outcomes(self.ledger.outcomes(
+            strategy_id=candidate.strategy_id,
+            asset=candidate.asset,
+            direction=candidate.direction,
+        ))
+
+    def strategy_health(self, candidate: AlphaCandidate) -> AlphaStrategyHealth:
+        return self.risk_controller.evaluate(candidate, self._outcomes_for(candidate))
+
     def _has_open_signal(self, candidate: AlphaCandidate, *, now) -> bool:
         events = self.ledger.events
         with self.store.engine.connect() as db:
@@ -139,12 +159,7 @@ class ExpandedAlphaFactoryService(AlphaFactoryService):
         return any(signal_id not in completed for signal_id, _ in signals)
 
     def qualification(self, candidate: AlphaCandidate) -> AlphaQualification:
-        raw_outcomes = self.ledger.outcomes(
-            strategy_id=candidate.strategy_id,
-            asset=candidate.asset,
-            direction=candidate.direction,
-        )
-        outcomes = self._independent_outcomes(raw_outcomes)
+        outcomes = self._outcomes_for(candidate)
         values = [item.realized_net_return for item in outcomes]
         positives = sum(value > 0 for value in values)
         hit_lower = _wilson_lower(positives, len(values))
@@ -191,6 +206,56 @@ class ExpandedAlphaFactoryService(AlphaFactoryService):
             live_execution_authority=False,
             paper_only=True,
         )
+
+    async def promoted_candidates(
+        self,
+        snapshot: ScanSnapshot,
+        *,
+        total_capital_usd: float,
+    ) -> list[AlphaCandidate]:
+        statistically_promoted = await super().promoted_candidates(
+            snapshot,
+            total_capital_usd=total_capital_usd,
+        )
+        healthy: list[AlphaCandidate] = []
+        for candidate in statistically_promoted:
+            health = self.strategy_health(candidate)
+            if not health.healthy_for_paper_allocation or health.capital_multiplier <= 0:
+                continue
+            scaled_notional = candidate.notional_usd * health.capital_multiplier
+            if scaled_notional < self.settings.alpha_min_notional_usd:
+                continue
+            candidate.notional_usd = scaled_notional
+            candidate.capital_required_usd *= health.capital_multiplier
+            candidate.expected_profit_usd = candidate.expected_net_return * scaled_notional
+            candidate.features.update({
+                "health_score": health.health_score,
+                "health_capital_multiplier": health.capital_multiplier,
+                "health_recent_mean_net_return": health.recent_mean_net_return or 0.0,
+                "health_recent_hit_rate": health.recent_hit_rate or 0.0,
+                "health_capture_ratio_median": health.forecast_capture_ratio_median or 0.0,
+                "health_recent_to_long_run_ratio": health.recent_to_long_run_ratio or 0.0,
+                "health_max_compounded_drawdown": health.max_compounded_drawdown or 0.0,
+                "health_trailing_loss_streak": health.trailing_loss_streak,
+            })
+            healthy.append(candidate)
+        healthy.sort(key=lambda item: (item.expected_net_return, item.expected_profit_usd), reverse=True)
+        return healthy
+
+    async def health_snapshot(
+        self,
+        snapshot: ScanSnapshot,
+        *,
+        total_capital_usd: float,
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for candidate in self.discover(snapshot, total_capital_usd=total_capital_usd):
+            rows.append({
+                "candidate": candidate.model_dump(mode="json"),
+                "qualification": self.qualification(candidate).model_dump(mode="json"),
+                "health": self.strategy_health(candidate).model_dump(mode="json"),
+            })
+        return rows
 
     async def _refresh_fundamentals(self) -> None:
         if self.fundamental_provider is None:

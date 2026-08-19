@@ -69,6 +69,7 @@ def build_advanced_router(
         status["universal_alpha_factory_available"] = alpha_factory is not None
         status["predictive_alpha_live_execution_available"] = False
         status["predictive_alpha_strategy_count"] = len(alpha_factory.manifests()) if alpha_factory is not None else 0
+        status["adaptive_alpha_health_control_available"] = alpha_factory is not None
         return status
 
     @router.get("/v2/alpha/strategies")
@@ -132,6 +133,28 @@ def build_advanced_router(
             ) from exc
         return {
             "paper_only": True,
+            "live_execution_authority": False,
+            "count": len(rows),
+            "rows": rows,
+        }
+
+    @router.get("/v2/alpha/health/live")
+    async def alpha_health_live(capital_usd: float = 100000.0):
+        require_store()
+        if capital_usd <= 0:
+            raise HTTPException(status_code=400, detail="capital_usd must be positive")
+        assert alpha_factory is not None
+        try:
+            snapshot = await service.collect_live_evidence()
+            rows = await alpha_factory.health_snapshot(snapshot, total_capital_usd=capital_usd)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"alpha health evaluation failed: {type(exc).__name__}",
+            ) from exc
+        return {
+            "paper_only": True,
+            "allocation_authority": False,
             "live_execution_authority": False,
             "count": len(rows),
             "rows": rows,
