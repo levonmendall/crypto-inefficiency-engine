@@ -8,6 +8,7 @@ def test_canonical_portfolio_and_operating_routes_are_mounted():
         "/v3/portfolio/performance",
         "/v3/portfolio/positions",
         "/v3/portfolio/trades",
+        "/v3/portfolio/skips",
         "/v3/portfolio/history",
         "/v3/portfolio/attribution",
         "/v3/portfolio/cycle",
