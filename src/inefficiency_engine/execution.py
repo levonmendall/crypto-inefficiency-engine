@@ -73,14 +73,12 @@ def estimate_market_order_quantity(
     """Estimate a taker fill for an exact base quantity against observed L2 depth."""
     if base_quantity <= 0:
         raise ValueError("base_quantity must be positive")
-
     ordered = _ordered_levels(snapshot, side)
     best_price = ordered[0].price
     remaining = base_quantity
     filled_quantity = 0.0
     filled_notional = 0.0
     levels_consumed = 0
-
     for level in ordered:
         if remaining <= 1e-12:
             break
@@ -89,20 +87,17 @@ def estimate_market_order_quantity(
         filled_notional += take_quantity * level.price
         remaining -= take_quantity
         levels_consumed += 1
-
     if require_full_fill and remaining > max(1e-12, base_quantity * 1e-9):
         raise InsufficientDepthError(
             f"visible depth filled {filled_quantity:.12g} of requested {base_quantity:.12g} base units"
         )
     if filled_quantity <= 0:
         raise InsufficientDepthError("no quantity could be filled")
-
     average_price = filled_notional / filled_quantity
     if side == TradeSide.BUY:
         slippage_bps = ((average_price / best_price) - 1.0) * 10_000
     else:
         slippage_bps = (1.0 - (average_price / best_price)) * 10_000
-
     return QuantityExecutionEstimate(
         side=side,
         requested_base_quantity=base_quantity,
@@ -125,14 +120,12 @@ def estimate_market_order(
     """Estimate a taker fill against a point-in-time L2 snapshot by USD notional."""
     if notional_usd <= 0:
         raise ValueError("notional_usd must be positive")
-
     ordered = _ordered_levels(snapshot, side)
     best_price = ordered[0].price
     remaining = notional_usd
     filled_notional = 0.0
     base_quantity = 0.0
     levels_consumed = 0
-
     for level in ordered:
         if remaining <= 1e-9:
             break
@@ -143,20 +136,17 @@ def estimate_market_order(
         base_quantity += take_quantity
         remaining -= take_notional
         levels_consumed += 1
-
     if require_full_fill and remaining > max(1e-6, notional_usd * 1e-9):
         raise InsufficientDepthError(
             f"visible depth filled ${filled_notional:.2f} of requested ${notional_usd:.2f}"
         )
     if base_quantity <= 0:
         raise InsufficientDepthError("no quantity could be filled")
-
     average_price = filled_notional / base_quantity
     if side == TradeSide.BUY:
         slippage_bps = ((average_price / best_price) - 1.0) * 10_000
     else:
         slippage_bps = (1.0 - (average_price / best_price)) * 10_000
-
     return ExecutionEstimate(
         side=side,
         requested_notional_usd=notional_usd,
@@ -205,12 +195,12 @@ def qualify_opportunity(
     latency_model: EmpiricalLatencyModel | None = None,
     latency_model_resolver: Callable[[Opportunity, float], EmpiricalLatencyModel] | None = None,
 ) -> OpportunityExecutability:
-    """Qualify a two-leg opportunity with explicit fees, capital, depth, and hedge risk.
+    """Qualify a two-leg opportunity with explicit fees, depth, and execution risk.
 
-    The v0.8.1 resolver can provide a different empirical model for each capital
-    size. It chooses the narrowest statistically valid cohort and falls back
-    hierarchically when evidence is sparse. Callers may still pass one fixed
-    EmpiricalLatencyModel for backward compatibility.
+    v0.8 resolves a statistically gated empirical model for each capital size.
+    Public L2 supports taker depth reconstruction only; no maker queue probability
+    is invented. If the empirical model is not usable, conservative fixed latency
+    and hedge-recovery buffers remain active automatically.
     """
     now = now or datetime.now(timezone.utc)
     notionals = notionals_usd or settings.capital_tiers_usd
@@ -234,7 +224,6 @@ def qualify_opportunity(
             missing.append(f"{leg.venue}:{leg.asset}:{leg.market_kind.value}")
         else:
             leg_books.append(book)
-
     if missing:
         reason = "missing order book(s): " + ", ".join(missing)
         return OpportunityExecutability(
@@ -337,8 +326,15 @@ def qualify_opportunity(
         net_total_bps = total_gross_bps - total_cost_bps - total_safety_bps
         net_hourly_bps_on_leg_notional = net_total_bps / opportunity.holding_hours
         leg_notional_annualized = (net_hourly_bps_on_leg_notional / 10_000.0) * 24 * 365
-        capital_adjusted_annualized = leg_notional_annualized / costs.capital_multiple if costs.capital_multiple > 0 else float("-inf")
-        passes = net_hourly_bps_on_leg_notional > 0 and capital_adjusted_annualized >= settings.min_net_annualized_return
+        capital_adjusted_annualized = (
+            leg_notional_annualized / costs.capital_multiple
+            if costs.capital_multiple > 0
+            else float("-inf")
+        )
+        passes = (
+            net_hourly_bps_on_leg_notional > 0
+            and capital_adjusted_annualized >= settings.min_net_annualized_return
+        )
 
         return CapitalTierQualification(
             opportunity_id=opportunity.id,
@@ -356,12 +352,24 @@ def qualify_opportunity(
             latency_model_scope=costs.latency_model_scope,
             latency_scope_fallbacks=costs.latency_scope_fallbacks,
             latency_reference_ms=costs.latency_reference_ms,
+            collector_latency_reference_ms=costs.collector_latency_reference_ms,
+            execution_latency_empirical=costs.execution_latency_empirical,
             latency_sample_count=costs.latency_sample_count,
+            latency_effective_sample_size=costs.latency_effective_sample_size,
+            latency_confidence_gate_passed=costs.latency_confidence_gate_passed,
             empirical_pair_fill_probability=costs.empirical_pair_fill_probability,
+            empirical_pair_fill_ci_lower=costs.empirical_pair_fill_ci_lower,
             empirical_reserve_fill_probability=costs.empirical_reserve_fill_probability,
             empirical_capture_probability=costs.empirical_capture_probability,
+            empirical_capture_ci_lower=costs.empirical_capture_ci_lower,
             empirical_hedge_recovery_probability=costs.empirical_hedge_recovery_probability,
+            empirical_partial_fill_probability=costs.empirical_partial_fill_probability,
+            empirical_unhedged_fraction_p95=costs.empirical_unhedged_fraction_p95,
+            empirical_hedge_recovery_loss_p95_bps=costs.empirical_hedge_recovery_loss_p95_bps,
+            fill_model_kind=costs.fill_model_kind,
+            queue_position_supported=costs.queue_position_supported,
             hedge_recovery_buffer_bps=costs.hedge_recovery_buffer_bps,
+            hedge_recovery_buffer_source=costs.hedge_recovery_buffer_source,
             capital_required_usd=costs.capital_required_usd,
             capital_multiple=costs.capital_multiple,
             observed_entry_slippage_bps=entry_slippage,

@@ -64,6 +64,7 @@ class OrderBookSnapshot(BaseModel):
     asks: list[OrderBookLevel]
     observed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     source: str
+    request_latency_ms: float | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_book(self):
@@ -130,7 +131,7 @@ class ShadowFailureCause(str, Enum):
 
 
 class EmpiricalLatencyModel(BaseModel):
-    model_version: str = "v0.8.2"
+    model_version: str = "v0.8.3"
     model_scope: str = "global"
     scope_strategy: Strategy | None = None
     scope_venue_pair: str | None = None
@@ -138,13 +139,23 @@ class EmpiricalLatencyModel(BaseModel):
     scope_notional_usd_per_leg: float | None = Field(default=None, gt=0)
     scope_candidate_counts: dict[str, int] = Field(default_factory=dict)
     scope_horizon_counts: dict[str, dict[str, int]] = Field(default_factory=dict)
+    scope_effective_counts: dict[str, dict[str, int]] = Field(default_factory=dict)
     scope_fallbacks: list[str] = Field(default_factory=list)
     latency_quantile: float = 0.95
     scan_latency_sample_count: int = 0
+    data_latency_sample_count: int = 0
+    data_latency_source: Literal["l2_request_roundtrip", "scan_duration_fallback", "unavailable"] = "unavailable"
     cohort_sample_count: int = 0
+    effective_sample_size: int = 0
     lower_horizon_sample_count: int = 0
     upper_horizon_sample_count: int = 0
     reference_latency_ms: float | None = None
+    collector_latency_reference_ms: float | None = None
+    assumed_order_ack_latency_ms: float = Field(default=0.0, ge=0)
+    assumed_second_leg_latency_ms: float = Field(default=0.0, ge=0)
+    effective_decision_to_hedge_latency_ms: float | None = Field(default=None, ge=0)
+    execution_latency_empirical: bool = False
+    execution_latency_note: str = "no live order/ack path; execution timing remains an explicit assumption"
     reference_horizon_seconds: float | None = None
     reference_lower_horizon_seconds: float | None = None
     reference_upper_horizon_seconds: float | None = None
@@ -153,14 +164,40 @@ class EmpiricalLatencyModel(BaseModel):
     scan_latency_p50_ms: float | None = None
     scan_latency_p90_ms: float | None = None
     scan_latency_p95_ms: float | None = None
+    data_latency_p50_ms: float | None = None
+    data_latency_p90_ms: float | None = None
+    data_latency_p95_ms: float | None = None
+    confidence_level: float = Field(default=0.95, gt=0, lt=1)
+    probability_max_ci_width: float | None = None
+    confidence_gate_passed: bool = False
     pair_fill_probability: float | None = None
+    pair_fill_ci_lower: float | None = None
+    pair_fill_ci_upper: float | None = None
     reserve_fill_probability: float | None = None
+    reserve_fill_ci_lower: float | None = None
+    reserve_fill_ci_upper: float | None = None
     capture_probability: float | None = None
+    capture_ci_lower: float | None = None
+    capture_ci_upper: float | None = None
     hedge_recovery_probability: float | None = None
+    hedge_recovery_ci_lower: float | None = None
+    hedge_recovery_ci_upper: float | None = None
+    partial_fill_probability: float | None = None
+    pair_fill_fraction_p10: float | None = None
+    pair_fill_fraction_p50: float | None = None
+    unhedged_fraction_p50: float | None = None
+    unhedged_fraction_p90: float | None = None
+    unhedged_fraction_p95: float | None = None
+    hedge_recovery_loss_p50_bps: float | None = None
+    hedge_recovery_loss_p90_bps: float | None = None
+    hedge_recovery_loss_p95_bps: float | None = None
     adverse_selection_p50_bps: float | None = None
     adverse_selection_p90_bps: float | None = None
     adverse_selection_p95_bps: float | None = None
     empirical_latency_risk_bps: float | None = None
+    fill_model_kind: Literal["visible_l2_taker_reconstruction"] = "visible_l2_taker_reconstruction"
+    queue_position_supported: bool = False
+    maker_fill_probability: float | None = None
     usable_for_qualification: bool = False
     reason: str | None = None
     paper_only: bool = True
@@ -182,12 +219,24 @@ class CapitalTierQualification(BaseModel):
     latency_model_scope: str = "fixed"
     latency_scope_fallbacks: list[str] = Field(default_factory=list)
     latency_reference_ms: float | None = None
+    collector_latency_reference_ms: float | None = None
+    execution_latency_empirical: bool = False
     latency_sample_count: int = 0
+    latency_effective_sample_size: int = 0
+    latency_confidence_gate_passed: bool = False
     empirical_pair_fill_probability: float | None = None
+    empirical_pair_fill_ci_lower: float | None = None
     empirical_reserve_fill_probability: float | None = None
     empirical_capture_probability: float | None = None
+    empirical_capture_ci_lower: float | None = None
     empirical_hedge_recovery_probability: float | None = None
+    empirical_partial_fill_probability: float | None = None
+    empirical_unhedged_fraction_p95: float | None = None
+    empirical_hedge_recovery_loss_p95_bps: float | None = None
+    fill_model_kind: str = "visible_l2_taker_reconstruction"
+    queue_position_supported: bool = False
     hedge_recovery_buffer_bps: float = 0.0
+    hedge_recovery_buffer_source: Literal["fixed", "max_fixed_empirical"] = "fixed"
     capital_required_usd: float = 0.0
     capital_multiple: float = 0.0
     observed_entry_slippage_bps: float = 0.0
@@ -266,12 +315,20 @@ class ShadowObservation(BaseModel):
     delay_seconds: float = Field(ge=0)
     initial_scan_latency_ms: float | None = Field(default=None, ge=0)
     verification_scan_latency_ms: float | None = Field(default=None, ge=0)
+    initial_data_path_latency_ms: float | None = Field(default=None, ge=0)
+    verification_data_path_latency_ms: float | None = Field(default=None, ge=0)
     initial_net_annualized_return: float
     initial_capacity_notional_usd: float
     survived: bool
     pair_fillable: bool | None = None
     pair_fillable_with_reserve: bool | None = None
     hedge_recovery_required: bool | None = None
+    pair_fill_fraction: float | None = Field(default=None, ge=0, le=1)
+    max_leg_fill_fraction: float | None = Field(default=None, ge=0, le=1)
+    unhedged_fraction: float | None = Field(default=None, ge=0, le=1)
+    partial_fill_state: bool | None = None
+    hedge_recovery_loss_proxy_bps: float | None = Field(default=None, ge=0)
+    queue_position_supported: bool = False
     verification_net_annualized_return: float | None = None
     outcome: ShadowOutcome
     reason: str | None = None

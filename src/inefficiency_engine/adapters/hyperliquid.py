@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any
 
 import httpx
@@ -18,16 +19,10 @@ def _utc_from_ms(value: int | float | None) -> datetime | None:
 
 
 def parse_predicted_fundings(payload: Any, observed_at: datetime | None = None) -> list[FundingQuote]:
-    """Parse Hyperliquid predictedFundings nested-array response.
-
-    Expected shape: [[coin, [[venue, {fundingRate, nextFundingTime,
-    fundingIntervalHours?}], ...]], ...]
-    """
     observed_at = observed_at or datetime.now(timezone.utc)
     quotes: list[FundingQuote] = []
     if not isinstance(payload, list):
         raise ValueError("predictedFundings response must be a list")
-
     for row in payload:
         if not isinstance(row, list) or len(row) != 2:
             continue
@@ -41,10 +36,8 @@ def parse_predicted_fundings(payload: Any, observed_at: datetime | None = None) 
             if not isinstance(venue, str) or not isinstance(details, dict):
                 continue
             rate = details.get("fundingRate")
-            if rate is None:
-                continue
             interval = details.get("fundingIntervalHours")
-            if interval is None:
+            if rate is None or interval is None:
                 continue
             quotes.append(
                 FundingQuote(
@@ -68,7 +61,6 @@ def parse_meta_and_asset_contexts(payload: Any, observed_at: datetime | None = N
     universe = meta.get("universe", []) if isinstance(meta, dict) else []
     if not isinstance(contexts, list):
         raise ValueError("asset contexts must be a list")
-
     quotes: list[MarketQuote] = []
     for instrument, context in zip(universe, contexts):
         if not isinstance(instrument, dict) or not isinstance(context, dict):
@@ -149,5 +141,9 @@ class HyperliquidAdapter:
         return parse_meta_and_asset_contexts(payload)
 
     async def order_book(self, asset: str) -> OrderBookSnapshot:
+        started = perf_counter()
         payload = await self._post_payload({"type": "l2Book", "coin": asset.upper()})
-        return parse_l2_book(payload)
+        latency_ms = max(0.0, (perf_counter() - started) * 1000.0)
+        book = parse_l2_book(payload)
+        book.request_latency_ms = latency_ms
+        return book

@@ -15,7 +15,7 @@
 - Lineage hashes and exact analysis configuration
 - Deterministic replay harness
 
-Next: retention/export policy, historical funding ingestion, partition/archival policy, and scan-level quality metrics.
+Future operational work: retention/export policy, historical funding ingestion, partition/archival policy, and scan-level quality metrics.
 
 ## Milestone 3 — Executability and economic realism — core complete
 - L2 parsers/adapters
@@ -29,7 +29,7 @@ Next: retention/export policy, historical funding ingestion, partition/archival 
 - Extra hedge-liquidity reserve
 - Fail-closed short-spot borrow economics
 
-## Milestone 4 — Broader alpha graph
+## Milestone 4 — Broader alpha graph — deferred
 - Direct exchange adapters
 - CEX/CEX spot dislocations
 - CEX/DEX and DEX/DEX routing
@@ -46,34 +46,35 @@ This remains secondary until the existing alpha is empirically shown to survive 
 - Adverse selection, spread/depth/slippage, edge decay, cost expansion, and capacity deterioration
 - Explicit failure causes and segmented survival statistics
 
-## v0.8 — Empirical fill/latency modeling — in progress
-### Implemented
-- Persist original target base quantity into shadow attribution
-- Measure initial/verification scan duration as observation-path latency
+## v0.8 — Empirical fill/latency modeling — complete
+- Persist original target quantity into shadow attribution
+- Measure public L2 request round-trip latency on Coinbase and Hyperliquid
+- Preserve whole-scan latency only as an explicitly labeled historical fallback
+- Separate measured collector/data timing from hypothetical order-ack and second-leg timing
+- Expose that execution latency is not empirical while no live order path exists
 - Reconstruct per-leg visible base-depth multiples
-- Reconstruct pair fillability and hedge-reserve fillability
-- Flag asymmetric visible-depth states that would require hedge recovery
-- Build latency p50/p90/p95 distributions from unique verification scans
-- Estimate pair-fill, reserve-fill, capture, and hedge-recovery probabilities
-- Derive p50/p90/p95 pair adverse-selection distributions
-- Gate empirical latency-risk use behind minimum evidence thresholds
-- Automatically retain the fixed expected-latency model until the evidence gate passes
+- Reconstruct pair/reserve fillability and visible taker fill fractions
+- Quantify asymmetric partial fills and unmatched/unhedged exposure
+- Estimate partial-fill probability and p50/p90/p95 unhedged-fraction distributions
+- Estimate p50/p90/p95 hedge-recovery-loss proxies
+- Ensure empirical recovery risk can increase, but never reduce, the fixed recovery floor
+- Build p50/p90/p95 adverse-selection distributions
 - Hierarchical empirical cohorts: strategy + venue pair + asset + capital, with controlled fallback through broader scopes
-- Resolve a separate empirical model for each evaluated capital size
-- Persist model scope and fallback provenance in executable capital-tier output
-- Support scoped inspection through `GET /v1/latency/model`
+- Resolve a separate empirical model for every evaluated capital size
 - Interval-censored interpolation between adjacent 1/5/15/30/60s horizons
-- Require sufficient observations at both interpolation endpoints
-- Enforce monotone-conservative probability and adverse-risk interpolation
+- Enforce monotone-conservative quality/risk interpolation
+- Cluster capital tiers from the same market event so correlated rows do not inflate sample size
+- Wilson confidence intervals for fill/reserve/capture/recovery probabilities
+- Gate calibration on raw count, effective independent-event count, tail-risk samples, and maximum CI width at every endpoint
+- Persist model scope, effective sample size, confidence intervals, and fallback provenance in executable output
+- Scoped inspection through `GET /v1/latency/model`
+- Explicitly abstain from maker queue-position/fill probability because current public L2 cannot establish queue position
+- Automatically retain the fixed conservative model whenever any empirical gate fails
 
-### Next v0.8 refinements
-- Separate network/data latency from hypothetical order-submission/acknowledgement latency
-- Queue-position and maker-fill modeling where public venue data makes it defensible
-- More explicit partial-fill sequencing and hedge-recovery cost distributions
-- Statistical confidence intervals / minimum effective sample size by cohort
+v0.8 is complete at the paper/shadow evidence boundary. It does not claim exchange-confirmed fills or empirical order acknowledgement latency.
 
 ## Milestone 6 — Tiny-capital controlled execution — blocked
-Separate service, credentials, explicit authorization, hard caps, paired-leg atomicity/hedge recovery, venue concentration limits, dead-man switches, and kill switch. This remains blocked until shadow and fill/latency evidence are statistically convincing.
+Separate service, credentials, explicit authorization, hard caps, paired-leg atomicity/hedge recovery, venue concentration limits, dead-man switches, and kill switch. This remains blocked until accumulated v0.8 evidence is statistically convincing and a separate live-execution decision is explicitly authorized.
 
 ## Milestone 7 — Machine-paid intelligence API
 - API keys and usage metering

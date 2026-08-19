@@ -24,6 +24,24 @@ services:
         value: "30"
       - key: CIE_SHADOW_NOTIONAL_USD
         value: "1000"
+      - key: CIE_EXPECTED_ORDER_ACK_LATENCY_MS
+        value: "0"
+      - key: CIE_EXPECTED_HEDGE_LATENCY_MS
+        value: "750"
+      - key: CIE_EMPIRICAL_LATENCY_ENABLED
+        value: "true"
+      - key: CIE_EMPIRICAL_LATENCY_MIN_SAMPLES
+        value: "100"
+      - key: CIE_EMPIRICAL_LATENCY_MIN_SCAN_SAMPLES
+        value: "30"
+      - key: CIE_EMPIRICAL_LATENCY_MIN_EFFECTIVE_SAMPLES
+        value: "30"
+      - key: CIE_EMPIRICAL_LATENCY_QUANTILE
+        value: "0.95"
+      - key: CIE_EMPIRICAL_PROBABILITY_CONFIDENCE_LEVEL
+        value: "0.95"
+      - key: CIE_EMPIRICAL_PROBABILITY_MAX_CI_WIDTH
+        value: "0.25"
       - key: CIE_WORKER_ERROR_BACKOFF_SECONDS
         value: "15"
       - key: CIE_WORKER_HEARTBEAT_STALE_SECONDS
@@ -46,6 +64,24 @@ services:
           property: connectionString
       - key: CIE_PAPER_ONLY
         value: "true"
+      - key: CIE_EXPECTED_ORDER_ACK_LATENCY_MS
+        value: "0"
+      - key: CIE_EXPECTED_HEDGE_LATENCY_MS
+        value: "750"
+      - key: CIE_EMPIRICAL_LATENCY_ENABLED
+        value: "true"
+      - key: CIE_EMPIRICAL_LATENCY_MIN_SAMPLES
+        value: "100"
+      - key: CIE_EMPIRICAL_LATENCY_MIN_SCAN_SAMPLES
+        value: "30"
+      - key: CIE_EMPIRICAL_LATENCY_MIN_EFFECTIVE_SAMPLES
+        value: "30"
+      - key: CIE_EMPIRICAL_LATENCY_QUANTILE
+        value: "0.95"
+      - key: CIE_EMPIRICAL_PROBABILITY_CONFIDENCE_LEVEL
+        value: "0.95"
+      - key: CIE_EMPIRICAL_PROBABILITY_MAX_CI_WIDTH
+        value: "0.25"
       - key: CIE_WORKER_HEARTBEAT_STALE_SECONDS
         value: "180"
 

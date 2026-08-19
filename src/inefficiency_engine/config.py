@@ -55,12 +55,19 @@ class Settings:
     perp_collateral_fraction: float = 1.0
     collateral_opportunity_cost_annual: float = 0.04
     spot_short_borrow_annual: float | None = None
+    # Hypothetical execution timings. No live order/ack path exists in v0.8.
+    # Order-ack defaults to zero for backward compatibility; the existing hedge
+    # latency remains the conservative fixed execution-gap assumption.
+    expected_order_ack_latency_ms: float = 0.0
     expected_hedge_latency_ms: float = 750.0
     latency_risk_bps_per_second: float = 0.5
     empirical_latency_enabled: bool = True
     empirical_latency_min_samples: int = 100
     empirical_latency_min_scan_samples: int = 30
+    empirical_latency_min_effective_samples: int = 30
     empirical_latency_quantile: float = 0.95
+    empirical_probability_confidence_level: float = 0.95
+    empirical_probability_max_ci_width: float = 0.25
     hedge_liquidity_reserve_ratio: float = 1.25
     hedge_recovery_buffer_bps: float = 2.0
     shadow_delay_seconds: float = 5.0
@@ -98,12 +105,16 @@ class Settings:
             perp_collateral_fraction=_float("CIE_PERP_COLLATERAL_FRACTION", 1.0),
             collateral_opportunity_cost_annual=_float("CIE_COLLATERAL_OPPORTUNITY_COST_ANNUAL", 0.04),
             spot_short_borrow_annual=_optional_float("CIE_SPOT_SHORT_BORROW_ANNUAL", None),
+            expected_order_ack_latency_ms=_float("CIE_EXPECTED_ORDER_ACK_LATENCY_MS", 0.0),
             expected_hedge_latency_ms=_float("CIE_EXPECTED_HEDGE_LATENCY_MS", 750.0),
             latency_risk_bps_per_second=_float("CIE_LATENCY_RISK_BPS_PER_SECOND", 0.5),
             empirical_latency_enabled=_bool("CIE_EMPIRICAL_LATENCY_ENABLED", True),
             empirical_latency_min_samples=_int("CIE_EMPIRICAL_LATENCY_MIN_SAMPLES", 100),
             empirical_latency_min_scan_samples=_int("CIE_EMPIRICAL_LATENCY_MIN_SCAN_SAMPLES", 30),
+            empirical_latency_min_effective_samples=_int("CIE_EMPIRICAL_LATENCY_MIN_EFFECTIVE_SAMPLES", 30),
             empirical_latency_quantile=_float("CIE_EMPIRICAL_LATENCY_QUANTILE", 0.95),
+            empirical_probability_confidence_level=_float("CIE_EMPIRICAL_PROBABILITY_CONFIDENCE_LEVEL", 0.95),
+            empirical_probability_max_ci_width=_float("CIE_EMPIRICAL_PROBABILITY_MAX_CI_WIDTH", 0.25),
             hedge_liquidity_reserve_ratio=_float("CIE_HEDGE_LIQUIDITY_RESERVE_RATIO", 1.25),
             hedge_recovery_buffer_bps=_float("CIE_HEDGE_RECOVERY_BUFFER_BPS", 2.0),
             shadow_delay_seconds=_float("CIE_SHADOW_DELAY_SECONDS", 5.0),
