@@ -54,7 +54,7 @@ def test_render_worker_command_keeps_main_thread_provider_free():
 
 
 @pytest.mark.asyncio
-async def test_threaded_runtime_puts_research_and_portfolio_on_daemon_threads(monkeypatch):
+async def test_threaded_runtime_isolates_research_portfolio_and_certification(monkeypatch):
     observed: list[dict[str, object]] = []
     heartbeats: list[tuple[str, str]] = []
 
@@ -88,6 +88,7 @@ async def test_threaded_runtime_puts_research_and_portfolio_on_daemon_threads(mo
     assert [item["name"] for item in observed] == [
         threaded_worker.RESEARCH_THREAD_NAME,
         threaded_worker.PORTFOLIO_THREAD_NAME,
+        threaded_worker.CERTIFICATION_THREAD_NAME,
     ]
     assert all(item["daemon"] is True for item in observed)
     assert all(item["started"] is True for item in observed)
@@ -96,7 +97,7 @@ async def test_threaded_runtime_puts_research_and_portfolio_on_daemon_threads(mo
     assert heartbeats[-1] == (threaded_worker.THREAD_SUPERVISOR_WORKER_ID, "stopped")
 
 
-def test_portfolio_watchdog_distinguishes_running_budget_from_normal_idle_cadence():
+def test_portfolio_watchdog_covers_accounting_only_budget_and_normal_idle_cadence():
     now = datetime.now(timezone.utc)
     started = now - timedelta(seconds=500)
     settings = SimpleNamespace(shadow_cycle_interval_seconds=30.0)
@@ -110,7 +111,7 @@ def test_portfolio_watchdog_distinguishes_running_budget_from_normal_idle_cadenc
 
     store = FakeStore()
     store.heartbeat = SimpleNamespace(
-        observed_at=now - timedelta(seconds=301),
+        observed_at=now - timedelta(seconds=181),
         state="running",
     )
     reason, age, timeout = threaded_worker._portfolio_watchdog_reason(
@@ -120,8 +121,9 @@ def test_portfolio_watchdog_distinguishes_running_budget_from_normal_idle_cadenc
         now=now,
     )
     assert reason is not None
-    assert age == pytest.approx(301.0)
-    assert timeout == pytest.approx(300.0)
+    assert "accounting-only" in reason
+    assert age == pytest.approx(181.0)
+    assert timeout == pytest.approx(180.0)
 
     store.heartbeat = SimpleNamespace(
         observed_at=now - timedelta(seconds=350),
@@ -139,7 +141,62 @@ def test_portfolio_watchdog_distinguishes_running_budget_from_normal_idle_cadenc
 
 
 @pytest.mark.asyncio
-async def test_portfolio_child_keeps_full_certification_allocator_off_canonical_hot_path(monkeypatch):
+async def test_portfolio_child_contains_no_forward_certification_work(monkeypatch):
+    created: dict[str, object] = {}
+
+    class FakeUniversal:
+        def __init__(self, service):
+            created["universal"] = self
+
+    class FakeComposite:
+        def __init__(self, service, *, universal):
+            created["composite"] = self
+
+    class FakeAlpha:
+        def __init__(self, service, store):
+            created["alpha"] = self
+
+    class FakePromotion:
+        def __init__(self, service, composite, store):
+            created["promotion"] = self
+
+    class FakeCanonicalAllocator:
+        def __init__(self, service, promotion, alpha):
+            created["canonical_allocator"] = self
+
+    class FakePortfolio:
+        def __init__(self, service, allocator, store):
+            created["portfolio"] = self
+            created["portfolio_allocator"] = allocator
+
+    async def fake_canonical_loop(service, store, **kwargs):
+        created["loop_portfolio"] = kwargs["portfolio"]
+        return 1
+
+    monkeypatch.setattr(worker_children, "UniversalOpportunityService", FakeUniversal)
+    monkeypatch.setattr(worker_children, "CexDexCompositeEvidenceService", FakeComposite)
+    monkeypatch.setattr(worker_children, "ExpandedAlphaFactoryService", FakeAlpha)
+    monkeypatch.setattr(worker_children, "CexDexPaperPromotionService", FakePromotion)
+    monkeypatch.setattr(worker_children, "CanonicalPortfolioAllocatorService", FakeCanonicalAllocator)
+    monkeypatch.setattr(worker_children, "OperationallyResilientPaperPortfolioService", FakePortfolio)
+    monkeypatch.setattr(worker_children, "run_canonical_portfolio_loop", fake_canonical_loop)
+    monkeypatch.setattr(worker_children, "_stop_event", lambda: object())
+
+    service = SimpleNamespace(settings=SimpleNamespace())
+    store = object()
+    attempted = await worker_children.run_portfolio_child(service, store)  # type: ignore[arg-type]
+
+    assert attempted == 1
+    assert created["portfolio_allocator"] is created["canonical_allocator"]
+    assert created["loop_portfolio"] is created["portfolio"]
+    source = inspect.getsource(worker_children.run_portfolio_child)
+    assert "UnifiedPaperAllocatorService" not in source
+    assert "AllocationForwardCertificationService" not in source
+    assert "OperatingCertificationService" not in source
+
+
+@pytest.mark.asyncio
+async def test_certification_child_retains_full_mechanism_surface(monkeypatch):
     created: dict[str, object] = {}
 
     class FakeUniversal:
@@ -162,16 +219,6 @@ async def test_portfolio_child_keeps_full_certification_allocator_off_canonical_
         def __init__(self, service, promotion, alpha):
             created["allocator"] = self
 
-    class FakeCanonicalAllocator:
-        def __init__(self, service, promotion, alpha):
-            created["canonical_allocator"] = self
-
-    class FakePortfolio:
-        def __init__(self, service, allocator, store):
-            created["portfolio"] = self
-            created["portfolio_service"] = service
-            created["portfolio_allocator"] = allocator
-
     class FakeAllocationCertification:
         def __init__(self, service, allocator, store):
             created["allocation_certification"] = self
@@ -182,8 +229,7 @@ async def test_portfolio_child_keeps_full_certification_allocator_off_canonical_
             created["operating_certification"] = self
             created["version"] = version
 
-    async def fake_loop(service, store, **kwargs):
-        created["loop_portfolio"] = kwargs["portfolio"]
+    async def fake_certification_loop(service, store, **kwargs):
         created["loop_allocation_certification"] = kwargs["allocation_certification"]
         created["loop_operating_certification"] = kwargs["operating_certification"]
         return 1
@@ -193,23 +239,17 @@ async def test_portfolio_child_keeps_full_certification_allocator_off_canonical_
     monkeypatch.setattr(worker_children, "ExpandedAlphaFactoryService", FakeAlpha)
     monkeypatch.setattr(worker_children, "CexDexPaperPromotionService", FakePromotion)
     monkeypatch.setattr(worker_children, "UnifiedPaperAllocatorService", FakeAllocator)
-    monkeypatch.setattr(worker_children, "CanonicalPortfolioAllocatorService", FakeCanonicalAllocator)
-    monkeypatch.setattr(worker_children, "OperationallyResilientPaperPortfolioService", FakePortfolio)
     monkeypatch.setattr(worker_children, "AllocationForwardCertificationService", FakeAllocationCertification)
     monkeypatch.setattr(worker_children, "OperatingCertificationService", FakeOperatingCertification)
-    monkeypatch.setattr(worker_children, "run_portfolio_operating_loop", fake_loop)
+    monkeypatch.setattr(worker_children, "run_certification_loop", fake_certification_loop)
     monkeypatch.setattr(worker_children, "_stop_event", lambda: object())
 
     service = SimpleNamespace(settings=SimpleNamespace())
     store = object()
-    attempted = await worker_children.run_portfolio_child(service, store)  # type: ignore[arg-type]
+    attempted = await worker_children.run_certification_child(service, store)  # type: ignore[arg-type]
 
     assert attempted == 1
-    assert created["portfolio_service"] is service
-    assert created["portfolio_allocator"] is created["canonical_allocator"]
     assert created["certification_allocator"] is created["allocator"]
-    assert created["portfolio_allocator"] is not created["certification_allocator"]
-    assert created["loop_portfolio"] is created["portfolio"]
     assert created["loop_allocation_certification"] is created["allocation_certification"]
     assert created["loop_operating_certification"] is created["operating_certification"]
     assert created["version"] == worker_children.__version__
