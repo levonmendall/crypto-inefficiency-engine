@@ -94,8 +94,6 @@ class UniversalOpportunityService:
                 continue
             for direction in ("buy_asset", "sell_asset"):
                 results: list[tuple[float, DexRouteQuote | None, str | None]] = []
-                # Intentionally sequential to keep the periodic public API probe
-                # modest and avoid turning an evidence study into a burst load.
                 for target in tiers:
                     try:
                         quote = await self.velora.quote(
@@ -166,6 +164,7 @@ class UniversalOpportunityService:
             depeg_multiplier=self.settings.stablecoin_depeg_risk_multiplier,
             risk_floor_bps=self.settings.stablecoin_conversion_risk_floor_bps,
         )
+        conversion_model = StablecoinConversionModel(conversion_edges)
         candidates = [
             *detect_stablecoin_dislocations(
                 stable_rows,
@@ -180,8 +179,9 @@ class UniversalOpportunityService:
             *detect_route_quoted_cex_dex(
                 market_quotes,
                 dex_route_quotes,
+                conversion_model=conversion_model,
                 minimum_edge_bps=self.settings.dex_dislocation_min_edge_bps,
-                conversion_risk_floor_bps=self.settings.stablecoin_conversion_risk_floor_bps,
+                conversion_max_age_seconds=self.settings.max_quote_age_seconds,
             ),
             *detect_option_relative_value(
                 option_quotes,
@@ -324,11 +324,13 @@ class UniversalOpportunityService:
                 "probe_notional_usd": self.settings.dex_route_evidence_notional_usd,
                 "multi_horizon_shadow": True,
                 "multi_notional_frontier": True,
+                "quote_currency_conversion_required": True,
+                "conversion_path_fail_closed": True,
                 "capacity_claimed": False,
                 "requirements": [
                     "statistically sufficient quote-survival evidence",
+                    "conversion execution depth/capacity",
                     "cross-venue inventory/settlement model",
-                    "stablecoin conversion qualification",
                     "atomic hedge/recovery model",
                 ],
             },
