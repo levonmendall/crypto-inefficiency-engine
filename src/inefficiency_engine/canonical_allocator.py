@@ -12,42 +12,31 @@ class CanonicalPortfolioAllocatorService(UnifiedPaperAllocatorService):
     """Allocator view restricted to families the canonical ledger can settle.
 
     The canonical ledger currently supports spot directional-long alpha positions.
-    Core CEX and CEX↔DEX candidates remain fully researched and certified by the
-    general allocator, but evaluating those unsupported settlement families again
-    inside the liveness-critical portfolio cycle only adds provider I/O that can
-    never produce a position. This allocator consumes the latest executable scan
-    already persisted by the portfolio's point-in-time scan and evaluates alpha
-    only, preserving broad research without putting it on the accounting path.
+    Broad CEX/CEX↔DEX executability remains a research concern. Canonical allocation
+    consumes the latest fresh persisted market snapshot and only asks for current
+    L2 after an alpha candidate has already cleared statistical qualification.
     """
 
-    def _latest_executable_snapshot(self) -> tuple[ScanSnapshot | None, str | None]:
+    def _latest_market_snapshot(self) -> tuple[ScanSnapshot | None, str | None]:
         if self.alpha_factory is None:
             return None, "AlphaFactoryUnavailable"
         store = self.alpha_factory.store
-        executable_scan_ids = select(store.order_books.c.scan_id)
-        query = (
-            select(store.scans.c.scan_id)
-            .where(store.scans.c.scan_id.in_(executable_scan_ids))
-            .order_by(store.scans.c.completed_at.desc())
-            .limit(1)
-        )
+        query = select(store.scans.c.scan_id).order_by(store.scans.c.completed_at.desc()).limit(1)
         with store.engine.connect() as db:
             scan_id = db.execute(query).scalar_one_or_none()
         if scan_id is None:
-            return None, "PersistedExecutabilitySnapshotUnavailable"
+            return None, "PersistedMarketSnapshotUnavailable"
 
         snapshot = store.load_scan(scan_id)
         age = max(
             0.0,
             (datetime.now(timezone.utc) - snapshot.completed_at).total_seconds(),
         )
-        freshness_limit = max(
-            30.0,
-            float(self.settings.max_quote_age_seconds),
-            float(self.settings.max_order_book_age_seconds),
-        )
+        freshness_limit = max(30.0, float(self.settings.max_quote_age_seconds))
         if age > freshness_limit:
-            return None, "PersistedExecutabilitySnapshotStale"
+            return None, "PersistedMarketSnapshotStale"
+        if not snapshot.market_quotes:
+            return None, "PersistedMarketSnapshotEmpty"
         return snapshot, None
 
     async def _candidates_with_failures(
@@ -58,12 +47,12 @@ class CanonicalPortfolioAllocatorService(UnifiedPaperAllocatorService):
         if total_capital_usd <= 0:
             raise ValueError("total_capital_usd must be positive")
 
-        snapshot, snapshot_error = self._latest_executable_snapshot()
+        snapshot, snapshot_error = self._latest_market_snapshot()
         if snapshot is None:
             return [], [{
                 "family": "alpha",
-                "error_type": snapshot_error or "PersistedExecutabilitySnapshotUnavailable",
-                "reason": "canonical portfolio requires a fresh persisted executable market snapshot",
+                "error_type": snapshot_error or "PersistedMarketSnapshotUnavailable",
+                "reason": "canonical portfolio requires a fresh persisted public market snapshot",
             }]
 
         try:
