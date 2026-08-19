@@ -81,6 +81,7 @@ class UnifiedPaperAllocationPlan(BaseModel):
     candidate_count: int = Field(ge=0)
     allocations: list[UnifiedPaperAllocation] = Field(default_factory=list)
     skipped: list[dict[str, object]] = Field(default_factory=list)
+    family_failures: list[dict[str, object]] = Field(default_factory=list)
     portfolio_risk_budget: PortfolioRiskBudget | None = None
     authorizes_execution: bool = False
     live_execution_eligible: bool = False
@@ -161,16 +162,16 @@ class UnifiedPaperAllocatorService:
         self.alpha_factory = alpha_factory
         self.settings = core.settings
 
-    async def candidates(self, *, total_capital_usd: float) -> list[UnifiedPaperCandidate]:
-        if total_capital_usd <= 0:
-            raise ValueError("total_capital_usd must be positive")
+    async def _core_family_candidates(self, *, total_capital_usd: float):
         snapshot = await self.core.collect_live_executability()
-        rows = _core_candidates(snapshot.opportunities, snapshot.executability)
+        return snapshot, _core_candidates(snapshot.opportunities, snapshot.executability)
 
-        cex_dex_probe = await self.cex_dex.live_qualification(
+    async def _cex_dex_family_candidates(self, *, total_capital_usd: float) -> list[UnifiedPaperCandidate]:
+        rows: list[UnifiedPaperCandidate] = []
+        probe = await self.cex_dex.live_qualification(
             paper_inventory_usd_per_side=total_capital_usd / 2.0
         )
-        for item in cex_dex_probe.qualifications:
+        for item in probe.qualifications:
             if not item.paper_allocation_eligible:
                 continue
             capital = item.paper_capital_required_usd
@@ -202,49 +203,103 @@ class UnifiedPaperAllocatorService:
                 executable_eligible=False,
                 paper_only=True,
             ))
+        return rows
+
+    async def _alpha_family_candidates(self, *, snapshot, total_capital_usd: float) -> list[UnifiedPaperCandidate]:
+        if self.alpha_factory is None:
+            return []
+        rows: list[UnifiedPaperCandidate] = []
+        alpha_rows = await self.alpha_factory.promoted_candidates(
+            snapshot,
+            total_capital_usd=total_capital_usd,
+        )
+        for item in alpha_rows:
+            capital = item.capital_required_usd
+            deployment_return = item.expected_profit_usd / capital
+            exposure: ExposureKind = (
+                "directional_long" if item.direction == "long"
+                else "directional_short" if item.direction == "short"
+                else "market_neutral"
+            )
+            rows.append(UnifiedPaperCandidate(
+                candidate_id=item.candidate_id,
+                family="alpha",
+                strategy=item.strategy_id,
+                asset=item.asset,
+                venues=[item.venue],
+                capital_required_usd=capital,
+                notional_usd_per_leg=item.notional_usd,
+                expected_profit_usd_per_deployment=item.expected_profit_usd,
+                expected_return_on_reserved_capital=max(0.0, deployment_return),
+                modeled_holding_hours=item.horizon_hours,
+                source_return_metric="forward_ci_health_haircut_net_return",
+                source_return_value=item.expected_net_return,
+                exposure_kind=exposure,
+                source_observed_at=item.observed_at,
+                instrument_symbol=item.symbol,
+                instrument_market_kind=item.market_kind.value,
+                entry_reference_price=item.entry_reference_price,
+                modeled_roundtrip_cost_return=item.estimated_cost_return,
+                conflict_keys=[
+                    *item.conflict_keys,
+                    f"venue-symbol:{item.venue}:{item.symbol}",
+                ],
+                capacity_reference_usd=None,
+                capacity_claimed=False,
+                allocation_eligible=True,
+                executable_eligible=False,
+                paper_only=True,
+            ))
+        return rows
+
+    async def _candidates_with_failures(
+        self, *, total_capital_usd: float
+    ) -> tuple[list[UnifiedPaperCandidate], list[dict[str, object]]]:
+        if total_capital_usd <= 0:
+            raise ValueError("total_capital_usd must be positive")
+
+        rows: list[UnifiedPaperCandidate] = []
+        failures: list[dict[str, object]] = []
+        snapshot = None
+
+        try:
+            snapshot, core_rows = await self._core_family_candidates(total_capital_usd=total_capital_usd)
+            rows.extend(core_rows)
+        except Exception as exc:
+            failures.append({
+                "family": "core_cex",
+                "error_type": type(exc).__name__,
+                "reason": "core CEX candidate family failed closed",
+            })
+
+        try:
+            rows.extend(await self._cex_dex_family_candidates(total_capital_usd=total_capital_usd))
+        except Exception as exc:
+            failures.append({
+                "family": "cex_dex",
+                "error_type": type(exc).__name__,
+                "reason": "CEX↔DEX candidate family failed closed",
+            })
 
         if self.alpha_factory is not None:
-            alpha_rows = await self.alpha_factory.promoted_candidates(
-                snapshot,
-                total_capital_usd=total_capital_usd,
-            )
-            for item in alpha_rows:
-                capital = item.capital_required_usd
-                deployment_return = item.expected_profit_usd / capital
-                exposure: ExposureKind = (
-                    "directional_long" if item.direction == "long"
-                    else "directional_short" if item.direction == "short"
-                    else "market_neutral"
-                )
-                rows.append(UnifiedPaperCandidate(
-                    candidate_id=item.candidate_id,
-                    family="alpha",
-                    strategy=item.strategy_id,
-                    asset=item.asset,
-                    venues=[item.venue],
-                    capital_required_usd=capital,
-                    notional_usd_per_leg=item.notional_usd,
-                    expected_profit_usd_per_deployment=item.expected_profit_usd,
-                    expected_return_on_reserved_capital=max(0.0, deployment_return),
-                    modeled_holding_hours=item.horizon_hours,
-                    source_return_metric="forward_ci_health_haircut_net_return",
-                    source_return_value=item.expected_net_return,
-                    exposure_kind=exposure,
-                    source_observed_at=item.observed_at,
-                    instrument_symbol=item.symbol,
-                    instrument_market_kind=item.market_kind.value,
-                    entry_reference_price=item.entry_reference_price,
-                    modeled_roundtrip_cost_return=item.estimated_cost_return,
-                    conflict_keys=[
-                        *item.conflict_keys,
-                        f"venue-symbol:{item.venue}:{item.symbol}",
-                    ],
-                    capacity_reference_usd=None,
-                    capacity_claimed=False,
-                    allocation_eligible=True,
-                    executable_eligible=False,
-                    paper_only=True,
-                ))
+            if snapshot is None:
+                failures.append({
+                    "family": "alpha",
+                    "error_type": "UpstreamSnapshotUnavailable",
+                    "reason": "alpha candidate family requires a valid point-in-time executable market snapshot",
+                })
+            else:
+                try:
+                    rows.extend(await self._alpha_family_candidates(
+                        snapshot=snapshot,
+                        total_capital_usd=total_capital_usd,
+                    ))
+                except Exception as exc:
+                    failures.append({
+                        "family": "alpha",
+                        "error_type": type(exc).__name__,
+                        "reason": "alpha candidate family failed closed",
+                    })
 
         rows.sort(
             key=lambda item: (
@@ -254,6 +309,10 @@ class UnifiedPaperAllocatorService:
             ),
             reverse=True,
         )
+        return rows, failures
+
+    async def candidates(self, *, total_capital_usd: float) -> list[UnifiedPaperCandidate]:
+        rows, _ = await self._candidates_with_failures(total_capital_usd=total_capital_usd)
         return rows
 
     async def allocate(
@@ -272,7 +331,7 @@ class UnifiedPaperAllocatorService:
         if not 0 < venue_fraction <= 1 or not 0 < asset_fraction <= 1 or allocation_limit <= 0:
             raise ValueError("invalid allocation constraints")
 
-        candidates = await self.candidates(total_capital_usd=total_capital_usd)
+        candidates, family_failures = await self._candidates_with_failures(total_capital_usd=total_capital_usd)
         venue_cap = total_capital_usd * venue_fraction
         asset_cap = total_capital_usd * asset_fraction
         venue_used: dict[str, float] = defaultdict(float)
@@ -356,6 +415,7 @@ class UnifiedPaperAllocatorService:
             candidate_count=len(candidates),
             allocations=allocations,
             skipped=skipped,
+            family_failures=family_failures,
             portfolio_risk_budget=risk_overlay.snapshot(),
             authorizes_execution=False,
             live_execution_eligible=False,
