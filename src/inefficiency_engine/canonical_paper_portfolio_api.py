@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
+from sqlalchemy import select
 
 from inefficiency_engine.canonical_paper_portfolio import (
     CANONICAL_INITIAL_CAPITAL_USD,
     CANONICAL_PORTFOLIO_ID,
     CanonicalPaperPortfolioService,
+    CanonicalPortfolioEvent,
 )
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
@@ -83,7 +85,16 @@ def build_canonical_paper_portfolio_router(
     def canonical_portfolio_skips(limit: int = 100):
         engine = require_portfolio()
         bounded = max(1, min(1000, int(limit)))
-        rows = [event for event in reversed(engine.ledger.events_all()) if event.event_type == "skip"][:bounded]
+        table = engine.ledger.events
+        with engine.store.engine.connect() as db:
+            payloads = list(db.execute(
+                select(table.c.payload_json)
+                .where(table.c.portfolio_id == CANONICAL_PORTFOLIO_ID)
+                .where(table.c.event_type == "skip")
+                .order_by(table.c.id.desc())
+                .limit(bounded)
+            ).scalars())
+        rows = [CanonicalPortfolioEvent.model_validate_json(payload) for payload in payloads]
         return {
             "portfolio_id": CANONICAL_PORTFOLIO_ID,
             "paper_only": True,
