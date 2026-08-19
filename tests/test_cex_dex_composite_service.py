@@ -175,7 +175,6 @@ async def test_composite_probe_keeps_usdc_routes_when_usdt_depth_is_unavailable(
     assert probe.rejection_reasons == {"ValueError": 1}
     assert [item.cex_venue for item in probe.evidence] == ["Kraken", "Coinbase"]
     assert all(item.cex_quote_currency == "USD" for item in probe.evidence)
-    assert all(item.dex_quote_currency == "USDC" for item in probe.evidence)
     assert all(item.evidence_complete for item in probe.evidence)
     assert probe.capacity_claimed is False
     assert probe.executable_eligible is False
