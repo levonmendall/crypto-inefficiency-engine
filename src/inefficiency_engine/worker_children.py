@@ -26,6 +26,9 @@ from inefficiency_engine.universal_service import UniversalOpportunityService
 from inefficiency_engine.worker import WorkerRunStats, run_shadow_worker
 
 
+RESEARCH_WORKER_ID = "shadow-research-auxiliary"
+
+
 def _stop_event() -> asyncio.Event:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -38,7 +41,14 @@ def _stop_event() -> asyncio.Event:
 
 
 async def run_research_child(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
-    """Run broad shadow research on its own event loop."""
+    """Run all non-canonical research and certification on one auxiliary event loop.
+
+    This deliberately caps the production worker at two heavy runtime domains:
+    canonical accounting and an auxiliary research/certification domain. Mechanism
+    certification remains complete, but it no longer needs a third simultaneous
+    OpportunityService/provider graph. A synchronous stall here can degrade research
+    without taking down canonical accounting.
+    """
 
     stop = _stop_event()
     universal = UniversalOpportunityService(service)
@@ -53,9 +63,39 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         evidence_store=store,
     )
     alpha_factory = ExpandedAlphaFactoryService(service, store)
+
+    # Full forward/mechanism certification shares the non-authoritative auxiliary
+    # service graph instead of constructing a third provider/database graph.
+    promotion = CexDexPaperPromotionService(service, composite_service, store)
+    unified = UnifiedPaperAllocatorService(service, promotion, alpha_factory)
+    allocation_certification = AllocationForwardCertificationService(service, unified, store)
+    operating_certification = OperatingCertificationService(
+        service,
+        store,
+        alpha_factory,
+        allocation_certification,
+        version=__version__,
+    )
+
+    async def certification_cycle() -> object:
+        await run_certification_loop(
+            service,
+            store,
+            allocation_certification=allocation_certification,
+            operating_certification=operating_certification,
+            stop_event=stop,
+            max_cycles=1,
+        )
+        return allocation_certification.ledger.summary()
+
+    certification_every = max(
+        1,
+        int(getattr(service.settings, "alpha_evidence_every_cycles", 10)),
+    )
     return await run_shadow_worker(
         service,
         store,
+        worker_id=RESEARCH_WORKER_ID,
         stop_event=stop,
         route_shadow_runner=universal.run_dex_route_shadow_cycle,
         tier_shadow_runner=tier_shadow.run_cycle,
@@ -66,20 +106,15 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         stablecoin_shadow_every_cycles=10,
         alpha_runner=alpha_factory.run_evidence_cycle,
         alpha_every_cycles=service.settings.alpha_evidence_every_cycles,
+        allocation_certification_runner=certification_cycle,
+        allocation_certification_every_cycles=certification_every,
         frontier_runner=universal.probe_dex_route_size_frontiers,
         frontier_every_cycles=service.settings.dex_route_frontier_every_cycles,
     )
 
 
 async def run_portfolio_child(service: OpportunityService, store: EvidenceStore) -> int:
-    """Run only canonical accounting on the isolated portfolio event loop.
-
-    The canonical thread is now certification-free. It scans the market, evaluates
-    only settlement-compatible alpha allocations, advances the persistent account,
-    and publishes the canonical heartbeat. Full forward/mechanism certification is
-    delegated to a separate thread so certification/provider stalls cannot make the
-    Render worker fail.
-    """
+    """Run only canonical accounting on the isolated portfolio event loop."""
 
     stop = _stop_event()
     universal = UniversalOpportunityService(service)
@@ -105,7 +140,7 @@ async def run_portfolio_child(service: OpportunityService, store: EvidenceStore)
 
 
 async def run_certification_child(service: OpportunityService, store: EvidenceStore) -> int:
-    """Run the complete evidence-driven certification surface independently."""
+    """Retained for explicit/manual certification runs; not used by `cie worker`."""
 
     stop = _stop_event()
     universal = UniversalOpportunityService(service)
