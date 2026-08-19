@@ -18,8 +18,6 @@ PORTFOLIO_STAGE_COMMANDS = {
 
 
 def _settings_and_store():
-    """Load only configuration/persistence for lightweight supervisor commands."""
-
     from inefficiency_engine.config import Settings
     from inefficiency_engine.evidence import build_evidence_store
 
@@ -55,18 +53,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # `cie worker` is the Render parent process. Keep it deliberately lean: it
-    # only needs configuration, the durable store and the supervisor. Before
-    # v3.5.7 the parent eagerly imported/constructed the full research, portfolio
-    # and stage stacks before spawning children, multiplying memory on a 512 MB
-    # Starter instance.
+    # v3.5.8 deliberately returns Render to one Python application process.
+    # Provider/order-book calls are now independently time-bounded at the adapter
+    # boundary, so the multi-process supervisor introduced to survive unbounded
+    # providers adds more memory pressure than protection on a 512 MB worker.
+    # `run_forever` keeps research and canonical portfolio as independent asyncio
+    # tasks while sharing one service/import graph and one process memory image.
     if args.command == "worker":
-        _, store = _settings_and_store()
+        service, store = _service()
         if store is None:
             raise RuntimeError("worker requires CIE_DATABASE_URL/DATABASE_URL or CIE_EVIDENCE_DB_PATH")
-        from inefficiency_engine.worker_supervisor import supervise_worker_processes
+        from inefficiency_engine.operating_worker import run_forever
 
-        asyncio.run(supervise_worker_processes(store))
+        asyncio.run(run_forever(service, store))
         return
 
     service, store = _service()
