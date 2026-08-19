@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 
 from inefficiency_engine.canonical_paper_portfolio import (
     CanonicalPaperPortfolioCycle,
     CanonicalPaperPortfolioService,
     CanonicalPortfolioEvent,
 )
+from inefficiency_engine.evidence import ScanSnapshot
 from inefficiency_engine.portfolio_integrity import PortfolioIntegrityLedger, PortfolioIntegritySnapshot, ValuationStatus
 
 
@@ -15,10 +17,11 @@ class OperationallyResilientPaperPortfolioService(CanonicalPaperPortfolioService
     """Canonical portfolio cycle with failure containment and valuation provenance.
 
     Canonical accounting only requires fresh point-in-time market quotes to value
-    and settle existing positions. It deliberately avoids the broad all-opportunity
-    L2 executability fanout: paper promotion fetches bounded L2 only after a
-    candidate has already cleared statistical qualification. This keeps accounting
-    live without weakening any deployment gate.
+    and settle existing positions. It deliberately avoids both broad opportunity
+    analysis and all-opportunity L2 executability fanout: research owns those heavy
+    transforms, while paper promotion fetches bounded L2 only after a candidate has
+    already cleared statistical qualification. This keeps accounting live without
+    weakening any deployment gate.
     """
 
     def __init__(self, core, allocator, store):
@@ -45,16 +48,53 @@ class OperationallyResilientPaperPortfolioService(CanonicalPaperPortfolioService
                 latest.pop(event.position_id, None)
         return latest
 
+    async def _collect_canonical_market_snapshot(self) -> ScanSnapshot:
+        """Persist the public quote/funding surface without synchronous opportunity analysis.
+
+        `OpportunityService.collect_live_evidence()` also constructs the global
+        opportunity graph. With broad exchange surfaces that CPU-bound transform can
+        consume the canonical 120-second stage budget even though provider I/O itself
+        is independently bounded. Canonical valuation and alpha history require the
+        raw quotes, not a completed global opportunity graph, so persist that surface
+        directly and leave full analysis to the auxiliary research worker.
+        """
+
+        started_at = datetime.now(timezone.utc)
+        funding_quotes, market_quotes, providers = await self.core.adapter_registry.collect_inputs()
+        completed_at = datetime.now(timezone.utc)
+        if not market_quotes:
+            raise RuntimeError("canonical public market surface returned no market quotes")
+
+        analysis_config = asdict(self.core.settings)
+        scan_id = self.store.record_scan(
+            funding_quotes=funding_quotes,
+            market_quotes=market_quotes,
+            opportunities=[],
+            providers=providers,
+            started_at=started_at,
+            completed_at=completed_at,
+            analysis_config=analysis_config,
+        )
+        return ScanSnapshot(
+            scan_id=scan_id,
+            started_at=started_at,
+            completed_at=completed_at,
+            providers=providers,
+            funding_quotes=funding_quotes,
+            market_quotes=market_quotes,
+            opportunities=[],
+            analysis_config=analysis_config,
+        )
+
     async def run_cycle(self) -> CanonicalPaperPortfolioCycle:
         self.ledger.ensure_genesis()
         previous_integrity = self.integrity.latest()
 
-        # The production failure presented as advancing fallback account timestamps
-        # while market evidence stayed frozen. The broad executability scan fans L2
-        # requests across every discovered opportunity and belongs to research, not
-        # liveness-critical accounting. Persist the complete public quote surface
-        # first; candidate-level L2 remains a mandatory, bounded promotion gate.
-        snapshot = await self.core.collect_live_evidence()
+        # Production showed advancing fallback account timestamps while market
+        # evidence stayed frozen. Canonical collection must therefore stop before
+        # global opportunity discovery as well as before L2 fanout. Persist the raw
+        # bounded provider surface first; candidate-level L2 remains mandatory later.
+        snapshot = await self._collect_canonical_market_snapshot()
         quote_index = self._quote_index(snapshot)
         state = self.ledger.current_state(observed_at=snapshot.completed_at)
         prior_evidence_times = self._latest_position_evidence_times()
@@ -102,6 +142,46 @@ class OperationallyResilientPaperPortfolioService(CanonicalPaperPortfolioService
         open_keys = {self._position_key(position) for position in after_close.positions}
         allocation_error_type: str | None = None
         family_failures: list[dict[str, object]] = []
+
+        # Checkpoint truthful market provenance before allocation. If a downstream
+        # allocator/provider call later consumes the outer stage deadline, the
+        # fallback snapshot can preserve the fresh market timestamp instead of
+        # making a successful public-data collection look frozen for hours.
+        if after_close.open_position_count == 0:
+            checkpoint_valuation: ValuationStatus = "cash_only"
+            checkpoint_market_evidence = snapshot.completed_at
+        elif stale_positions == 0:
+            checkpoint_valuation = "fresh"
+            checkpoint_market_evidence = (
+                min(fresh_position_evidence.values())
+                if fresh_position_evidence else snapshot.completed_at
+            )
+        elif stale_positions < after_close.open_position_count:
+            checkpoint_valuation = "partial"
+            checkpoint_market_evidence = (
+                previous_integrity.market_evidence_at
+                if previous_integrity is not None else None
+            )
+        else:
+            checkpoint_valuation = "stale"
+            checkpoint_market_evidence = (
+                previous_integrity.market_evidence_at
+                if previous_integrity is not None else None
+            )
+
+        checkpoint = PortfolioIntegritySnapshot(
+            observed_at=snapshot.completed_at,
+            account_snapshot_at=after_close.observed_at,
+            market_evidence_at=checkpoint_market_evidence,
+            valuation_status=checkpoint_valuation,
+            cycle_status="accounting_only",
+            fallback_snapshot=False,
+            stale_position_count=stale_positions,
+            settlement_evidence_blocked_count=settlement_blocked,
+            open_position_count=after_close.open_position_count,
+            market_snapshot_id=snapshot.scan_id,
+        )
+        self.integrity.record(checkpoint)
 
         # Preserve marks and account history, but never deploy new capital if the
         # current portfolio itself is not decision-grade.
