@@ -109,6 +109,29 @@ class Settings:
     allocator_max_venue_fraction: float = 0.50
     allocator_max_asset_fraction: float = 0.50
     allocator_max_allocations: int = 10
+
+    # V2 Universal Alpha Factory. Discovery may be broad; promotion remains
+    # deliberately hard and forward-only so research cannot create authority.
+    alpha_history_hours: float = 72.0
+    alpha_min_history_points: int = 12
+    alpha_momentum_lookback_hours: float = 24.0
+    alpha_momentum_horizon_hours: float = 6.0
+    alpha_momentum_min_abs_return: float = 0.01
+    alpha_forecast_shrinkage: float = 0.25
+    alpha_research_cost_floor_bps: float = 25.0
+    alpha_execution_risk_floor_bps: float = 5.0
+    alpha_research_capital_usd: float = 100000.0
+    alpha_candidate_capital_fraction: float = 0.10
+    alpha_min_notional_usd: float = 1000.0
+    alpha_min_forward_samples: int = 30
+    alpha_min_forward_mean_return: float = 0.0005
+    alpha_multiple_testing_penalty_return: float = 0.00025
+    alpha_min_hit_rate_lower_bound: float = 0.50
+    alpha_min_regimes: int = 2
+    alpha_min_regime_mean_return: float = 0.0
+    alpha_min_current_net_return: float = 0.0005
+    alpha_evidence_every_cycles: int = 10
+
     evidence_db_path: str | None = None
 
     @classmethod
@@ -206,5 +229,24 @@ class Settings:
             allocator_max_venue_fraction=_float("CIE_ALLOCATOR_MAX_VENUE_FRACTION", 0.50),
             allocator_max_asset_fraction=_float("CIE_ALLOCATOR_MAX_ASSET_FRACTION", 0.50),
             allocator_max_allocations=_int("CIE_ALLOCATOR_MAX_ALLOCATIONS", 10),
+            alpha_history_hours=_float("CIE_ALPHA_HISTORY_HOURS", 72.0),
+            alpha_min_history_points=max(3, _int("CIE_ALPHA_MIN_HISTORY_POINTS", 12)),
+            alpha_momentum_lookback_hours=_float("CIE_ALPHA_MOMENTUM_LOOKBACK_HOURS", 24.0),
+            alpha_momentum_horizon_hours=_float("CIE_ALPHA_MOMENTUM_HORIZON_HOURS", 6.0),
+            alpha_momentum_min_abs_return=_float("CIE_ALPHA_MOMENTUM_MIN_ABS_RETURN", 0.01),
+            alpha_forecast_shrinkage=_float("CIE_ALPHA_FORECAST_SHRINKAGE", 0.25),
+            alpha_research_cost_floor_bps=_float("CIE_ALPHA_RESEARCH_COST_FLOOR_BPS", 25.0),
+            alpha_execution_risk_floor_bps=_float("CIE_ALPHA_EXECUTION_RISK_FLOOR_BPS", 5.0),
+            alpha_research_capital_usd=_float("CIE_ALPHA_RESEARCH_CAPITAL_USD", 100000.0),
+            alpha_candidate_capital_fraction=_float("CIE_ALPHA_CANDIDATE_CAPITAL_FRACTION", 0.10),
+            alpha_min_notional_usd=_float("CIE_ALPHA_MIN_NOTIONAL_USD", 1000.0),
+            alpha_min_forward_samples=max(1, _int("CIE_ALPHA_MIN_FORWARD_SAMPLES", 30)),
+            alpha_min_forward_mean_return=_float("CIE_ALPHA_MIN_FORWARD_MEAN_RETURN", 0.0005),
+            alpha_multiple_testing_penalty_return=_float("CIE_ALPHA_MULTIPLE_TESTING_PENALTY_RETURN", 0.00025),
+            alpha_min_hit_rate_lower_bound=_float("CIE_ALPHA_MIN_HIT_RATE_LOWER_BOUND", 0.50),
+            alpha_min_regimes=max(1, _int("CIE_ALPHA_MIN_REGIMES", 2)),
+            alpha_min_regime_mean_return=_float("CIE_ALPHA_MIN_REGIME_MEAN_RETURN", 0.0),
+            alpha_min_current_net_return=_float("CIE_ALPHA_MIN_CURRENT_NET_RETURN", 0.0005),
+            alpha_evidence_every_cycles=max(1, _int("CIE_ALPHA_EVIDENCE_EVERY_CYCLES", 10)),
             evidence_db_path=os.getenv("CIE_EVIDENCE_DB_PATH") or None,
         )
