@@ -140,7 +140,7 @@ class UniversalCandidate(BaseModel):
     family: UniversalFamily
     asset: str
     gross_edge_bps: float
-    modeled_cost_bps: float = Field(ge=0)
+    modeled_cost_bps: float = Field(default=0.0, ge=0)
     risk_haircut_bps: float = Field(ge=0)
     net_edge_bps: float
     capacity_usd: float | None = Field(default=None, ge=0)
