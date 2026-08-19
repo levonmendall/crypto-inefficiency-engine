@@ -25,6 +25,9 @@ from inefficiency_engine.worker import WorkerRunStats, run_shadow_worker
 
 
 PORTFOLIO_WORKER_ID = "canonical-portfolio-operating-loop"
+PORTFOLIO_STAGE_TIMEOUT_SECONDS = 120.0
+ALLOCATION_CERTIFICATION_TIMEOUT_SECONDS = 60.0
+OPERATING_CERTIFICATION_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -42,24 +45,33 @@ async def run_operating_bundle_once(
     portfolio: OperationallyResilientPaperPortfolioService,
     allocation_certification: AllocationForwardCertificationService,
     operating_certification: OperatingCertificationService,
+    portfolio_timeout_seconds: float = PORTFOLIO_STAGE_TIMEOUT_SECONDS,
+    allocation_certification_timeout_seconds: float = ALLOCATION_CERTIFICATION_TIMEOUT_SECONDS,
+    operating_certification_timeout_seconds: float = OPERATING_CERTIFICATION_TIMEOUT_SECONDS,
 ) -> OperatingBundleResult:
-    """Run operating subsystems without letting one failure freeze the account."""
+    """Advance accounting first and contain slow/failing certification stages.
+
+    The canonical account is the liveness-critical state boundary. Research and
+    certification are useful only after accounting has had a bounded opportunity
+    to advance. Every external-data-heavy stage therefore has an explicit
+    deadline so a slow provider cannot freeze the portfolio heartbeat forever.
+    """
 
     current = portfolio.ledger.current_state()
-    capital_usd = max(1.0, current.nav_usd)
     errors: dict[str, str] = {}
     allocation_cycle: object | None = None
     portfolio_cycle: object | None = None
     operating_cycle: object | None = None
     fallback_snapshot_recorded = False
 
+    # Accounting comes first. Before this repair allocation certification ran
+    # first, so one slow certification/provider call could prevent the account
+    # snapshot from advancing at all.
     try:
-        allocation_cycle = await allocation_certification.run_cycle(total_capital_usd=capital_usd)
-    except Exception as exc:
-        errors["allocation_certification_error_type"] = type(exc).__name__
-
-    try:
-        portfolio_cycle = await portfolio.run_cycle()
+        portfolio_cycle = await asyncio.wait_for(
+            portfolio.run_cycle(),
+            timeout=max(1.0, float(portfolio_timeout_seconds)),
+        )
         integrity = portfolio.integrity.latest()
         if integrity is not None and integrity.cycle_status == "degraded":
             if integrity.cycle_error_type:
@@ -105,8 +117,21 @@ async def run_operating_bundle_once(
     latest = portfolio.ledger.latest_snapshot()
     nav_usd = max(1.0, latest.nav_usd if latest is not None else current.nav_usd)
 
+    # Forward allocation certification is intentionally downstream of the
+    # canonical account and may degrade without blocking the next account state.
     try:
-        operating_cycle = await operating_certification.run_cycle(total_capital_usd=nav_usd)
+        allocation_cycle = await asyncio.wait_for(
+            allocation_certification.run_cycle(total_capital_usd=nav_usd),
+            timeout=max(1.0, float(allocation_certification_timeout_seconds)),
+        )
+    except Exception as exc:
+        errors["allocation_certification_error_type"] = type(exc).__name__
+
+    try:
+        operating_cycle = await asyncio.wait_for(
+            operating_certification.run_cycle(total_capital_usd=nav_usd),
+            timeout=max(1.0, float(operating_certification_timeout_seconds)),
+        )
     except Exception as exc:
         errors["operating_certification_error_type"] = type(exc).__name__
 
