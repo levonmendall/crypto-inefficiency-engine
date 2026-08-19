@@ -5,12 +5,15 @@ import signal
 
 from inefficiency_engine import __version__
 from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
+from inefficiency_engine.bounded_alpha_factory import (
+    BoundedExpandedAlphaFactoryService as ExpandedAlphaFactoryService,
+)
+from inefficiency_engine.canonical_allocator import CanonicalPortfolioAllocatorService
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeShadowService
 from inefficiency_engine.dex_tier_shadow import DexTierShadowService
 from inefficiency_engine.evidence import EvidenceStore
-from inefficiency_engine.expanded_alpha_factory import ExpandedAlphaFactoryService
 from inefficiency_engine.operating_certification import OperatingCertificationService
 from inefficiency_engine.operating_worker import run_portfolio_operating_loop
 from inefficiency_engine.resilient_paper_portfolio import OperationallyResilientPaperPortfolioService
@@ -68,15 +71,15 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
 
 
 async def run_portfolio_child(service: OpportunityService, store: EvidenceStore) -> int:
-    """Run canonical accounting directly inside the isolated portfolio process.
+    """Run canonical accounting on the isolated portfolio event loop.
 
-    Provider and order-book fanout is now bounded at the individual request level,
-    so the additional disposable Python stage processes introduced in v3.5.5 are
-    no longer necessary for normal liveness. Keeping the portfolio and research
-    workers in separate OS processes preserves the important failure boundary,
-    while direct bounded async stages materially reduce peak memory on the Render
-    Starter worker. The operating loop still has explicit portfolio/certification
-    deadlines and the parent supervisor retains its process watchdog.
+    Broad research/certification keeps the full unified allocator. The canonical
+    accounting hot path uses a settlement-compatible allocator that consumes the
+    executable scan already persisted by the portfolio cycle and considers only
+    alpha positions the canonical ledger can actually settle. This removes CEX↔DEX
+    and multi-leg structural provider work from a path where those families could
+    only be skipped anyway. Alpha L2 promotion consumes the scan's point-in-time
+    books first and any fallback provider request is bounded.
     """
 
     stop = _stop_event()
@@ -84,9 +87,22 @@ async def run_portfolio_child(service: OpportunityService, store: EvidenceStore)
     composite_service = CexDexCompositeEvidenceService(service, universal=universal)
     alpha_factory = ExpandedAlphaFactoryService(service, store)
     promotion = CexDexPaperPromotionService(service, composite_service, store)
+
+    # Full mechanism surface remains available to forward certification.
     unified = UnifiedPaperAllocatorService(service, promotion, alpha_factory)
-    portfolio = OperationallyResilientPaperPortfolioService(service, unified, store)
     allocation_certification = AllocationForwardCertificationService(service, unified, store)
+
+    # Canonical accounting only evaluates families it can settle today.
+    canonical_allocator = CanonicalPortfolioAllocatorService(
+        service,
+        promotion,
+        alpha_factory,
+    )
+    portfolio = OperationallyResilientPaperPortfolioService(
+        service,
+        canonical_allocator,
+        store,
+    )
     operating_certification = OperatingCertificationService(
         service,
         store,
