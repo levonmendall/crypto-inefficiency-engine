@@ -1,65 +1,66 @@
 # Crypto Inefficiency Engine
 
-A **paper-first, fail-closed** engine for discovering structural crypto-market inefficiencies and testing whether apparent edge survives fees, visible L2 depth, slippage, capital usage, hedge risk, latency, and time. The engine does not place live orders and does not require exchange trading keys.
+A **paper-first, fail-closed** engine for discovering structural crypto-market inefficiencies and testing whether apparent edge survives fees, visible L2 depth, slippage, capital usage, hedge risk, latency, and time. It does not place live orders or require exchange trading keys.
 
-## v0.9 — Universal Opportunity Graph foundation
+## v0.9 — Universal Opportunity Graph
 
-v0.9 begins the transition from a funding/basis engine into a strategy-agnostic crypto inefficiency platform without weakening the v0.8 evidence boundary.
+v0.9 changes the discovery architecture from two hard-wired strategies into a common crypto market graph plus detector registry.
 
-### Canonical market graph
+### v0.9.0 — graph foundation
 
-Normalized observations are converted into a graph of:
+- stable canonical asset, venue, and instrument identities;
+- provider symbols retained as aliases rather than primary identity;
+- asset/instrument/venue graph with economic-equivalence edges;
+- common detector registry and graph lineage on every opportunity;
+- strategy-neutral ranking of already-qualified opportunities;
+- ranking remains non-authoritative: it does not reserve capital or authorize execution.
 
-**canonical assets ↔ venue instruments ↔ venues**
+### v0.9.1 — market breadth
 
-Provider symbols are aliases, not identity. Current spot and perpetual instruments receive stable canonical IDs derived from venue, canonical asset, market kind, and contract identity. Instruments representing the same economic asset are linked by explicit economic-equivalence edges so future detectors can search across fragmented markets rather than hard-code venue pairs.
+Public market coverage now includes:
 
-`GET /v1/graph/live` exposes the current graph, provider status, and graph summary.
+- **Coinbase** USD spot;
+- **Kraken** USD spot via public PreTrade depth;
+- **Hyperliquid** perpetual/funding data;
+- **Bybit** USDT spot, linear perpetuals, and nearest dated linear futures.
 
-### Detector registry
+The detector registry now contains four strategy families:
 
-Funding dispersion and spot/perp basis now run through a common detector registry. Their existing economics are preserved, but every discovered opportunity is enriched with detector provenance, graph version, canonical asset ID, and canonical instrument IDs.
+1. funding dispersion;
+2. spot/perpetual basis;
+3. dated futures basis;
+4. CEX↔CEX spot dislocation.
 
-`GET /v1/detectors` exposes the installed discovery modules and their required normalized inputs. Future futures, CEX/CEX, stablecoin, DEX, cross-chain, solver, liquidation, and options modules can plug into the same downstream Opportunity contract.
+Dated futures receive contract-specific canonical IDs, so two expiries on the same venue cannot collide. Spot/perp, futures-basis, and CEX-spot comparisons require compatible quote currencies when both sides declare them; stablecoin/FX conversion risk is not silently assumed away.
 
-### Strategy-neutral opportunity ranking
+CEX↔CEX spot dislocation is intentionally **fail-closed at executable qualification** when the expensive spot leg requires a short and no borrow-cost assumption is configured. Discovery can show the raw gap without pretending inventory or borrow is free.
 
-`GET /v1/opportunities/ranked/live` ranks only opportunities that already pass the existing L2/economic qualification pipeline. The current comparator is **capital-adjusted net annualized return**, with capacity kept explicit.
-
-This is not a capital allocator and has no execution authority. It is the common comparison surface the future allocator will consume once multiple independent strategy families exist.
+Provider degradation is now opportunity-scoped in shadow attribution. A Bybit failure invalidates Bybit-dependent opportunities but does not automatically turn an unrelated Coinbase/Hyperliquid opportunity into a provider failure.
 
 ## v0.8 — Empirical Fill / Latency Modeling — complete
 
 v0.8 turns the shadow runtime into a statistically gated execution-realism model while preserving conservative fixed fallbacks whenever evidence is insufficient.
 
-Each qualified opportunity/capital cohort is followed at 1s, 5s, 15s, 30s, and 60s. Shadow evidence records provider/data-path timing, visible depth, spread/slippage change, adverse selection, edge decay, capacity deterioration, reconstructed fill fractions, unhedged exposure, and hedge-recovery loss proxies.
+Each qualified opportunity/capital cohort is followed at 1s, 5s, 15s, 30s, and 60s. Evidence records target quantity, public L2 request timing, visible depth, spread/slippage change, adverse selection, edge decay, capacity deterioration, reconstructed fill fractions, unhedged exposure, and hedge-recovery loss proxies.
 
-Coinbase and Hyperliquid L2 requests measure their own public-data round-trip latency. Because the engine sends **no orders**, exchange order acknowledgement and second-leg hedge timing remain explicit assumptions and `execution_latency_empirical=false` remains visible.
+The empirical resolver uses hierarchical cohorts and Wilson confidence intervals. Empirical risk can influence qualification only after raw-sample, independent-event, tail-sample, and confidence-width gates pass. Otherwise the fixed model remains active automatically.
 
-Public L2 supports taker visible-depth reconstruction but cannot prove maker queue position. Accordingly `queue_position_supported=false` and maker-fill probability is not invented.
+Public L2 supports taker visible-depth reconstruction, not maker queue position. Accordingly `queue_position_supported=false` and no maker-fill probability is invented.
 
-For each evaluated capital size, the empirical resolver tries:
+## Current pipeline
 
-**strategy + venue pair + asset + capital → strategy + venue pair + asset → strategy + venue pair → strategy → global**
-
-A cohort can affect qualification only when every required interpolation endpoint passes raw observation, independent/effective market-event, tail-risk sample, and confidence-width gates. Capital tiers from the same market event do not inflate effective sample size.
-
-## Evidence pipeline
-
-**Normalize public data → build canonical market graph → run registered opportunity detectors → qualify economics → prove L2 executability → rank qualified opportunities on a common capital-adjusted basis → observe 1/5/15/30/60s → measure public-data latency → reconstruct taker fill/partial-fill states → statistically calibrate execution risk or fall back conservatively.**
+**Public venue data → canonical opportunity graph → detector registry → conservative screening → L2 executable economics → capital-adjusted ranking → multi-horizon shadow attribution → statistically gated execution-risk learning → durable evidence.**
 
 ## Safety boundary
 
 - `paper_only=true` is enforced.
-- No private keys, trading secrets, custody, deposits, withdrawals, or live order placement.
+- No private keys, custody, deposits, withdrawals, or live order placement.
 - Stale/incomplete evidence fails closed.
 - Unknown venue fees fail closed during executable qualification.
 - Short spot fails closed without an explicit borrow-cost assumption.
 - Reconstructed fills are visible-L2 taker reconstructions, not exchange-confirmed fills.
-- Maker queue probability is not estimated from data that cannot identify queue position.
-- Empirical calibration cannot influence qualification until all configured evidence/confidence gates pass.
-- The v0.9 ranking layer has no allocation or execution authority.
-- Tiny-capital live execution remains blocked pending convincing evidence plus separate authorization and controls.
+- Ranking does not allocate or authorize capital.
+- Tiny-capital live execution remains separately blocked pending convincing evidence and explicit authorization.
 
 ## Quick start
 
@@ -72,32 +73,16 @@ export CIE_EVIDENCE_DB_PATH=data/cie-evidence.sqlite3
 uvicorn inefficiency_engine.api:app --reload
 ```
 
-Useful commands:
-
-```bash
-cie demo
-cie live
-cie executability
-cie shadow-once
-cie shadow-loop
-cie worker
-cie worker-health
-```
-
-Endpoints:
+Useful endpoints include:
 
 - `GET /health`
+- `GET /v1/opportunities/live`
+- `GET /v1/executability/live`
 - `GET /v1/detectors`
 - `GET /v1/graph/live`
-- `GET /v1/opportunities/demo`
-- `GET /v1/opportunities/live`
 - `GET /v1/opportunities/ranked/live`
-- `GET /v1/executability/live`
-- `GET /v1/evidence/{scan_id}/replay`
+- `GET /v1/latency/model`
 - `POST /v1/shadow/cycle`
 - `GET /v1/shadow/summary`
-- `GET /v1/latency/model`
-- `GET /v1/worker/health`
-- `GET /v1/evidence/counts`
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/ROADMAP.md`](docs/ROADMAP.md), and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).

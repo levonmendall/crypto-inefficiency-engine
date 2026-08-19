@@ -7,6 +7,7 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from inefficiency_engine.instrument_identity import normalized_contract_key
 from inefficiency_engine.models import FundingQuote, MarketKind, MarketQuote
 
 
@@ -34,6 +35,8 @@ class CanonicalInstrument(BaseModel):
     asset: str
     market_kind: MarketKind
     contract_key: str
+    quote_currency: str | None = None
+    expires_at: datetime | None = None
     provider_symbols: dict[str, str] = Field(default_factory=dict)
     sources: list[str] = Field(default_factory=list)
     observed_at: datetime | None = None
@@ -53,7 +56,7 @@ class MarketGraphEdge(BaseModel):
 
 
 class MarketGraphSnapshot(BaseModel):
-    graph_version: str = "v0.9.0"
+    graph_version: str = "v0.9.1"
     observed_at: datetime
     assets: list[CanonicalAsset] = Field(default_factory=list)
     venues: list[CanonicalVenue] = Field(default_factory=list)
@@ -62,8 +65,14 @@ class MarketGraphSnapshot(BaseModel):
     price_observation_count: int = 0
     funding_observation_count: int = 0
 
-    def instrument_id_for(self, venue: str, asset: str, market_kind: MarketKind) -> str | None:
-        expected = canonical_instrument_id(venue, asset, market_kind)
+    def instrument_id_for(
+        self,
+        venue: str,
+        asset: str,
+        market_kind: MarketKind,
+        contract_key: str | None = None,
+    ) -> str | None:
+        expected = canonical_instrument_id(venue, asset, market_kind, contract_key=contract_key)
         return expected if any(item.instrument_id == expected for item in self.instruments) else None
 
     def summary(self) -> dict[str, object]:
@@ -99,16 +108,10 @@ def canonical_instrument_id(
     *,
     contract_key: str | None = None,
 ) -> str:
-    if contract_key is None:
-        if market_kind == MarketKind.SPOT:
-            contract_key = "spot"
-        elif market_kind == MarketKind.PERPETUAL:
-            contract_key = "continuous"
-        else:
-            contract_key = "unspecified"
+    key = normalized_contract_key(market_kind, contract_key)
     return (
         f"crypto:instrument:{_slug(venue)}:{market_kind.value}:"
-        f"{asset.strip().upper()}:{_slug(contract_key)}"
+        f"{asset.strip().upper()}:{_slug(key)}"
     )
 
 
@@ -132,15 +135,18 @@ def build_market_graph(
         asset: str,
         market_kind: MarketKind,
         observed_at: datetime,
+        contract_key: str | None = None,
+        quote_currency: str | None = None,
+        expires_at: datetime | None = None,
     ) -> CanonicalInstrument:
         asset_id = canonical_asset_id(asset)
         venue_id = canonical_venue_id(venue)
-        instrument_id = canonical_instrument_id(venue, asset, market_kind)
+        key = normalized_contract_key(market_kind, contract_key)
+        instrument_id = canonical_instrument_id(venue, asset, market_kind, contract_key=key)
         assets.setdefault(asset_id, CanonicalAsset(asset_id=asset_id, symbol=asset.upper()))
         venues.setdefault(venue_id, CanonicalVenue(venue_id=venue_id, name=venue))
         instrument = instruments.get(instrument_id)
         if instrument is None:
-            contract_key = "spot" if market_kind == MarketKind.SPOT else "continuous" if market_kind == MarketKind.PERPETUAL else "unspecified"
             instrument = CanonicalInstrument(
                 instrument_id=instrument_id,
                 asset_id=asset_id,
@@ -148,12 +154,18 @@ def build_market_graph(
                 venue=venue,
                 asset=asset.upper(),
                 market_kind=market_kind,
-                contract_key=contract_key,
+                contract_key=key,
+                quote_currency=quote_currency.upper() if quote_currency else None,
+                expires_at=expires_at,
                 observed_at=observed_at,
             )
             instruments[instrument_id] = instrument
         if instrument.observed_at is None or observed_at >= instrument.observed_at:
             instrument.observed_at = observed_at
+            if quote_currency:
+                instrument.quote_currency = quote_currency.upper()
+            if expires_at is not None:
+                instrument.expires_at = expires_at
         for source_id, target_id, relationship in (
             (venue_id, instrument_id, GraphRelationship.LISTS),
             (instrument_id, asset_id, GraphRelationship.REPRESENTS),
@@ -177,6 +189,9 @@ def build_market_graph(
             asset=quote.asset,
             market_kind=quote.market_kind,
             observed_at=quote.observed_at,
+            contract_key=quote.contract_key,
+            quote_currency=quote.quote_currency,
+            expires_at=quote.expires_at,
         )
         instrument.provider_symbols[quote.source] = quote.symbol
         if quote.source not in instrument.sources:
@@ -193,8 +208,10 @@ def build_market_graph(
             asset=quote.asset,
             market_kind=MarketKind.PERPETUAL,
             observed_at=quote.observed_at,
+            contract_key=quote.contract_key,
+            quote_currency=quote.quote_currency,
         )
-        instrument.provider_symbols.setdefault(quote.source, quote.asset.upper())
+        instrument.provider_symbols.setdefault(quote.source, quote.symbol or quote.asset.upper())
         if quote.source not in instrument.sources:
             instrument.sources.append(quote.source)
         if instrument.observed_at == quote.observed_at:
@@ -215,7 +232,16 @@ def build_market_graph(
                     source_id=source_id,
                     target_id=target_id,
                     relationship=GraphRelationship.ECONOMIC_EQUIVALENCE,
-                    metadata={"asset_id": asset_id},
+                    metadata={
+                        "asset_id": asset_id,
+                        "left_quote_currency": left.quote_currency,
+                        "right_quote_currency": right.quote_currency,
+                        "quote_currency_match": (
+                            left.quote_currency is None
+                            or right.quote_currency is None
+                            or left.quote_currency == right.quote_currency
+                        ),
+                    },
                 )
 
     observed_at = max(observed_times) if observed_times else datetime.now(timezone.utc)

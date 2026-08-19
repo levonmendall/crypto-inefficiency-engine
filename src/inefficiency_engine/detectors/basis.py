@@ -25,6 +25,12 @@ class SpotPerpBasisDetector:
             perps = [q for q in asset_quotes if q.market_kind == MarketKind.PERPETUAL]
             for spot in spots:
                 for perp in perps:
+                    if (
+                        spot.quote_currency is not None
+                        and perp.quote_currency is not None
+                        and spot.quote_currency.upper() != perp.quote_currency.upper()
+                    ):
+                        continue
                     if perp.mid <= spot.mid:
                         continue
                     basis = (perp.mid / spot.mid) - 1.0
@@ -36,14 +42,33 @@ class SpotPerpBasisDetector:
                         continue
                     observed = min(spot.observed_at, perp.observed_at)
                     raw_id = f"basis:{asset}:{spot.venue}:{perp.venue}:{observed.isoformat()}"
+                    quote_currency = spot.quote_currency or perp.quote_currency
                     results.append(
                         Opportunity(
                             id=sha256(raw_id.encode()).hexdigest()[:20],
                             strategy=Strategy.SPOT_PERP_BASIS,
                             asset=asset,
                             legs=[
-                                OpportunityLeg(venue=spot.venue, asset=asset, market_kind=MarketKind.SPOT, side=Side.LONG, reference_price=spot.mid),
-                                OpportunityLeg(venue=perp.venue, asset=asset, market_kind=MarketKind.PERPETUAL, side=Side.SHORT, reference_price=perp.mid),
+                                OpportunityLeg(
+                                    venue=spot.venue,
+                                    asset=asset,
+                                    market_kind=MarketKind.SPOT,
+                                    side=Side.LONG,
+                                    symbol=spot.symbol,
+                                    quote_currency=spot.quote_currency,
+                                    contract_key=spot.contract_key,
+                                    reference_price=spot.mid,
+                                ),
+                                OpportunityLeg(
+                                    venue=perp.venue,
+                                    asset=asset,
+                                    market_kind=MarketKind.PERPETUAL,
+                                    side=Side.SHORT,
+                                    symbol=perp.symbol,
+                                    quote_currency=perp.quote_currency,
+                                    contract_key=perp.contract_key,
+                                    reference_price=perp.mid,
+                                ),
                             ],
                             gross_edge_bps_per_hour=gross_bps_hour,
                             modeled_cost_bps=self.settings.pair_roundtrip_cost_bps,
@@ -54,7 +79,12 @@ class SpotPerpBasisDetector:
                             observed_at=observed,
                             expires_at=observed + timedelta(seconds=self.settings.max_quote_age_seconds),
                             confidence="low",
-                            evidence={"spot_mid": spot.mid, "perp_mid": perp.mid, "raw_basis": basis},
+                            evidence={
+                                "spot_mid": spot.mid,
+                                "perp_mid": perp.mid,
+                                "raw_basis": basis,
+                                "quote_currency": quote_currency,
+                            },
                         )
                     )
         return sorted(results, key=lambda x: x.net_annualized_return, reverse=True)

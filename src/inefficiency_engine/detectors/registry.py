@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 from inefficiency_engine.config import Settings
 from inefficiency_engine.detectors.basis import SpotPerpBasisDetector
 from inefficiency_engine.detectors.funding import FundingDispersionDetector
+from inefficiency_engine.detectors.futures_basis import FuturesBasisDetector
+from inefficiency_engine.detectors.spot_dislocation import CexSpotDislocationDetector
 from inefficiency_engine.market_graph import MarketGraphSnapshot, canonical_asset_id
 from inefficiency_engine.models import FundingQuote, MarketQuote, Opportunity, Strategy
 
@@ -60,12 +62,39 @@ class SpotPerpBasisModule:
         return self.detector.detect(context.market_quotes)
 
 
+class FuturesBasisModule:
+    def __init__(self, settings: Settings):
+        self.detector = FuturesBasisDetector(settings)
+        self.manifest = DetectorManifest(
+            name="futures_basis",
+            strategies=[Strategy.FUTURES_BASIS],
+            required_inputs=["market_quotes", "dated_future_expiry"],
+            graph_native=True,
+        )
+
+    def detect(self, context: DetectorContext) -> list[Opportunity]:
+        return self.detector.detect(context.market_quotes)
+
+
+class CexSpotDislocationModule:
+    def __init__(self, settings: Settings):
+        self.detector = CexSpotDislocationDetector(settings)
+        self.manifest = DetectorManifest(
+            name="cex_spot_dislocation",
+            strategies=[Strategy.CEX_SPOT_DISLOCATION],
+            required_inputs=["market_quotes", "same_quote_currency"],
+            graph_native=True,
+        )
+
+    def detect(self, context: DetectorContext) -> list[Opportunity]:
+        return self.detector.detect(context.market_quotes)
+
+
 class OpportunityDetectorRegistry:
     """Strategy-neutral detector registry.
 
-    Existing v0.8 detectors are wrapped without changing their economics. New
-    strategies can consume the canonical market graph directly while exposing
-    the same Opportunity contract to the downstream risk/execution pipeline.
+    All detector modules expose the same Opportunity contract. New modules can
+    consume the graph directly while downstream risk/execution remains shared.
     """
 
     def __init__(self, modules: list[DetectorModule]):
@@ -76,6 +105,8 @@ class OpportunityDetectorRegistry:
         return cls([
             FundingDispersionModule(settings),
             SpotPerpBasisModule(settings),
+            FuturesBasisModule(settings),
+            CexSpotDislocationModule(settings),
         ])
 
     def manifests(self) -> list[DetectorManifest]:
@@ -92,6 +123,7 @@ class OpportunityDetectorRegistry:
                         leg.venue,
                         leg.asset,
                         leg.market_kind,
+                        leg.contract_key,
                     )
                     if instrument_id is not None:
                         instrument_ids.append(instrument_id)

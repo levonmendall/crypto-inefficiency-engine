@@ -25,6 +25,12 @@ class FundingDispersionDetector:
                 for short_quote in asset_quotes:
                     if long_quote.venue == short_quote.venue:
                         continue
+                    if (
+                        long_quote.quote_currency is not None
+                        and short_quote.quote_currency is not None
+                        and long_quote.quote_currency.upper() != short_quote.quote_currency.upper()
+                    ):
+                        continue
                     gross_hourly = short_quote.hourly_rate - long_quote.hourly_rate
                     if gross_hourly <= 0:
                         continue
@@ -37,14 +43,31 @@ class FundingDispersionDetector:
                     observed = min(long_quote.observed_at, short_quote.observed_at)
                     expires = observed + timedelta(seconds=self.settings.max_quote_age_seconds)
                     raw_id = f"funding:{asset}:{long_quote.venue}:{short_quote.venue}:{observed.isoformat()}"
+                    quote_currency = long_quote.quote_currency or short_quote.quote_currency
                     results.append(
                         Opportunity(
                             id=sha256(raw_id.encode()).hexdigest()[:20],
                             strategy=Strategy.FUNDING_DISPERSION,
                             asset=asset,
                             legs=[
-                                OpportunityLeg(venue=long_quote.venue, asset=asset, market_kind=MarketKind.PERPETUAL, side=Side.LONG),
-                                OpportunityLeg(venue=short_quote.venue, asset=asset, market_kind=MarketKind.PERPETUAL, side=Side.SHORT),
+                                OpportunityLeg(
+                                    venue=long_quote.venue,
+                                    asset=asset,
+                                    market_kind=MarketKind.PERPETUAL,
+                                    side=Side.LONG,
+                                    symbol=long_quote.symbol or asset,
+                                    quote_currency=long_quote.quote_currency,
+                                    contract_key=long_quote.contract_key,
+                                ),
+                                OpportunityLeg(
+                                    venue=short_quote.venue,
+                                    asset=asset,
+                                    market_kind=MarketKind.PERPETUAL,
+                                    side=Side.SHORT,
+                                    symbol=short_quote.symbol or asset,
+                                    quote_currency=short_quote.quote_currency,
+                                    contract_key=short_quote.contract_key,
+                                ),
                             ],
                             gross_edge_bps_per_hour=gross_bps_hour,
                             modeled_cost_bps=self.settings.pair_roundtrip_cost_bps,
@@ -60,6 +83,7 @@ class FundingDispersionDetector:
                                 "long_interval_hours": long_quote.interval_hours,
                                 "short_funding_rate": short_quote.rate,
                                 "short_interval_hours": short_quote.interval_hours,
+                                "quote_currency": quote_currency,
                                 "source": "normalized predicted funding dispersion",
                             },
                         )
