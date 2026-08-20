@@ -1,6 +1,9 @@
 from inefficiency_engine.config import Settings
 from inefficiency_engine.cycle_trend_strategy import CycleAwareMultiHorizonTrendStrategy
-from inefficiency_engine.profit_coverage import build_profit_coverage_summary
+from inefficiency_engine.profit_coverage import (
+    build_profit_coverage_summary,
+    profit_coverage_gaps,
+)
 
 
 def test_v381_readiness_taxonomy_tracks_current_capabilities_without_lowering_gates():
@@ -15,10 +18,11 @@ def test_v381_readiness_taxonomy_tracks_current_capabilities_without_lowering_ga
     assert summary.mechanism_count == 13
     assert summary.taxonomy_version == "2026-08-20-v3.8.1"
     by_id = {row.mechanism_id: row for row in summary.mechanisms}
+    gaps = {row.mechanism_id: row for row in profit_coverage_gaps(summary)}
 
     discrepancy = by_id["price_discrepancy"]
     assert discrepancy.stage == "profitability_certifiable"
-    assert discrepancy.profitability_certification_available
+    assert not discrepancy.profitability_certification_available
     assert any(
         "CEX↔DEX amount-specific persisted requalification settlement" in item
         for item in discrepancy.implemented_components
@@ -27,10 +31,14 @@ def test_v381_readiness_taxonomy_tracks_current_capabilities_without_lowering_ga
         "allocator-level realized settlement" in blocker
         for blocker in discrepancy.blockers
     )
+    assert (
+        gaps["price_discrepancy"].next_required_capability
+        == "allocator-level forward profitability settlement"
+    )
 
     carry = by_id["carry"]
     assert carry.stage == "profitability_certifiable"
-    assert carry.profitability_certification_available
+    assert not carry.profitability_certification_available
     assert any(
         "canonical visible-L2 two-leg settlement" in item
         for item in carry.implemented_components
@@ -38,6 +46,10 @@ def test_v381_readiness_taxonomy_tracks_current_capabilities_without_lowering_ga
     assert any(
         "observed perpetual funding accrual" in item
         for item in carry.implemented_components
+    )
+    assert (
+        gaps["carry"].next_required_capability
+        == "allocator-level forward profitability settlement"
     )
 
     trend = by_id["trend_momentum"]
