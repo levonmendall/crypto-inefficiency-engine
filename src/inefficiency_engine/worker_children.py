@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import signal
-from collections.abc import Awaitable, Callable
 
 from inefficiency_engine import __version__
 from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
@@ -17,6 +16,7 @@ from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeShadowService
 from inefficiency_engine.certification_worker import run_certification_loop
 from inefficiency_engine.dex_tier_shadow import DexTierShadowService
 from inefficiency_engine.evidence import EvidenceStore
+from inefficiency_engine.memory_bounded_research_worker import run_memory_bounded_research_worker
 from inefficiency_engine.operating_certification import OperatingCertificationService
 from inefficiency_engine.resilient_paper_portfolio import OperationallyResilientPaperPortfolioService
 from inefficiency_engine.service import OpportunityService
@@ -24,7 +24,7 @@ from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDep
 from inefficiency_engine.stablecoin_depth_shadow import StablecoinDepthShadowService
 from inefficiency_engine.unified_allocation import UnifiedPaperAllocatorService
 from inefficiency_engine.universal_service import UniversalOpportunityService
-from inefficiency_engine.worker import WorkerRunStats, run_shadow_worker
+from inefficiency_engine.worker import WorkerRunStats
 
 
 RESEARCH_WORKER_ID = "shadow-research-auxiliary"
@@ -41,52 +41,17 @@ def _stop_event() -> asyncio.Event:
     return stop
 
 
-class _MemorySerializedService:
-    """Duck-typed OpportunityService wrapper that serializes the heavy core shadow scan.
-
-    `run_shadow_worker` intentionally schedules its research surfaces with
-    `asyncio.gather`. On a 512 MB Render worker, concurrent full-market scans can
-    exceed the instance memory ceiling even though each individual research surface
-    fits. A shared gate preserves all research work while allowing only one
-    provider/data-heavy auxiliary surface to own peak memory at a time.
-    """
-
-    def __init__(self, service: OpportunityService, gate: asyncio.Lock):
-        self._service = service
-        self._gate = gate
-        self.settings = service.settings
-
-    async def run_shadow_cycle(self):
-        async with self._gate:
-            return await self._service.run_shadow_cycle()
-
-
-def _serialized_runner(
-    gate: asyncio.Lock,
-    runner: Callable[[], Awaitable[object]],
-) -> Callable[[], Awaitable[object]]:
-    async def run() -> object:
-        async with gate:
-            return await runner()
-
-    return run
-
-
 async def run_research_child(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
-    """Run complete research/certification with a single auxiliary peak-memory owner.
+    """Run full research/certification while releasing each heavyweight result promptly.
 
-    Canonical accounting stays isolated on its own thread. Inside the auxiliary
-    research thread, the worker's normal staggered schedule is preserved, but the
-    full-market shadow scan, route probes, mechanism shadows, alpha evidence and
-    certification are serialized behind one lock. This prevents `asyncio.gather`
-    from multiplying large point-in-time market snapshots in memory while retaining
-    the same evidence surfaces, thresholds, paper-only authority and durable output.
+    v3.5.17 serialized the coroutines behind a lock, but ``asyncio.gather`` still
+    retained every completed result until all siblings finished. The production
+    worker therefore could still exceed 512 MB. This path executes the same research
+    surfaces and cadence sequentially and compacts/releases each result before the
+    next surface begins.
     """
 
     stop = _stop_event()
-    memory_gate = asyncio.Lock()
-    serialized_service = _MemorySerializedService(service, memory_gate)
-
     universal = UniversalOpportunityService(service)
     tier_shadow = DexTierShadowService(service, evidence_store=store)
     composite_service = CexDexCompositeEvidenceService(service, universal=universal)
@@ -100,8 +65,6 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
     )
     alpha_factory = ExpandedAlphaFactoryService(service, store)
 
-    # Full forward/mechanism certification shares the non-authoritative auxiliary
-    # service graph instead of constructing a third provider/database graph.
     promotion = CexDexPaperPromotionService(service, composite_service, store)
     unified = UnifiedPaperAllocatorService(service, promotion, alpha_factory)
     allocation_certification = AllocationForwardCertificationService(service, unified, store)
@@ -113,7 +76,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         version=__version__,
     )
 
-    async def _certification_cycle() -> object:
+    async def certification_cycle() -> object:
         await run_certification_loop(
             service,
             store,
@@ -124,52 +87,39 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         )
         return allocation_certification.ledger.summary()
 
-    certification_cycle = _serialized_runner(memory_gate, _certification_cycle)
     certification_every = max(
         1,
         int(getattr(service.settings, "alpha_evidence_every_cycles", 10)),
     )
-    return await run_shadow_worker(
-        serialized_service,  # type: ignore[arg-type]
+    return await run_memory_bounded_research_worker(
+        service,
         store,
         worker_id=RESEARCH_WORKER_ID,
         stop_event=stop,
-        route_shadow_runner=_serialized_runner(
-            memory_gate,
-            universal.run_dex_route_shadow_cycle,
-        ),
-        tier_shadow_runner=_serialized_runner(memory_gate, tier_shadow.run_cycle),
+        route_shadow_runner=universal.run_dex_route_shadow_cycle,
+        tier_shadow_runner=tier_shadow.run_cycle,
         tier_shadow_every_cycles=service.settings.dex_route_tier_shadow_every_cycles,
-        composite_shadow_runner=_serialized_runner(memory_gate, composite_shadow.run_cycle),
+        composite_shadow_runner=composite_shadow.run_cycle,
         composite_shadow_every_cycles=10,
-        stablecoin_shadow_runner=_serialized_runner(memory_gate, stablecoin_shadow.run_cycle),
+        stablecoin_shadow_runner=stablecoin_shadow.run_cycle,
         stablecoin_shadow_every_cycles=10,
-        alpha_runner=_serialized_runner(memory_gate, alpha_factory.run_evidence_cycle),
+        alpha_runner=alpha_factory.run_evidence_cycle,
         alpha_every_cycles=service.settings.alpha_evidence_every_cycles,
         allocation_certification_runner=certification_cycle,
         allocation_certification_every_cycles=certification_every,
-        frontier_runner=_serialized_runner(
-            memory_gate,
-            universal.probe_dex_route_size_frontiers,
-        ),  # type: ignore[arg-type]
+        frontier_runner=universal.probe_dex_route_size_frontiers,
         frontier_every_cycles=service.settings.dex_route_frontier_every_cycles,
     )
 
 
 async def run_portfolio_child(service: OpportunityService, store: EvidenceStore) -> int:
-    """Run only canonical accounting on the isolated portfolio event loop.
-
-    The canonical allocator overrides unified family discovery and only consumes the
-    settlement-compatible alpha family. Do not construct the unused universal,
-    composite CEX↔DEX, or promotion graphs in this thread: they add memory pressure
-    but have no authority or code path in canonical allocation.
-    """
+    """Run only canonical accounting on the isolated portfolio event loop."""
 
     stop = _stop_event()
     alpha_factory = ExpandedAlphaFactoryService(service, store)
     canonical_allocator = CanonicalPortfolioAllocatorService(
         service,
-        None,  # inherited CEX↔DEX constructor seam is unused by canonical allocator
+        None,
         alpha_factory,
     )
     portfolio = OperationallyResilientPaperPortfolioService(
