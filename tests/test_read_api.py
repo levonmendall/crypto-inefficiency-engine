@@ -64,12 +64,15 @@ def test_mechanism_overlay_never_full_scans_growing_evidence_tables():
     assert '"query_mode": "append_only_primary_key_tail"' in source
 
 
-def test_render_web_service_uses_fast_read_plane_entrypoint():
+def test_render_web_service_uses_deployment_safe_read_plane_entrypoint():
     payload = yaml.safe_load(Path("render.yaml").read_text())
     api = next(service for service in payload["services"] if service["name"] == "cie-shadow-api")
     worker = next(service for service in payload["services"] if service["name"] == "cie-shadow-worker")
 
-    assert api["startCommand"] == "uvicorn inefficiency_engine.read_api_fast:app --host 0.0.0.0 --port $PORT"
+    assert api["startCommand"] == "uvicorn inefficiency_engine.read_api_deploy:app --host 0.0.0.0 --port $PORT"
+    assert api["healthCheckPath"] == "/health"
+    assert api["autoDeployTrigger"] == "off"
+    assert api["buildCommand"] == "python -m pip install --retries 5 --timeout 30 ."
     assert api["plan"] == "free"
     assert worker["startCommand"] == "cie worker"
     assert "plan" not in worker
