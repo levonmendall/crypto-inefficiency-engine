@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-inefficiency-engine"
-version = "3.5.15"
-description = "Paper-first crypto opportunity engine with canonical-first two-domain runtime isolation, raw-market canonical accounting that bypasses global opportunity analysis, pre-allocation market provenance checkpoints, candidate-level bounded L2 promotion, one provider-free supervisor, bounded auxiliary research/certification, fail-closed watchdog recovery, persistent $250,000 compounding accounting, mobile Portfolio Command Center, forward-evidence health telemetry, and progressive profitability certification."
+version = "3.5.16"
+description = "Paper-first crypto opportunity engine with canonical-first two-domain runtime isolation, raw-market canonical accounting, pre-allocation market provenance checkpoints, candidate-level bounded L2 promotion, progressive profitability certification, and read-only per-mechanism evidence-accumulation visibility in the mobile Portfolio Command Center."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
