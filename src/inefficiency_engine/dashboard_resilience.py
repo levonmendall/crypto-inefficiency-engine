@@ -13,12 +13,12 @@ def _replace_once(source: str, old: str, new: str) -> str:
 
 
 def _build_resilient_dashboard_html() -> str:
-    """Keep the command center usable through brief Render/API restarts.
+    """Keep the command center usable through brief or wedged API reads.
 
-    The dashboard remains read-only. Primary portfolio requests retry transient proxy
-    failures and fall back to a short-lived last-known-good browser snapshot instead
-    of allowing one 502/503/504 to blank the entire page. No portfolio, execution,
-    certification, or evidence rules are changed by this presentation-layer repair.
+    Every dashboard request now has a client-side deadline. A slow secondary endpoint
+    therefore cannot leave the whole command center permanently stuck on the initial
+    placeholders, and transient primary failures can still fall back to a short-lived
+    last-known-good browser snapshot. Presentation remains read-only.
     """
 
     html = INTEGRITY_DASHBOARD_HTML
@@ -26,14 +26,15 @@ def _build_resilient_dashboard_html() -> str:
         html,
         "async function getJSON(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`${url}: HTTP ${r.status}`);return r.json()}\n"
         "async function safeJSON(url,fallback){try{return await getJSON(url)}catch(e){return {...fallback,__error:e.message}}}",
-        """async function getJSON(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok){const e=new Error(`${url}: HTTP ${r.status}`);e.status=r.status;throw e}return r.json()}
+        """const DASHBOARD_REQUEST_TIMEOUT_MS=5000;
+async function getJSON(url,timeoutMs=DASHBOARD_REQUEST_TIMEOUT_MS){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),timeoutMs);try{const r=await fetch(url,{cache:'no-store',signal:controller.signal});if(!r.ok){const e=new Error(`${url}: HTTP ${r.status}`);e.status=r.status;throw e}return await r.json()}catch(e){if(e&&e.name==='AbortError'){const timeoutError=new Error(`${url}: timed out after ${timeoutMs}ms`);timeoutError.status=504;throw timeoutError}throw e}finally{clearTimeout(timer)}}
 const DASHBOARD_CACHE_TTL_MS=15*60*1000;
 const dashboardLastGood={};
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 function saveLastGood(key,payload){dashboardLastGood[key]=payload;try{sessionStorage.setItem(`cie-dashboard-${key}`,JSON.stringify({saved_at:Date.now(),payload}))}catch(e){}}
 function loadLastGood(key){if(dashboardLastGood[key])return dashboardLastGood[key];try{const raw=sessionStorage.getItem(`cie-dashboard-${key}`);if(!raw)return null;const cached=JSON.parse(raw);if(!cached||Date.now()-(+cached.saved_at||0)>DASHBOARD_CACHE_TTL_MS){sessionStorage.removeItem(`cie-dashboard-${key}`);return null}dashboardLastGood[key]=cached.payload;return cached.payload}catch(e){return null}}
-async function resilientJSON(url,key,fallback,attempts=5){let lastError=null;for(let attempt=0;attempt<attempts;attempt++){try{const payload=await getJSON(url);saveLastGood(key,payload);return payload}catch(e){lastError=e;const transient=e.status===502||e.status===503||e.status===504||e.status===429||e.status===undefined;if(!transient||attempt===attempts-1)break;await wait(300*Math.pow(2,attempt))}}const cached=loadLastGood(key);if(cached)return {...cached,__error:lastError?.message||`${url}: temporarily unavailable`,__stale:true};return {...fallback,__error:lastError?.message||`${url}: temporarily unavailable`,__stale:true}}
-async function safeJSON(url,fallback){try{return await getJSON(url)}catch(e){return {...fallback,__error:e.message}}}""",
+async function resilientJSON(url,key,fallback,attempts=2){let lastError=null;for(let attempt=0;attempt<attempts;attempt++){try{const payload=await getJSON(url,5000);saveLastGood(key,payload);return payload}catch(e){lastError=e;const transient=e.status===502||e.status===503||e.status===504||e.status===429||e.status===undefined;if(!transient||attempt===attempts-1)break;await wait(350*Math.pow(2,attempt))}}const cached=loadLastGood(key);if(cached)return {...cached,__error:lastError?.message||`${url}: temporarily unavailable`,__stale:true};return {...fallback,__error:lastError?.message||`${url}: temporarily unavailable`,__stale:true}}
+async function safeJSON(url,fallback){try{return await getJSON(url,5000)}catch(e){return {...fallback,__error:e.message}}}""",
     )
     html = _replace_once(
         html,
@@ -48,7 +49,7 @@ async function safeJSON(url,fallback){try{return await getJSON(url)}catch(e){ret
     html = _replace_once(
         html,
         "Auto-refresh: 30 seconds · Account freshness and market-valuation freshness tracked separately",
-        "Auto-refresh: 30 seconds · Primary API calls retry transient failures and preserve short-lived last-known-good display",
+        "Auto-refresh: 30 seconds · Every API read has a bounded timeout; primary data retains short-lived last-known-good fallback",
     )
     return html
 
