@@ -9,7 +9,12 @@ from inefficiency_engine.cex_dex_canonical_runtime import (
     candidate_has_canonical_settlement,
     prepare_cex_dex_candidate,
 )
+from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.models import MarketKind
+from inefficiency_engine.qualified_opportunity import (
+    QualifiedOpportunityLedger,
+    QualifiedOpportunitySnapshot,
+)
 from inefficiency_engine.unified_allocation import UnifiedPaperAllocation, UnifiedPaperCandidate
 
 
@@ -42,14 +47,14 @@ def raw_candidate() -> UnifiedPaperCandidate:
     )
 
 
-def prepared_candidate() -> UnifiedPaperCandidate:
+def prepared_candidate(observed_at: datetime = NOW) -> UnifiedPaperCandidate:
     return prepare_cex_dex_candidate(
         raw_candidate(),
         settings=SimpleNamespace(
             shadow_horizons_seconds=(60.0, 300.0),
             shadow_delay_seconds=60.0,
         ),
-        observed_at=NOW,
+        observed_at=observed_at,
     )
 
 
@@ -78,6 +83,13 @@ def allocation() -> UnifiedPaperAllocation:
     )
 
 
+def trial():
+    return CexDexAwareAllocationForwardCertificationService.trial_from_allocation(
+        allocation(),
+        plan_observed_at=NOW,
+    )
+
+
 def test_cex_dex_candidate_gets_exact_bounded_settlement_contract():
     item = prepared_candidate()
     assert item.source_observed_at == NOW
@@ -86,24 +98,18 @@ def test_cex_dex_candidate_gets_exact_bounded_settlement_contract():
     assert item.modeled_holding_hours == pytest.approx(60.0 / 3600.0)
     assert candidate_has_canonical_settlement(item) is True
 
-    trial = CexDexAwareAllocationForwardCertificationService.trial_from_allocation(
-        allocation(),
-        plan_observed_at=NOW,
-    )
-    assert trial.settlement_supported is True
-    assert trial.settlement_method == CEX_DEX_SETTLEMENT_METHOD
-    assert trial.due_at == NOW + timedelta(seconds=60)
-    assert trial.paper_only is True
-    assert trial.live_execution_authority is False
+    row = trial()
+    assert row.settlement_supported is True
+    assert row.settlement_method == CEX_DEX_SETTLEMENT_METHOD
+    assert row.due_at == NOW + timedelta(seconds=60)
+    assert row.cohort_key == "cex_dex|cex-dex:composite-key"
+    assert row.paper_only is True
+    assert row.live_execution_authority is False
 
 
 def test_cex_dex_settlement_caps_upside_at_precommitted_conservative_edge():
-    trial = CexDexAwareAllocationForwardCertificationService.trial_from_allocation(
-        allocation(),
-        plan_observed_at=NOW,
-    )
     outcome = CexDexAwareAllocationForwardCertificationService._cex_dex_outcome(
-        trial,
+        trial(),
         matured_at=NOW + timedelta(seconds=75),
         verification_net_edge_bps=40.0,
         survived=True,
@@ -116,12 +122,8 @@ def test_cex_dex_settlement_caps_upside_at_precommitted_conservative_edge():
 
 
 def test_cex_dex_missing_route_realizes_zero_instead_of_invented_profit():
-    trial = CexDexAwareAllocationForwardCertificationService.trial_from_allocation(
-        allocation(),
-        plan_observed_at=NOW,
-    )
     outcome = CexDexAwareAllocationForwardCertificationService._cex_dex_outcome(
-        trial,
+        trial(),
         matured_at=NOW + timedelta(seconds=75),
         verification_net_edge_bps=None,
         survived=False,
@@ -132,15 +134,79 @@ def test_cex_dex_missing_route_realizes_zero_instead_of_invented_profit():
 
 
 def test_cex_dex_adverse_verified_edge_can_realize_a_loss():
-    trial = CexDexAwareAllocationForwardCertificationService.trial_from_allocation(
-        allocation(),
-        plan_observed_at=NOW,
-    )
     outcome = CexDexAwareAllocationForwardCertificationService._cex_dex_outcome(
-        trial,
+        trial(),
         matured_at=NOW + timedelta(seconds=75),
         verification_net_edge_bps=-5.0,
         survived=True,
     )
     assert outcome.realized_profit_usd == pytest.approx(-5.0)
     assert outcome.profitable is False
+
+
+def test_cex_dex_verification_reads_later_requalified_bridge_candidate(tmp_path):
+    store = EvidenceStore(tmp_path / "cex-dex-requalified.sqlite3")
+    later = NOW + timedelta(seconds=75)
+    QualifiedOpportunityLedger(store).record(
+        QualifiedOpportunitySnapshot(
+            observed_at=later,
+            expires_at=later + timedelta(minutes=10),
+            source_scan_id="scan-later",
+            total_capital_usd=250_000.0,
+            candidates=[prepared_candidate(later)],
+            family_failures=[],
+        )
+    )
+    service = CexDexAwareAllocationForwardCertificationService(
+        SimpleNamespace(), SimpleNamespace(), store  # type: ignore[arg-type]
+    )
+    verification = service._cex_dex_verification(trial())
+    assert verification is not None
+    matured_at, edge_bps, survived = verification
+    assert matured_at == later
+    assert edge_bps == pytest.approx(12.0)
+    assert survived is True
+
+
+def test_cex_dex_successful_later_bridge_without_candidate_means_zero_capture(tmp_path):
+    store = EvidenceStore(tmp_path / "cex-dex-absent.sqlite3")
+    later = NOW + timedelta(seconds=75)
+    QualifiedOpportunityLedger(store).record(
+        QualifiedOpportunitySnapshot(
+            observed_at=later,
+            expires_at=later + timedelta(minutes=10),
+            source_scan_id="scan-later",
+            total_capital_usd=250_000.0,
+            candidates=[],
+            family_failures=[],
+        )
+    )
+    service = CexDexAwareAllocationForwardCertificationService(
+        SimpleNamespace(), SimpleNamespace(), store  # type: ignore[arg-type]
+    )
+    assert service._cex_dex_verification(trial()) == (later, None, False)
+
+
+def test_cex_dex_failed_later_bridge_remains_fail_closed(tmp_path):
+    store = EvidenceStore(tmp_path / "cex-dex-failed.sqlite3")
+    later = NOW + timedelta(seconds=75)
+    QualifiedOpportunityLedger(store).record(
+        QualifiedOpportunitySnapshot(
+            observed_at=later,
+            expires_at=later + timedelta(minutes=10),
+            source_scan_id="scan-later",
+            total_capital_usd=250_000.0,
+            candidates=[],
+            family_failures=[
+                {
+                    "family": "cex_dex",
+                    "error_type": "ProviderUnavailable",
+                    "reason": "CEX↔DEX bridge projection failed closed",
+                }
+            ],
+        )
+    )
+    service = CexDexAwareAllocationForwardCertificationService(
+        SimpleNamespace(), SimpleNamespace(), store  # type: ignore[arg-type]
+    )
+    assert service._cex_dex_verification(trial()) is None
