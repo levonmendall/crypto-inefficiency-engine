@@ -64,7 +64,9 @@ services:
     branch: main
     autoDeployTrigger: checksPass
     buildCommand: python -m pip install --retries 20 --timeout 120 .
-    startCommand: uvicorn inefficiency_engine.api:app --host 0.0.0.0 --port $PORT
+    # Production web is a read plane only. Heavy scans, certification and allocation
+    # stay in cie-shadow-worker and persist their results to PostgreSQL.
+    startCommand: uvicorn inefficiency_engine.read_api:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
@@ -73,24 +75,10 @@ services:
           property: connectionString
       - key: CIE_PAPER_ONLY
         value: "true"
-      - key: CIE_EXPECTED_ORDER_ACK_LATENCY_MS
-        value: "0"
-      - key: CIE_EXPECTED_HEDGE_LATENCY_MS
-        value: "750"
-      - key: CIE_EMPIRICAL_LATENCY_ENABLED
-        value: "true"
-      - key: CIE_EMPIRICAL_LATENCY_MIN_SAMPLES
-        value: "100"
-      - key: CIE_EMPIRICAL_LATENCY_MIN_SCAN_SAMPLES
+      - key: CIE_SHADOW_HORIZONS_SECONDS
+        value: "1,5,15,30,60"
+      - key: CIE_SHADOW_CYCLE_INTERVAL_SECONDS
         value: "30"
-      - key: CIE_EMPIRICAL_LATENCY_MIN_EFFECTIVE_SAMPLES
-        value: "30"
-      - key: CIE_EMPIRICAL_LATENCY_QUANTILE
-        value: "0.95"
-      - key: CIE_EMPIRICAL_PROBABILITY_CONFIDENCE_LEVEL
-        value: "0.95"
-      - key: CIE_EMPIRICAL_PROBABILITY_MAX_CI_WIDTH
-        value: "0.25"
       - key: CIE_WORKER_HEARTBEAT_STALE_SECONDS
         value: "180"
 
