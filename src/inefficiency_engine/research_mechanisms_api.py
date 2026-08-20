@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 from inefficiency_engine import __version__
 from inefficiency_engine.alpha_coverage_strategies import EventLedger
 from inefficiency_engine.canonical_paper_portfolio_api import build_canonical_paper_portfolio_router
-from inefficiency_engine.dashboard_integrity import build_dashboard_router
+from inefficiency_engine.dashboard_resilience import build_dashboard_router
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.operating_certification_api import build_operating_certification_router
 from inefficiency_engine.research_mechanisms import (

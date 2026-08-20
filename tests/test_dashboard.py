@@ -21,7 +21,6 @@ def test_dashboard_is_available_at_root_and_dashboard_path():
         assert "valuationStatus" in response.text
         assert "settlement_evidence_blocked_count" in response.text
         assert "awaiting post-horizon settlement evidence" in response.text
-        assert "Account freshness and market-valuation freshness tracked separately" in response.text
         assert "Evidence accumulation" in response.text
         assert "Read-only progress · thresholds unchanged" in response.text
         assert "renderEvidenceProgress" in response.text
@@ -29,6 +28,16 @@ def test_dashboard_is_available_at_root_and_dashboard_path():
         assert "settled_allocator_outcomes" in response.text
         assert "Authoritative data" in response.text
         assert "Executable now" in response.text
+
+        # Primary portfolio surfaces tolerate brief Render/API proxy restarts.
+        assert "resilientJSON('/v3/portfolio/canonical','portfolio'" in response.text
+        assert "resilientJSON('/v3/portfolio/performance','performance'" in response.text
+        assert "resilientJSON('/v3/portfolio/runtime-status','runtime'" in response.text
+        assert "e.status===502||e.status===503||e.status===504||e.status===429" in response.text
+        assert "sessionStorage.setItem(`cie-dashboard-${key}`" in response.text
+        assert "DASHBOARD_CACHE_TTL_MS=15*60*1000" in response.text
+        assert "Temporary API issue; showing last known portfolio data where available" in response.text
+        assert "Primary API calls retry transient failures and preserve short-lived last-known-good display" in response.text
 
 
 def test_dashboard_routes_are_hidden_from_openapi_but_portfolio_api_remains_visible():
