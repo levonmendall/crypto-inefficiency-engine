@@ -50,8 +50,6 @@ def _publish_dashboard_projection(
             },
         )
     except Exception as exc:
-        # Presentation publication can never invalidate canonical accounting or
-        # authorize a portfolio change. It is bounded and independently observable.
         try:
             store.record_worker_heartbeat(
                 worker_id=DASHBOARD_PROJECTION_WORKER_ID,
@@ -91,6 +89,7 @@ async def run_canonical_portfolio_loop(
         if interval_seconds is not None
         else max(60.0, service.settings.shadow_cycle_interval_seconds * 10.0)
     )
+    dashboard_projection = dashboard_projection or DashboardProjectionLedger(store)
     portfolio.ledger.ensure_genesis()
     if portfolio.ledger.latest_snapshot() is None:
         portfolio.ledger.record_snapshot(portfolio.ledger.current_state())
@@ -191,8 +190,6 @@ async def run_canonical_portfolio_loop(
             },
         )
 
-        # Publish only after the authoritative cycle and heartbeat are durable. The
-        # projection has no authority and failures do not change the portfolio state.
         _publish_dashboard_projection(service, store, dashboard_projection)
 
         if not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
