@@ -7,6 +7,7 @@ from sqlalchemy import text
 
 from inefficiency_engine import __version__
 from inefficiency_engine import evidence as evidence_module
+from inefficiency_engine.cycle_history_runtime import read_cycle_history_status
 from inefficiency_engine.operating_state_read import (
     rebuild_live_action_queue,
     reconcile_live_operating_states,
@@ -61,6 +62,7 @@ def deployment_health():
         "strategy_evidence_attribution": True,
         "provider_readiness_reconciliation": True,
         "live_operating_state_reconciliation": True,
+        "cycle_history_backfill_observability": True,
     }
 
 
@@ -88,6 +90,7 @@ def deployment_readiness():
         "strategy_evidence_attribution": True,
         "provider_readiness_reconciliation": True,
         "live_operating_state_reconciliation": True,
+        "cycle_history_backfill_observability": True,
     }
 
 
@@ -139,6 +142,21 @@ def _attributed_sections(
         return mechanisms, queue
 
 
+@app.get("/v3/research/cycle-history")
+def cycle_history_status():
+    """Read-only proof of historical backfill coverage and replay readiness."""
+    store = _base.evidence_store
+    if store is None:
+        raise HTTPException(status_code=503, detail="evidence persistence is not configured")
+    try:
+        return read_cycle_history_status(store)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="cycle-history status is temporarily unavailable",
+        ) from exc
+
+
 @app.get("/v3/dashboard/snapshot")
 def dashboard_snapshot():
     """Return portfolio state plus the independently refreshed research-card projection.
@@ -147,7 +165,9 @@ def dashboard_snapshot():
     one transaction: the latest portfolio-led snapshot plus, when available, the
     research snapshot published after the latest successful research cycle. Provider,
     strategy, and operating-state reconciliation are presentation-only and cannot
-    create economic, statistical, allocation, or execution authority.
+    create economic, statistical, allocation, or execution authority. Cycle-history
+    status is read from a tiny durable per-asset status table owned by the maintenance
+    worker; historical rows remain separate from genuine forward evidence.
     """
     store = _base.evidence_store
     if store is None:
@@ -200,11 +220,22 @@ def dashboard_snapshot():
         dict(source_mechanisms) if isinstance(source_mechanisms, dict) else {},
         dict(source_queue) if isinstance(source_queue, dict) else {},
     )
+    try:
+        cycle_history = read_cycle_history_status(store)
+    except Exception:
+        cycle_history = {
+            "available": False,
+            "assets": [],
+            "historical_counts_as_forward": False,
+            "full_forward_promotion_gate_unchanged": True,
+            "live_execution_authority": False,
+        }
 
     if research is None:
         combined = dict(base)
         combined["mechanisms"] = mechanisms
         combined["queue"] = queue
+        combined["cycle_history"] = cycle_history
         combined["strategy_evidence_attribution"] = bool(
             mechanisms.get("strategy_evidence_attribution")
         )
@@ -227,6 +258,7 @@ def dashboard_snapshot():
         "source_research_heartbeat_at": research.get("source_research_heartbeat_at"),
         "mechanisms": mechanisms,
         "queue": queue,
+        "cycle_history": cycle_history,
         "strategy_evidence_attribution": bool(
             mechanisms.get("strategy_evidence_attribution")
         ),
