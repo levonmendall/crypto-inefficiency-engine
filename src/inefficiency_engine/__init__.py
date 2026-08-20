@@ -1,3 +1,3 @@
 """Crypto Opportunity Engine."""
 
-__version__ = "3.5.24"
+__version__ = "3.5.25"
