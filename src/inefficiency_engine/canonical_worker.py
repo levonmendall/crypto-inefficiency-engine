@@ -89,7 +89,8 @@ async def run_canonical_portfolio_loop(
         if interval_seconds is not None
         else max(60.0, service.settings.shadow_cycle_interval_seconds * 10.0)
     )
-    dashboard_projection = dashboard_projection or DashboardProjectionLedger(store)
+    if dashboard_projection is None and hasattr(store, "engine"):
+        dashboard_projection = DashboardProjectionLedger(store)
     portfolio.ledger.ensure_genesis()
     if portfolio.ledger.latest_snapshot() is None:
         portfolio.ledger.record_snapshot(portfolio.ledger.current_state())
