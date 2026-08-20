@@ -37,7 +37,15 @@ def test_dashboard_is_available_at_root_and_dashboard_path():
         assert "sessionStorage.setItem(`cie-dashboard-${key}`" in response.text
         assert "DASHBOARD_CACHE_TTL_MS=15*60*1000" in response.text
         assert "Temporary API issue; showing last known portfolio data where available" in response.text
-        assert "Primary API calls retry transient failures and preserve short-lived last-known-good display" in response.text
+
+        # No endpoint can leave Promise.all pending forever. This is especially
+        # important for the evidence/mechanism calls that are intentionally fail-soft.
+        assert "DASHBOARD_REQUEST_TIMEOUT_MS=5000" in response.text
+        assert "new AbortController()" in response.text
+        assert "controller.abort()" in response.text
+        assert "timed out after ${timeoutMs}ms" in response.text
+        assert "async function safeJSON(url,fallback){try{return await getJSON(url,5000)}" in response.text
+        assert "Every API read has a bounded timeout" in response.text
 
 
 def test_dashboard_routes_are_hidden_from_openapi_but_portfolio_api_remains_visible():
