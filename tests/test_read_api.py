@@ -3,7 +3,7 @@ from pathlib import Path
 import yaml
 from fastapi.testclient import TestClient
 
-from inefficiency_engine.read_api_fast import app
+from inefficiency_engine.read_api_research import app
 
 
 def test_read_plane_exposes_dashboard_and_durable_status_routes_only():
@@ -11,6 +11,8 @@ def test_read_plane_exposes_dashboard_and_durable_status_routes_only():
     root = client.get("/")
     assert root.status_code == 200
     assert "Portfolio Command Center" in root.text
+    assert "Rejection funnel" in root.text
+    assert "worker scheduled" in root.text
 
     health = client.get("/health")
     assert health.status_code == 200
@@ -33,6 +35,7 @@ def test_read_plane_exposes_dashboard_and_durable_status_routes_only():
         "/v3/operations/certification/summary",
         "/v3/operations/mechanisms",
         "/v3/operations/action-queue",
+        "/v3/operations/research-closure",
         "/v1/worker/health",
         "/v1/evidence/counts",
     }
@@ -52,7 +55,21 @@ def test_read_plane_exposes_dashboard_and_durable_status_routes_only():
         if getattr(route, "path", None) == "/v3/operations/mechanisms"
         and "GET" in (getattr(route, "methods", set()) or set())
     ]
+    action_routes = [
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/v3/operations/action-queue"
+        and "GET" in (getattr(route, "methods", set()) or set())
+    ]
+    root_routes = [
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/"
+        and "GET" in (getattr(route, "methods", set()) or set())
+    ]
     assert len(mechanism_routes) == 1
+    assert len(action_routes) == 1
+    assert len(root_routes) == 1
 
 
 def test_mechanism_overlay_never_full_scans_growing_evidence_tables():
@@ -61,15 +78,24 @@ def test_mechanism_overlay_never_full_scans_growing_evidence_tables():
     assert "func.max" not in source
     assert "order_by(table.c.id.desc()).limit(1)" in source
     assert "dex_route_quotes.c.observed_at.desc()" in source
-    assert '"query_mode": "append_only_primary_key_tail"' in source
+    assert '"query_mode": "append_only_primary_key_tail_plus_compact_closure_summary"' in source
 
 
-def test_render_web_service_uses_fast_read_plane_entrypoint():
+def test_reconciled_capability_truth_removes_obsolete_settlement_blockers():
+    source = Path("src/inefficiency_engine/read_api_fast.py").read_text()
+    assert 'capabilities.get("realized_two_leg_cex_settlement")' in source
+    assert 'capabilities.get("perpetual_short_observed_funding_settlement")' in source
+    assert '"capital_location_forward_testing": True' in Path(
+        "src/inefficiency_engine/research_closure_worker.py"
+    ).read_text()
+
+
+def test_render_web_service_uses_research_closure_read_plane_entrypoint():
     payload = yaml.safe_load(Path("render.yaml").read_text())
     api = next(service for service in payload["services"] if service["name"] == "cie-shadow-api")
     worker = next(service for service in payload["services"] if service["name"] == "cie-shadow-worker")
 
-    assert api["startCommand"] == "uvicorn inefficiency_engine.read_api_fast:app --host 0.0.0.0 --port $PORT"
+    assert api["startCommand"] == "uvicorn inefficiency_engine.read_api_research:app --host 0.0.0.0 --port $PORT"
     assert api["plan"] == "free"
     assert worker["startCommand"] == "cie worker"
     assert "plan" not in worker
