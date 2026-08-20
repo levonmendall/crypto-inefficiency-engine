@@ -3,12 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 
 from pydantic import BaseModel, Field
 from sqlalchemy import Column, Index, Integer, MetaData, String, Table, Text, insert, select
 
-from inefficiency_engine.research_closure import ResearchClosureService
+from inefficiency_engine.bounded_research_closure import MemoryBoundedResearchClosureService
 from inefficiency_engine.research_mechanisms import CapitalLocationResearchService
 
 
@@ -109,10 +109,11 @@ async def run_research_closure_cycle(
     """Persist diagnostics/forward cohorts after an operating certification cycle.
 
     The function consumes the newest already-persisted scan. It does not trigger a
-    second provider scan and therefore does not expand the worker's peak data-plane
-    working set.
+    second provider scan. Rejection analysis retains only running best candidates,
+    so broad discovery does not create a quadratic diagnostics working set.
     """
 
+    del alpha_factory
     with store.engine.connect() as db:
         scan_id = db.execute(
             select(store.scans.c.scan_id).order_by(store.scans.c.completed_at.desc()).limit(1)
@@ -128,7 +129,7 @@ async def run_research_closure_cycle(
                 microstructure_emitted_count = row.current_candidate_count
                 break
 
-    closure = ResearchClosureService(store, service.settings)
+    closure = MemoryBoundedResearchClosureService(store, service.settings)
     rejection_rows = closure.record_rejection_funnels(
         market_quotes=snapshot.market_quotes,
         funding_quotes=snapshot.funding_quotes,
