@@ -11,6 +11,8 @@ def test_auxiliary_runtime_uses_result_releasing_sequential_worker():
     worker_source = inspect.getsource(memory_worker.run_memory_bounded_research_worker)
 
     assert "run_memory_bounded_research_worker" in child_source
+    assert "MemoryBoundedShadowService" in child_source
+    assert "bounded_shadow" in child_source
     assert "run_shadow_worker(" not in child_source
     assert "asyncio.gather(*tasks" not in worker_source
     assert "await _run_and_release(route_shadow_runner" in worker_source
