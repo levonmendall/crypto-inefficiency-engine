@@ -23,6 +23,17 @@ def _build_resilient_dashboard_html() -> str:
     html = INTEGRITY_DASHBOARD_HTML
     html = _replace_once(
         html,
+        '  <section class="card section full">\n    <div class="section-head"><div><div class="section-title">Evidence accumulation</div>',
+        '''  <section class="card section full">
+    <div class="section-head"><div><div class="section-title">Cycle history backfill</div><div class="section-note">Separated historical research · never counted as forward evidence</div></div><div id="cycleHistorySummary" class="section-note">Awaiting maintenance status</div></div>
+    <div id="cycleHistoryList" class="queue"><div class="muted">Awaiting first historical maintenance pass.</div></div>
+  </section>
+
+  <section class="card section full">
+    <div class="section-head"><div><div class="section-title">Evidence accumulation</div>''',
+    )
+    html = _replace_once(
+        html,
         "async function getJSON(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`${url}: HTTP ${r.status}`);return r.json()}\n"
         "async function safeJSON(url,fallback){try{return await getJSON(url)}catch(e){return {...fallback,__error:e.message}}}",
         """const DASHBOARD_REQUEST_TIMEOUT_MS=5000;
@@ -38,14 +49,14 @@ async function safeJSON(url,fallback){try{return await getJSON(url,5000)}catch(e
     html = _replace_once(
         html,
         "const [portfolio,performance,runtime,positions,trades,history,skips,attribution,mechanisms,queue]=await Promise.all([",
-        """const dashboardSnapshot=resilientJSON('/v3/dashboard/snapshot','dashboard',{portfolio:{available:false},performance:{},runtime:{operational:false,degraded:true,valuation_status:'unavailable',allocation_family_failures:[],cycle_status:'unavailable'},positions:{positions:[]},trades:{trades:[]},history:{count:0,snapshots:[]},skips:{skips:[]},attribution:{pnl_by_mechanism_usd:{},pnl_by_strategy_usd:{}},mechanisms:{mechanisms:[],requirements:{}},queue:{actions:[]}});
+        """const dashboardSnapshot=resilientJSON('/v3/dashboard/snapshot','dashboard',{portfolio:{available:false},performance:{},runtime:{operational:false,degraded:true,valuation_status:'unavailable',allocation_family_failures:[],cycle_status:'unavailable'},positions:{positions:[]},trades:{trades:[]},history:{count:0,snapshots:[]},skips:{skips:[]},attribution:{pnl_by_mechanism_usd:{},pnl_by_strategy_usd:{}},mechanisms:{mechanisms:[],requirements:{}},queue:{actions:[]},cycle_history:{available:false,assets:[]}});
 const projectionSection=(payload,key,fallback,reportError=false)=>{const section={...fallback,...(payload?.[key]||{})};if(reportError&&payload?.__error){section.__error=payload.__error;section.__stale=payload.__stale}return section};
-const [portfolio,performance,runtime,positions,trades,history,skips,attribution,mechanisms,queue]=await Promise.all([""",
+const [portfolio,performance,runtime,positions,trades,history,skips,attribution,mechanisms,queue,cycleHistory]=await Promise.all([""",
     )
     html = _replace_once(
         html,
         "getJSON('/v3/portfolio/canonical'),getJSON('/v3/portfolio/performance'),getJSON('/v3/portfolio/runtime-status'),safeJSON('/v3/portfolio/positions',{positions:[]}),safeJSON('/v3/portfolio/trades?limit=20',{trades:[]}),safeJSON('/v3/portfolio/history?limit=500',{count:0,snapshots:[]}),safeJSON('/v3/portfolio/skips?limit=20',{skips:[]}),safeJSON('/v3/portfolio/attribution',{pnl_by_mechanism_usd:{},pnl_by_strategy_usd:{}}),safeJSON('/v3/operations/mechanisms',{mechanisms:[],requirements:{}}),safeJSON('/v3/operations/action-queue',{actions:[]})",
-        "dashboardSnapshot.then(x=>projectionSection(x,'portfolio',{available:false},true)),dashboardSnapshot.then(x=>projectionSection(x,'performance',{})),dashboardSnapshot.then(x=>projectionSection(x,'runtime',{operational:false,degraded:true,valuation_status:'unavailable',allocation_family_failures:[],cycle_status:'unavailable'})),dashboardSnapshot.then(x=>projectionSection(x,'positions',{positions:[]})),dashboardSnapshot.then(x=>projectionSection(x,'trades',{trades:[]})),dashboardSnapshot.then(x=>projectionSection(x,'history',{count:0,snapshots:[]})),dashboardSnapshot.then(x=>projectionSection(x,'skips',{skips:[]})),dashboardSnapshot.then(x=>projectionSection(x,'attribution',{pnl_by_mechanism_usd:{},pnl_by_strategy_usd:{}})),dashboardSnapshot.then(x=>projectionSection(x,'mechanisms',{mechanisms:[],requirements:{}})),dashboardSnapshot.then(x=>projectionSection(x,'queue',{actions:[]}))",
+        "dashboardSnapshot.then(x=>projectionSection(x,'portfolio',{available:false},true)),dashboardSnapshot.then(x=>projectionSection(x,'performance',{})),dashboardSnapshot.then(x=>projectionSection(x,'runtime',{operational:false,degraded:true,valuation_status:'unavailable',allocation_family_failures:[],cycle_status:'unavailable'})),dashboardSnapshot.then(x=>projectionSection(x,'positions',{positions:[]})),dashboardSnapshot.then(x=>projectionSection(x,'trades',{trades:[]})),dashboardSnapshot.then(x=>projectionSection(x,'history',{count:0,snapshots:[]})),dashboardSnapshot.then(x=>projectionSection(x,'skips',{skips:[]})),dashboardSnapshot.then(x=>projectionSection(x,'attribution',{pnl_by_mechanism_usd:{},pnl_by_strategy_usd:{}})),dashboardSnapshot.then(x=>projectionSection(x,'mechanisms',{mechanisms:[],requirements:{}})),dashboardSnapshot.then(x=>projectionSection(x,'queue',{actions:[]})),dashboardSnapshot.then(x=>projectionSection(x,'cycle_history',{available:false,assets:[]}))",
     )
     html = _replace_once(
         html,
@@ -72,8 +83,28 @@ const [portfolio,performance,runtime,positions,trades,history,skips,attribution,
     return `<div class="item" style="margin:0"><div class="item-top"><div><div class="item-title">${esc(s.name||s.strategy_id)}</div><div class="item-sub">${esc(s.strategy_id)} · qualification scope: ${esc(s.qualification_scope||'strategy-specific')}</div></div><span class="state ${esc(s.state)}">${esc((s.state||'unknown').replaceAll('_',' '))}</span></div><div class="item-sub" style="margin-top:7px">${metric('Forward',forwardLabel)}${metric('Mean',forwardMean)}${metric('CI lower',`${meanLower} vs ${meanRequired}`)}${metric('Hit',hit)}${metric('Hit CI',`${hitLower} vs ${hitRequired}`)}${metric('Regimes',regimeLabel)}${metric('Settled',num(s.settled_allocator_outcome_count||0))}</div><div class="item-sub" style="margin-top:5px">${esc(s.primary_reason||'No strategy-specific reason recorded')}</div>${gateText(s)}</div>`
   }).join('')}</div><div class="muted" style="font-size:10px;margin-top:6px">Diagnostic aggregation only. Capital authority remains qualified independently by strategy + asset + direction; historical failed cohorts are not reset.</div></details>`;
 }
+function renderCycleHistory(payload){
+  const rows=payload?.assets||[],summary=$('cycleHistorySummary'),list=$('cycleHistoryList');if(!summary||!list)return;
+  if(!payload?.available){summary.textContent='Awaiting first maintenance pass';list.innerHTML=itemEmpty('Historical maintenance has not published durable status yet.');return}
+  const coverage=Number.isFinite(+payload.overall_coverage_fraction)?pct(payload.overall_coverage_fraction):'—';
+  summary.textContent=payload.all_complete?`Complete · ${coverage} coverage`:`${num(payload.complete_asset_count||0)} / ${num(payload.asset_count||0)} complete · ${coverage} coverage · retrying incomplete assets`;
+  list.innerHTML=rows.length?rows.map(r=>{
+    const stateClass=r.complete?'certified':'collecting',stateLabel=r.complete?'Complete':'Retrying';
+    const coverageLabel=Number.isFinite(+r.coverage_fraction)?pct(r.coverage_fraction):'—';
+    const range=(r.earliest_observed_at&&r.latest_observed_at)?`${when(r.earliest_observed_at)} → ${when(r.latest_observed_at)}`:'No durable historical range yet';
+    const replay=r.historical_replay_long_qualified?'Long replay support qualified':(r.walk_forward_ready?'Walk-forward span ready · replay support not qualified yet':'Building walk-forward span');
+    const error=r.last_error_type?`<div class="bad" style="margin-top:5px">Last fetch error: ${esc(r.last_error_type)}</div>`:'';
+    const retry=(!r.complete&&r.next_retry_at)?` · next retry ${when(r.next_retry_at)}`:'';
+    return `<div class="queue-item"><div class="queue-title"><strong>${esc(r.asset)}</strong><span class="state ${stateClass}">${stateLabel}</span></div><div class="queue-reason">${num(r.quote_count||0)} / ${num(r.expected_quote_count||0)} candles · ${coverageLabel} · ${esc(range)}</div><div class="queue-action">${esc(replay)} · historical samples never increment genuine forward outcomes${esc(retry)}</div>${error}</div>`;
+  }).join(''):itemEmpty('No cycle-history assets are configured.')
+}
 renderMechanisms=function(rows){rows=rows||[];const state=r=>`<span class="state ${esc(r.state)}">${esc((r.state||'unknown').replaceAll('_',' '))}</span>`;$('mechanismsBody').innerHTML=rows.length?rows.map(r=>`<tr><td><strong>${esc(r.name)}</strong><br><span class="muted">${esc(r.mechanism_id)}</span></td><td>${state(r)}</td><td class="num">${num(r.independent_forward_outcome_count)}</td><td class="num">${num(r.settled_allocator_outcome_count)}</td><td class="num ${pnlClass(r.mean_forward_net_return)}">${pct(r.mean_forward_net_return)}</td><td><div>${esc(r.primary_reason)}</div>${strategyEvidenceDetail(r)}</td></tr>`).join(''):`<tr><td colspan="6" class="muted">No certification snapshot yet.</td></tr>`;$('mechanismsMobile').innerHTML=rows.length?rows.map(r=>`<div class="item"><div class="item-top"><div class="item-title">${esc(r.name)}</div>${state(r)}</div><div class="item-sub">${esc(r.primary_reason)}</div>${strategyEvidenceDetail(r)}</div>`).join(''):itemEmpty('No certification snapshot yet.')}
 async function refresh(){""",
+    )
+    html = _replace_once(
+        html,
+        'renderChart(history.snapshots);renderAttribution(attribution);renderPositions(positions.positions);renderTrades(trades.trades);renderSkips(skips.skips);renderEvidenceProgress(mechRows,mechanisms.requirements||{},mechanisms.observed_at);renderMechanisms(mechRows);renderQueue(queue.actions);',
+        'renderChart(history.snapshots);renderAttribution(attribution);renderPositions(positions.positions);renderTrades(trades.trades);renderSkips(skips.skips);renderCycleHistory(cycleHistory);renderEvidenceProgress(mechRows,mechanisms.requirements||{},mechanisms.observed_at);renderMechanisms(mechRows);renderQueue(queue.actions);',
     )
     return html
 
