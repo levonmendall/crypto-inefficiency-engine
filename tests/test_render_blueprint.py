@@ -24,7 +24,7 @@ def test_render_blueprint_defines_durable_shadow_topology():
     api = services["cie-shadow-api"]
     assert api["type"] == "web"
     assert api["healthCheckPath"] == "/health"
-    assert api["autoDeployTrigger"] == "off"
+    assert api["autoDeployTrigger"] == "checksPass"
     assert api["buildCommand"] == "python -m pip install --retries 5 --timeout 30 ."
     assert api["startCommand"] == "uvicorn inefficiency_engine.read_api_research_deploy:app --host 0.0.0.0 --port $PORT"
 

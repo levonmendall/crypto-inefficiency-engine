@@ -62,9 +62,11 @@ services:
     region: oregon
     plan: free
     branch: main
-    # This service is Blueprint-controlled. Disabling branch auto-deploy prevents
-    # a second deployment of the same SHA immediately after a Blueprint deploy.
-    autoDeployTrigger: "off"
+    # Deploy the API from main after repository checks pass, matching the worker.
+    # Deployment safety is handled by the lightweight process-local /health path,
+    # lazy read-only database bootstrap, bounded DB waits, and bounded pip retries;
+    # disabling auto-deploy here would leave the API pinned to stale code.
+    autoDeployTrigger: checksPass
     # Bound dependency retries so an external package/network failure becomes an
     # explicit failed deploy instead of an opaque 15+ minute spinner.
     buildCommand: python -m pip install --retries 5 --timeout 30 .
