@@ -64,7 +64,7 @@ services:
     branch: main
     # This service is Blueprint-controlled. Disabling branch auto-deploy prevents
     # a second deployment of the same SHA immediately after a Blueprint deploy.
-    autoDeployTrigger: off
+    autoDeployTrigger: "off"
     # Bound dependency retries so an external package/network failure becomes an
     # explicit failed deploy instead of an opaque 15+ minute spinner.
     buildCommand: python -m pip install --retries 5 --timeout 30 .
