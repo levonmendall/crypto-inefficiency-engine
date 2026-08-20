@@ -12,7 +12,7 @@ API_APP = "inefficiency_engine.read_api_research_deploy:app"
 
 
 def child_commands(port: str | int) -> dict[str, list[str]]:
-    """Return the two critical child commands for the consolidated Render service."""
+    """Return the critical child commands for the consolidated Render service."""
     port_text = str(port)
     return {
         "api": [
@@ -30,6 +30,11 @@ def child_commands(port: str | int) -> dict[str, list[str]]:
             "-m",
             "inefficiency_engine.cli",
             "worker",
+        ],
+        "history": [
+            sys.executable,
+            "-m",
+            "inefficiency_engine.cycle_history_runtime",
         ],
     }
 
@@ -51,11 +56,12 @@ def _terminate_children(children: Sequence[subprocess.Popen[bytes]], *, timeout_
 
 
 def main() -> int:
-    """Run the read API and governed worker inside one paid Render web instance.
+    """Run the read API, governed worker, and history maintenance in one Render service.
 
-    Both children are critical. If either exits, the supervisor terminates the other
-    and exits non-zero so Render restarts the complete service. This keeps the API
-    lightweight while ensuring the paid instance also owns the worker compute plane.
+    The history process is deliberately fail-contained internally: transient Coinbase
+    failures are persisted and retried instead of terminating the process. All three
+    children are supervised so an unexpected process exit still causes Render to
+    restart the complete service with one coherent durable database attachment.
     """
     port = os.getenv("PORT", "10000")
     commands = child_commands(port)
@@ -71,7 +77,7 @@ def main() -> int:
         signal.signal(sig, _request_stop)
 
     try:
-        for name in ("worker", "api"):
+        for name in ("worker", "history", "api"):
             command = commands[name]
             print(f"starting critical child {name}: {' '.join(command)}", flush=True)
             children[name] = subprocess.Popen(command)
