@@ -6,7 +6,7 @@ import statistics
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Column, Index, Integer, MetaData, Text, insert, inspect, text
+from sqlalchemy import Column, Index, Integer, MetaData, Table, Text, insert, inspect, text
 
 from inefficiency_engine.canonical_paper_portfolio import (
     CANONICAL_INITIAL_CAPITAL_USD,
@@ -248,11 +248,7 @@ def build_dashboard_projection(
     forward_target: int = 30,
     settled_target: int = 20,
 ) -> dict[str, Any]:
-    """Build one compact, point-in-time dashboard view on the worker side.
-
-    This intentionally performs the multi-table assembly outside the web request
-    path. The API later serves the latest projection with one indexed tail lookup.
-    """
+    """Build one compact, point-in-time dashboard view on the worker side."""
     available = set(inspect(store.engine).get_table_names())
     with store.engine.begin() as db:
         if store.backend == "postgresql":
