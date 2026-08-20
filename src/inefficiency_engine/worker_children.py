@@ -5,9 +5,14 @@ import signal
 from types import SimpleNamespace
 
 from inefficiency_engine import __version__
-from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
 from inefficiency_engine.bounded_shadow_service import MemoryBoundedShadowService
 from inefficiency_engine.canonical_worker import run_canonical_portfolio_loop
+from inefficiency_engine.cex_dex_canonical import (
+    CexDexCanonicalAllocationCertificationService as AllocationForwardCertificationService,
+    CexDexCanonicalPaperPortfolioService as OperationallyResilientPaperPortfolioService,
+    CexDexCanonicalQualifiedOpportunityAllocatorService as CanonicalPortfolioAllocatorService,
+    CexDexCanonicalQualifiedOpportunityBridgePublisher as QualifiedOpportunityBridgePublisher,
+)
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeShadowService
@@ -23,18 +28,11 @@ from inefficiency_engine.memory_bounded_alpha_factory import (
 )
 from inefficiency_engine.memory_bounded_research_worker import run_memory_bounded_research_worker
 from inefficiency_engine.operating_certification import OperatingCertificationService
-from inefficiency_engine.qualified_opportunity_freshness import (
-    FreshnessSeparatedQualifiedOpportunityAllocatorService as CanonicalPortfolioAllocatorService,
-    FreshnessSeparatedQualifiedOpportunityBridgePublisher as QualifiedOpportunityBridgePublisher,
-)
 from inefficiency_engine.research_closure_worker import run_research_closure_cycle
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
 from inefficiency_engine.stablecoin_depth_shadow import StablecoinDepthShadowService
 from inefficiency_engine.unified_allocation import UnifiedPaperAllocatorService
-from inefficiency_engine.universal_paper_portfolio import (
-    UniversalOperationallyResilientPaperPortfolioService as OperationallyResilientPaperPortfolioService,
-)
 from inefficiency_engine.universal_service import UniversalOpportunityService
 from inefficiency_engine.worker import WorkerRunStats
 
@@ -136,6 +134,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
                         "candidate_count": 0,
                         "memory_bounded_projection": True,
                         "candidate_freshness_separated": True,
+                        "cex_dex_canonical_settlement": True,
                         "paper_only": True,
                     },
                 )
@@ -146,9 +145,13 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
                     scan_id=snapshot.source_scan_id,
                     detail={
                         "candidate_count": len(snapshot.candidates),
+                        "cex_dex_candidate_count": sum(
+                            item.family == "cex_dex" for item in snapshot.candidates
+                        ),
                         "expires_at": snapshot.expires_at.isoformat(),
                         "memory_bounded_projection": True,
                         "candidate_freshness_separated": True,
+                        "cex_dex_canonical_settlement": True,
                         "paper_only": True,
                     },
                 )
@@ -161,6 +164,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
                     "message": str(exc)[:500],
                     "memory_bounded_projection": True,
                     "candidate_freshness_separated": True,
+                    "cex_dex_canonical_settlement": True,
                     "paper_only": True,
                 },
             )
@@ -268,10 +272,13 @@ async def run_portfolio_child(service: OpportunityService, store: EvidenceStore)
     """Run only canonical accounting on the isolated portfolio event loop."""
 
     stop = _stop_event()
+    universal = UniversalOpportunityService(service)
+    composite_service = CexDexCompositeEvidenceService(service, universal=universal)
+    promotion = CexDexPaperPromotionService(service, composite_service, store)
     alpha_factory = ExpandedAlphaFactoryService(service, store)
     canonical_allocator = CanonicalPortfolioAllocatorService(
         service,
-        None,
+        promotion,
         alpha_factory,
     )
     portfolio = OperationallyResilientPaperPortfolioService(
