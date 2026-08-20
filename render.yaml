@@ -3,7 +3,10 @@ services:
     name: cie-shadow-worker
     runtime: python
     region: oregon
-    plan: starter
+    # Intentionally omit `plan` for the existing worker. Render retains the
+    # instance type selected in the dashboard when a Blueprint omits this field.
+    # Pinning `starter` here would silently downgrade a manual RAM upgrade back to
+    # 512 MB on the next Blueprint sync/deploy.
     branch: main
     autoDeployTrigger: checksPass
     buildCommand: python -m pip install --retries 20 --timeout 120 .
