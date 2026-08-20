@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
+from inefficiency_engine.dashboard_projection import (
+    DASHBOARD_PROJECTION_WORKER_ID,
+    DashboardProjectionLedger,
+)
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.operating_worker import PORTFOLIO_STAGE_TIMEOUT_SECONDS, PORTFOLIO_WORKER_ID
 from inefficiency_engine.portfolio_integrity import PortfolioIntegritySnapshot
@@ -19,12 +23,58 @@ async def _interruptible_wait(seconds: float, stop_event: asyncio.Event) -> None
         return
 
 
+def _publish_dashboard_projection(
+    service: OpportunityService,
+    store: EvidenceStore,
+    projection: DashboardProjectionLedger | None,
+) -> None:
+    """Publish presentation state without making it part of portfolio authority."""
+    if projection is None:
+        return
+    try:
+        payload = projection.publish(
+            forward_target=max(1, int(getattr(service.settings, "alpha_min_forward_samples", 30))),
+            settled_target=max(
+                5,
+                int(getattr(service.settings, "operating_certification_min_settled_trials", 20)),
+            ),
+        )
+        store.record_worker_heartbeat(
+            worker_id=DASHBOARD_PROJECTION_WORKER_ID,
+            state="success",
+            detail={
+                "projection_observed_at": payload.get("observed_at"),
+                "source_portfolio_observed_at": payload.get("source_portfolio_observed_at"),
+                "presentation_only": True,
+                "paper_only": True,
+            },
+        )
+    except Exception as exc:
+        # Presentation publication can never invalidate canonical accounting or
+        # authorize a portfolio change. It is bounded and independently observable.
+        try:
+            store.record_worker_heartbeat(
+                worker_id=DASHBOARD_PROJECTION_WORKER_ID,
+                state="error",
+                error_type=type(exc).__name__,
+                detail={
+                    "message": str(exc)[:500],
+                    "presentation_only": True,
+                    "portfolio_authority_unchanged": True,
+                    "paper_only": True,
+                },
+            )
+        except Exception:
+            pass
+
+
 async def run_canonical_portfolio_loop(
     service: OpportunityService,
     store: EvidenceStore,
     *,
     portfolio: OperationallyResilientPaperPortfolioService,
     stop_event: asyncio.Event,
+    dashboard_projection: DashboardProjectionLedger | None = None,
     interval_seconds: float | None = None,
     max_cycles: int | None = None,
 ) -> int:
@@ -32,7 +82,8 @@ async def run_canonical_portfolio_loop(
 
     Forward allocation and mechanism certification deliberately do not run here.
     A provider-heavy certification stall must never hold the canonical heartbeat
-    open long enough for the process watchdog to kill the Render worker.
+    open long enough for the process watchdog to kill the Render worker. Dashboard
+    projection is a bounded, presentation-only post-cycle publication.
     """
 
     interval = (
@@ -139,6 +190,10 @@ async def run_canonical_portfolio_loop(
                 "paper_only": True,
             },
         )
+
+        # Publish only after the authoritative cycle and heartbeat are durable. The
+        # projection has no authority and failures do not change the portfolio state.
+        _publish_dashboard_projection(service, store, dashboard_projection)
 
         if not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
             await _interruptible_wait(interval, stop_event)
