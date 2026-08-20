@@ -127,6 +127,34 @@ async def test_expired_control_envelope_still_fails_closed_as_real_degradation(t
 
 
 @pytest.mark.asyncio
+async def test_explicit_bridge_error_overrides_active_control_envelope(tmp_path):
+    now = _now()
+    settings = Settings(max_quote_age_seconds=120.0)
+    store = EvidenceStore(tmp_path / "bridge-error.sqlite3")
+    QualifiedOpportunityLedger(store).record(
+        QualifiedOpportunitySnapshot(
+            observed_at=now - timedelta(seconds=10),
+            expires_at=now + timedelta(minutes=9),
+            source_scan_id="bridge-control-active",
+            total_capital_usd=250_000.0,
+            candidates=[_alpha_candidate(now - timedelta(seconds=10))],
+        )
+    )
+    store.record_worker_heartbeat(
+        worker_id="qualified-opportunity-bridge",
+        state="degraded",
+        error_type="QualifiedOpportunitySourceScanUnavailableOrStale",
+        detail={"candidate_count": 0, "paper_only": True},
+    )
+
+    plan = await _allocator(store, settings).allocate(total_capital_usd=250_000.0)
+
+    assert plan.allocations == []
+    assert len(plan.family_failures) == 1
+    assert plan.family_failures[0]["error_type"] == "QualifiedOpportunitySourceScanUnavailableOrStale"
+
+
+@pytest.mark.asyncio
 async def test_publisher_control_ttl_outlives_candidate_market_ttl(tmp_path):
     now = _now()
     settings = Settings(max_quote_age_seconds=120.0)
