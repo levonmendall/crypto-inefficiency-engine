@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-inefficiency-engine"
-version = "3.7.0"
-description = "Paper-first crypto opportunity engine with a durable qualified-opportunity bridge, universal settlement-supported canonical portfolio accounting, memory-bounded research, worker-published dashboard projections, and fail-closed profitability certification."
+version = "3.7.1"
+description = "Paper-first crypto opportunity engine with a memory-bounded qualified-opportunity bridge, universal settlement-supported canonical portfolio accounting, bounded alpha-history projection, worker-published dashboard projections, and fail-closed profitability certification."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
