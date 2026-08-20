@@ -16,6 +16,10 @@ from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidence
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeShadowService
 from inefficiency_engine.certification_worker import run_certification_loop
+from inefficiency_engine.dashboard_projection import (
+    DASHBOARD_RESEARCH_PROJECTION_WORKER_ID,
+    ResearchDashboardProjectionLedger,
+)
 from inefficiency_engine.dex_tier_shadow import DexTierShadowService
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.memory_bounded_research_worker import run_memory_bounded_research_worker
@@ -71,7 +75,8 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
     working set, so one scan cannot materialize books/tier state for the entire
     discovered universe at every horizon. Full public-market discovery is still
     persisted on every scan and the exploration half of the L2 budget rotates across
-    the tail of the universe.
+    the tail of the universe. Every successful research cycle also publishes a tiny
+    read-only research-card projection after the research heartbeat is durable.
     """
 
     stop = _stop_event()
@@ -100,6 +105,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         allocation_certification,
         version=__version__,
     )
+    research_projection = ResearchDashboardProjectionLedger(store)
 
     async def certification_cycle() -> object:
         await run_certification_loop(
@@ -121,6 +127,57 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
             "allocation": allocation_certification.ledger.summary(),
             "research_closure": closure.model_dump(mode="json") if closure is not None else None,
         }
+
+    def publish_research_dashboard() -> None:
+        try:
+            payload = research_projection.publish(
+                forward_target=max(1, int(service.settings.alpha_min_forward_samples)),
+                settled_target=max(
+                    5,
+                    int(getattr(service.settings, "operating_certification_min_settled_trials", 20)),
+                ),
+                shadow_horizons_seconds=tuple(
+                    getattr(service.settings, "shadow_horizons_seconds", (60.0,)) or (60.0,)
+                ),
+                shadow_cycle_interval_seconds=float(
+                    getattr(service.settings, "shadow_cycle_interval_seconds", 30.0)
+                ),
+                alpha_evidence_every_cycles=max(
+                    1,
+                    int(getattr(service.settings, "alpha_evidence_every_cycles", 10)),
+                ),
+                heartbeat_stale_seconds=float(
+                    getattr(service.settings, "worker_heartbeat_stale_seconds", 180.0)
+                ),
+            )
+            store.record_worker_heartbeat(
+                worker_id=DASHBOARD_RESEARCH_PROJECTION_WORKER_ID,
+                state="success",
+                detail={
+                    "projection_observed_at": payload.get("observed_at"),
+                    "source_research_heartbeat_at": payload.get("source_research_heartbeat_at"),
+                    "source_operating_observed_at": payload.get("source_operating_observed_at"),
+                    "presentation_only": True,
+                    "portfolio_authority_unchanged": True,
+                    "paper_only": True,
+                },
+            )
+        except Exception as exc:
+            try:
+                store.record_worker_heartbeat(
+                    worker_id=DASHBOARD_RESEARCH_PROJECTION_WORKER_ID,
+                    state="error",
+                    error_type=type(exc).__name__,
+                    detail={
+                        "message": str(exc)[:500],
+                        "presentation_only": True,
+                        "portfolio_authority_unchanged": True,
+                        "research_authority_unchanged": True,
+                        "paper_only": True,
+                    },
+                )
+            except Exception:
+                pass
 
     certification_every = max(
         1,
@@ -144,6 +201,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         allocation_certification_every_cycles=certification_every,
         frontier_runner=universal.probe_dex_route_size_frontiers,
         frontier_every_cycles=service.settings.dex_route_frontier_every_cycles,
+        post_success_publisher=publish_research_dashboard,
     )
 
 
