@@ -59,6 +59,12 @@ class OperationallyResilientPaperPortfolioService(CanonicalPaperPortfolioService
         directly and leave full analysis to the auxiliary research worker.
         """
 
+        # Keep the service usable with deliberately minimal test/injected cores.
+        # Production OpportunityService always exposes adapter_registry and therefore
+        # always takes the raw bounded-provider path below.
+        if not hasattr(self.core, "adapter_registry"):
+            return await self.core.collect_live_evidence()
+
         started_at = datetime.now(timezone.utc)
         funding_quotes, market_quotes, providers = await self.core.adapter_registry.collect_inputs()
         completed_at = datetime.now(timezone.utc)
