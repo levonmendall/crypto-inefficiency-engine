@@ -9,6 +9,7 @@ from inefficiency_engine.allocation_certification import AllocationForwardCertif
 from inefficiency_engine.bounded_alpha_factory import (
     BoundedExpandedAlphaFactoryService as ExpandedAlphaFactoryService,
 )
+from inefficiency_engine.bounded_shadow_service import MemoryBoundedShadowService
 from inefficiency_engine.canonical_allocator import CanonicalPortfolioAllocatorService
 from inefficiency_engine.canonical_worker import run_canonical_portfolio_loop
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
@@ -62,17 +63,19 @@ class _CompactCoreResearchService:
 
 
 async def run_research_child(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
-    """Run full research/certification while releasing each heavyweight result promptly.
+    """Run full research/certification under a bounded 512 MB working set.
 
-    v3.5.17 serialized the coroutines behind a lock, but ``asyncio.gather`` still
-    retained every completed result until all siblings finished. The production
-    worker therefore could still exceed 512 MB. This path executes the same research
-    surfaces and cadence sequentially and compacts/releases each result before the
-    next surface begins.
+    Research surfaces execute sequentially and release their results between phases.
+    The core multi-horizon shadow surface additionally uses a rotating bounded L2
+    working set, so one scan cannot materialize books/tier state for the entire
+    discovered universe at every horizon. Full public-market discovery is still
+    persisted on every scan and the exploration half of the L2 budget rotates across
+    the tail of the universe.
     """
 
     stop = _stop_event()
-    compact_core = _CompactCoreResearchService(service)
+    bounded_shadow = MemoryBoundedShadowService(service, store)
+    compact_core = _CompactCoreResearchService(bounded_shadow)
     universal = UniversalOpportunityService(service)
     tier_shadow = DexTierShadowService(service, evidence_store=store)
     composite_service = CexDexCompositeEvidenceService(service, universal=universal)
