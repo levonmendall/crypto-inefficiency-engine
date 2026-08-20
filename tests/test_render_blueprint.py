@@ -11,7 +11,10 @@ def test_render_blueprint_defines_durable_shadow_topology():
     worker = services["cie-shadow-worker"]
     assert worker["type"] == "worker"
     assert worker["startCommand"] == "cie worker"
-    assert worker["plan"] != "free"
+    # The existing worker's instance type is intentionally dashboard-managed.
+    # Omitting `plan` prevents Blueprint syncs from downgrading a manual RAM
+    # upgrade back to Render Starter (512 MB).
+    assert "plan" not in worker
     assert worker["autoDeployTrigger"] == "checksPass"
 
     worker_env = {item["key"]: item for item in worker["envVars"]}
