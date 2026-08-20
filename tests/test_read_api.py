@@ -85,15 +85,15 @@ def test_reconciled_capability_truth_removes_obsolete_settlement_blockers():
     ).read_text()
 
 
-def test_render_web_service_preserves_deployment_safe_research_read_plane():
+def test_render_combined_service_preserves_deployment_safe_research_read_plane():
     payload = yaml.safe_load(Path("render.yaml").read_text())
-    api = next(service for service in payload["services"] if service["name"] == "cie-shadow-api")
-    worker = next(service for service in payload["services"] if service["name"] == "cie-shadow-worker")
+    assert len(payload["services"]) == 1
+    runtime = payload["services"][0]
 
-    assert api["startCommand"] == "uvicorn inefficiency_engine.read_api_research_deploy:app --host 0.0.0.0 --port $PORT"
-    assert api["healthCheckPath"] == "/health"
-    assert api["autoDeployTrigger"] == "checksPass"
-    assert api["buildCommand"] == "python -m pip install --retries 5 --timeout 30 ."
-    assert api["plan"] == "free"
-    assert worker["startCommand"] == "cie worker"
-    assert "plan" not in worker
+    assert runtime["name"] == "cie-shadow-worker"
+    assert runtime["type"] == "web"
+    assert runtime["plan"] == "standard"
+    assert runtime["startCommand"] == "python -m inefficiency_engine.render_combined"
+    assert runtime["healthCheckPath"] == "/health"
+    assert runtime["autoDeployTrigger"] == "checksPass"
+    assert runtime["buildCommand"] == "python -m pip install --retries 5 --timeout 30 ."
