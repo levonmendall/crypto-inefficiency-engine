@@ -113,7 +113,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         version=__version__,
     )
 
-    async def certification_cycle() -> object:
+    async def _certification_cycle() -> object:
         await run_certification_loop(
             service,
             store,
@@ -124,6 +124,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         )
         return allocation_certification.ledger.summary()
 
+    certification_cycle = _serialized_runner(memory_gate, _certification_cycle)
     certification_every = max(
         1,
         int(getattr(service.settings, "alpha_evidence_every_cycles", 10)),
@@ -145,7 +146,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         stablecoin_shadow_every_cycles=10,
         alpha_runner=_serialized_runner(memory_gate, alpha_factory.run_evidence_cycle),
         alpha_every_cycles=service.settings.alpha_evidence_every_cycles,
-        allocation_certification_runner=_serialized_runner(memory_gate, certification_cycle),
+        allocation_certification_runner=certification_cycle,
         allocation_certification_every_cycles=certification_every,
         frontier_runner=_serialized_runner(
             memory_gate,
