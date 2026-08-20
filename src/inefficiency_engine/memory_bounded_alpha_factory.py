@@ -13,23 +13,14 @@ from inefficiency_engine.models import MarketKind, MarketQuote
 
 
 class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryService):
-    """Exact fast-alpha history plus compact long-horizon trend evidence.
-
-    Fast strategies retain their exact active windows. The cycle-aware trend lane
-    receives a compact daily sample from older persisted history, so adding
-    7/30/90/180-day context does not materialize months of high-frequency quotes.
-    """
+    """Exact fast-alpha history plus isolated compact long-horizon trend evidence."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        strategies = list(getattr(self.registry, "_strategies", []))
-        if not any(
-            item.manifest.strategy_id == CycleAwareMultiHorizonTrendStrategy.strategy_id
-            for item in strategies
-        ):
-            self.registry = AlphaStrategyRegistry(
-                [*strategies, CycleAwareMultiHorizonTrendStrategy()]
-            )
+        self._base_registry = self.registry
+        self._cycle_strategy = CycleAwareMultiHorizonTrendStrategy()
+        strategies = list(getattr(self._base_registry, "_strategies", []))
+        self.registry = AlphaStrategyRegistry([*strategies, self._cycle_strategy])
         self._cycle_history_cache: dict[
             tuple[str, str, MarketKind], list[MarketQuote]
         ] = {}
@@ -48,11 +39,11 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
         return max(1.0, *active_lookbacks)
 
     def _effective_history_hours(self) -> float:
-        refresh = CycleAwareMultiHorizonTrendStrategy.history_refresh(
-            self._expanded_settings
+        # Preserve the v3.7.1 contract exactly for every existing fast strategy.
+        return min(
+            max(1.0, float(self.settings.alpha_history_hours)),
+            self._short_history_hours(),
         )
-        required = self._short_history_hours() + refresh
-        return min(max(1.0, float(self.settings.alpha_history_hours)), required)
 
     def _current_keys(
         self,
@@ -96,7 +87,7 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
             )
         )
         recent_cutoff = snapshot.completed_at - timedelta(
-            hours=self._short_history_hours() + refresh_hours
+            hours=self._effective_history_hours()
         )
 
         table = self.store.market_quotes
@@ -120,11 +111,9 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
             .where(or_(*pair_filters))
             .subquery()
         )
-        rows_per_day = CycleAwareMultiHorizonTrendStrategy.rows_per_day(
-            self._expanded_settings
-        )
         query = select(ranked.c.payload_json).where(
-            ranked.c.daily_rank <= rows_per_day
+            ranked.c.daily_rank
+            <= CycleAwareMultiHorizonTrendStrategy.rows_per_day(self._expanded_settings)
         )
 
         grouped: dict[tuple[str, str, MarketKind], list[MarketQuote]] = defaultdict(list)
@@ -148,6 +137,7 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
         self,
         snapshot: ScanSnapshot,
     ) -> dict[tuple[str, str, MarketKind], list[MarketQuote]]:
+        """Return the original exact short-history projection, unchanged."""
         current_keys = self._current_keys(snapshot)
         if not current_keys:
             return {}
@@ -162,31 +152,30 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
             )
             .order_by(self.store.market_quotes.c.observed_at)
         )
-        exact: dict[tuple[str, str, MarketKind], list[MarketQuote]] = defaultdict(list)
+        grouped: dict[tuple[str, str, MarketKind], list[MarketQuote]] = defaultdict(list)
         with self.store.engine.connect() as db:
             payloads = db.execution_options(stream_results=True).execute(query).scalars()
             for payload in payloads:
                 quote = MarketQuote.model_validate_json(payload)
                 key = (quote.venue, quote.asset.upper(), quote.market_kind)
                 if key in current_keys:
-                    exact[key].append(quote)
+                    grouped[key].append(quote)
+        return grouped
 
-        try:
-            compact = self._compact_cycle_history(snapshot, current_keys)
-        except Exception:
-            compact = {}
-
+    def _cycle_history_for_snapshot(
+        self,
+        snapshot: ScanSnapshot,
+        exact: dict[tuple[str, str, MarketKind], list[MarketQuote]],
+    ) -> dict[tuple[str, str, MarketKind], list[MarketQuote]]:
+        current_keys = self._current_keys(snapshot)
+        compact = self._compact_cycle_history(snapshot, current_keys)
         combined: dict[tuple[str, str, MarketKind], list[MarketQuote]] = {}
         for key in current_keys:
             rows = [*compact.get(key, []), *exact.get(key, [])]
             seen: set[tuple[str, str, float]] = set()
             deduped: list[MarketQuote] = []
             for quote in sorted(rows, key=lambda item: item.observed_at):
-                identity = (
-                    quote.observed_at.isoformat(),
-                    quote.symbol,
-                    quote.mid,
-                )
+                identity = (quote.observed_at.isoformat(), quote.symbol, quote.mid)
                 if identity in seen:
                     continue
                 seen.add(identity)
@@ -201,9 +190,28 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
         *,
         total_capital_usd: float,
     ):
-        return self.registry.discover(
+        exact = self._history_for_snapshot(snapshot)
+        rows = self._base_registry.discover(
             snapshot,
-            self._history_for_snapshot(snapshot),
+            exact,
             self._expanded_settings,  # type: ignore[arg-type]
             total_capital_usd=total_capital_usd,
         )
+        try:
+            cycle_history = self._cycle_history_for_snapshot(snapshot, exact)
+            rows.extend(
+                self._cycle_strategy.discover(
+                    snapshot,
+                    cycle_history,
+                    self._expanded_settings,  # type: ignore[arg-type]
+                    total_capital_usd=total_capital_usd,
+                )
+            )
+        except Exception:
+            # New slow-history research fails closed without suppressing legacy alpha.
+            pass
+        rows.sort(
+            key=lambda item: (item.expected_net_return, item.confidence_score),
+            reverse=True,
+        )
+        return rows
