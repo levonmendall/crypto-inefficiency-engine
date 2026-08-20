@@ -8,6 +8,10 @@ from sqlalchemy import text
 from inefficiency_engine import __version__
 from inefficiency_engine import evidence as evidence_module
 from inefficiency_engine.read_evidence import build_read_only_evidence_store
+from inefficiency_engine.strategy_evidence_read import (
+    augment_mechanism_payload,
+    reconcile_action_queue,
+)
 
 
 # Production import bootstrap: keep the deployment guarantees while layering the
@@ -52,6 +56,7 @@ def deployment_health():
         "schema_owner": "worker",
         "research_closure": True,
         "dashboard_projection": "portfolio_plus_live_research",
+        "strategy_evidence_attribution": True,
     }
 
 
@@ -76,6 +81,7 @@ def deployment_readiness():
         "schema_owner": "worker",
         "research_closure": True,
         "dashboard_projection": "portfolio_plus_live_research",
+        "strategy_evidence_attribution": True,
     }
 
 
@@ -106,13 +112,29 @@ def _decode_projection(raw: object | None, *, label: str) -> dict[str, object] |
     return payload
 
 
+def _attributed_sections(
+    store,
+    mechanisms: dict[str, object],
+    queue: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Presentation-only strategy attribution; never changes portfolio authority."""
+    try:
+        attributed = augment_mechanism_payload(store, _base.settings, mechanisms)
+        return attributed, reconcile_action_queue(queue, attributed)
+    except Exception:
+        # Dashboard attribution is fail-contained. The durable operating projection
+        # remains authoritative if diagnostics cannot be enriched.
+        return mechanisms, queue
+
+
 @app.get("/v3/dashboard/snapshot")
 def dashboard_snapshot():
     """Return portfolio state plus the independently refreshed research-card projection.
 
     The browser still makes one request. The API performs bounded tail reads inside
     one transaction: the latest portfolio-led snapshot plus, when available, the
-    research snapshot published after the latest successful research cycle.
+    research snapshot published after the latest successful research cycle. Strategy
+    attribution is cached by append-only ledger tails and is presentation-only.
     """
     store = _base.evidence_store
     if store is None:
@@ -149,8 +171,31 @@ def dashboard_snapshot():
             detail="dashboard projection is awaiting its first worker publication",
         )
     research = _decode_projection(research_raw, label="research")
+
+    source_mechanisms = (
+        (research or {}).get("mechanisms")
+        or base.get("mechanisms")
+        or {}
+    )
+    source_queue = (
+        (research or {}).get("queue")
+        or base.get("queue")
+        or {}
+    )
+    mechanisms, queue = _attributed_sections(
+        store,
+        dict(source_mechanisms) if isinstance(source_mechanisms, dict) else {},
+        dict(source_queue) if isinstance(source_queue, dict) else {},
+    )
+
     if research is None:
-        return base
+        combined = dict(base)
+        combined["mechanisms"] = mechanisms
+        combined["queue"] = queue
+        combined["strategy_evidence_attribution"] = bool(
+            mechanisms.get("strategy_evidence_attribution")
+        )
+        return combined
 
     combined = dict(base)
     combined.update({
@@ -161,7 +206,10 @@ def dashboard_snapshot():
         "source_operating_observed_at": research.get("source_operating_observed_at"),
         "source_research_closure_observed_at": research.get("source_research_closure_observed_at"),
         "source_research_heartbeat_at": research.get("source_research_heartbeat_at"),
-        "mechanisms": research.get("mechanisms") or base.get("mechanisms") or {},
-        "queue": research.get("queue") or base.get("queue") or {},
+        "mechanisms": mechanisms,
+        "queue": queue,
+        "strategy_evidence_attribution": bool(
+            mechanisms.get("strategy_evidence_attribution")
+        ),
     })
     return combined

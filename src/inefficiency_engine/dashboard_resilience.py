@@ -57,6 +57,24 @@ const [portfolio,performance,runtime,positions,trades,history,skips,attribution,
         "Auto-refresh: 30 seconds · Account freshness and market-valuation freshness tracked separately",
         "Auto-refresh: 30 seconds · One compact worker-published snapshot per refresh · detailed endpoints remain diagnostic-only",
     )
+    html = _replace_once(
+        html,
+        "async function refresh(){",
+        """function strategyEvidenceDetail(r){
+  const rows=r?.strategy_evidence||[];if(!rows.length)return '';
+  const gateText=s=>(s.failed_gates||[]).length?(s.failed_gates||[]).map(x=>`<div class="bad" style="font-size:11px;margin-top:2px">• ${esc(x)}</div>`).join(''):'<div class="good" style="font-size:11px;margin-top:2px">No diagnostic evidence gate currently failing</div>';
+  const metric=(label,value)=>`<span style="display:inline-block;margin-right:10px"><span class="muted">${esc(label)}</span> ${esc(value)}</span>`;
+  return `<details style="margin-top:8px"><summary style="cursor:pointer;color:#bae6fd;font-weight:750">Strategy evidence (${rows.length})</summary><div style="display:grid;gap:7px;margin-top:7px">${rows.map(s=>{
+    const forwardRequired=+s.required_forward_outcomes||0,forward=+s.independent_forward_outcome_count||0,regimeRequired=+s.required_regimes||0,regimes=+s.observed_regime_count||0;
+    const forwardMean=Number.isFinite(+s.mean_forward_net_return)?pct(s.mean_forward_net_return):'—',meanLower=Number.isFinite(+s.mean_forward_net_return_ci_lower)?pct(s.mean_forward_net_return_ci_lower):'—',meanRequired=Number.isFinite(+s.required_mean_return_ci_lower)?pct(s.required_mean_return_ci_lower):'—';
+    const hit=Number.isFinite(+s.forward_hit_rate)?pct(s.forward_hit_rate):'—',hitLower=Number.isFinite(+s.forward_hit_rate_ci_lower)?pct(s.forward_hit_rate_ci_lower):'—',hitRequired=Number.isFinite(+s.required_hit_rate_ci_lower)?pct(s.required_hit_rate_ci_lower):'—';
+    const forwardLabel=forwardRequired?`${num(forward)} / ${num(forwardRequired)}`:'n/a',regimeLabel=regimeRequired?`${num(regimes)} / ${num(regimeRequired)}`:'n/a';
+    return `<div class="item" style="margin:0"><div class="item-top"><div><div class="item-title">${esc(s.name||s.strategy_id)}</div><div class="item-sub">${esc(s.strategy_id)} · qualification scope: ${esc(s.qualification_scope||'strategy-specific')}</div></div><span class="state ${esc(s.state)}">${esc((s.state||'unknown').replaceAll('_',' '))}</span></div><div class="item-sub" style="margin-top:7px">${metric('Forward',forwardLabel)}${metric('Mean',forwardMean)}${metric('CI lower',`${meanLower} vs ${meanRequired}`)}${metric('Hit',hit)}${metric('Hit CI',`${hitLower} vs ${hitRequired}`)}${metric('Regimes',regimeLabel)}${metric('Settled',num(s.settled_allocator_outcome_count||0))}</div><div class="item-sub" style="margin-top:5px">${esc(s.primary_reason||'No strategy-specific reason recorded')}</div>${gateText(s)}</div>`
+  }).join('')}</div><div class="muted" style="font-size:10px;margin-top:6px">Diagnostic aggregation only. Capital authority remains qualified independently by strategy + asset + direction; historical failed cohorts are not reset.</div></details>`;
+}
+renderMechanisms=function(rows){rows=rows||[];const state=r=>`<span class="state ${esc(r.state)}">${esc((r.state||'unknown').replaceAll('_',' '))}</span>`;$('mechanismsBody').innerHTML=rows.length?rows.map(r=>`<tr><td><strong>${esc(r.name)}</strong><br><span class="muted">${esc(r.mechanism_id)}</span></td><td>${state(r)}</td><td class="num">${num(r.independent_forward_outcome_count)}</td><td class="num">${num(r.settled_allocator_outcome_count)}</td><td class="num ${pnlClass(r.mean_forward_net_return)}">${pct(r.mean_forward_net_return)}</td><td><div>${esc(r.primary_reason)}</div>${strategyEvidenceDetail(r)}</td></tr>`).join(''):`<tr><td colspan="6" class="muted">No certification snapshot yet.</td></tr>`;$('mechanismsMobile').innerHTML=rows.length?rows.map(r=>`<div class="item"><div class="item-top"><div class="item-title">${esc(r.name)}</div>${state(r)}</div><div class="item-sub">${esc(r.primary_reason)}</div>${strategyEvidenceDetail(r)}</div>`).join(''):itemEmpty('No certification snapshot yet.')}
+async function refresh(){""",
+    )
     return html
 
 
