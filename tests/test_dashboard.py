@@ -22,6 +22,13 @@ def test_dashboard_is_available_at_root_and_dashboard_path():
         assert "settlement_evidence_blocked_count" in response.text
         assert "awaiting post-horizon settlement evidence" in response.text
         assert "Account freshness and market-valuation freshness tracked separately" in response.text
+        assert "Evidence accumulation" in response.text
+        assert "Read-only progress · thresholds unchanged" in response.text
+        assert "renderEvidenceProgress" in response.text
+        assert "independent_forward_outcomes" in response.text
+        assert "settled_allocator_outcomes" in response.text
+        assert "Authoritative data" in response.text
+        assert "Executable now" in response.text
 
 
 def test_dashboard_routes_are_hidden_from_openapi_but_portfolio_api_remains_visible():
