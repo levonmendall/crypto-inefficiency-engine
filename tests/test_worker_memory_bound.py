@@ -1,46 +1,25 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
-from types import SimpleNamespace
 
-import pytest
-
+import inefficiency_engine.memory_bounded_research_worker as memory_worker
 import inefficiency_engine.worker_children as worker_children
 
 
-@pytest.mark.asyncio
-async def test_auxiliary_memory_gate_prevents_concurrent_heavy_surfaces():
-    active = 0
-    peak = 0
+def test_auxiliary_runtime_uses_result_releasing_sequential_worker():
+    child_source = inspect.getsource(worker_children.run_research_child)
+    worker_source = inspect.getsource(memory_worker.run_memory_bounded_research_worker)
 
-    async def heavy(name: str):
-        nonlocal active, peak
-        active += 1
-        peak = max(peak, active)
-        await asyncio.sleep(0.01)
-        active -= 1
-        return name
-
-    class FakeService:
-        settings = SimpleNamespace()
-
-        async def run_shadow_cycle(self):
-            return await heavy("core")
-
-    gate = asyncio.Lock()
-    serialized_service = worker_children._MemorySerializedService(FakeService(), gate)  # type: ignore[arg-type]
-    route = worker_children._serialized_runner(gate, lambda: heavy("route"))
-    alpha = worker_children._serialized_runner(gate, lambda: heavy("alpha"))
-
-    results = await asyncio.gather(
-        serialized_service.run_shadow_cycle(),
-        route(),
-        alpha(),
-    )
-
-    assert sorted(results) == ["alpha", "core", "route"]
-    assert peak == 1
+    assert "run_memory_bounded_research_worker" in child_source
+    assert "run_shadow_worker(" not in child_source
+    assert "asyncio.gather(*tasks" not in worker_source
+    assert "await _run_and_release(route_shadow_runner" in worker_source
+    assert "await _run_and_release(tier_shadow_runner" in worker_source
+    assert "await _run_and_release(composite_shadow_runner" in worker_source
+    assert "await _run_and_release(stablecoin_shadow_runner" in worker_source
+    assert "await _run_and_release(allocation_certification_runner" in worker_source
+    assert "await _run_and_release(alpha_runner" in worker_source
+    assert "await _run_and_release(frontier_runner" in worker_source
 
 
 def test_canonical_child_does_not_construct_unused_broad_research_graphs():
