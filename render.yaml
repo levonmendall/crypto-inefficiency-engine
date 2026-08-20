@@ -20,8 +20,12 @@ services:
         value: "true"
       - key: CIE_SHADOW_HORIZONS_SECONDS
         value: "1,5,15,30,60"
+      - key: CIE_SHADOW_MAX_OPPORTUNITIES
+        value: "16"
       - key: CIE_SHADOW_MAX_CANDIDATES
-        value: "0"
+        value: "80"
+      - key: CIE_DEX_ROUTE_TIER_SHADOW_MAX_CONCURRENCY
+        value: "1"
       - key: CIE_SHADOW_CYCLE_INTERVAL_SECONDS
         value: "30"
       - key: CIE_SHADOW_NOTIONAL_USD
