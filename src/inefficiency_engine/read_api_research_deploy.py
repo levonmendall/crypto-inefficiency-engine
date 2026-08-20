@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
+
 from fastapi import HTTPException
+from sqlalchemy import text
 
 from inefficiency_engine import __version__
 from inefficiency_engine import evidence as evidence_module
 from inefficiency_engine.read_evidence import build_read_only_evidence_store
 
 
-# Production import bootstrap: keep the v3.5.26 deployment guarantees while
-# layering the research-closure read plane. The web process never owns schema.
+# Production import bootstrap: keep the deployment guarantees while layering the
+# research-closure read plane. The web process never owns schema.
 _original_builder = evidence_module.build_evidence_store
 evidence_module.build_evidence_store = build_read_only_evidence_store
 try:
@@ -48,6 +51,7 @@ def deployment_health():
         "database_check": "deferred_to_readiness",
         "schema_owner": "worker",
         "research_closure": True,
+        "dashboard_projection": True,
     }
 
 
@@ -71,4 +75,38 @@ def deployment_readiness():
         "evidence_backend": store.backend,
         "schema_owner": "worker",
         "research_closure": True,
+        "dashboard_projection": True,
     }
+
+
+@app.get("/v3/dashboard/snapshot")
+def dashboard_snapshot():
+    """Return the worker-published command-center projection with one tail query."""
+    store = _base.evidence_store
+    if store is None:
+        raise HTTPException(status_code=503, detail="evidence persistence is not configured")
+    try:
+        with store.engine.begin() as db:
+            if store.backend == "postgresql":
+                db.execute(text("SET LOCAL statement_timeout = '2500ms'"))
+                db.execute(text("SET LOCAL lock_timeout = '1000ms'"))
+            raw = db.execute(
+                text(
+                    "SELECT payload_json FROM dashboard_projection_snapshots "
+                    "ORDER BY id DESC LIMIT 1"
+                )
+            ).scalar_one_or_none()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="dashboard projection is temporarily unavailable",
+        ) from exc
+    if raw is None:
+        raise HTTPException(status_code=503, detail="dashboard projection is awaiting its first worker publication")
+    try:
+        payload = json.loads(str(raw))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=503, detail="dashboard projection is invalid") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=503, detail="dashboard projection is invalid")
+    return payload
