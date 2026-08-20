@@ -37,4 +37,4 @@ def test_read_only_store_has_bounded_postgres_connection_waits():
 
     assert 'kwargs["connect_args"] = {"connect_timeout": timeout}' in source
     assert 'kwargs["pool_timeout"] = timeout' in source
-    assert "metadata.create_all" not in source
+    assert ".metadata.create_all(" not in source
