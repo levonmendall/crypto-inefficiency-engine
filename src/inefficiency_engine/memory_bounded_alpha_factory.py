@@ -5,15 +5,29 @@ from datetime import timedelta
 
 from sqlalchemy import and_, func, or_, select
 
-from inefficiency_engine.alpha_factory import AlphaStrategyRegistry
+from inefficiency_engine.alpha_factory import AlphaCandidate, AlphaStrategyRegistry
 from inefficiency_engine.bounded_alpha_factory import BoundedExpandedAlphaFactoryService
+from inefficiency_engine.cycle_probation import (
+    PROBATIONARY_FORWARD_MEAN_HAIRCUT,
+    PROBATIONARY_HISTORICAL_MEAN_HAIRCUT,
+    PROBATIONARY_MAX_CANDIDATE_FRACTION,
+    PROBATIONARY_MAX_TOTAL_FRACTION,
+    CycleHistoricalResearch,
+    probationary_policy,
+)
 from inefficiency_engine.cycle_trend_strategy import CycleAwareMultiHorizonTrendStrategy
 from inefficiency_engine.evidence import ScanSnapshot
 from inefficiency_engine.models import MarketKind, MarketQuote
 
 
 class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryService):
-    """Exact fast-alpha history plus isolated compact long-horizon trend evidence."""
+    """Exact fast-alpha history plus isolated compact long-horizon trend evidence.
+
+    The cycle-aware lane also owns a separated historical backfill/replay store and
+    a tightly capped probationary paper tier. Historical replay can warm signal
+    construction and support probationary sizing, but it never increments genuine
+    forward qualification counts and can never grant live execution authority.
+    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -26,6 +40,9 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
         ] = {}
         self._cycle_history_pairs: frozenset[tuple[str, str]] = frozenset()
         self._cycle_history_refreshed_at = None
+        self._historical_research = CycleHistoricalResearch(self.store)
+        self._historical_backfill_attempted = False
+        self._historical_backfill_report = None
 
     def _short_history_hours(self) -> float:
         settings = self._expanded_settings
@@ -54,6 +71,29 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
             for quote in snapshot.market_quotes
             if quote.market_kind in {MarketKind.SPOT, MarketKind.PERPETUAL}
         }
+
+    def _historical_assets(self) -> tuple[str, ...]:
+        registry = getattr(self.core, "adapter_registry", None)
+        coinbase = getattr(registry, "coinbase", None)
+        assets = getattr(coinbase, "assets", ("BTC", "ETH", "SOL"))
+        return tuple(sorted({str(asset).upper() for asset in assets if str(asset).strip()}))
+
+    async def _ensure_historical_research(self) -> None:
+        if self._historical_backfill_attempted:
+            return
+        self._historical_backfill_attempted = True
+        try:
+            self._historical_backfill_report = await self._historical_research.ensure_backfilled(
+                self._historical_assets()
+            )
+            # A successful backfill changes the long-history projection. Force one
+            # refresh so the current process sees the new history immediately.
+            self._cycle_history_refreshed_at = None
+            self._cycle_history_cache = {}
+        except Exception:
+            # Historical acceleration is additive. Failure must not suppress legacy
+            # alpha, live evidence collection, or the canonical portfolio worker.
+            self._historical_backfill_report = None
 
     def _compact_cycle_history(
         self,
@@ -123,6 +163,21 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
                 key = (quote.venue, quote.asset.upper(), quote.market_kind)
                 if key in current_keys:
                     grouped[key].append(quote)
+
+        # Historical backfill is stored separately from live evidence and merged
+        # only into the slow strategy's history projection. It never contaminates
+        # live ScanSnapshot records or AlphaForwardOutcome counts.
+        try:
+            historical = self._historical_research.history(
+                start=long_cutoff,
+                end=recent_cutoff,
+                assets={asset for _, asset, _ in current_keys},
+            )
+            for key, values in historical.items():
+                if key in current_keys:
+                    grouped[key].extend(values)
+        except Exception:
+            pass
 
         compact = {
             key: sorted(values, key=lambda item: item.observed_at)
@@ -215,3 +270,142 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
             reverse=True,
         )
         return rows
+
+    async def _probationary_cycle_candidates(
+        self,
+        snapshot: ScanSnapshot,
+        *,
+        total_capital_usd: float,
+        fully_promoted: list[AlphaCandidate],
+    ) -> list[AlphaCandidate]:
+        full_keys = {
+            (item.strategy_id, item.asset.upper(), item.direction)
+            for item in fully_promoted
+        }
+        try:
+            replay = self._historical_research.replay_summaries(
+                self._cycle_strategy,
+                self._expanded_settings,
+                total_capital_usd=total_capital_usd,
+                now=snapshot.completed_at,
+            )
+        except Exception:
+            return []
+
+        eligible: list[AlphaCandidate] = []
+        total_cap = total_capital_usd * PROBATIONARY_MAX_TOTAL_FRACTION
+        candidate_cap = total_capital_usd * PROBATIONARY_MAX_CANDIDATE_FRACTION
+        used_capital = 0.0
+
+        for candidate in self.discover(snapshot, total_capital_usd=total_capital_usd):
+            key = (candidate.strategy_id, candidate.asset.upper(), candidate.direction)
+            if candidate.strategy_id != self._cycle_strategy.strategy_id or key in full_keys:
+                continue
+
+            qualification = self.qualification(candidate)
+            health = self.strategy_health(candidate)
+            historical = replay.get((candidate.asset.upper(), candidate.direction))
+            policy = probationary_policy(
+                qualification,
+                health,
+                historical,
+                self._expanded_settings,
+            )
+            if not policy.eligible or historical is None:
+                continue
+
+            book = self._snapshot_book(candidate, snapshot)
+            current_cost = (
+                self._cost_from_book(candidate, book)
+                if book is not None
+                else await self._bounded_current_l2_cost(candidate)
+            )
+            if current_cost is None:
+                continue
+            current_cost += self._holding_carry_cost(candidate)
+            current_net = candidate.expected_gross_return - current_cost
+            forward_mean = qualification.mean_realized_net_return or 0.0
+            historical_mean = historical.mean_realized_net_return or 0.0
+            conservative = min(
+                current_net,
+                forward_mean * PROBATIONARY_FORWARD_MEAN_HAIRCUT,
+                historical_mean * PROBATIONARY_HISTORICAL_MEAN_HAIRCUT,
+            )
+            if conservative <= self.settings.alpha_min_current_net_return:
+                continue
+
+            remaining = max(0.0, total_cap - used_capital)
+            allowed_capital = min(candidate.capital_required_usd, candidate_cap, remaining)
+            if allowed_capital < self.settings.alpha_min_notional_usd:
+                continue
+            scale = allowed_capital / candidate.capital_required_usd
+            scale *= min(1.0, max(0.0, health.capital_multiplier))
+            if scale <= 0:
+                continue
+
+            probationary = candidate.model_copy(deep=True)
+            probationary.candidate_id = f"probationary:{candidate.candidate_id}"
+            probationary.notional_usd *= scale
+            probationary.capital_required_usd *= scale
+            if probationary.notional_usd < self.settings.alpha_min_notional_usd:
+                continue
+            probationary.estimated_cost_return = current_cost
+            probationary.expected_net_return = conservative
+            probationary.expected_profit_usd = probationary.notional_usd * conservative
+            # Keep stage='research' deliberately: this candidate has paper authority
+            # only through the explicit probationary tier, not full qualification.
+            probationary.paper_allocation_eligible = True
+            probationary.features.update(
+                {
+                    "allocation_tier": "probationary_paper",
+                    "probationary_paper": True,
+                    "probationary_cap_fraction_per_candidate": PROBATIONARY_MAX_CANDIDATE_FRACTION,
+                    "probationary_cap_fraction_total": PROBATIONARY_MAX_TOTAL_FRACTION,
+                    "forward_independent_samples": qualification.sample_count,
+                    "full_forward_sample_target": self.settings.alpha_min_forward_samples,
+                    "historical_walk_forward_support_only": True,
+                    "historical_replay_samples": historical.sample_count,
+                    "historical_replay_hit_rate": historical.hit_rate or 0.0,
+                    "historical_replay_mean_net_return": historical.mean_realized_net_return or 0.0,
+                    "historical_replay_regime_count": historical.regime_count,
+                    "health_capital_multiplier": health.capital_multiplier,
+                    "live_execution_authority": False,
+                }
+            )
+            eligible.append(probationary)
+            used_capital += probationary.capital_required_usd
+            if used_capital >= total_cap - 1e-9:
+                break
+
+        eligible.sort(
+            key=lambda item: (item.expected_net_return, item.expected_profit_usd),
+            reverse=True,
+        )
+        return eligible
+
+    async def promoted_candidates(
+        self,
+        snapshot: ScanSnapshot,
+        *,
+        total_capital_usd: float,
+    ) -> list[AlphaCandidate]:
+        await self._ensure_historical_research()
+        fully_promoted = await super().promoted_candidates(
+            snapshot,
+            total_capital_usd=total_capital_usd,
+        )
+        probationary = await self._probationary_cycle_candidates(
+            snapshot,
+            total_capital_usd=total_capital_usd,
+            fully_promoted=fully_promoted,
+        )
+        rows = [*fully_promoted, *probationary]
+        rows.sort(
+            key=lambda item: (item.expected_net_return, item.expected_profit_usd),
+            reverse=True,
+        )
+        return rows
+
+    async def run_evidence_cycle(self, *, total_capital_usd: float | None = None):
+        await self._ensure_historical_research()
+        return await super().run_evidence_cycle(total_capital_usd=total_capital_usd)
