@@ -92,7 +92,7 @@ def test_render_web_service_preserves_deployment_safe_research_read_plane():
 
     assert api["startCommand"] == "uvicorn inefficiency_engine.read_api_research_deploy:app --host 0.0.0.0 --port $PORT"
     assert api["healthCheckPath"] == "/health"
-    assert api["autoDeployTrigger"] == "off"
+    assert api["autoDeployTrigger"] == "checksPass"
     assert api["buildCommand"] == "python -m pip install --retries 5 --timeout 30 ."
     assert api["plan"] == "free"
     assert worker["startCommand"] == "cie worker"
