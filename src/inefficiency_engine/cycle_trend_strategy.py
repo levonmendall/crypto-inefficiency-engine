@@ -25,7 +25,10 @@ class CycleAwareMultiHorizonTrendStrategy:
     """Slow directional alpha with a bounded halving-cycle prior, never a trigger."""
 
     strategy_id = "cycle_aware_multi_horizon_trend_v1"
-    family = "directional_cycle_trend"
+    # The distinct strategy_id preserves independent strategy/asset/direction
+    # forward qualification while the canonical 13-lane view classifies this
+    # implementation under the existing directional trend/momentum mechanism.
+    family = "directional_time_series"
     lookbacks = (168.0, 720.0, 2160.0, 4320.0)  # 7/30/90/180d
     horizon_hours = 72.0
     history_refresh_hours = 6.0

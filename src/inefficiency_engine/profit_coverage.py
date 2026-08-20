@@ -55,7 +55,7 @@ class ProfitCoverageSummary(BaseModel):
     version: str
     observed_at: datetime
     objective: str
-    taxonomy_version: str = "2026-08-19-v3"
+    taxonomy_version: str = "2026-08-20-v3.8.1"
     mechanism_count: int = Field(ge=0)
     catalogued_count: int = Field(ge=0)
     decision_grade_count: int = Field(ge=0)
@@ -153,10 +153,10 @@ def canonical_profit_mechanisms(
 ) -> list[ProfitMechanismCoverage]:
     """Canonical economic-mechanism coverage map.
 
-    Decision-grade remains an evidence claim, not a code-completeness claim. V3
-    closes architecture/economics gaps broadly while provider-dependent families
-    remain below decision-grade until authoritative point-in-time observations and
-    the required forward/statistical evidence actually exist.
+    Decision-grade remains an evidence claim, not a code-completeness claim. V3.8.1
+    reflects the currently deployed paper-settlement capabilities while provider-
+    dependent families remain below decision-grade until authoritative point-in-time
+    observations and the required forward/statistical evidence actually exist.
     """
 
     alpha_families = alpha_families or set()
@@ -178,13 +178,18 @@ def canonical_profit_mechanisms(
             name="Price discrepancy / arbitrage",
             economic_role="Capture simultaneous or convergent pricing differences across venues, instruments, and settlement domains.",
             priority="critical",
-            stage="paper_allocatable",
-            implemented=["CEX spot dislocation", "CEX↔DEX composite edge", "stablecoin conversion depth"],
+            stage="profitability_certifiable",
+            implemented=[
+                "CEX spot dislocation",
+                "CEX↔DEX composite edge",
+                "stablecoin conversion depth",
+                "canonical CEX two-leg visible-L2 settlement",
+                "canonical CEX↔DEX amount-specific persisted requalification settlement",
+            ],
             research=["DEX↔DEX", "stablecoin convergence", "cross-chain price discrepancy"],
             blockers=[
                 "DEX↔DEX still lacks authoritative pool-specific executable route depth",
                 "cross-chain still lacks authoritative bridge fill-time and settlement-risk evidence",
-                "allocator-level realized settlement remains incomplete for multi-leg arbitrage families",
             ],
             authoritative_data=True,
             economics=True,
@@ -198,11 +203,17 @@ def canonical_profit_mechanisms(
             name="Carry / basis / funding",
             economic_role="Earn return from term structure, funding dispersion, financing differences, and market-neutral carry.",
             priority="critical",
-            stage="paper_allocatable",
-            implemented=["funding dispersion", "spot/perpetual basis", "dated-futures basis"],
+            stage="profitability_certifiable",
+            implemented=[
+                "funding dispersion",
+                "spot/perpetual basis",
+                "dated-futures basis",
+                "canonical visible-L2 two-leg settlement",
+                "observed perpetual funding accrual",
+            ],
             research=["provider-neutral generalized yield/carry contract"],
             missing=["collateral-specific financing dispersion"],
-            blockers=["allocator-level realized settlement still needs exact multi-leg carry and funding accrual reconstruction"],
+            blockers=[],
             authoritative_data=True,
             economics=True,
             forward=True,
@@ -260,9 +271,19 @@ def canonical_profit_mechanisms(
             economic_role="Take directional exposure when forward expected return is positive after costs and risk.",
             priority="critical",
             stage="profitability_certifiable" if momentum else "catalogued",
-            implemented=["time-series momentum"] if momentum else [],
-            missing=["multi-horizon trend ensemble", "cross-asset trend confirmation"],
-            blockers=["perpetual-short allocator settlement still needs realized funding accrual"],
+            implemented=(
+                [
+                    "time-series momentum",
+                    "cycle-aware 7/30/90/180-day trend ensemble",
+                    "BTC trend and cross-asset breadth confirmation",
+                    "bounded Bitcoin-halving-cycle prior",
+                    "spot-long and observed-funding perpetual-short settlement",
+                ]
+                if momentum
+                else []
+            ),
+            missing=[],
+            blockers=[],
             authoritative_data=momentum,
             economics=momentum,
             forward=momentum,
@@ -276,9 +297,16 @@ def canonical_profit_mechanisms(
             economic_role="Take directional exposure when statistically abnormal displacement is expected to revert after costs.",
             priority="critical",
             stage="profitability_certifiable" if reversion else "catalogued",
-            implemented=["robust median/MAD reversal"] if reversion else [],
+            implemented=(
+                [
+                    "robust median/MAD reversal",
+                    "spot-long and observed-funding perpetual-short settlement",
+                ]
+                if reversion
+                else []
+            ),
             missing=["cross-venue residual reversion", "multi-horizon reversion ensemble"],
-            blockers=["perpetual-short allocator settlement still needs realized funding accrual"],
+            blockers=[],
             authoritative_data=reversion,
             economics=reversion,
             forward=reversion,
@@ -308,9 +336,18 @@ def canonical_profit_mechanisms(
             economic_role="Exploit relative expected-return differences among tokens, sectors, baskets, and statistically linked instruments.",
             priority="high",
             stage="profitability_certifiable" if cross_sectional else "catalogued",
-            implemented=["cross-sectional residual ranking", "robust median/MAD dispersion", "shared forward/statistical promotion"] if cross_sectional else [],
+            implemented=(
+                [
+                    "cross-sectional residual ranking",
+                    "robust median/MAD dispersion",
+                    "shared forward/statistical promotion",
+                    "observed-funding perpetual-short settlement for directional legs",
+                ]
+                if cross_sectional
+                else []
+            ),
             missing=["sector-neutral baskets", "cointegration/pairs ensemble", "dedicated multi-leg relative-value settlement"],
-            blockers=["short legs use perpetuals and still require exact funding settlement for complete allocator-level certification"],
+            blockers=[],
             authoritative_data=cross_sectional,
             economics=cross_sectional,
             forward=cross_sectional,
