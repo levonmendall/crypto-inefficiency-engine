@@ -14,6 +14,9 @@ from inefficiency_engine.qualified_opportunity import (
 from inefficiency_engine.unified_allocation import UnifiedPaperAllocationPlan, UnifiedPaperCandidate, _core_candidates
 
 
+BRIDGE_WORKER_ID = "qualified-opportunity-bridge"
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -133,6 +136,19 @@ class FreshnessSeparatedQualifiedOpportunityAllocatorService(
 ):
     """Consume an operational bridge without ever consuming stale candidate evidence."""
 
+    def _bridge_failure(self) -> dict[str, object] | None:
+        try:
+            heartbeat = self.qualified_ledger.store.latest_worker_heartbeat(BRIDGE_WORKER_ID)
+        except Exception:
+            heartbeat = None
+        if heartbeat is None or heartbeat.state not in {"degraded", "error", "stopped"}:
+            return None
+        return {
+            "family": "qualified_opportunity_bridge",
+            "error_type": heartbeat.error_type or "QualifiedOpportunityBridgeDegraded",
+            "reason": "latest qualified-opportunity bridge publication failed closed",
+        }
+
     def _active_candidates_with_diagnostics(
         self,
     ) -> tuple[
@@ -140,6 +156,10 @@ class FreshnessSeparatedQualifiedOpportunityAllocatorService(
         list[dict[str, object]],
         list[dict[str, object]],
     ]:
+        bridge_failure = self._bridge_failure()
+        if bridge_failure is not None:
+            return [], [bridge_failure], []
+
         snapshot = self.qualified_ledger.latest_active()
         if snapshot is None:
             return [], [
