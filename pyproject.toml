@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-inefficiency-engine"
-version = "3.5.19"
-description = "Paper-first crypto opportunity engine with canonical-first runtime isolation, rotating bounded shadow L2 evaluation for 512 MB workers, result-releasing sequential research, raw-market canonical accounting, bounded L2 promotion, progressive profitability certification, and read-only per-mechanism evidence visibility."
+version = "3.5.20"
+description = "Paper-first crypto opportunity engine with canonical-first runtime isolation, rotating bounded shadow L2 evaluation, result-releasing sequential research, Blueprint-safe worker compute retention, raw-market canonical accounting, bounded L2 promotion, progressive profitability certification, and read-only per-mechanism evidence visibility."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
