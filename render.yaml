@@ -14,6 +14,8 @@ services:
         fromDatabase:
           name: cie-evidence
           property: connectionString
+      - key: MALLOC_ARENA_MAX
+        value: "2"
       - key: CIE_PAPER_ONLY
         value: "true"
       - key: CIE_SHADOW_HORIZONS_SECONDS
