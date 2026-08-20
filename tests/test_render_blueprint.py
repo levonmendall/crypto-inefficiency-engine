@@ -12,8 +12,6 @@ def test_render_blueprint_defines_durable_shadow_topology():
     assert worker["type"] == "worker"
     assert worker["startCommand"] == "cie worker"
     # The existing worker's instance type is intentionally dashboard-managed.
-    # Omitting `plan` prevents Blueprint syncs from downgrading a manual RAM
-    # upgrade back to Render Starter (512 MB).
     assert "plan" not in worker
     assert worker["autoDeployTrigger"] == "checksPass"
     assert worker["buildCommand"] == "python -m pip install --retries 20 --timeout 120 ."
@@ -28,7 +26,7 @@ def test_render_blueprint_defines_durable_shadow_topology():
     assert api["healthCheckPath"] == "/health"
     assert api["autoDeployTrigger"] == "off"
     assert api["buildCommand"] == "python -m pip install --retries 5 --timeout 30 ."
-    assert api["startCommand"] == "uvicorn inefficiency_engine.read_api_deploy:app --host 0.0.0.0 --port $PORT"
+    assert api["startCommand"] == "uvicorn inefficiency_engine.read_api_research_deploy:app --host 0.0.0.0 --port $PORT"
 
     database = databases["cie-evidence"]
     assert database["plan"] != "free"

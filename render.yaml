@@ -68,11 +68,10 @@ services:
     # Bound dependency retries so an external package/network failure becomes an
     # explicit failed deploy instead of an opaque 15+ minute spinner.
     buildCommand: python -m pip install --retries 5 --timeout 30 .
-    # Production web is a read plane only. The deployment bootstrap constructs a
-    # lazy non-schema-owning evidence store, keeps /health process-local, and leaves
-    # PostgreSQL readiness on /ready. Heavy scans/certification/allocation stay in
-    # cie-shadow-worker and persist their results to PostgreSQL.
-    startCommand: uvicorn inefficiency_engine.read_api_deploy:app --host 0.0.0.0 --port $PORT
+    # Production web remains a deployment-safe read plane: process-local liveness,
+    # separate bounded database readiness, no schema ownership, no heavy compute.
+    # Research-closure diagnostics consume compact append-only summaries only.
+    startCommand: uvicorn inefficiency_engine.read_api_research_deploy:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL

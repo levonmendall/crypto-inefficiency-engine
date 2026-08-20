@@ -20,6 +20,7 @@ from inefficiency_engine.dex_tier_shadow import DexTierShadowService
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.memory_bounded_research_worker import run_memory_bounded_research_worker
 from inefficiency_engine.operating_certification import OperatingCertificationService
+from inefficiency_engine.research_closure_worker import run_research_closure_cycle
 from inefficiency_engine.resilient_paper_portfolio import OperationallyResilientPaperPortfolioService
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
@@ -63,7 +64,7 @@ class _CompactCoreResearchService:
 
 
 async def run_research_child(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
-    """Run full research/certification under a bounded 512 MB working set.
+    """Run full research/certification under a bounded working set.
 
     Research surfaces execute sequentially and release their results between phases.
     The core multi-horizon shadow surface additionally uses a rotating bounded L2
@@ -109,7 +110,17 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
             stop_event=stop,
             max_cycles=1,
         )
-        return allocation_certification.ledger.summary()
+        closure = await run_research_closure_cycle(
+            service=service,
+            store=store,
+            alpha_factory=alpha_factory,
+            operating_certification=operating_certification,
+            total_capital_usd=float(service.settings.alpha_research_capital_usd),
+        )
+        return {
+            "allocation": allocation_certification.ledger.summary(),
+            "research_closure": closure.model_dump(mode="json") if closure is not None else None,
+        }
 
     certification_every = max(
         1,
