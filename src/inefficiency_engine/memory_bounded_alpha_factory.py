@@ -10,23 +10,24 @@ from inefficiency_engine.bounded_alpha_factory import BoundedExpandedAlphaFactor
 from inefficiency_engine.cycle_probation import (
     PROBATIONARY_FORWARD_MEAN_HAIRCUT,
     PROBATIONARY_HISTORICAL_MEAN_HAIRCUT,
-    PROBATIONARY_MAX_CANDIDATE_FRACTION,
-    PROBATIONARY_MAX_TOTAL_FRACTION,
     CycleHistoricalResearch,
-    probationary_policy,
 )
 from inefficiency_engine.cycle_trend_strategy import CycleAwareMultiHorizonTrendStrategy
 from inefficiency_engine.evidence import ScanSnapshot
+from inefficiency_engine.incremental_forward_sizing import (
+    FORWARD_EVIDENCE_STEP_SAMPLES,
+    incremental_forward_policy,
+)
 from inefficiency_engine.models import MarketKind, MarketQuote
 
 
 class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryService):
     """Exact fast-alpha history plus isolated compact long-horizon trend evidence.
 
-    The cycle-aware lane also owns a separated historical backfill/replay store and
-    a tightly capped probationary paper tier. Historical replay can warm signal
-    construction and support probationary sizing, but it never increments genuine
-    forward qualification counts and can never grant live execution authority.
+    The cycle-aware lane owns separated historical backfill/replay plus an
+    incrementally sized pre-certification paper tier. Historical replay can warm
+    signal construction and support bounded paper learning, but it never increments
+    genuine forward qualification counts and can never grant live execution authority.
     """
 
     def __init__(self, *args, **kwargs):
@@ -293,9 +294,6 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
             return []
 
         eligible: list[AlphaCandidate] = []
-        total_cap = total_capital_usd * PROBATIONARY_MAX_TOTAL_FRACTION
-        candidate_cap = total_capital_usd * PROBATIONARY_MAX_CANDIDATE_FRACTION
-        used_capital = 0.0
 
         for candidate in self.discover(snapshot, total_capital_usd=total_capital_usd):
             key = (candidate.strategy_id, candidate.asset.upper(), candidate.direction)
@@ -305,7 +303,7 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
             qualification = self.qualification(candidate)
             health = self.strategy_health(candidate)
             historical = replay.get((candidate.asset.upper(), candidate.direction))
-            policy = probationary_policy(
+            policy = incremental_forward_policy(
                 qualification,
                 health,
                 historical,
@@ -334,12 +332,7 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
             if conservative <= self.settings.alpha_min_current_net_return:
                 continue
 
-            remaining = max(0.0, total_cap - used_capital)
-            allowed_capital = min(candidate.capital_required_usd, candidate_cap, remaining)
-            if allowed_capital < self.settings.alpha_min_notional_usd:
-                continue
-            scale = allowed_capital / candidate.capital_required_usd
-            scale *= min(1.0, max(0.0, health.capital_multiplier))
+            scale = policy.allocation_fraction
             if scale <= 0:
                 continue
 
@@ -353,14 +346,17 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
             probationary.expected_net_return = conservative
             probationary.expected_profit_usd = probationary.notional_usd * conservative
             # Keep stage='research' deliberately: this candidate has paper authority
-            # only through the explicit probationary tier, not full qualification.
+            # only through the explicit incremental tier, not full qualification.
             probationary.paper_allocation_eligible = True
             probationary.features.update(
                 {
-                    "allocation_tier": "probationary_paper",
+                    "allocation_tier": "incremental_forward_paper",
                     "probationary_paper": True,
-                    "probationary_cap_fraction_per_candidate": PROBATIONARY_MAX_CANDIDATE_FRACTION,
-                    "probationary_cap_fraction_total": PROBATIONARY_MAX_TOTAL_FRACTION,
+                    "forward_evidence_allocation_fraction": policy.allocation_fraction,
+                    "forward_evidence_allocation_percent": int(
+                        round(policy.allocation_fraction * 100.0)
+                    ),
+                    "forward_evidence_step_samples": FORWARD_EVIDENCE_STEP_SAMPLES,
                     "forward_independent_samples": qualification.sample_count,
                     "full_forward_sample_target": self.settings.alpha_min_forward_samples,
                     "historical_walk_forward_support_only": True,
@@ -368,14 +364,17 @@ class MemoryBoundedExpandedAlphaFactoryService(BoundedExpandedAlphaFactoryServic
                     "historical_replay_hit_rate": historical.hit_rate or 0.0,
                     "historical_replay_mean_net_return": historical.mean_realized_net_return or 0.0,
                     "historical_replay_regime_count": historical.regime_count,
-                    "health_capital_multiplier": health.capital_multiplier,
+                    "health_recent_sample_count": health.recent_sample_count,
+                    "health_recent_mean_net_return": health.recent_mean_net_return or 0.0,
+                    "health_recent_hit_rate": health.recent_hit_rate or 0.0,
+                    "health_capture_ratio_median": health.forecast_capture_ratio_median or 0.0,
+                    "health_recent_to_long_run_ratio": health.recent_to_long_run_ratio or 0.0,
+                    "health_max_compounded_drawdown": health.max_compounded_drawdown or 0.0,
+                    "health_trailing_loss_streak": health.trailing_loss_streak,
                     "live_execution_authority": False,
                 }
             )
             eligible.append(probationary)
-            used_capital += probationary.capital_required_usd
-            if used_capital >= total_cap - 1e-9:
-                break
 
         eligible.sort(
             key=lambda item: (item.expected_net_return, item.expected_profit_usd),
