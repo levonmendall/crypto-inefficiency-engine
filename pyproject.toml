@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-inefficiency-engine"
-version = "3.5.25"
-description = "Paper-first crypto opportunity engine with a worker-owned heavy compute plane, a PostgreSQL-backed lightweight production read API, constant-time append-only mechanism telemetry, canonical-first runtime isolation, rotating bounded shadow L2 evaluation, bounded dashboard API waits, raw-market canonical accounting, progressive profitability certification, and fail-closed paper-only execution authority."
+version = "3.6.0"
+description = "Paper-first crypto opportunity engine with a worker-owned compute plane, PostgreSQL-backed lightweight read API, near-miss rejection funnels, explicit research-worker cadence health, canonical settlement-capability reconciliation, capital-location forward cohorts, conservative maker shadow learning, provider admission contracts, bounded L2 evaluation, and fail-closed profitability certification."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
