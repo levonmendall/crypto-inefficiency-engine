@@ -36,7 +36,8 @@ def test_worker_projection_publishes_complete_cash_genesis_snapshot(tmp_path):
     assert payload["trades"] == {"trades": []}
     assert payload["skips"] == {"skips": []}
     assert payload["mechanisms"]["requirements"]["independent_forward_outcomes"] == 30
-    assert projection.latest()["source_portfolio_observed_at"] == snapshot.observed_at.isoformat()
+    persisted = projection.latest()["source_portfolio_observed_at"]
+    assert persisted.replace("Z", "+00:00") == snapshot.observed_at.isoformat()
 
 
 def test_dashboard_uses_one_projection_request_instead_of_endpoint_fanout():
