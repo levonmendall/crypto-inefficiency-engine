@@ -5,10 +5,10 @@ import signal
 from types import SimpleNamespace
 
 from inefficiency_engine import __version__
+from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
 from inefficiency_engine.bounded_shadow_service import MemoryBoundedShadowService
 from inefficiency_engine.canonical_worker import run_canonical_portfolio_loop
 from inefficiency_engine.cex_dex_canonical_runtime import (
-    CexDexAwareAllocationForwardCertificationService as AllocationForwardCertificationService,
     CexDexFreshnessSeparatedQualifiedOpportunityAllocatorService as CanonicalPortfolioAllocatorService,
     CexDexFreshnessSeparatedQualifiedOpportunityBridgePublisher as QualifiedOpportunityBridgePublisher,
     CexDexUniversalOperationallyResilientPaperPortfolioService as OperationallyResilientPaperPortfolioService,
