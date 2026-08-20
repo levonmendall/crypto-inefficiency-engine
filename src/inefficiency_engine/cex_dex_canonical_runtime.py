@@ -41,6 +41,16 @@ CEX_DEX_SETTLEMENT_METHOD = "verified_amount_specific_cex_dex_composite_capture"
 
 
 def _cex_dex_holding_hours(settings) -> float:
+    reference_seconds = float(
+        getattr(
+            settings,
+            "cex_dex_composite_statistical_reference_horizon_seconds",
+            getattr(settings, "dex_statistical_reference_horizon_seconds", 0.0),
+        )
+        or 0.0
+    )
+    if reference_seconds > 0.0:
+        return reference_seconds / 3600.0
     horizons = [
         float(value)
         for value in (getattr(settings, "shadow_horizons_seconds", (60.0,)) or (60.0,))
@@ -312,6 +322,7 @@ class CexDexAwareAllocationForwardCertificationService(
                 "settlement_supported": True,
                 "settlement_method": cls.CEX_DEX_SETTLEMENT_METHOD,
                 "settlement_blocker": None,
+                "cohort_key": f"cex_dex|{allocation.candidate_id}",
             }
         )
 
