@@ -7,6 +7,7 @@ from sqlalchemy import text
 
 from inefficiency_engine import __version__
 from inefficiency_engine import evidence as evidence_module
+from inefficiency_engine.provider_readiness_read import reconcile_provider_readiness
 from inefficiency_engine.read_evidence import build_read_only_evidence_store
 from inefficiency_engine.strategy_evidence_read import (
     augment_mechanism_payload,
@@ -57,6 +58,7 @@ def deployment_health():
         "research_closure": True,
         "dashboard_projection": "portfolio_plus_live_research",
         "strategy_evidence_attribution": True,
+        "provider_readiness_reconciliation": True,
     }
 
 
@@ -82,6 +84,7 @@ def deployment_readiness():
         "research_closure": True,
         "dashboard_projection": "portfolio_plus_live_research",
         "strategy_evidence_attribution": True,
+        "provider_readiness_reconciliation": True,
     }
 
 
@@ -117,12 +120,16 @@ def _attributed_sections(
     mechanisms: dict[str, object],
     queue: dict[str, object],
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Presentation-only strategy attribution; never changes portfolio authority."""
+    """Presentation-only live reconciliation; never changes portfolio authority."""
     try:
-        attributed = augment_mechanism_payload(store, _base.settings, mechanisms)
+        # Provider admission is a newer and narrower fact than a cached operating
+        # projection. Reconcile it first so strategy attribution never preserves a
+        # stale provider-gap state after an authoritative surface is freshly admitted.
+        provider_reconciled = reconcile_provider_readiness(store, mechanisms)
+        attributed = augment_mechanism_payload(store, _base.settings, provider_reconciled)
         return attributed, reconcile_action_queue(queue, attributed)
     except Exception:
-        # Dashboard attribution is fail-contained. The durable operating projection
+        # Dashboard enrichment is fail-contained. The durable operating projection
         # remains authoritative if diagnostics cannot be enriched.
         return mechanisms, queue
 
@@ -134,7 +141,8 @@ def dashboard_snapshot():
     The browser still makes one request. The API performs bounded tail reads inside
     one transaction: the latest portfolio-led snapshot plus, when available, the
     research snapshot published after the latest successful research cycle. Strategy
-    attribution is cached by append-only ledger tails and is presentation-only.
+    attribution and provider-readiness reconciliation are presentation-only and
+    cannot create economic, statistical, allocation, or execution authority.
     """
     store = _base.evidence_store
     if store is None:
@@ -195,6 +203,9 @@ def dashboard_snapshot():
         combined["strategy_evidence_attribution"] = bool(
             mechanisms.get("strategy_evidence_attribution")
         )
+        combined["provider_readiness_reconciliation"] = bool(
+            mechanisms.get("provider_readiness_reconciled")
+        )
         return combined
 
     combined = dict(base)
@@ -210,6 +221,9 @@ def dashboard_snapshot():
         "queue": queue,
         "strategy_evidence_attribution": bool(
             mechanisms.get("strategy_evidence_attribution")
+        ),
+        "provider_readiness_reconciliation": bool(
+            mechanisms.get("provider_readiness_reconciled")
         ),
     })
     return combined

@@ -111,6 +111,58 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         allocation_certification,
         version=__version__,
     )
+
+    # The canonical portfolio has already completed its supervisor bootstrap before
+    # this research thread starts. Probe provider-dependent research surfaces here,
+    # once per research-thread start, so a deploy/restart does not leave the dashboard
+    # showing an obsolete provider gap until the staggered certification cadence fires.
+    # Each individual provider remains isolated/fail-closed inside run_cycle().
+    try:
+        store.record_worker_heartbeat(
+            worker_id=RESEARCH_WORKER_ID,
+            state="starting",
+            detail={
+                "provider_gap_bootstrap": True,
+                "provider_gap_bootstrap_complete": False,
+                "paper_only": True,
+            },
+        )
+        bootstrap = await operating_certification.provider_gap_collection.run_cycle()
+        mechanisms = bootstrap.get("mechanisms", {}) if isinstance(bootstrap, dict) else {}
+        healthy_count = sum(
+            bool(row.get("healthy"))
+            for row in mechanisms.values()
+            if isinstance(row, dict)
+        ) if isinstance(mechanisms, dict) else 0
+        store.record_worker_heartbeat(
+            worker_id=RESEARCH_WORKER_ID,
+            state="running",
+            detail={
+                "provider_gap_bootstrap": True,
+                "provider_gap_bootstrap_complete": True,
+                "provider_gap_bootstrap_healthy_count": healthy_count,
+                "provider_gap_bootstrap_mechanism_count": len(mechanisms) if isinstance(mechanisms, dict) else 0,
+                "paper_only": True,
+            },
+        )
+    except Exception as exc:
+        # Provider bootstrap is additive research telemetry. Never suppress the
+        # canonical portfolio or the established research loop if this probe fails.
+        try:
+            store.record_worker_heartbeat(
+                worker_id=RESEARCH_WORKER_ID,
+                state="degraded",
+                error_type=type(exc).__name__,
+                detail={
+                    "provider_gap_bootstrap": True,
+                    "provider_gap_bootstrap_complete": False,
+                    "message": str(exc)[:500],
+                    "paper_only": True,
+                },
+            )
+        except Exception:
+            pass
+
     research_projection = ResearchDashboardProjectionLedger(store)
 
     async def qualified_opportunity_cycle() -> object:
