@@ -13,12 +13,7 @@ def _replace_once(source: str, old: str, new: str) -> str:
 
 
 def _build_resilient_dashboard_html() -> str:
-    """Serve the command center from one worker-published compact projection.
-
-    The browser makes one bounded request per refresh instead of fanning out ten
-    concurrent PostgreSQL-backed reads. The latest successful projection remains
-    available in session storage for brief API/database interruptions.
-    """
+    """Serve one HTTP snapshot with independently refreshed portfolio/research projections."""
 
     html = INTEGRITY_DASHBOARD_HTML
     html = _replace_once(
@@ -34,6 +29,13 @@ function saveLastGood(key,payload){dashboardLastGood[key]=payload;try{sessionSto
 function loadLastGood(key){if(dashboardLastGood[key])return dashboardLastGood[key];try{const raw=sessionStorage.getItem(`cie-dashboard-${key}`);if(!raw)return null;const cached=JSON.parse(raw);if(!cached||Date.now()-(+cached.saved_at||0)>DASHBOARD_CACHE_TTL_MS){sessionStorage.removeItem(`cie-dashboard-${key}`);return null}dashboardLastGood[key]=cached.payload;return cached.payload}catch(e){return null}}
 async function resilientJSON(url,key,fallback,attempts=2){let lastError=null;for(let attempt=0;attempt<attempts;attempt++){try{const payload=await getJSON(url,5000);saveLastGood(key,payload);return payload}catch(e){lastError=e;const transient=e.status===502||e.status===503||e.status===504||e.status===429||e.status===undefined;if(!transient||attempt===attempts-1)break;await wait(350*Math.pow(2,attempt))}}const cached=loadLastGood(key);if(cached)return {...cached,__error:lastError?.message||`${url}: temporarily unavailable`,__stale:true};return {...fallback,__error:lastError?.message||`${url}: temporarily unavailable`,__stale:true}}
 async function safeJSON(url,fallback){try{return await getJSON(url,5000)}catch(e){return {...fallback,__error:e.message}}}""",
+    )
+    html = _replace_once(
+        html,
+        "    const last=r.forward_evidence_last_outcome_at||r.forward_evidence_last_signal_at||r.forward_evidence_last_cycle_at,next=r.forward_evidence_next_expected_at;\n"
+        "    return `<div class=\"evidence-card\"><div class=\"evidence-card-head\"><div><div class=\"evidence-card-name\">${esc(r.name)}</div><div class=\"evidence-card-meta\">${esc((r.stage||'unknown').replaceAll('_',' '))} · ${esc(worker)} · ${esc(persist)}</div></div><span class=\"state ${esc(r.state)}\">${esc((r.state||'unknown').replaceAll('_',' '))}</span></div><div class=\"evidence-pipeline\">${evidenceStep('Provider',r.provider_ready?'Ready':'Gap',`${obs} authoritative`,providerCls)}${evidenceStep('Observations',num(obs),`${signals} signals`,obsCls)}${evidenceStep('Forward',forwardApplicable?`${num(outcomes)} / ${num(forwardTarget)}`:'Not enabled',forwardApplicable?'independent outcomes':'stage not forward-testable',forwardCls)}${evidenceStep('Qualified',forwardApplicable?num(q):'—','current statistical gate',statsCls)}${evidenceStep('Executable',stage>=4?num(p):'—','current L2 / cost / capacity',executionCls)}${evidenceStep('Settled',settlementApplicable?`${num(settled)} / ${num(settledTarget)}`:'Not enabled',settlementApplicable?'allocator outcomes':'allocation not enabled',settlementCls)}${evidenceStep('Certified',r.state==='certified'?'Yes':'No','profitability certification',certCls)}</div><div class=\"evidence-reason\">${esc(r.primary_reason||'No current reason recorded')}</div><div class=\"evidence-next\">Next: ${esc(r.next_action||'Continue evidence collection')}</div><div class=\"evidence-time\">${last?`Last evidence ${when(last)}`:'No forward evidence timestamp yet'}${next?` · Next expected ${when(next)}`:''}</div></div>`",
+        "    const last=r.forward_evidence_last_outcome_at||r.forward_evidence_last_signal_at||r.forward_evidence_last_cycle_at,next=r.forward_evidence_next_expected_at,projected=r.research_projection_observed_at||observedAt;\n"
+        "    return `<div class=\"evidence-card\"><div class=\"evidence-card-head\"><div><div class=\"evidence-card-name\">${esc(r.name)}</div><div class=\"evidence-card-meta\">${esc((r.stage||'unknown').replaceAll('_',' '))} · ${esc(worker)} · ${esc(persist)}</div></div><span class=\"state ${esc(r.state)}\">${esc((r.state||'unknown').replaceAll('_',' '))}</span></div><div class=\"evidence-pipeline\">${evidenceStep('Provider',r.provider_ready?'Ready':'Gap',`${obs} authoritative`,providerCls)}${evidenceStep('Observations',num(obs),`${signals} signals`,obsCls)}${evidenceStep('Forward',forwardApplicable?`${num(outcomes)} / ${num(forwardTarget)}`:'Not enabled',forwardApplicable?'independent outcomes':'stage not forward-testable',forwardCls)}${evidenceStep('Qualified',forwardApplicable?num(q):'—','current statistical gate',statsCls)}${evidenceStep('Executable',stage>=4?num(p):'—','current L2 / cost / capacity',executionCls)}${evidenceStep('Settled',settlementApplicable?`${num(settled)} / ${num(settledTarget)}`:'Not enabled',settlementApplicable?'allocator outcomes':'allocation not enabled',settlementCls)}${evidenceStep('Certified',r.state==='certified'?'Yes':'No','profitability certification',certCls)}</div><div class=\"evidence-reason\">${esc(r.primary_reason||'No current reason recorded')}</div><div class=\"evidence-next\">Next: ${esc(r.next_action||'Continue evidence collection')}</div><div class=\"evidence-time\">${projected?`Updated ${when(projected)}`:'Update time unavailable'}${last?` · Last evidence ${when(last)}`:' · No forward evidence yet'}${next?` · Next expected ${when(next)}`:''}</div></div>`",
     )
     html = _replace_once(
         html,
@@ -55,7 +57,7 @@ const [portfolio,performance,runtime,positions,trades,history,skips,attribution,
     html = _replace_once(
         html,
         "Auto-refresh: 30 seconds · Account freshness and market-valuation freshness tracked separately",
-        "Auto-refresh: 30 seconds · One compact worker-published snapshot per refresh · detailed endpoints remain diagnostic-only",
+        "Auto-refresh: 30 seconds · One HTTP snapshot · portfolio and research projections refresh independently",
     )
     return html
 
