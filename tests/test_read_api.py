@@ -3,6 +3,7 @@ from pathlib import Path
 import yaml
 from fastapi.testclient import TestClient
 
+from inefficiency_engine.dashboard_research_closure import RESEARCH_CLOSURE_DASHBOARD_HTML
 from inefficiency_engine.read_api_research import app
 
 
@@ -11,8 +12,9 @@ def test_read_plane_exposes_dashboard_and_durable_status_routes_only():
     root = client.get("/")
     assert root.status_code == 200
     assert "Portfolio Command Center" in root.text
-    assert "Rejection funnel" in root.text
-    assert "worker scheduled" in root.text
+    assert "evidence-diagnostic" in RESEARCH_CLOSURE_DASHBOARD_HTML
+    assert "Rejection funnel" in RESEARCH_CLOSURE_DASHBOARD_HTML
+    assert "worker scheduled" in RESEARCH_CLOSURE_DASHBOARD_HTML
 
     health = client.get("/health")
     assert health.status_code == 200
