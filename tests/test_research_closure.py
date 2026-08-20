@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+from inefficiency_engine.bounded_research_closure import MemoryBoundedResearchClosureService
 from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.models import (
@@ -12,10 +14,7 @@ from inefficiency_engine.models import (
     Side,
     Strategy,
 )
-from inefficiency_engine.research_closure import (
-    ResearchClosureService,
-    classify_research_worker_state,
-)
+from inefficiency_engine.research_closure import classify_research_worker_state
 from inefficiency_engine.research_mechanisms import (
     CapitalLocationPlan,
     CapitalLocationScore,
@@ -111,7 +110,7 @@ def test_worker_cadence_state_distinguishes_wait_late_stall_and_failure():
 
 def test_rejection_funnel_exposes_best_near_miss_without_lowering_hurdle(tmp_path):
     store = EvidenceStore(tmp_path / "closure.db")
-    service = ResearchClosureService(store, Settings())
+    service = MemoryBoundedResearchClosureService(store, Settings())
     observed = datetime(2026, 8, 20, 16, 0, tzinfo=timezone.utc)
     quotes = [
         MarketQuote(
@@ -148,7 +147,7 @@ def test_rejection_funnel_exposes_best_near_miss_without_lowering_hurdle(tmp_pat
         observed_at=observed,
     )
     price = rows["price_discrepancy"]
-    assert price.raw_candidate_count > 0
+    assert price.raw_candidate_count == 2
     assert price.emitted_candidate_count == 0
     assert price.best_net_economics is not None
     assert price.required_net_economics == Settings().min_net_annualized_return
@@ -159,9 +158,17 @@ def test_rejection_funnel_exposes_best_near_miss_without_lowering_hurdle(tmp_pat
     assert persisted.snapshot_id == price.snapshot_id
 
 
+def test_production_rejection_funnel_does_not_materialize_cross_venue_pair_lists():
+    source = Path("src/inefficiency_engine/bounded_research_closure.py").read_text()
+    assert "price_candidates" not in source
+    assert "carry_candidates" not in source
+    assert "price_raw += self._different_venue_ordered_pair_count(rows)" in source
+    assert "only the best candidate economics are retained" in source
+
+
 def test_capital_location_recommendation_is_forward_evaluated_without_authority(tmp_path):
     store = EvidenceStore(tmp_path / "location.db")
-    service = ResearchClosureService(store, Settings())
+    service = MemoryBoundedResearchClosureService(store, Settings())
     start = datetime(2026, 8, 20, 16, 0, tzinfo=timezone.utc)
     plan = CapitalLocationPlan(
         observed_at=start,
@@ -216,7 +223,7 @@ def test_capital_location_recommendation_is_forward_evaluated_without_authority(
 
 def test_maker_shadow_collects_cross_through_without_claiming_queue_fill(tmp_path):
     store = EvidenceStore(tmp_path / "maker.db")
-    service = ResearchClosureService(store, Settings())
+    service = MemoryBoundedResearchClosureService(store, Settings())
     start = datetime(2026, 8, 20, 16, 0, tzinfo=timezone.utc)
     first = service.run_maker_shadow_cycle(
         [_book(observed_at=start, bid=100.0, ask=101.0)],
