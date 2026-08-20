@@ -10,13 +10,7 @@ from inefficiency_engine.models import OrderBookSnapshot, TradeSide
 
 
 class BoundedExpandedAlphaFactoryService(ExpandedAlphaFactoryService):
-    """Expanded alpha promotion that cannot stall canonical accounting on L2 I/O.
-
-    The live executability scan has already collected point-in-time order books.
-    Promotion consumes that exact evidence first. A direct provider fetch is only a
-    fallback when the scan lacks a matching fresh book, and that fallback is bounded
-    by the adapter registry's order-book timeout.
-    """
+    """Expanded alpha promotion that cannot stall canonical accounting on L2 I/O."""
 
     def _snapshot_book(
         self,
@@ -62,6 +56,14 @@ class BoundedExpandedAlphaFactoryService(ExpandedAlphaFactoryService):
         )
         return max(0.0, total_bps / 10_000.0)
 
+    @staticmethod
+    def _holding_carry_cost(candidate: AlphaCandidate) -> float:
+        raw = candidate.features.get("holding_carry_cost_return", 0.0)
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 0.0
+
     async def _bounded_current_l2_cost(self, candidate: AlphaCandidate) -> float | None:
         timeout = max(
             0.05,
@@ -95,6 +97,7 @@ class BoundedExpandedAlphaFactoryService(ExpandedAlphaFactoryService):
             )
             if current_cost is None:
                 continue
+            current_cost += self._holding_carry_cost(candidate)
 
             net = candidate.expected_gross_return - current_cost
             conservative_forward = qualification.mean_realized_net_return_ci_lower or 0.0
