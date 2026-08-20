@@ -53,6 +53,19 @@ def build_operating_certification_router(
             raise HTTPException(status_code=503, detail="evidence persistence is not configured")
         return operating
 
+    def evidence_requirements(engine: OperatingCertificationService) -> dict[str, int]:
+        """Expose the immutable evidence hurdles used by the operating interpreter.
+
+        The dashboard consumes these only for visibility. Returning the thresholds
+        from the same service that enforces them avoids duplicating or drifting UI
+        assumptions, and does not create allocation or execution authority.
+        """
+
+        return {
+            "independent_forward_outcomes": engine.min_forward_samples,
+            "settled_allocator_outcomes": engine.min_allocator_settled_trials,
+        }
+
     @router.get("/v3/operations/certification/latest")
     def operating_certification_latest():
         engine = require_operating()
@@ -103,11 +116,21 @@ def build_operating_certification_router(
     def operating_mechanisms():
         engine = require_operating()
         latest = engine.ledger.latest()
+        requirements = evidence_requirements(engine)
         if latest is None:
-            return {"paper_only": True, "count": 0, "mechanisms": []}
+            return {
+                "paper_only": True,
+                "count": 0,
+                "observed_at": None,
+                "requirements": requirements,
+                "mechanisms": [],
+            }
         return {
             "paper_only": True,
             "count": len(latest.mechanisms),
+            "observed_at": latest.observed_at,
+            "version": latest.version,
+            "requirements": requirements,
             "mechanisms": [row.model_dump(mode="json") for row in latest.mechanisms],
         }
 
