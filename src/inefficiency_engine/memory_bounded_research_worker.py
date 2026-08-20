@@ -12,6 +12,7 @@ from inefficiency_engine.worker import WorkerRunStats
 SleepFn = Callable[[float], Awaitable[None]]
 Runner = Callable[[], Awaitable[object]]
 FrontierRunner = Callable[[], Awaitable[list[object]]]
+Publisher = Callable[[], None]
 
 
 def _offset_due(attempted: int, every_cycles: int, offset: int) -> bool:
@@ -177,6 +178,7 @@ async def run_memory_bounded_research_worker(
     allocation_certification_every_cycles: int = 10,
     frontier_runner: FrontierRunner | None = None,
     frontier_every_cycles: int = 10,
+    post_success_publisher: Publisher | None = None,
 ) -> WorkerRunStats:
     """Run every research surface sequentially and release each result before the next.
 
@@ -184,7 +186,8 @@ async def run_memory_bounded_research_worker(
     512 MB worker: completed task results remain strongly referenced by the gather
     operation until all sibling tasks finish. This loop preserves the same cadence
     and durable evidence writes but never retains more than one heavyweight research
-    result at a time.
+    result at a time. A lightweight post-success publisher may project already-durable
+    research state; publisher failures never change research success/failure authority.
     """
 
     attempted = succeeded = failed = 0
@@ -297,6 +300,13 @@ async def run_memory_bounded_research_worker(
             scan_id=scan_id,
             detail=detail,
         )
+        if post_success_publisher is not None:
+            try:
+                post_success_publisher()
+            except Exception:
+                # Presentation projection is explicitly fail-contained. The durable
+                # research cycle has already succeeded and cannot be reclassified.
+                pass
         if not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
             await _interruptible_sleep(
                 service.settings.shadow_cycle_interval_seconds,
