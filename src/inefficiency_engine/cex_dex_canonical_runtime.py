@@ -10,13 +10,10 @@ from inefficiency_engine.allocation_certification import (
     PaperAllocationTrial,
 )
 from inefficiency_engine.canonical_paper_portfolio import CanonicalPortfolioEvent
-from inefficiency_engine.cex_dex_shadow import (
-    CexDexCompositeEdgeLedger,
-    CexDexCompositeEdgeShadowCycle,
-)
 from inefficiency_engine.evidence import ScanSnapshot
 from inefficiency_engine.models import MarketKind
 from inefficiency_engine.qualified_opportunity import (
+    QualifiedOpportunityLedger,
     QualifiedOpportunitySnapshot,
     _candidate_has_canonical_settlement as _base_candidate_has_canonical_settlement,
 )
@@ -332,36 +329,57 @@ class CexDexAwareAllocationForwardCertificationService(
     ) -> tuple[datetime, float | None, bool] | None:
         if trial.due_at is None or not trial.candidate_id.startswith("cex-dex:"):
             return None
-        composite_key = trial.candidate_id.split(":", 1)[1]
-        ledger = CexDexCompositeEdgeLedger(self.store)
+
+        ledger = QualifiedOpportunityLedger(self.store)
+        lower_bound = trial.source_observed_at or trial.plan_observed_at
         with self.store.engine.connect() as db:
             payloads = list(
                 db.execute(
-                    select(ledger.cycles.c.payload_json)
-                    .where(ledger.cycles.c.completed_at >= trial.due_at.isoformat())
-                    .order_by(ledger.cycles.c.completed_at)
-                    .limit(50)
+                    select(ledger.snapshots.c.payload_json)
+                    .where(ledger.snapshots.c.observed_at >= lower_bound.isoformat())
+                    .order_by(ledger.snapshots.c.id)
+                    .limit(100)
                 ).scalars()
             )
 
         for payload in payloads:
-            cycle = CexDexCompositeEdgeShadowCycle.model_validate_json(payload)
-            matches = sorted(
-                (
-                    row
-                    for row in cycle.observations
-                    if row.composite_key == composite_key and row.verified_at >= trial.due_at
-                ),
-                key=lambda row: row.verified_at,
+            snapshot = QualifiedOpportunitySnapshot.model_validate_json(payload)
+            cex_failure = any(
+                row.get("family") == "cex_dex" for row in snapshot.family_failures
             )
-            if matches:
-                row = matches[0]
-                return row.verified_at, row.verification_net_edge_bps, bool(row.survived)
-            if cycle.started_at >= trial.due_at:
-                # A complete post-horizon reconstruction did not rediscover this exact
-                # route/notional signature. Treat that as zero captured edge, never as
-                # invented profit and never as live-execution evidence.
-                return cycle.completed_at, None, False
+            if cex_failure:
+                continue
+
+            later_candidates = [
+                item
+                for item in snapshot.candidates
+                if item.family == "cex_dex"
+                and item.source_observed_at is not None
+                and item.source_observed_at >= trial.due_at
+            ]
+            exact = next(
+                (item for item in later_candidates if item.candidate_id == trial.candidate_id),
+                None,
+            )
+            if exact is not None:
+                verified_edge_bps = (
+                    exact.expected_profit_usd_per_deployment
+                    / exact.notional_usd_per_leg
+                    * 10_000.0
+                )
+                return exact.source_observed_at or snapshot.observed_at, verified_edge_bps, True
+
+            if later_candidates:
+                verified_at = min(
+                    item.source_observed_at for item in later_candidates if item.source_observed_at is not None
+                )
+                return verified_at, None, False
+
+            if snapshot.observed_at >= trial.due_at:
+                # The bridge completed a post-horizon qualification pass without a
+                # CEX↔DEX family failure and the exact opportunity was absent. Record
+                # zero capture rather than fabricating a profitable fill.
+                return snapshot.observed_at, None, False
         return None
 
     @classmethod
