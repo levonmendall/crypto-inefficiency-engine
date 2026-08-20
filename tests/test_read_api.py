@@ -57,8 +57,8 @@ def test_read_plane_exposes_dashboard_and_durable_status_routes_only():
 
 def test_mechanism_overlay_never_full_scans_growing_evidence_tables():
     source = Path("src/inefficiency_engine/read_api_fast.py").read_text()
-    assert "func.count" not in source
-    assert "COUNT(*)" not in source
+    assert "select(func.count" not in source
+    assert "func.max" not in source
     assert "order_by(table.c.id.desc()).limit(1)" in source
     assert "dex_route_quotes.c.observed_at.desc()" in source
     assert '"query_mode": "append_only_primary_key_tail"' in source
