@@ -59,6 +59,11 @@ async def test_memory_bounded_worker_releases_previous_surface_before_next_runs(
         return SimpleNamespace(cycle_id="tier-1", initial_quote_count=0, observations=[])
 
     store = FakeStore()
+
+    def publish():
+        assert store.heartbeats[-1] == ("research-test", "success")
+        order.append("publish")
+
     stats = await run_memory_bounded_research_worker(
         FakeService(),  # type: ignore[arg-type]
         store,  # type: ignore[arg-type]
@@ -68,9 +73,10 @@ async def test_memory_bounded_worker_releases_previous_surface_before_next_runs(
         route_shadow_runner=route_runner,
         tier_shadow_runner=tier_runner,
         tier_shadow_every_cycles=1,
+        post_success_publisher=publish,
     )
 
-    assert order == ["core", "route", "tier"]
+    assert order == ["core", "route", "tier", "publish"]
     assert stats.cycles_attempted == 1
     assert stats.cycles_succeeded == 1
     assert ("research-test", "success") in store.heartbeats

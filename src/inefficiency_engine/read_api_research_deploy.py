@@ -51,7 +51,7 @@ def deployment_health():
         "database_check": "deferred_to_readiness",
         "schema_owner": "worker",
         "research_closure": True,
-        "dashboard_projection": True,
+        "dashboard_projection": "portfolio_plus_live_research",
     }
 
 
@@ -75,13 +75,45 @@ def deployment_readiness():
         "evidence_backend": store.backend,
         "schema_owner": "worker",
         "research_closure": True,
-        "dashboard_projection": True,
+        "dashboard_projection": "portfolio_plus_live_research",
     }
+
+
+def _projection_table_exists(db, backend: str, table_name: str) -> bool:
+    if backend == "postgresql":
+        return db.execute(
+            text("SELECT to_regclass(:table_name)"),
+            {"table_name": table_name},
+        ).scalar_one_or_none() is not None
+    return db.execute(
+        text(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name=:table_name LIMIT 1"
+        ),
+        {"table_name": table_name},
+    ).scalar_one_or_none() is not None
+
+
+def _decode_projection(raw: object | None, *, label: str) -> dict[str, object] | None:
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(str(raw))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=503, detail=f"{label} dashboard projection is invalid") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=503, detail=f"{label} dashboard projection is invalid")
+    return payload
 
 
 @app.get("/v3/dashboard/snapshot")
 def dashboard_snapshot():
-    """Return the worker-published command-center projection with one tail query."""
+    """Return portfolio state plus the independently refreshed research-card projection.
+
+    The browser still makes one request. The API performs bounded tail reads inside
+    one transaction: the latest portfolio-led snapshot plus, when available, the
+    research snapshot published after the latest successful research cycle.
+    """
     store = _base.evidence_store
     if store is None:
         raise HTTPException(status_code=503, detail="evidence persistence is not configured")
@@ -90,23 +122,46 @@ def dashboard_snapshot():
             if store.backend == "postgresql":
                 db.execute(text("SET LOCAL statement_timeout = '2500ms'"))
                 db.execute(text("SET LOCAL lock_timeout = '1000ms'"))
-            raw = db.execute(
+            base_raw = db.execute(
                 text(
                     "SELECT payload_json FROM dashboard_projection_snapshots "
                     "ORDER BY id DESC LIMIT 1"
                 )
             ).scalar_one_or_none()
+            research_raw = None
+            if _projection_table_exists(db, store.backend, "dashboard_research_projection_snapshots"):
+                research_raw = db.execute(
+                    text(
+                        "SELECT payload_json FROM dashboard_research_projection_snapshots "
+                        "ORDER BY id DESC LIMIT 1"
+                    )
+                ).scalar_one_or_none()
     except Exception as exc:
         raise HTTPException(
             status_code=503,
             detail="dashboard projection is temporarily unavailable",
         ) from exc
-    if raw is None:
-        raise HTTPException(status_code=503, detail="dashboard projection is awaiting its first worker publication")
-    try:
-        payload = json.loads(str(raw))
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=503, detail="dashboard projection is invalid") from exc
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=503, detail="dashboard projection is invalid")
-    return payload
+
+    base = _decode_projection(base_raw, label="portfolio")
+    if base is None:
+        raise HTTPException(
+            status_code=503,
+            detail="dashboard projection is awaiting its first worker publication",
+        )
+    research = _decode_projection(research_raw, label="research")
+    if research is None:
+        return base
+
+    combined = dict(base)
+    combined.update({
+        "projection_version": 2,
+        "projection_mode": "portfolio_plus_live_research",
+        "observed_at": research.get("observed_at") or base.get("observed_at"),
+        "research_projection_observed_at": research.get("observed_at"),
+        "source_operating_observed_at": research.get("source_operating_observed_at"),
+        "source_research_closure_observed_at": research.get("source_research_closure_observed_at"),
+        "source_research_heartbeat_at": research.get("source_research_heartbeat_at"),
+        "mechanisms": research.get("mechanisms") or base.get("mechanisms") or {},
+        "queue": research.get("queue") or base.get("queue") or {},
+    })
+    return combined
