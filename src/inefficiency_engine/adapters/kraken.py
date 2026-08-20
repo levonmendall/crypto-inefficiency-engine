@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
@@ -94,33 +95,37 @@ class KrakenSpotAdapter:
                 await client.aclose()
 
     async def market_quotes(self) -> list[MarketQuote]:
-        quotes: list[MarketQuote] = []
-        for asset in self.assets:
+        async def for_asset(asset: str) -> MarketQuote | None:
             symbol = f"{asset}/USD"
             try:
                 book = parse_pretrade(await self._get(symbol=symbol), asset=asset, symbol=symbol)
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 404:
-                    continue
+                if exc.response.status_code in {400, 404}:
+                    return None
                 raise
+            except ValueError:
+                # Kraken represents unsupported pairs as a successful HTTP response
+                # with an error payload. Skip only that asset; do not collapse the
+                # rest of the bounded provider surface.
+                return None
             bid = max(level.price for level in book.bids)
             ask = min(level.price for level in book.asks)
-            quotes.append(
-                MarketQuote(
-                    venue="Kraken",
-                    asset=asset,
-                    market_kind=MarketKind.SPOT,
-                    symbol=symbol,
-                    quote_currency="USD",
-                    contract_key="spot",
-                    bid=bid,
-                    ask=ask,
-                    mid=(bid + ask) / 2.0,
-                    observed_at=book.observed_at,
-                    source="kraken:PreTrade",
-                )
+            return MarketQuote(
+                venue="Kraken",
+                asset=asset,
+                market_kind=MarketKind.SPOT,
+                symbol=symbol,
+                quote_currency="USD",
+                contract_key="spot",
+                bid=bid,
+                ask=ask,
+                mid=(bid + ask) / 2.0,
+                observed_at=book.observed_at,
+                source="kraken:PreTrade",
             )
-        return quotes
+
+        rows = await asyncio.gather(*(for_asset(asset) for asset in self.assets))
+        return [row for row in rows if row is not None]
 
     async def order_book(self, asset: str, *, symbol: str | None = None) -> OrderBookSnapshot:
         symbol = symbol or f"{asset.upper()}/USD"

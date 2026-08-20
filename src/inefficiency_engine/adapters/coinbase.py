@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
 
 import httpx
 
+from inefficiency_engine.asset_universe import configured_liquid_research_assets
 from inefficiency_engine.models import MarketKind, MarketQuote, OrderBookLevel, OrderBookSnapshot
 
 
@@ -45,15 +47,22 @@ def parse_product_book(payload: Any, *, asset: str, symbol: str) -> OrderBookSna
 class CoinbaseSpotAdapter:
     """Public Coinbase Exchange market-data adapter; no credentials required."""
 
-    def __init__(self, assets: tuple[str, ...] = ("BTC", "ETH", "SOL"), client: httpx.AsyncClient | None = None):
-        self.assets = assets
+    def __init__(
+        self,
+        assets: tuple[str, ...] | None = None,
+        client: httpx.AsyncClient | None = None,
+    ):
+        self.assets = tuple(asset.upper() for asset in (assets or configured_liquid_research_assets()))
         self._client = client
 
     async def _get(self, path: str, *, params: dict[str, object] | None = None) -> Any:
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(
             timeout=10.0,
-            headers={"User-Agent": "crypto-inefficiency-engine/0.9", "Cache-Control": "no-cache"},
+            headers={
+                "User-Agent": "crypto-inefficiency-engine/0.9",
+                "Cache-Control": "no-cache",
+            },
         )
         try:
             response = await client.get(f"{BASE_URL}{path}", params=params)
@@ -64,33 +73,40 @@ class CoinbaseSpotAdapter:
                 await client.aclose()
 
     async def market_quotes(self) -> list[MarketQuote]:
-        quotes: list[MarketQuote] = []
-        for asset in self.assets:
+        """Collect the bounded liquid universe concurrently.
+
+        The registry already enforces an outer provider deadline. Concurrent ticker
+        requests keep the expanded universe inside that same budget instead of
+        multiplying latency by the number of assets. A Coinbase product that is not
+        listed is skipped without shrinking the configured research universe.
+        """
+
+        async def for_asset(asset: str) -> MarketQuote | None:
             symbol = f"{asset}-USD"
             try:
                 data = await self._get(f"/products/{symbol}/ticker")
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 404:
-                    continue
+                if exc.response.status_code in {400, 404}:
+                    return None
                 raise
             bid = float(data["bid"])
             ask = float(data["ask"])
-            quotes.append(
-                MarketQuote(
-                    venue="Coinbase",
-                    asset=asset,
-                    market_kind=MarketKind.SPOT,
-                    symbol=symbol,
-                    quote_currency="USD",
-                    contract_key="spot",
-                    bid=bid,
-                    ask=ask,
-                    mid=(bid + ask) / 2.0,
-                    observed_at=datetime.now(timezone.utc),
-                    source="coinbase-exchange:ticker",
-                )
+            return MarketQuote(
+                venue="Coinbase",
+                asset=asset,
+                market_kind=MarketKind.SPOT,
+                symbol=symbol,
+                quote_currency="USD",
+                contract_key="spot",
+                bid=bid,
+                ask=ask,
+                mid=(bid + ask) / 2.0,
+                observed_at=datetime.now(timezone.utc),
+                source="coinbase-exchange:ticker",
             )
-        return quotes
+
+        rows = await asyncio.gather(*(for_asset(asset) for asset in self.assets))
+        return [row for row in rows if row is not None]
 
     async def order_book(self, asset: str) -> OrderBookSnapshot:
         symbol = f"{asset.upper()}-USD"

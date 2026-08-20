@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
@@ -10,6 +11,7 @@ from inefficiency_engine.models import FundingQuote, MarketKind, MarketQuote, Or
 
 
 DEFAULT_BASE_URL = "https://www.okx.com"
+DEFAULT_FANOUT_CONCURRENCY = 8
 
 
 def _utc_ms(value: str | int | float | None) -> datetime | None:
@@ -66,11 +68,16 @@ def parse_order_book(payload: Any, *, asset: str, market_kind: MarketKind, symbo
     if not rows:
         raise ValueError("OKX order book response is empty")
     row = rows[0]
+
     def side(values: Any) -> list[OrderBookLevel]:
         if not isinstance(values, list):
             return []
-        return [OrderBookLevel(price=float(item[0]), size=float(item[1])) for item in values
-                if isinstance(item, list) and len(item) >= 2]
+        return [
+            OrderBookLevel(price=float(item[0]), size=float(item[1]))
+            for item in values
+            if isinstance(item, list) and len(item) >= 2
+        ]
+
     return OrderBookSnapshot(
         venue="OKX", asset=asset.upper(), market_kind=market_kind, symbol=symbol,
         quote_currency=quote_currency.upper(), contract_key="spot" if market_kind == MarketKind.SPOT else "continuous",
@@ -81,12 +88,20 @@ def parse_order_book(payload: Any, *, asset: str, market_kind: MarketKind, symbo
 
 class OKXPublicAdapter:
     """Public OKX market-data adapter; no credentials or trading endpoints."""
-    def __init__(self, assets: tuple[str, ...] = ("BTC", "ETH", "SOL"), quote_currency: str = "USDT",
-                 base_url: str = DEFAULT_BASE_URL, client: httpx.AsyncClient | None = None):
+
+    def __init__(
+        self,
+        assets: tuple[str, ...] = ("BTC", "ETH", "SOL"),
+        quote_currency: str = "USDT",
+        base_url: str = DEFAULT_BASE_URL,
+        client: httpx.AsyncClient | None = None,
+        fanout_concurrency: int = DEFAULT_FANOUT_CONCURRENCY,
+    ):
         self.assets = tuple(asset.upper() for asset in assets)
         self.quote_currency = quote_currency.upper()
         self.base_url = base_url.rstrip("/")
         self._client = client
+        self.fanout_concurrency = max(1, int(fanout_concurrency))
 
     async def _get(self, path: str, *, params: dict[str, object]) -> Any:
         owns = self._client is None
@@ -108,35 +123,61 @@ class OKXPublicAdapter:
         raise ValueError("OKX adapter currently supports spot and perpetual only")
 
     async def market_quotes(self) -> list[MarketQuote]:
-        quotes: list[MarketQuote] = []
-        for asset in self.assets:
-            for kind in (MarketKind.SPOT, MarketKind.PERPETUAL):
-                symbol = self.symbol(asset, kind)
-                try:
+        semaphore = asyncio.Semaphore(self.fanout_concurrency)
+
+        async def collect(asset: str, kind: MarketKind) -> MarketQuote | None:
+            symbol = self.symbol(asset, kind)
+            try:
+                async with semaphore:
                     payload = await self._get("/api/v5/market/ticker", params={"instId": symbol})
-                    quotes.append(parse_ticker(payload, asset=asset, market_kind=kind, symbol=symbol,
-                                               quote_currency=self.quote_currency))
-                except (httpx.HTTPStatusError, ValueError, KeyError):
-                    continue
-        return quotes
+                return parse_ticker(
+                    payload,
+                    asset=asset,
+                    market_kind=kind,
+                    symbol=symbol,
+                    quote_currency=self.quote_currency,
+                )
+            except (httpx.HTTPStatusError, ValueError, KeyError):
+                return None
+
+        rows = await asyncio.gather(*(
+            collect(asset, kind)
+            for asset in self.assets
+            for kind in (MarketKind.SPOT, MarketKind.PERPETUAL)
+        ))
+        return [row for row in rows if row is not None]
 
     async def funding_quotes(self) -> list[FundingQuote]:
-        quotes: list[FundingQuote] = []
-        for asset in self.assets:
+        semaphore = asyncio.Semaphore(self.fanout_concurrency)
+
+        async def collect(asset: str) -> FundingQuote | None:
             symbol = self.symbol(asset, MarketKind.PERPETUAL)
             try:
-                payload = await self._get("/api/v5/public/funding-rate", params={"instId": symbol})
-                quotes.append(parse_funding_rate(payload, asset=asset, symbol=symbol, quote_currency=self.quote_currency))
+                async with semaphore:
+                    payload = await self._get("/api/v5/public/funding-rate", params={"instId": symbol})
+                return parse_funding_rate(
+                    payload,
+                    asset=asset,
+                    symbol=symbol,
+                    quote_currency=self.quote_currency,
+                )
             except (httpx.HTTPStatusError, ValueError, KeyError):
-                continue
-        return quotes
+                return None
+
+        rows = await asyncio.gather(*(collect(asset) for asset in self.assets))
+        return [row for row in rows if row is not None]
 
     async def order_book(self, asset: str, market_kind: MarketKind, *, symbol: str | None = None) -> OrderBookSnapshot:
         symbol = symbol or self.symbol(asset, market_kind)
         started = perf_counter()
         payload = await self._get("/api/v5/market/books", params={"instId": symbol, "sz": 100})
         latency_ms = max(0.0, (perf_counter() - started) * 1000.0)
-        book = parse_order_book(payload, asset=asset, market_kind=market_kind, symbol=symbol,
-                                quote_currency=self.quote_currency)
+        book = parse_order_book(
+            payload,
+            asset=asset,
+            market_kind=market_kind,
+            symbol=symbol,
+            quote_currency=self.quote_currency,
+        )
         book.request_latency_ms = latency_ms
         return book

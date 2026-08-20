@@ -12,6 +12,7 @@ from inefficiency_engine.adapters.coinbase import CoinbaseSpotAdapter
 from inefficiency_engine.adapters.hyperliquid import HyperliquidAdapter
 from inefficiency_engine.adapters.kraken import KrakenSpotAdapter
 from inefficiency_engine.adapters.okx import OKXPublicAdapter
+from inefficiency_engine.asset_universe import configured_liquid_research_assets
 from inefficiency_engine.evidence import ProviderStatus
 from inefficiency_engine.instrument_identity import book_identity
 from inefficiency_engine.models import (
@@ -91,11 +92,12 @@ class PublicAdapterRegistry:
         provider_surface_timeout_seconds: float = DEFAULT_PROVIDER_SURFACE_TIMEOUT_SECONDS,
         order_book_timeout_seconds: float = DEFAULT_ORDER_BOOK_TIMEOUT_SECONDS,
     ):
+        research_assets = configured_liquid_research_assets()
         self.hyperliquid = hyperliquid or HyperliquidAdapter()
-        self.coinbase = coinbase or CoinbaseSpotAdapter()
-        self.bybit = bybit or BybitPublicAdapter()
-        self.kraken = kraken or KrakenSpotAdapter()
-        self.okx = okx or OKXPublicAdapter()
+        self.coinbase = coinbase or CoinbaseSpotAdapter(assets=research_assets)
+        self.bybit = bybit or BybitPublicAdapter(assets=research_assets)
+        self.kraken = kraken or KrakenSpotAdapter(assets=research_assets)
+        self.okx = okx or OKXPublicAdapter(assets=research_assets)
         self.provider_surface_timeout_seconds = max(0.05, float(provider_surface_timeout_seconds))
         self.order_book_timeout_seconds = max(0.05, float(order_book_timeout_seconds))
 
@@ -350,6 +352,7 @@ class PublicAdapterRegistry:
             started_at=started_at,
             completed_at=completed_at,
             healthy=healthy,
+            paper_only=True,
             venue_count=len({q.venue for q in market_quotes} | {q.venue for q in funding_quotes}),
             market_quote_count=len(market_quotes),
             funding_quote_count=len(funding_quotes),
