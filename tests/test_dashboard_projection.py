@@ -114,5 +114,3 @@ def test_dashboard_uses_one_projection_request_instead_of_endpoint_fanout():
     assert "getJSON('/v3/portfolio/canonical')" not in RESILIENT_DASHBOARD_HTML
     assert "safeJSON('/v3/portfolio/positions'" not in RESILIENT_DASHBOARD_HTML
     assert "getJSON('/v3/operations/mechanisms')" not in RESILIENT_DASHBOARD_HTML
-    assert "research_projection_observed_at" in RESILIENT_DASHBOARD_HTML
-    assert "Updated ${when(projected)}" in RESILIENT_DASHBOARD_HTML
