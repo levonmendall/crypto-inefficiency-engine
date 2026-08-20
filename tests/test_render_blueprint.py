@@ -14,6 +14,11 @@ def test_render_blueprint_defines_durable_shadow_topology():
     assert worker["plan"] != "free"
     assert worker["autoDeployTrigger"] == "checksPass"
 
+    worker_env = {item["key"]: item for item in worker["envVars"]}
+    assert worker_env["CIE_SHADOW_MAX_OPPORTUNITIES"]["value"] == "16"
+    assert worker_env["CIE_SHADOW_MAX_CANDIDATES"]["value"] == "80"
+    assert worker_env["CIE_DEX_ROUTE_TIER_SHADOW_MAX_CONCURRENCY"]["value"] == "1"
+
     api = services["cie-shadow-api"]
     assert api["type"] == "web"
     assert api["healthCheckPath"] == "/health"
