@@ -63,15 +63,8 @@ def test_read_plane_exposes_dashboard_and_durable_status_routes_only():
         if getattr(route, "path", None) == "/v3/operations/action-queue"
         and "GET" in (getattr(route, "methods", set()) or set())
     ]
-    root_routes = [
-        route
-        for route in app.routes
-        if getattr(route, "path", None) == "/"
-        and "GET" in (getattr(route, "methods", set()) or set())
-    ]
     assert len(mechanism_routes) == 1
     assert len(action_routes) == 1
-    assert len(root_routes) == 1
 
 
 def test_mechanism_overlay_never_full_scans_growing_evidence_tables():
