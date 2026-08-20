@@ -62,12 +62,17 @@ services:
     region: oregon
     plan: free
     branch: main
-    autoDeployTrigger: checksPass
-    buildCommand: python -m pip install --retries 20 --timeout 120 .
-    # Production web is a read plane only. Heavy scans, certification and allocation
-    # stay in cie-shadow-worker and persist their results to PostgreSQL. Mechanism
-    # telemetry uses append-only index tails rather than rescanning growing ledgers.
-    startCommand: uvicorn inefficiency_engine.read_api_fast:app --host 0.0.0.0 --port $PORT
+    # This service is Blueprint-controlled. Disabling branch auto-deploy prevents
+    # a second deployment of the same SHA immediately after a Blueprint deploy.
+    autoDeployTrigger: "off"
+    # Bound dependency retries so an external package/network failure becomes an
+    # explicit failed deploy instead of an opaque 15+ minute spinner.
+    buildCommand: python -m pip install --retries 5 --timeout 30 .
+    # Production web is a read plane only. The deployment bootstrap constructs a
+    # lazy non-schema-owning evidence store, keeps /health process-local, and leaves
+    # PostgreSQL readiness on /ready. Heavy scans/certification/allocation stay in
+    # cie-shadow-worker and persist their results to PostgreSQL.
+    startCommand: uvicorn inefficiency_engine.read_api_deploy:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
