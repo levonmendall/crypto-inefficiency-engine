@@ -16,6 +16,7 @@ def test_render_blueprint_defines_durable_shadow_topology():
     # upgrade back to Render Starter (512 MB).
     assert "plan" not in worker
     assert worker["autoDeployTrigger"] == "checksPass"
+    assert worker["buildCommand"] == "python -m pip install --retries 20 --timeout 120 ."
 
     worker_env = {item["key"]: item for item in worker["envVars"]}
     assert worker_env["CIE_SHADOW_MAX_OPPORTUNITIES"]["value"] == "16"
@@ -25,10 +26,9 @@ def test_render_blueprint_defines_durable_shadow_topology():
     api = services["cie-shadow-api"]
     assert api["type"] == "web"
     assert api["healthCheckPath"] == "/health"
-
-    expected_build = "python -m pip install --retries 20 --timeout 120 ."
-    assert worker["buildCommand"] == expected_build
-    assert api["buildCommand"] == expected_build
+    assert api["autoDeployTrigger"] == "off"
+    assert api["buildCommand"] == "python -m pip install --retries 5 --timeout 30 ."
+    assert api["startCommand"] == "uvicorn inefficiency_engine.read_api_deploy:app --host 0.0.0.0 --port $PORT"
 
     database = databases["cie-evidence"]
     assert database["plan"] != "free"
