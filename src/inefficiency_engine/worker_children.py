@@ -10,7 +10,6 @@ from inefficiency_engine.bounded_alpha_factory import (
     BoundedExpandedAlphaFactoryService as ExpandedAlphaFactoryService,
 )
 from inefficiency_engine.bounded_shadow_service import MemoryBoundedShadowService
-from inefficiency_engine.canonical_allocator import CanonicalPortfolioAllocatorService
 from inefficiency_engine.canonical_worker import run_canonical_portfolio_loop
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
@@ -24,12 +23,18 @@ from inefficiency_engine.dex_tier_shadow import DexTierShadowService
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.memory_bounded_research_worker import run_memory_bounded_research_worker
 from inefficiency_engine.operating_certification import OperatingCertificationService
+from inefficiency_engine.qualified_opportunity import (
+    QualifiedOpportunityAllocatorService as CanonicalPortfolioAllocatorService,
+    QualifiedOpportunityBridgePublisher,
+)
 from inefficiency_engine.research_closure_worker import run_research_closure_cycle
-from inefficiency_engine.resilient_paper_portfolio import OperationallyResilientPaperPortfolioService
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
 from inefficiency_engine.stablecoin_depth_shadow import StablecoinDepthShadowService
 from inefficiency_engine.unified_allocation import UnifiedPaperAllocatorService
+from inefficiency_engine.universal_paper_portfolio import (
+    UniversalOperationallyResilientPaperPortfolioService as OperationallyResilientPaperPortfolioService,
+)
 from inefficiency_engine.universal_service import UniversalOpportunityService
 from inefficiency_engine.worker import WorkerRunStats
 
@@ -97,6 +102,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
 
     promotion = CexDexPaperPromotionService(service, composite_service, store)
     unified = UnifiedPaperAllocatorService(service, promotion, alpha_factory)
+    qualified_bridge = QualifiedOpportunityBridgePublisher(service, store, unified)
     allocation_certification = AllocationForwardCertificationService(service, unified, store)
     operating_certification = OperatingCertificationService(
         service,
@@ -106,6 +112,47 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         version=__version__,
     )
     research_projection = ResearchDashboardProjectionLedger(store)
+
+    async def qualified_opportunity_cycle() -> object:
+        nav_heartbeat = store.latest_worker_heartbeat("canonical-portfolio-operating-loop")
+        nav = None
+        if nav_heartbeat is not None:
+            value = nav_heartbeat.detail.get("portfolio_nav_usd")
+            if isinstance(value, (float, int)) and value > 0:
+                nav = float(value)
+        return await qualified_bridge.publish_latest(
+            total_capital_usd=nav or 250_000.0
+        )
+
+    async def route_shadow_with_bridge() -> object:
+        try:
+            snapshot = await qualified_opportunity_cycle()
+            if snapshot is None:
+                store.record_worker_heartbeat(
+                    worker_id="qualified-opportunity-bridge",
+                    state="degraded",
+                    error_type="QualifiedOpportunitySourceScanUnavailableOrStale",
+                    detail={"candidate_count": 0, "paper_only": True},
+                )
+            else:
+                store.record_worker_heartbeat(
+                    worker_id="qualified-opportunity-bridge",
+                    state="success",
+                    scan_id=snapshot.source_scan_id,
+                    detail={
+                        "candidate_count": len(snapshot.candidates),
+                        "expires_at": snapshot.expires_at.isoformat(),
+                        "paper_only": True,
+                    },
+                )
+        except Exception as exc:
+            store.record_worker_heartbeat(
+                worker_id="qualified-opportunity-bridge",
+                state="error",
+                error_type=type(exc).__name__,
+                detail={"message": str(exc)[:500], "paper_only": True},
+            )
+        return await universal.run_dex_route_shadow_cycle()
 
     async def certification_cycle() -> object:
         await run_certification_loop(
@@ -188,7 +235,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         store,
         worker_id=RESEARCH_WORKER_ID,
         stop_event=stop,
-        route_shadow_runner=universal.run_dex_route_shadow_cycle,
+        route_shadow_runner=route_shadow_with_bridge,
         tier_shadow_runner=tier_shadow.run_cycle,
         tier_shadow_every_cycles=service.settings.dex_route_tier_shadow_every_cycles,
         composite_shadow_runner=composite_shadow.run_cycle,
