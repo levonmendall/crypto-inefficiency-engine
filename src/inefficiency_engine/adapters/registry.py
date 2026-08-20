@@ -96,11 +96,8 @@ class PublicAdapterRegistry:
         self.hyperliquid = hyperliquid or HyperliquidAdapter()
         self.coinbase = coinbase or CoinbaseSpotAdapter(assets=research_assets)
         self.bybit = bybit or BybitPublicAdapter(assets=research_assets)
-        # Kraken/OKX remain supplementary bounded surfaces until their sequential
-        # collectors are converted to broad concurrent fanout. The primary broad
-        # cross-venue surface is Coinbase spot + Bybit spot/perp + dynamic Hyperliquid.
-        self.kraken = kraken or KrakenSpotAdapter()
-        self.okx = okx or OKXPublicAdapter()
+        self.kraken = kraken or KrakenSpotAdapter(assets=research_assets)
+        self.okx = okx or OKXPublicAdapter(assets=research_assets)
         self.provider_surface_timeout_seconds = max(0.05, float(provider_surface_timeout_seconds))
         self.order_book_timeout_seconds = max(0.05, float(order_book_timeout_seconds))
 
