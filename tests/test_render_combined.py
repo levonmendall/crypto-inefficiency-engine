@@ -5,15 +5,20 @@ import sys
 from inefficiency_engine.render_combined import API_APP, child_commands
 
 
-def test_combined_runtime_starts_worker_and_api_on_render_port():
+def test_combined_runtime_starts_worker_history_and_api_on_render_port():
     commands = child_commands("12345")
 
-    assert set(commands) == {"worker", "api"}
+    assert set(commands) == {"worker", "history", "api"}
     assert commands["worker"] == [
         sys.executable,
         "-m",
         "inefficiency_engine.cli",
         "worker",
+    ]
+    assert commands["history"] == [
+        sys.executable,
+        "-m",
+        "inefficiency_engine.cycle_history_runtime",
     ]
     assert commands["api"] == [
         sys.executable,
