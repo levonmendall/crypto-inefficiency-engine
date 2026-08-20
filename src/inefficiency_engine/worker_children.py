@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+from types import SimpleNamespace
 
 from inefficiency_engine import __version__
 from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
@@ -41,6 +42,25 @@ def _stop_event() -> asyncio.Event:
     return stop
 
 
+class _CompactCoreResearchService:
+    """Keep only the tiny heartbeat summary from a completed full shadow cycle."""
+
+    def __init__(self, service: OpportunityService):
+        self._service = service
+        self.settings = service.settings
+
+    async def run_shadow_cycle(self):
+        cycle = await self._service.run_shadow_cycle()
+        return SimpleNamespace(
+            cycle_id=cycle.cycle_id,
+            verification_scan_id=cycle.verification_scan_id,
+            observations=tuple(
+                SimpleNamespace(survived=bool(observation.survived))
+                for observation in cycle.observations
+            ),
+        )
+
+
 async def run_research_child(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
     """Run full research/certification while releasing each heavyweight result promptly.
 
@@ -52,6 +72,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
     """
 
     stop = _stop_event()
+    compact_core = _CompactCoreResearchService(service)
     universal = UniversalOpportunityService(service)
     tier_shadow = DexTierShadowService(service, evidence_store=store)
     composite_service = CexDexCompositeEvidenceService(service, universal=universal)
@@ -92,7 +113,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         int(getattr(service.settings, "alpha_evidence_every_cycles", 10)),
     )
     return await run_memory_bounded_research_worker(
-        service,
+        compact_core,  # type: ignore[arg-type]
         store,
         worker_id=RESEARCH_WORKER_ID,
         stop_event=stop,
