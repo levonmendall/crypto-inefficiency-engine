@@ -27,7 +27,9 @@ from inefficiency_engine.memory_bounded_alpha_factory import (
     MemoryBoundedExpandedAlphaFactoryService as ExpandedAlphaFactoryService,
 )
 from inefficiency_engine.memory_bounded_research_worker import run_memory_bounded_research_worker
-from inefficiency_engine.operating_certification import OperatingCertificationService
+from inefficiency_engine.provider_gap_collection import (
+    ProviderGapAwareOperatingCertificationService as OperatingCertificationService,
+)
 from inefficiency_engine.research_closure_worker import run_research_closure_cycle
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
