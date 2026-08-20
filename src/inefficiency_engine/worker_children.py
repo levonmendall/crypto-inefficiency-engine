@@ -6,9 +6,6 @@ from types import SimpleNamespace
 
 from inefficiency_engine import __version__
 from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
-from inefficiency_engine.bounded_alpha_factory import (
-    BoundedExpandedAlphaFactoryService as ExpandedAlphaFactoryService,
-)
 from inefficiency_engine.bounded_shadow_service import MemoryBoundedShadowService
 from inefficiency_engine.canonical_worker import run_canonical_portfolio_loop
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
@@ -21,11 +18,16 @@ from inefficiency_engine.dashboard_projection import (
 )
 from inefficiency_engine.dex_tier_shadow import DexTierShadowService
 from inefficiency_engine.evidence import EvidenceStore
+from inefficiency_engine.memory_bounded_alpha_factory import (
+    MemoryBoundedExpandedAlphaFactoryService as ExpandedAlphaFactoryService,
+)
+from inefficiency_engine.memory_bounded_qualified_opportunity import (
+    MemoryBoundedQualifiedOpportunityBridgePublisher as QualifiedOpportunityBridgePublisher,
+)
 from inefficiency_engine.memory_bounded_research_worker import run_memory_bounded_research_worker
 from inefficiency_engine.operating_certification import OperatingCertificationService
 from inefficiency_engine.qualified_opportunity import (
     QualifiedOpportunityAllocatorService as CanonicalPortfolioAllocatorService,
-    QualifiedOpportunityBridgePublisher,
 )
 from inefficiency_engine.research_closure_worker import run_research_closure_cycle
 from inefficiency_engine.service import OpportunityService
@@ -132,7 +134,11 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
                     worker_id="qualified-opportunity-bridge",
                     state="degraded",
                     error_type="QualifiedOpportunitySourceScanUnavailableOrStale",
-                    detail={"candidate_count": 0, "paper_only": True},
+                    detail={
+                        "candidate_count": 0,
+                        "memory_bounded_projection": True,
+                        "paper_only": True,
+                    },
                 )
             else:
                 store.record_worker_heartbeat(
@@ -142,6 +148,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
                     detail={
                         "candidate_count": len(snapshot.candidates),
                         "expires_at": snapshot.expires_at.isoformat(),
+                        "memory_bounded_projection": True,
                         "paper_only": True,
                     },
                 )
@@ -150,7 +157,11 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
                 worker_id="qualified-opportunity-bridge",
                 state="error",
                 error_type=type(exc).__name__,
-                detail={"message": str(exc)[:500], "paper_only": True},
+                detail={
+                    "message": str(exc)[:500],
+                    "memory_bounded_projection": True,
+                    "paper_only": True,
+                },
             )
         return await universal.run_dex_route_shadow_cycle()
 
