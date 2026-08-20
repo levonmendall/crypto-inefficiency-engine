@@ -7,12 +7,13 @@ from sqlalchemy import text
 
 from inefficiency_engine import __version__
 from inefficiency_engine import evidence as evidence_module
+from inefficiency_engine.operating_state_read import (
+    rebuild_live_action_queue,
+    reconcile_live_operating_states,
+)
 from inefficiency_engine.provider_readiness_read import reconcile_provider_readiness
 from inefficiency_engine.read_evidence import build_read_only_evidence_store
-from inefficiency_engine.strategy_evidence_read import (
-    augment_mechanism_payload,
-    reconcile_action_queue,
-)
+from inefficiency_engine.strategy_evidence_read import augment_mechanism_payload
 
 
 # Production import bootstrap: keep the deployment guarantees while layering the
@@ -59,6 +60,7 @@ def deployment_health():
         "dashboard_projection": "portfolio_plus_live_research",
         "strategy_evidence_attribution": True,
         "provider_readiness_reconciliation": True,
+        "live_operating_state_reconciliation": True,
     }
 
 
@@ -85,6 +87,7 @@ def deployment_readiness():
         "dashboard_projection": "portfolio_plus_live_research",
         "strategy_evidence_attribution": True,
         "provider_readiness_reconciliation": True,
+        "live_operating_state_reconciliation": True,
     }
 
 
@@ -122,12 +125,14 @@ def _attributed_sections(
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Presentation-only live reconciliation; never changes portfolio authority."""
     try:
-        # Provider admission is a newer and narrower fact than a cached operating
-        # projection. Reconcile it first so strategy attribution never preserves a
-        # stale provider-gap state after an authoritative surface is freshly admitted.
+        # Reconcile from narrowest/latest evidence outward. Provider admission fixes
+        # connectivity first; strategy attribution reconstructs current statistical
+        # and allocator evidence; the final operating pass updates the displayed lane
+        # label and rebuilds the action queue from that reconciled state.
         provider_reconciled = reconcile_provider_readiness(store, mechanisms)
         attributed = augment_mechanism_payload(store, _base.settings, provider_reconciled)
-        return attributed, reconcile_action_queue(queue, attributed)
+        operating_reconciled = reconcile_live_operating_states(attributed, _base.settings)
+        return operating_reconciled, rebuild_live_action_queue(operating_reconciled)
     except Exception:
         # Dashboard enrichment is fail-contained. The durable operating projection
         # remains authoritative if diagnostics cannot be enriched.
@@ -140,9 +145,9 @@ def dashboard_snapshot():
 
     The browser still makes one request. The API performs bounded tail reads inside
     one transaction: the latest portfolio-led snapshot plus, when available, the
-    research snapshot published after the latest successful research cycle. Strategy
-    attribution and provider-readiness reconciliation are presentation-only and
-    cannot create economic, statistical, allocation, or execution authority.
+    research snapshot published after the latest successful research cycle. Provider,
+    strategy, and operating-state reconciliation are presentation-only and cannot
+    create economic, statistical, allocation, or execution authority.
     """
     store = _base.evidence_store
     if store is None:
@@ -206,6 +211,9 @@ def dashboard_snapshot():
         combined["provider_readiness_reconciliation"] = bool(
             mechanisms.get("provider_readiness_reconciled")
         )
+        combined["live_operating_state_reconciliation"] = bool(
+            mechanisms.get("live_operating_state_reconciled")
+        )
         return combined
 
     combined = dict(base)
@@ -224,6 +232,9 @@ def dashboard_snapshot():
         ),
         "provider_readiness_reconciliation": bool(
             mechanisms.get("provider_readiness_reconciled")
+        ),
+        "live_operating_state_reconciliation": bool(
+            mechanisms.get("live_operating_state_reconciled")
         ),
     })
     return combined
