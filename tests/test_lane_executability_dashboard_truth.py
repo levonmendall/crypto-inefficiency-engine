@@ -29,6 +29,7 @@ def test_dashboard_does_not_equate_thirteen_lane_architecture_with_executability
     assert summary["architecture_executable_count"] == 13
     assert summary["production_evidence_connected_count"] == 12
     assert summary["decision_grade_outcome_qualified_count"] == 0
+    assert summary["currently_qualified_count"] == 0
     assert summary["paper_execution_capable_count"] == 0
     assert summary["paper_execution_capable_lanes"] == []
     assert summary["all_lanes_paper_execution_capable"] is False
@@ -42,11 +43,22 @@ def test_dashboard_requires_decision_grade_state_and_connected_production_eviden
     summary = _lane_summary_from_payload(_payload(rows))
 
     assert summary["decision_grade_outcome_qualified_count"] == 2
-    assert summary["currently_qualified_count"] == 2
+    assert summary["currently_qualified_count"] == 0
     assert summary["paper_execution_capable_count"] == 1
     assert summary["paper_execution_capable_lanes"] == ["price_discrepancy"]
     assert summary["all_lanes_paper_execution_capable"] is False
     assert summary["profitability_certified_count"] == 1
+
+
+def test_current_promoted_candidate_is_also_positive_decision_grade_proof():
+    rows = [_row(lane_id) for lane_id in LANES]
+    rows[0] = _row("price_discrepancy", promoted=1)
+
+    summary = _lane_summary_from_payload(_payload(rows))
+
+    assert summary["currently_qualified_count"] == 1
+    assert summary["decision_grade_outcome_qualified_count"] == 1
+    assert summary["paper_execution_capable_lanes"] == ["price_discrepancy"]
 
 
 def test_dashboard_fails_closed_on_stale_operating_projection():
@@ -56,6 +68,7 @@ def test_dashboard_fails_closed_on_stale_operating_projection():
     )
 
     assert summary["decision_grade_outcome_qualified_count"] == 13
+    assert summary["currently_qualified_count"] == 0
     assert summary["projection_current_for_execution"] is False
     assert summary["paper_execution_capable_count"] == 0
     assert summary["paper_execution_capable_lanes"] == []
