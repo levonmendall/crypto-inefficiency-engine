@@ -355,53 +355,27 @@ async def run_memory_bounded_research_worker(
             scan_id = getattr(core_value, "verification_scan_id", None)
         _release(core_value)
 
-        async def run_optional(
-            runner: Runner | None,
-            summarizer: Callable[[dict[str, object], object | BaseException | None], None],
-            stage_name: str,
-        ) -> None:
-            if runner is None:
-                return
-            _stage_heartbeat(
-                store,
-                worker_id=worker_id,
-                attempted=attempted,
-                stage_name=stage_name,
-                timeout_seconds=stage_timeout_seconds,
-            )
-            await _run_and_release(
-                runner,
-                detail,
-                summarizer,
-                timeout_seconds=stage_timeout_seconds,
-                stage_name=stage_name,
-            )
-
         if route_shadow_runner is not None:
-            _stage_heartbeat(
-                store,
-                worker_id=worker_id,
-                attempted=attempted,
-                stage_name="dex_route_shadow",
-                timeout_seconds=stage_timeout_seconds,
-            )
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="dex_route_shadow", timeout_seconds=stage_timeout_seconds)
             await _run_and_release(route_shadow_runner, detail, _route_summary, timeout_seconds=stage_timeout_seconds, stage_name="dex_route_shadow")
         if run_tier_shadow:
-            await run_optional(tier_shadow_runner, _tier_summary, "dex_tier_shadow")
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="dex_tier_shadow", timeout_seconds=stage_timeout_seconds)
+            await _run_and_release(tier_shadow_runner, detail, _tier_summary, timeout_seconds=stage_timeout_seconds, stage_name="dex_tier_shadow")
         if run_composite_shadow:
-            await run_optional(composite_shadow_runner, _composite_summary, "cex_dex_composite_shadow")
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="cex_dex_composite_shadow", timeout_seconds=stage_timeout_seconds)
+            await _run_and_release(composite_shadow_runner, detail, _composite_summary, timeout_seconds=stage_timeout_seconds, stage_name="cex_dex_composite_shadow")
         if run_stablecoin_shadow:
-            await run_optional(stablecoin_shadow_runner, _stablecoin_summary, "stablecoin_depth_shadow")
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="stablecoin_depth_shadow", timeout_seconds=stage_timeout_seconds)
+            await _run_and_release(stablecoin_shadow_runner, detail, _stablecoin_summary, timeout_seconds=stage_timeout_seconds, stage_name="stablecoin_depth_shadow")
         if run_allocation_certification:
-            await run_optional(
-                allocation_certification_runner,
-                _allocation_summary,
-                "allocation_operating_certification",
-            )
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="allocation_operating_certification", timeout_seconds=stage_timeout_seconds)
+            await _run_and_release(allocation_certification_runner, detail, _allocation_summary, timeout_seconds=stage_timeout_seconds, stage_name="allocation_operating_certification")
         if run_alpha:
-            await run_optional(alpha_runner, _alpha_summary, "alpha_forward_evidence")
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="alpha_forward_evidence", timeout_seconds=stage_timeout_seconds)
+            await _run_and_release(alpha_runner, detail, _alpha_summary, timeout_seconds=stage_timeout_seconds, stage_name="alpha_forward_evidence")
         if run_frontier:
-            await run_optional(frontier_runner, _frontier_summary, "dex_route_frontier")  # type: ignore[arg-type]
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="dex_route_frontier", timeout_seconds=stage_timeout_seconds)
+            await _run_and_release(frontier_runner, detail, _frontier_summary, timeout_seconds=stage_timeout_seconds, stage_name="dex_route_frontier")  # type: ignore[arg-type]
 
         if core_error_type is not None:
             failed += 1
