@@ -123,7 +123,7 @@ def test_parse_bybit_candles_uses_close_price_and_usdt_spot_identity():
     assert rows[0].quote_currency == "USDT"
 
 
-def test_parse_coingecko_prices_downsamples_hourly_reference_to_six_hours():
+def test_parse_coingecko_prices_downsamples_without_relabeling_future_prices():
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     payload = {
         "prices": [
@@ -140,9 +140,9 @@ def test_parse_coingecko_prices_downsamples_hourly_reference_to_six_hours():
     assert len(rows) == 2
     assert rows[0].venue == "CoinGecko"
     assert rows[0].observed_at == base
-    assert rows[0].mid == 105.0
+    assert rows[0].mid == 100.0
     assert rows[1].observed_at == base + timedelta(hours=6)
-    assert rows[1].mid == 111.0
+    assert rows[1].mid == 106.0
 
 
 @pytest.mark.asyncio
@@ -256,6 +256,32 @@ def test_provider_coverage_is_not_summed_across_venues(tmp_path):
     assert earliest == start
     assert latest == start + timedelta(hours=6 * 599)
     assert research.preferred_venue("ACE") == "Coinbase"
+
+
+def test_target_window_coverage_ignores_old_append_only_rows(tmp_path):
+    store = EvidenceStore(tmp_path / "windowed-coverage.db")
+    research = CycleHistoricalResearch(store, backfill_days=260)
+    now = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    start = now - timedelta(days=260)
+
+    research.record_quotes(
+        _six_hour_series(
+            "ACE",
+            start=start - timedelta(days=300),
+            count=1040,
+            venue="Coinbase",
+        )
+    )
+    recent_start = now - timedelta(days=25)
+    research.record_quotes(
+        _six_hour_series("ACE", start=recent_start, count=100, venue="Coinbase")
+    )
+
+    count, earliest, latest = research._coverage("ACE", start=start, end=now)
+
+    assert count == 100
+    assert earliest == recent_start
+    assert latest == recent_start + timedelta(hours=6 * 99)
 
 
 def test_probationary_policy_requires_history_and_real_forward_learning():
