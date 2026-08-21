@@ -24,6 +24,7 @@ class LaneExecutableReadiness(BaseModel):
     source_sufficiency_state: str
     source_headline_state: str
     qualification_stage: str
+    evidence_producer_implemented: bool = True
     economics_model_implemented: bool
     forward_loop_implemented: bool
     statistical_gate_implemented: bool
@@ -60,9 +61,15 @@ class LaneExecutableReadinessSnapshot(BaseModel):
     live_execution_capable: bool = False
 
 
-# These contracts are code capabilities, not claims about current profitability.
+# Code-path capability is separate from evidence-source truth. Twelve lanes have a
+# production evidence producer feeding the complete forward path. Capital-location
+# has downstream economics/forward/statistics/allocation/settlement code, but its
+# required transfer-cost/latency table currently has no production producer. Tests
+# may inject that evidence to validate downstream contracts; that is not production
+# evidence capability and must not be reported as such.
 _ARCHITECTURE = {
     lane_id: {
+        "evidence_producer": lane_id != "capital_location_settlement",
         "economics": True,
         "forward": True,
         "statistics": True,
@@ -71,6 +78,11 @@ _ARCHITECTURE = {
     }
     for lane_id in LANES
 }
+
+_CAPITAL_LOCATION_PRODUCER_BLOCKER = (
+    "production authoritative transfer-cost/transfer-latency evidence producer is not implemented; "
+    "do not infer empirical transfer telemetry from paper policy, fee configuration, or chain timing"
+)
 
 
 def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnapshot:
@@ -88,6 +100,7 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
     rows: list[LaneExecutableReadiness] = []
     for lane_id, definition in LANES.items():
         architecture = _ARCHITECTURE[lane_id]
+        evidence_producer = bool(architecture["evidence_producer"])
         source = source_by_id.get(lane_id)
         dimensions = classify_lane_source_dimensions(source) if source is not None else None
         source_ready = bool(
@@ -147,8 +160,13 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
         profitability_certified = bool(
             operating_row is not None and operating_row.profitability_certified
         )
-        paper_capable = all(bool(value) for value in architecture.values())
+        paper_capable = evidence_producer and all(
+            bool(architecture[key])
+            for key in ("economics", "forward", "statistics", "allocation", "settlement")
+        )
         blockers: list[str] = []
+        if not evidence_producer:
+            blockers.append(_CAPITAL_LOCATION_PRODUCER_BLOCKER)
         if source is None:
             blockers.append("source coverage has not been observed")
         else:
@@ -165,7 +183,9 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
         if operating_row is not None:
             blockers.extend(item for item in operating_row.blockers if item not in blockers)
 
-        if not research_eligible:
+        if not evidence_producer:
+            qualification_stage = "upstream_evidence_producer_missing"
+        elif not research_eligible:
             qualification_stage = f"waiting_for_source:{source_sufficiency_state}"
         elif not forward_test_eligible:
             qualification_stage = "research_active_waiting_for_complete_forward_evidence"
@@ -180,7 +200,9 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
         else:
             qualification_stage = "awaiting_operating_snapshot"
 
-        if not paper_capable:
+        if not evidence_producer:
+            execution_state = "architecture_incomplete_upstream_evidence"
+        elif not paper_capable:
             execution_state = "architecture_incomplete"
         elif currently_qualified:
             execution_state = "qualified_for_paper_allocation"
@@ -209,6 +231,7 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
                 source_sufficiency_state=source_sufficiency_state,
                 source_headline_state=source_headline_state,
                 qualification_stage=qualification_stage,
+                evidence_producer_implemented=evidence_producer,
                 economics_model_implemented=bool(architecture["economics"]),
                 forward_loop_implemented=bool(architecture["forward"]),
                 statistical_gate_implemented=bool(architecture["statistics"]),
@@ -240,10 +263,11 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
         all_lanes_paper_execution_capable=all(row.paper_execution_capable for row in rows),
         lanes=rows,
         interpretation=(
-            "research_eligible and forward_test_eligible show evidence-learning progress; "
-            "allocation_source_qualified/source_layer_sufficient preserve the decision-grade "
-            "two-source gate. provisional_forward_positive is diagnostic only and grants no "
-            "portfolio authority. Final qualification, execution, risk, settlement and profitability "
+            "paper_execution_capable requires both the downstream lane contracts and an actual production evidence producer. "
+            "research_eligible and forward_test_eligible show evidence-learning progress; allocation_source_qualified/"
+            "source_layer_sufficient preserve the decision-grade two-source gate. capital-location remains fail-closed until "
+            "authoritative transfer cost/latency evidence is genuinely produced. provisional_forward_positive is diagnostic "
+            "only and grants no portfolio authority. Final qualification, execution, risk, settlement and profitability "
             "thresholds remain unchanged."
         ),
     )
