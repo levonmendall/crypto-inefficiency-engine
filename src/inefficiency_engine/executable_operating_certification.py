@@ -13,6 +13,7 @@ from inefficiency_engine.operating_certification import (
     MechanismOperatingStatus,
     OperatingCertificationCycle,
 )
+from inefficiency_engine.source_state_dimensions import classify_lane_source_dimensions
 
 
 class AllLaneOperatingCertificationService(
@@ -42,6 +43,7 @@ class AllLaneOperatingCertificationService(
         mechanism_id = existing.mechanism_id
         readiness = self.mechanism_execution.readiness_summary()[mechanism_id]
         lane = self.source_coverage.lane(mechanism_id)
+        source = classify_lane_source_dimensions(lane)
         outcomes = self.mechanism_execution.ledger.outcomes(mechanism_id=mechanism_id)
         values = [row.realized_net_return for row in outcomes]
         positive = sum(value > 0 for value in values)
@@ -68,32 +70,73 @@ class AllLaneOperatingCertificationService(
             and allocator_profit > 0
         )
 
-        if not lane.source_layer_sufficient:
-            state = "provider_gap"
-            reason = (
-                "execution architecture is complete, but the source layer is not yet "
-                f"decision-grade ({lane.source_state})"
-            )
-            next_action = "restore the missing/redundant source evidence; execution remains fail-closed"
+        # Provider connectivity and complete source sufficiency are deliberately
+        # separate. ``provider_gap`` now means exactly that no fresh admitted
+        # authoritative provider is usable. Missing evidence classes, insufficient
+        # independent-source redundancy, or stale evidence remain fail-closed but do
+        # not pretend an already-connected provider disappeared.
+        if not source.source_layer_sufficient:
+            stage = f"waiting_for_source:{source.source_sufficiency_state}"
+            if source.source_sufficiency_state == "provider_gap":
+                state = "provider_gap"
+                reason = (
+                    "no fresh admitted authoritative provider is currently usable; "
+                    f"provider connectivity is {source.provider_connectivity_state}"
+                )
+                next_action = (
+                    "restore or connect an authoritative provider; forward eligibility remains fail-closed"
+                )
+            elif source.source_sufficiency_state == "stale":
+                state = "collecting"
+                reason = (
+                    "provider integration exists, but its authoritative evidence is stale; "
+                    "this is a freshness gap, not a missing-provider gap"
+                )
+                next_action = (
+                    "refresh the admitted source evidence; do not lower freshness or qualification thresholds"
+                )
+            elif source.source_sufficiency_state == "redundancy_gap":
+                state = "collecting"
+                reason = (
+                    "authoritative provider evidence is connected, but the independent-source redundancy "
+                    "target is not yet satisfied"
+                )
+                next_action = (
+                    "continue/restore independent authoritative source collection; forward eligibility remains fail-closed"
+                )
+            else:
+                state = "collecting"
+                reason = (
+                    "authoritative provider evidence is connected, but one or more required evidence classes "
+                    "are incomplete"
+                )
+                next_action = (
+                    "collect the missing evidence classes; do not add duplicate providers or lower source requirements"
+                )
         elif len(values) < 3:
+            stage = "profitability_certifiable"
             state = "collecting"
             reason = f"native forward settlement is operating ({len(values)}/3 outcomes before incremental paper eligibility)"
             next_action = "continue native forward settlement without lowering economic or statistical gates"
         elif full_qualified <= 0 and incremental_qualified <= 0:
+            stage = "profitability_certifiable"
             state = "statistical_failure" if len(values) >= 30 else "collecting"
             reason = (
                 "forward outcomes exist, but no cohort currently clears the incremental/full statistical gate"
             )
             next_action = "continue independent forward outcomes; 3→30 sizing remains unchanged"
         elif current_promoted <= 0:
+            stage = "profitability_certifiable"
             state = "collecting"
             reason = "forward evidence is qualified, but no fresh current mechanism candidate is present"
             next_action = "wait for a fresh after-cost opportunity under the unchanged qualification policy"
         elif certified:
+            stage = "profitability_certifiable"
             state = "certified"
             reason = "native mechanism allocations have statistically conservative positive settled paper profitability"
             next_action = "maintain monitoring and automatically revoke if future realized evidence degrades"
         else:
+            stage = "profitability_certifiable"
             state = "certifying"
             reason = (
                 f"native mechanism path is paper-allocatable; allocator settlement is accumulating "
@@ -101,11 +144,24 @@ class AllLaneOperatingCertificationService(
             )
             next_action = "continue canonical paper allocation and native settlement toward profitability certification"
 
+        blockers = [
+            *lane.missing_evidence_classes,
+            *lane.downstream_evidence_gaps,
+        ]
+        if source.source_sufficiency_state == "redundancy_gap":
+            blockers.insert(0, "authoritative source redundancy target is not satisfied")
+        elif source.source_sufficiency_state == "stale":
+            blockers.insert(0, "authoritative source evidence is stale")
+        elif source.source_sufficiency_state == "provider_gap":
+            blockers.insert(0, "no fresh admitted authoritative provider is currently usable")
+
         return existing.model_copy(
             update={
                 "state": state,
-                "stage": "profitability_certifiable",
-                "provider_ready": lane.source_layer_sufficient,
+                "stage": stage,
+                # provider_ready now means provider connectivity only. The separate
+                # source_layer_sufficient gate still controls forward-trial admission.
+                "provider_ready": source.provider_ready,
                 "authoritative_observation_count": max(
                     existing.authoritative_observation_count,
                     lane.healthy_source_count,
@@ -125,10 +181,7 @@ class AllLaneOperatingCertificationService(
                 "profitability_certified": certified,
                 "primary_reason": reason,
                 "next_action": next_action,
-                "blockers": [] if state in {"certifying", "certified"} else [
-                    *lane.missing_evidence_classes,
-                    *lane.downstream_evidence_gaps,
-                ],
+                "blockers": [] if state in {"certifying", "certified"} else blockers,
             }
         )
 
@@ -153,6 +206,8 @@ class AllLaneOperatingCertificationService(
             update={
                 "snapshot_id": uuid.uuid4().hex,
                 "mechanisms": statuses,
+                # This count is now literal: evidence-class/redundancy/freshness gaps
+                # no longer inflate the missing-provider number.
                 "provider_gap_count": sum(row.state == "provider_gap" for row in statuses),
                 "collecting_count": sum(row.state == "collecting" for row in statuses),
                 "poor_economics_count": sum(row.state == "poor_economics" for row in statuses),
