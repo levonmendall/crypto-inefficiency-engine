@@ -3,9 +3,11 @@ from __future__ import annotations
 from inefficiency_engine.dashboard_research_closure import build_research_closure_dashboard_router
 from inefficiency_engine.read_api import _latest_payload, _payload_history, _require_store
 from inefficiency_engine.read_api_fast import app
+from inefficiency_engine.research_reset_runtime import RESEARCH_RESET_POLICY_VERSION
 
 
 RESEARCH_CLOSURE_WORKER_ID = "research-closure-diagnostic-loop"
+RESEARCH_RESET_WORKER_ID = "research-qualification-reset"
 
 
 # Replace only the HTML presentation routes. The API remains the v3.5.25 fast,
@@ -82,7 +84,9 @@ def candidate_observatory_status(limit: int = 50):
             "available": False,
             "recent_candidates": recent_candidates,
             "recent_diagnostic_shadow_events": recent_shadow_events,
-            "qualification_thresholds_unchanged": True,
+            "qualification_policy_version": RESEARCH_RESET_POLICY_VERSION,
+            "qualification_thresholds_unchanged": False,
+            "observatory_allocation_authority": False,
             "allocation_authority": False,
             "paper_only": True,
             "live_execution_authority": False,
@@ -93,8 +97,40 @@ def candidate_observatory_status(limit: int = 50):
         **latest,
         "recent_candidates": recent_candidates,
         "recent_diagnostic_shadow_events": recent_shadow_events,
-        "qualification_thresholds_unchanged": True,
+        "qualification_policy_version": RESEARCH_RESET_POLICY_VERSION,
+        "qualification_thresholds_unchanged": False,
+        "observatory_allocation_authority": False,
         "allocation_authority": False,
+        "paper_only": True,
+        "live_execution_authority": False,
+    }
+
+
+@app.get("/v3/research/qualification-reset")
+def qualification_reset_status():
+    """Expose the active research-reset policy and its scientific checkpoint."""
+
+    store = _require_store()
+    latest = _latest_payload(store, "research_qualification_reset_snapshots")
+    heartbeat = None
+    try:
+        heartbeat = store.latest_worker_heartbeat(RESEARCH_RESET_WORKER_ID)
+    except Exception:
+        heartbeat = None
+    runtime = heartbeat.model_dump(mode="json") if heartbeat is not None else None
+    if latest is None:
+        return {
+            "available": False,
+            "policy_version": RESEARCH_RESET_POLICY_VERSION,
+            "runtime": runtime,
+            "paper_only": True,
+            "live_execution_authority": False,
+            "message": "no research qualification reset snapshot has been recorded yet",
+        }
+    return {
+        "available": True,
+        **latest,
+        "runtime": runtime,
         "paper_only": True,
         "live_execution_authority": False,
     }
