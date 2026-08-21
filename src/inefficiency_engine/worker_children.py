@@ -73,15 +73,13 @@ class _CompactCoreResearchService:
 
 
 async def run_research_child(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
-    """Run full research/certification under a bounded working set.
+    """Run full research/certification under bounded memory and stage deadlines.
 
-    Research surfaces execute sequentially and release their results between phases.
-    The core multi-horizon shadow surface additionally uses a rotating bounded L2
-    working set, so one scan cannot materialize books/tier state for the entire
-    discovered universe at every horizon. Full public-market discovery is still
-    persisted on every scan and the exploration half of the L2 budget rotates across
-    the tail of the universe. Every successful research cycle also publishes a tiny
-    read-only research-card projection after the research heartbeat is durable.
+    Every cycle refreshes source evidence first. Source-specific TTLs keep that
+    refresh cheap when a source is still current, while the worker-level stage
+    deadline prevents a provider call from wedging the auxiliary thread forever.
+    Heavy research surfaces remain sequential and release their results between
+    phases. The canonical portfolio remains isolated from this auxiliary work.
     """
 
     stop = _stop_event()
@@ -111,60 +109,10 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         allocation_certification,
         version=__version__,
     )
-
-    # The canonical portfolio has already completed its supervisor bootstrap before
-    # this research thread starts. Probe provider-dependent research surfaces here,
-    # once per research-thread start, so a deploy/restart does not leave the dashboard
-    # showing an obsolete provider gap until the staggered certification cadence fires.
-    # Each individual provider remains isolated/fail-closed inside run_cycle().
-    try:
-        store.record_worker_heartbeat(
-            worker_id=RESEARCH_WORKER_ID,
-            state="starting",
-            detail={
-                "provider_gap_bootstrap": True,
-                "provider_gap_bootstrap_complete": False,
-                "paper_only": True,
-            },
-        )
-        bootstrap = await operating_certification.provider_gap_collection.run_cycle()
-        mechanisms = bootstrap.get("mechanisms", {}) if isinstance(bootstrap, dict) else {}
-        healthy_count = sum(
-            bool(row.get("healthy"))
-            for row in mechanisms.values()
-            if isinstance(row, dict)
-        ) if isinstance(mechanisms, dict) else 0
-        store.record_worker_heartbeat(
-            worker_id=RESEARCH_WORKER_ID,
-            state="running",
-            detail={
-                "provider_gap_bootstrap": True,
-                "provider_gap_bootstrap_complete": True,
-                "provider_gap_bootstrap_healthy_count": healthy_count,
-                "provider_gap_bootstrap_mechanism_count": len(mechanisms) if isinstance(mechanisms, dict) else 0,
-                "source_coverage_sufficient_lane_count": int((bootstrap.get("source_coverage") or {}).get("sufficient_lane_count") or 0) if isinstance(bootstrap, dict) else 0,
-                "paper_only": True,
-            },
-        )
-    except Exception as exc:
-        # Provider bootstrap is additive research telemetry. Never suppress the
-        # canonical portfolio or the established research loop if this probe fails.
-        try:
-            store.record_worker_heartbeat(
-                worker_id=RESEARCH_WORKER_ID,
-                state="degraded",
-                error_type=type(exc).__name__,
-                detail={
-                    "provider_gap_bootstrap": True,
-                    "provider_gap_bootstrap_complete": False,
-                    "message": str(exc)[:500],
-                    "paper_only": True,
-                },
-            )
-        except Exception:
-            pass
-
     research_projection = ResearchDashboardProjectionLedger(store)
+
+    async def source_refresh_cycle() -> object:
+        return await operating_certification.provider_gap_collection.run_cycle()
 
     async def qualified_opportunity_cycle() -> object:
         nav_heartbeat = store.latest_worker_heartbeat("canonical-portfolio-operating-loop")
@@ -295,11 +243,17 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         1,
         int(getattr(service.settings, "alpha_evidence_every_cycles", 10)),
     )
+    stage_timeout_seconds = max(
+        30.0,
+        float(getattr(service.settings, "research_stage_timeout_seconds", 120.0)),
+    )
     return await run_memory_bounded_research_worker(
         compact_core,  # type: ignore[arg-type]
         store,
         worker_id=RESEARCH_WORKER_ID,
         stop_event=stop,
+        source_refresh_runner=source_refresh_cycle,
+        source_refresh_every_cycles=1,
         route_shadow_runner=route_shadow_with_bridge,
         tier_shadow_runner=tier_shadow.run_cycle,
         tier_shadow_every_cycles=service.settings.dex_route_tier_shadow_every_cycles,
@@ -314,6 +268,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         frontier_runner=universal.probe_dex_route_size_frontiers,
         frontier_every_cycles=service.settings.dex_route_frontier_every_cycles,
         post_success_publisher=publish_research_dashboard,
+        stage_timeout_seconds=stage_timeout_seconds,
     )
 
 
