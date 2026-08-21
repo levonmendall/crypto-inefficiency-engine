@@ -28,16 +28,19 @@ class LaneSourceDimensions(BaseModel):
     """Independent read-model dimensions for one profit lane's source layer.
 
     Provider connectivity answers whether an authoritative provider is currently
-    usable. Source sufficiency answers whether the complete decision-grade source
-    contract is satisfied. Neither dimension grants qualification or allocation
-    authority; callers must continue to gate forward trials on
-    ``source_layer_sufficient``.
+    usable. Research/forward eligibility describe whether the lane may continue
+    evidence accumulation. Allocation source qualification remains the original
+    decision-grade two-source contract. None of these dimensions independently
+    grants portfolio authority.
     """
 
     provider_connectivity_state: ProviderConnectivityState
     source_sufficiency_state: SourceSufficiencyState
     source_headline_state: SourceHeadlineState
     provider_ready: bool
+    research_eligible: bool = False
+    forward_test_eligible: bool = False
+    allocation_source_qualified: bool = False
     source_layer_sufficient: bool
 
 
@@ -69,27 +72,34 @@ def classify_lane_source_dimensions(lane: _LaneSourceLike) -> LaneSourceDimensio
         connectivity = "missing"
 
     source_layer_sufficient = bool(getattr(lane, "source_layer_sufficient", False))
+    research_eligible = bool(getattr(lane, "research_eligible", provider_ready))
+    forward_test_eligible = bool(
+        getattr(
+            lane,
+            "forward_test_eligible",
+            research_eligible and not list(getattr(lane, "missing_evidence_classes", []) or []),
+        )
+    )
+    allocation_source_qualified = bool(
+        getattr(lane, "allocation_source_qualified", source_layer_sufficient)
+    )
     missing_classes = list(getattr(lane, "missing_evidence_classes", []) or [])
     redundancy_satisfied = bool(getattr(lane, "source_redundancy_satisfied", False))
 
-    if source_layer_sufficient:
+    if allocation_source_qualified:
         sufficiency: SourceSufficiencyState = "sufficient"
     elif not provider_ready and connectivity == "stale":
         sufficiency = "stale"
     elif not provider_ready:
-        # This label now has one literal meaning: there is no fresh admitted
-        # authoritative provider available to this lane.
         sufficiency = "provider_gap"
     elif missing_classes:
         sufficiency = "evidence_class_gap"
     elif not redundancy_satisfied:
         sufficiency = "redundancy_gap"
     else:
-        # Fail closed for any unmodelled source-contract shortfall without falsely
-        # claiming the connected provider disappeared.
         sufficiency = "evidence_class_gap"
 
-    if source_layer_sufficient:
+    if allocation_source_qualified:
         headline: SourceHeadlineState = "ready"
     elif connectivity in {"degraded", "stale"}:
         headline = "degraded"
@@ -103,5 +113,8 @@ def classify_lane_source_dimensions(lane: _LaneSourceLike) -> LaneSourceDimensio
         source_sufficiency_state=sufficiency,
         source_headline_state=headline,
         provider_ready=provider_ready,
+        research_eligible=research_eligible,
+        forward_test_eligible=forward_test_eligible,
+        allocation_source_qualified=allocation_source_qualified,
         source_layer_sufficient=source_layer_sufficient,
     )

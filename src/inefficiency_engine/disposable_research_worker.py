@@ -4,7 +4,6 @@ import gc
 from types import SimpleNamespace
 
 from inefficiency_engine import __version__
-from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
 from inefficiency_engine.bounded_shadow_service import MemoryBoundedShadowService
 from inefficiency_engine.cex_dex_canonical_runtime import (
     CexDexFreshnessSeparatedQualifiedOpportunityBridgePublisher as QualifiedOpportunityBridgePublisher,
@@ -20,14 +19,15 @@ from inefficiency_engine.dashboard_projection import (
 from inefficiency_engine.dex_tier_shadow import DexTierShadowService
 from inefficiency_engine.disposable_alpha_factory import DisposableExpandedAlphaFactoryService
 from inefficiency_engine.evidence import EvidenceStore
-from inefficiency_engine.priority_source_collection import (
-    SourceCoverageAwareOperatingCertificationService as OperatingCertificationService,
+from inefficiency_engine.evidence_velocity_runtime import (
+    EvidenceVelocityAllLaneOperatingCertificationService as OperatingCertificationService,
+    EvidenceVelocityLaneSuccessAllocationForwardCertificationService as AllocationForwardCertificationService,
+    EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService as UnifiedPaperAllocatorService,
 )
 from inefficiency_engine.research_closure_worker import run_research_closure_cycle
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
 from inefficiency_engine.stablecoin_depth_shadow import StablecoinDepthShadowService
-from inefficiency_engine.unified_allocation import UnifiedPaperAllocatorService
 from inefficiency_engine.universal_service import UniversalOpportunityService
 from inefficiency_engine.worker import WorkerRunStats
 
@@ -55,11 +55,13 @@ async def run_disposable_research_cycle(
     *,
     sequence: int,
 ) -> WorkerRunStats:
-    """Run exactly one research cycle, persist every result, then return to the OS.
+    """Run exactly one integrated research cycle, persist results, then exit.
 
-    The durable sequence preserves the old staggered cadence across process exits.
-    Nothing here sleeps or loops. The Render supervisor owns cadence and process
-    lifetime so Python's research heap is unconditionally reclaimed after each cycle.
+    The disposable process is the production Render research path. It therefore
+    installs the all-lane evidence factory, evidence-velocity source boundary, and
+    Release D subtractive lane-success allocator/certification together. Final
+    statistical, source, execution, risk, settlement, and profitability thresholds
+    remain unchanged.
     """
 
     sequence = max(1, int(sequence))
@@ -101,6 +103,8 @@ async def run_disposable_research_cycle(
         "disposable_process": True,
         "history_backfill_inline": False,
         "sequential_research_surfaces": True,
+        "all_lane_evidence_velocity_runtime": True,
+        "release_d_lane_success_runtime": True,
         "paper_only": True,
     }
     store.record_worker_heartbeat(
@@ -109,16 +113,24 @@ async def run_disposable_research_cycle(
         detail=detail,
     )
 
-    # Provider/source bootstrap is periodic rather than every process start. The
-    # operating-certification path also refreshes it when due.
+    # Source refresh is periodic rather than repeated on every process start. The
+    # executable collector supplies multi-venue trade-flow integrity, class-specific
+    # freshness, dynamic priority and stagnation diagnostics.
     if sequence == 1 or sequence % 10 == 1:
         try:
             bootstrap = await operating_certification.provider_gap_collection.run_cycle()
             source_coverage = bootstrap.get("source_coverage", {}) if isinstance(bootstrap, dict) else {}
             detail["provider_gap_bootstrap_complete"] = True
-            detail["source_coverage_sufficient_lane_count"] = int(
-                source_coverage.get("sufficient_lane_count") or 0
-            ) if isinstance(source_coverage, dict) else 0
+            if isinstance(source_coverage, dict):
+                detail["source_coverage_sufficient_lane_count"] = int(
+                    source_coverage.get("sufficient_lane_count") or 0
+                )
+                detail["source_coverage_research_eligible_lane_count"] = int(
+                    source_coverage.get("research_eligible_lane_count") or 0
+                )
+                detail["source_coverage_forward_test_eligible_lane_count"] = int(
+                    source_coverage.get("forward_test_eligible_lane_count") or 0
+                )
         except Exception as exc:
             detail["provider_gap_bootstrap_complete"] = False
             detail["provider_gap_bootstrap_error_type"] = type(exc).__name__
@@ -145,8 +157,9 @@ async def run_disposable_research_cycle(
         )
         return WorkerRunStats(RESEARCH_WORKER_ID, 1, 0, 1)
 
-    # Publish the durable bridge before route verification. Candidate freshness is
-    # still checked independently by the canonical portfolio.
+    # Publish the durable bridge before route verification. The integrated allocator
+    # applies Release D subtractive calibration while mechanism promotion remains
+    # evidence-velocity source governed.
     try:
         nav_heartbeat = store.latest_worker_heartbeat("canonical-portfolio-operating-loop")
         nav_value = nav_heartbeat.detail.get("portfolio_nav_usd") if nav_heartbeat else None
@@ -227,6 +240,11 @@ async def run_disposable_research_cycle(
             detail["alpha_candidate_count"] = value.candidate_count
             detail["alpha_signals_recorded"] = value.signals_recorded
             detail["alpha_outcomes_matured"] = value.outcomes_matured
+            mechanism = alpha_factory.mechanism_execution.readiness_summary()
+            detail["mechanism_forward_outcomes"] = {
+                lane: int(row.get("forward_outcome_count") or 0)
+                for lane, row in mechanism.items()
+            }
             del value
         except Exception as exc:
             detail["alpha_forward_evidence_error_type"] = type(exc).__name__
