@@ -259,7 +259,7 @@ def test_provider_admission_reconciler_is_diagnostic_before_fail_closed_state_re
     assert final_row["stage"] == "research"
 
 
-def test_research_dashboard_exposes_three_source_dimensions():
+def test_research_dashboard_exposes_canonical_source_dimensions():
     # Importing the overlay also proves its guarded string replacements still match
     # the current resilient dashboard template.
     from inefficiency_engine.dashboard_research_closure import (
@@ -267,5 +267,7 @@ def test_research_dashboard_exposes_three_source_dimensions():
     )
 
     assert "sourceDimensions" in RESEARCH_CLOSURE_DASHBOARD_HTML
-    assert "provider healthy" in RESEARCH_CLOSURE_DASHBOARD_HTML
-    assert "qualification blocked" in RESEARCH_CLOSURE_DASHBOARD_HTML
+    assert "provider connected" in RESEARCH_CLOSURE_DASHBOARD_HTML
+    assert "Provider missing" in RESEARCH_CLOSURE_DASHBOARD_HTML
+    assert "Evidence incomplete" in RESEARCH_CLOSURE_DASHBOARD_HTML
+    assert "Redundancy pending" in RESEARCH_CLOSURE_DASHBOARD_HTML
