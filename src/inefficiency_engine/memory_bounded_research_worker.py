@@ -66,7 +66,7 @@ async def _capture(
         if timeout_seconds is None or timeout_seconds <= 0:
             return await runner()
         try:
-            return await asyncio.wait_for(runner(), timeout=max(0.1, float(timeout_seconds)))
+            return await asyncio.wait_for(runner(), timeout=max(0.001, float(timeout_seconds)))
         except TimeoutError as exc:
             error = ResearchStageTimeoutError(
                 f"research stage {stage_name!r} exceeded {float(timeout_seconds):.1f}s"
@@ -377,7 +377,15 @@ async def run_memory_bounded_research_worker(
                 stage_name=stage_name,
             )
 
-        await run_optional(route_shadow_runner, _route_summary, "dex_route_shadow")
+        if route_shadow_runner is not None:
+            _stage_heartbeat(
+                store,
+                worker_id=worker_id,
+                attempted=attempted,
+                stage_name="dex_route_shadow",
+                timeout_seconds=stage_timeout_seconds,
+            )
+            await _run_and_release(route_shadow_runner, detail, _route_summary, timeout_seconds=stage_timeout_seconds, stage_name="dex_route_shadow")
         if run_tier_shadow:
             await run_optional(tier_shadow_runner, _tier_summary, "dex_tier_shadow")
         if run_composite_shadow:
