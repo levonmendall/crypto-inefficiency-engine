@@ -46,7 +46,7 @@ SOURCES: tuple[dict[str, object], ...] = (
     {"id":"bybit-distress","name":"Bybit ADL / insurance state","lanes":["liquidation_distress"],"classes":["distress_state"],"group":"bybit","tier":"first_party","provider":["bybit-v5:adl-alert","bybit-v5:insurance-pool"]},
     {"id":"hyperliquid-distress","name":"Hyperliquid distress state","lanes":["liquidation_distress"],"classes":["distress_state"],"group":"hyperliquid","tier":"first_party","provider":["hyperliquid:perp-asset-contexts"]},
     {"id":"internal-maker-shadow","name":"Internal maker-fill outcomes","lanes":["liquidity_provision"],"classes":["maker_fill_outcomes"],"group":"internal-maker","tier":"internal","table":("maker_shadow_outcomes",None,None)},
-    {"id":"public-trade-flow","name":"Public trade-flow capture","lanes":["liquidity_provision","microstructure"],"classes":["trade_flow"],"group":"trade-flow","tier":"first_party","active":False},
+    {"id":"public-trade-flow","name":"Public trade-flow capture","lanes":["liquidity_provision","microstructure"],"classes":["trade_flow"],"group":"trade-flow","tier":"first_party","active":True},
     {"id":"internal-opportunity-history","name":"Durable opportunity history","lanes":["capital_location_settlement"],"classes":["venue_opportunity_history"],"group":"internal-opportunities","tier":"internal","table":("opportunities",None,None)},
     {"id":"internal-transfer-telemetry","name":"Transfer / withdrawal telemetry","lanes":["capital_location_settlement"],"classes":["transfer_costs","transfer_latency"],"group":"internal-transfer","tier":"internal","table":("capital_transfer_outcomes",None,None)},
 )
