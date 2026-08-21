@@ -9,12 +9,17 @@ from inefficiency_engine.mechanism_execution import MECHANISM_IDS
 from inefficiency_engine.operating_certification import OperatingCertificationLedger
 from inefficiency_engine.source_coverage import SourceCoveragePlane
 from inefficiency_engine.source_coverage_catalog import LANES
+from inefficiency_engine.source_state_dimensions import classify_lane_source_dimensions
 
 
 class LaneExecutableReadiness(BaseModel):
     lane_id: str
     name: str
     source_layer_sufficient: bool
+    provider_connectivity_state: str
+    source_sufficiency_state: str
+    source_headline_state: str
+    qualification_stage: str
     economics_model_implemented: bool
     forward_loop_implemented: bool
     statistical_gate_implemented: bool
@@ -24,6 +29,8 @@ class LaneExecutableReadiness(BaseModel):
     currently_qualified: bool
     profitability_certified: bool
     execution_state: str
+    # Backward-compatible legacy source taxonomy from SourceCoveragePlane. New
+    # consumers should use provider_connectivity_state + source_sufficiency_state.
     source_state: str
     forward_outcome_count: int = Field(default=0, ge=0)
     current_promoted_candidate_count: int = Field(default=0, ge=0)
@@ -77,6 +84,16 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
         source = source_by_id.get(lane_id)
         source_ready = bool(source and source.source_layer_sufficient)
         source_state = source.source_state if source is not None else "unobserved"
+        dimensions = classify_lane_source_dimensions(source) if source is not None else None
+        provider_connectivity_state = (
+            dimensions.provider_connectivity_state if dimensions is not None else "missing"
+        )
+        source_sufficiency_state = (
+            dimensions.source_sufficiency_state if dimensions is not None else "provider_gap"
+        )
+        source_headline_state = (
+            dimensions.source_headline_state if dimensions is not None else "provider_gap"
+        )
         operating_row = operating_by_id.get(lane_id)
 
         if lane_id in MECHANISM_IDS:
@@ -109,12 +126,25 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
         if not source_ready:
             if source is not None:
                 blockers.extend(source.missing_evidence_classes)
-                if source.source_state == "concentration_risk":
+                if source_sufficiency_state == "redundancy_gap":
                     blockers.append("authoritative source redundancy target is not satisfied")
+                elif source_sufficiency_state == "stale":
+                    blockers.append("authoritative source evidence is stale")
+                elif source_sufficiency_state == "provider_gap":
+                    blockers.append("no fresh admitted authoritative provider is currently usable")
             else:
                 blockers.append("source coverage has not been observed")
         if operating_row is not None:
             blockers.extend(item for item in operating_row.blockers if item not in blockers)
+
+        if not source_ready:
+            qualification_stage = f"waiting_for_source:{source_sufficiency_state}"
+        elif operating_row is not None:
+            qualification_stage = operating_row.stage
+        elif currently_qualified:
+            qualification_stage = "qualified_for_paper_allocation"
+        else:
+            qualification_stage = "awaiting_operating_snapshot"
 
         if not paper_capable:
             execution_state = "architecture_incomplete"
@@ -131,6 +161,10 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
             lane_id=lane_id,
             name=str(definition["name"]),
             source_layer_sufficient=source_ready,
+            provider_connectivity_state=provider_connectivity_state,
+            source_sufficiency_state=source_sufficiency_state,
+            source_headline_state=source_headline_state,
+            qualification_stage=qualification_stage,
             economics_model_implemented=bool(architecture["economics"]),
             forward_loop_implemented=bool(architecture["forward"]),
             statistical_gate_implemented=bool(architecture["statistics"]),
@@ -155,7 +189,9 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
         all_lanes_paper_execution_capable=all(row.paper_execution_capable for row in rows),
         lanes=rows,
         interpretation=(
-            "paper_execution_capable means a fail-closed source/economics/forward/statistical/allocation/settlement "
-            "path exists in code; currently_qualified means real accumulated evidence presently authorizes a paper allocation."
+            "provider_connectivity_state reports whether authoritative providers are currently usable; "
+            "source_sufficiency_state reports evidence-class/redundancy completeness; qualification_stage "
+            "reports downstream economic/forward progress. paper_execution_capable remains architecture-only, "
+            "and source_layer_sufficient remains the unchanged fail-closed gate for forward eligibility."
         ),
     )

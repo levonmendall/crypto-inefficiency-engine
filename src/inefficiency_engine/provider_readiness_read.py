@@ -15,6 +15,7 @@ PROVIDER_DEPENDENT_MECHANISMS = {
     "liquidation_distress",
 }
 DEFAULT_PROVIDER_MAX_AGE_HOURS = 24.0
+_SOURCE_WAIT_PREFIX = "waiting_for_source:"
 
 
 def _now() -> datetime:
@@ -29,6 +30,14 @@ def _parse_time(value: object | None) -> datetime | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _source_wait_state(row: dict[str, Any]) -> str | None:
+    stage = str(row.get("stage") or "")
+    if not stage.startswith(_SOURCE_WAIT_PREFIX):
+        return None
+    value = stage[len(_SOURCE_WAIT_PREFIX):].strip()
+    return value or None
 
 
 def _latest_provider_rows(store) -> dict[str, list[dict[str, Any]]]:
@@ -131,11 +140,14 @@ def reconcile_provider_readiness(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Correct stale provider-gap presentation from the admission ledger.
+    """Reconcile provider connectivity without overwriting source sufficiency.
 
-    A fresh admitted provider may move a stale lane from PROVIDER GAP to COLLECTING.
-    It cannot move a lane to certifying/certified, create an economic candidate,
-    increment a forward sample, or grant paper/live allocation authority.
+    The provider-admission ledger is narrower than the 13-lane Source Coverage Plane.
+    It can prove that a known provider surface is fresh, but it cannot prove that all
+    required evidence classes or independent-source redundancy are sufficient. Newer
+    ``waiting_for_source:*`` stages therefore remain authoritative for source
+    sufficiency. This function is presentation-only and never creates qualification,
+    allocation, or execution authority.
     """
     readiness = provider_readiness_snapshot(store, now=now)
     result = dict(mechanism_payload or {})
@@ -153,34 +165,51 @@ def reconcile_provider_readiness(
 
         row["provider_admission"] = status
         admitted_count = int(status.get("admitted_provider_count") or 0)
+        source_wait = _source_wait_state(row)
         if admitted_count > 0:
             row["provider_ready"] = True
             row["authoritative_observation_count"] = max(
                 int(row.get("authoritative_observation_count") or 0),
                 admitted_count,
             )
-            if row.get("state") == "provider_gap":
+            # A fresh provider closes only a literal provider gap. It does not close
+            # evidence-class, redundancy, or other source-contract gaps.
+            if row.get("state") == "provider_gap" and source_wait in {None, "provider_gap"}:
                 row["state"] = "collecting"
                 row["primary_reason"] = (
-                    "authoritative provider is connected and fresh; economic/forward evidence "
-                    "is now accumulating under the existing qualification gates"
+                    "authoritative provider connectivity is fresh; complete source sufficiency "
+                    "and downstream qualification remain independently gated"
                 )
                 row["next_action"] = (
-                    "continue point-in-time economic and forward evidence collection; do not lower "
-                    "profitability, statistical, execution, or settlement thresholds"
+                    "continue source/economic/forward evidence collection under unchanged gates"
                 )
         else:
-            # If this provider surface has actually been probed, its newest durable
-            # admission is a more current provider-health fact than an older dashboard
-            # projection. Keep the economic lane fail-closed and expose the real probe.
-            row["provider_ready"] = False
-            row["state"] = "provider_gap"
-            row["primary_reason"] = (
-                "provider is configured but no fresh admitted provider observation is currently healthy"
+            # Explicit source stages come from the broader Source Coverage Plane and
+            # are more specific than this legacy provider-admission ledger. Preserve
+            # them. A completed source layer is also authoritative even if one legacy
+            # primary probe fails because another independent source may be carrying
+            # the lane. Legacy/generic rows still honor the newest failed probe and
+            # fail closed exactly as before this repair.
+            explicit_non_provider_gap = source_wait in {
+                "evidence_class_gap",
+                "redundancy_gap",
+                "stale",
+            }
+            broader_source_complete = bool(
+                source_wait is None
+                and str(row.get("stage") or "") == "profitability_certifiable"
+                and row.get("provider_ready") is True
             )
-            row["next_action"] = (
-                "restore the failing/stale provider probe; economic and forward gates remain unchanged"
-            )
+            if not explicit_non_provider_gap and not broader_source_complete:
+                row["provider_ready"] = False
+                row["state"] = "provider_gap"
+                row["stage"] = "waiting_for_source:provider_gap"
+                row["primary_reason"] = (
+                    "no fresh admitted authoritative provider is currently usable"
+                )
+                row["next_action"] = (
+                    "restore the failing provider probe; source and downstream gates remain unchanged"
+                )
         row["provider_readiness_reconciled_from_admission_ledger"] = True
         row["provider_readiness_presentation_only"] = True
         mechanisms.append(row)
