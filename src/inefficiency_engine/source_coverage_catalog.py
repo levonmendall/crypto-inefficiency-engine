@@ -3,7 +3,7 @@ from __future__ import annotations
 LANES: dict[str, dict[str, object]] = {
     "price_discrepancy": {"name":"Price discrepancy / arbitrage","required":["market_quotes","executable_depth"]},
     "carry": {"name":"Carry / basis / funding","required":["market_quotes","funding_or_basis","executable_depth"]},
-    "yield": {"name":"Yield / staking / lending","required":["yield_rate","capacity","exit_liquidity","protocol_risk_calibration"],"downstream":["realized-yield forward cohort"]},
+    "yield": {"name":"Yield / staking / lending","required":["yield_rate","capacity","exit_liquidity"],"downstream":["protocol-loss statistical calibration","realized-yield forward cohort"]},
     "liquidity_provision": {"name":"Liquidity provision / market making","required":["order_book","trade_flow"],"downstream":["empirical maker queue/fill outcomes"]},
     "trend_momentum": {"name":"Directional trend / momentum","required":["market_history","execution_costs"]},
     "mean_reversion": {"name":"Mean reversion / reversal","required":["market_history","execution_costs"]},
