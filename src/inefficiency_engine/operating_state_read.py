@@ -28,6 +28,7 @@ STATE_PRIORITY = {
     "poor_economics": 6,
     "provider_gap": 7,
 }
+_SOURCE_WAIT_PREFIX = "waiting_for_source:"
 
 
 def _number(value: object | None) -> float | None:
@@ -42,6 +43,14 @@ def _number(value: object | None) -> float | None:
 def _int(value: object | None) -> int:
     parsed = _number(value)
     return max(0, int(parsed or 0))
+
+
+def _source_wait_state(row: dict[str, Any]) -> str | None:
+    stage = str(row.get("stage") or "")
+    if not stage.startswith(_SOURCE_WAIT_PREFIX):
+        return None
+    value = stage[len(_SOURCE_WAIT_PREFIX):].strip()
+    return value or None
 
 
 def _mixed_strategy_state(rows: list[dict[str, Any]]) -> str | None:
@@ -97,8 +106,34 @@ def _blocked_state_cleared(source_state: str, rows: list[dict[str, Any]]) -> boo
     return any(_int(row.get("settled_allocator_outcome_count")) > 0 for row in rows)
 
 
+def _source_wait_reason(row: dict[str, Any], source_wait: str) -> str:
+    existing = str(row.get("primary_reason") or "")
+    if existing:
+        return existing
+    if source_wait == "provider_gap":
+        return "no fresh admitted authoritative provider is currently usable"
+    if source_wait == "stale":
+        return "authoritative provider integration exists, but its source evidence is stale"
+    if source_wait == "redundancy_gap":
+        return "authoritative provider evidence is connected, but independent-source redundancy is incomplete"
+    if source_wait == "evidence_class_gap":
+        return "authoritative provider evidence is connected, but required evidence classes are incomplete"
+    return "source sufficiency is incomplete under the existing fail-closed source contract"
+
+
 def _derive_non_strategy_state(row: dict[str, Any], settings) -> tuple[str | None, str | None]:
     """Recompute states that are fully determined by fields already projected live."""
+    source_wait = _source_wait_state(row)
+    if source_wait is not None:
+        if source_wait == "provider_gap":
+            return "provider_gap", _source_wait_reason(row, source_wait)
+        # A connected-but-insufficient source layer blocks downstream interpretation.
+        # Keep the operating headline at COLLECTING while stage carries the exact
+        # evidence-class/redundancy/freshness reason.
+        return "collecting", _source_wait_reason(row, source_wait)
+
+    # Legacy snapshots without the newer source stage retain the old fail-closed
+    # behavior so backward compatibility does not accidentally loosen a gate.
     if row.get("provider_ready") is False:
         return "provider_gap", "required authoritative provider evidence is not currently fresh and admitted"
 
@@ -174,8 +209,10 @@ def reconcile_live_operating_states(
 ) -> dict[str, Any]:
     """Reconcile every displayed lane state from the newest durable read-plane facts.
 
-    This function is presentation-only. It never writes evidence, creates candidates,
-    changes qualification thresholds, or grants allocation/execution authority.
+    Provider connectivity, source sufficiency, and downstream qualification remain
+    distinct. This function is presentation-only: it never writes evidence, creates
+    candidates, changes qualification thresholds, or grants allocation/execution
+    authority.
     """
     result = dict(mechanism_payload or {})
     rows: list[dict[str, Any]] = []
@@ -185,6 +222,7 @@ def reconcile_live_operating_states(
             continue
         row = dict(source)
         source_state = str(row.get("state") or "collecting")
+        source_wait = _source_wait_state(row)
         strategy_rows = [
             dict(item)
             for item in list(row.get("strategy_evidence") or [])
@@ -194,7 +232,14 @@ def reconcile_live_operating_states(
         new_state: str | None = None
         reason: str | None = None
 
-        if row.get("provider_ready") is False:
+        # An explicit source-sufficiency blocker precedes downstream strategy
+        # interpretation. A redundancy/evidence/freshness gap is not a provider gap.
+        if source_wait is not None:
+            new_state = "provider_gap" if source_wait == "provider_gap" else "collecting"
+            reason = _source_wait_reason(row, source_wait)
+        elif row.get("provider_ready") is False:
+            # Backward-compatible handling for old snapshots that predate the
+            # waiting_for_source taxonomy.
             new_state = "provider_gap"
             reason = "required authoritative provider evidence is not currently fresh and admitted"
         elif strategy_rows:
@@ -225,22 +270,25 @@ def reconcile_live_operating_states(
             row["state"] = new_state
             if reason:
                 row["primary_reason"] = reason
-            if new_state == "provider_gap":
-                row["next_action"] = "restore fresh authoritative provider evidence; downstream gates remain fail-closed"
-            elif new_state == "collecting":
-                row["next_action"] = "continue append-only evidence collection under unchanged thresholds"
-            elif new_state == "poor_economics":
-                row["next_action"] = "continue observing; do not allocate unless after-cost/risk economics recover"
-            elif new_state == "statistical_failure":
-                row["next_action"] = "continue independent evidence accumulation; do not weaken confidence or regime gates"
-            elif new_state == "execution_blocked":
-                row["next_action"] = "continue fresh execution/cost/capacity evidence and require the existing promotion gates"
-            elif new_state == "settlement_blocked":
-                row["next_action"] = "restore supported forward settlement evidence before interpreting realized profitability"
-            elif new_state == "certifying":
-                row["next_action"] = "continue independent forward and allocator settlement evidence until certification is complete"
-            elif new_state == "certified":
-                row["next_action"] = "maintain forward monitoring and revoke automatically if later evidence degrades"
+            # Preserve precise source remediation written by the worker. Generic
+            # operating next-actions apply only once the source layer is not the gate.
+            if source_wait is None:
+                if new_state == "provider_gap":
+                    row["next_action"] = "restore fresh authoritative provider evidence; downstream gates remain fail-closed"
+                elif new_state == "collecting":
+                    row["next_action"] = "continue append-only evidence collection under unchanged thresholds"
+                elif new_state == "poor_economics":
+                    row["next_action"] = "continue observing; do not allocate unless after-cost/risk economics recover"
+                elif new_state == "statistical_failure":
+                    row["next_action"] = "continue independent evidence accumulation; do not weaken confidence or regime gates"
+                elif new_state == "execution_blocked":
+                    row["next_action"] = "continue fresh execution/cost/capacity evidence and require the existing promotion gates"
+                elif new_state == "settlement_blocked":
+                    row["next_action"] = "restore supported forward settlement evidence before interpreting realized profitability"
+                elif new_state == "certifying":
+                    row["next_action"] = "continue independent forward and allocator settlement evidence until certification is complete"
+                elif new_state == "certified":
+                    row["next_action"] = "maintain forward monitoring and revoke automatically if later evidence degrades"
 
         row["live_operating_state_reconciled"] = True
         row["live_operating_state_source"] = "latest durable dashboard/provider/strategy evidence"
@@ -264,6 +312,8 @@ def rebuild_live_action_queue(mechanism_payload: dict[str, Any]) -> dict[str, An
                 "mechanism_id": row.get("mechanism_id"),
                 "name": row.get("name"),
                 "state": row.get("state"),
+                "stage": row.get("stage"),
+                "provider_ready": row.get("provider_ready"),
                 "primary_reason": row.get("primary_reason"),
                 "next_action": row.get("next_action"),
                 "blockers": list(row.get("blockers") or []),
