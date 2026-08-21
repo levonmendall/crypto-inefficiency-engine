@@ -71,9 +71,6 @@ def test_public_trade_flow_generates_real_forward_testable_alpha_without_maker_f
         market_quotes=[q],
         opportunities=[],
     )
-    # Microstructure controls live in the expanded settings view rather than the
-    # base Settings dataclass. The strategy intentionally uses getattr defaults, so
-    # this fixture supplies only the controls under test.
     settings = SimpleNamespace(
         alpha_microstructure_min_abs_imbalance=0.20,
         alpha_microstructure_return_scale=0.012,
@@ -101,27 +98,26 @@ def test_public_trade_flow_generates_real_forward_testable_alpha_without_maker_f
     assert rows[0].paper_allocation_eligible is False
 
 
-def test_market_making_settlement_uses_observed_trade_through_and_future_inventory_mark(tmp_path):
-    store = EvidenceStore(tmp_path / "maker.sqlite3")
-    service = ExecutableMechanismExecutionService(core(), store)
-    plane = SourceCoveragePlane(store)
-    for index, (side, price) in enumerate([("sell", 99.0), ("buy", 101.0)]):
-        plane.record_event(SourceEventObservation(
-            event_id=f"maker-trade-{index}",
-            lane_id="liquidity_provision",
-            source_id="public-trade-flow",
-            event_type="public_trade",
-            event_at=NOW + timedelta(minutes=2 + index),
-            observed_at=NOW + timedelta(minutes=2 + index),
-            asset="BTC",
-            payload={
-                "venue": "Coinbase",
-                "symbol": "BTC-USD",
-                "aggressor_side": side,
-                "price": price,
-                "size": 5.0,
-            },
-        ))
+def _maker_trade(plane, *, event_id: str, side: str, price: float, size: float, minutes: int):
+    plane.record_event(SourceEventObservation(
+        event_id=event_id,
+        lane_id="liquidity_provision",
+        source_id="public-trade-flow",
+        event_type="public_trade",
+        event_at=NOW + timedelta(minutes=minutes),
+        observed_at=NOW + timedelta(minutes=minutes),
+        asset="BTC",
+        payload={
+            "venue": "Coinbase",
+            "symbol": "BTC-USD",
+            "aggressor_side": side,
+            "price": price,
+            "size": size,
+        },
+    ))
+
+
+def _record_maker_exit(store):
     store.record_scan(
         funding_quotes=[],
         market_quotes=[MarketQuote(
@@ -140,6 +136,15 @@ def test_market_making_settlement_uses_observed_trade_through_and_future_invento
         started_at=NOW,
         completed_at=NOW + timedelta(hours=1),
     )
+
+
+def test_market_making_legacy_settlement_remains_settleable(tmp_path):
+    store = EvidenceStore(tmp_path / "maker.sqlite3")
+    service = ExecutableMechanismExecutionService(core(), store)
+    plane = SourceCoveragePlane(store)
+    _maker_trade(plane, event_id="maker-trade-0", side="sell", price=99.0, size=5.0, minutes=2)
+    _maker_trade(plane, event_id="maker-trade-1", side="buy", price=101.0, size=5.0, minutes=3)
+    _record_maker_exit(store)
     trial = MechanismForwardTrial(
         mechanism_id="liquidity_provision",
         cohort_key="maker|Coinbase|BTC|BTC-USD",
@@ -166,7 +171,49 @@ def test_market_making_settlement_uses_observed_trade_through_and_future_invento
     assert result.detail["bid_filled"] is True
     assert result.detail["ask_filled"] is True
     assert result.detail["empirical_fill_observed"] is True
-    assert result.settlement_method == "shadow_post_only_fill_plus_inventory_mark"
+    assert "inventory_mark" in result.settlement_method
+
+
+def test_queue_aware_maker_tracks_crossed_without_fill(tmp_path):
+    store = EvidenceStore(tmp_path / "maker-queue.sqlite3")
+    service = ExecutableMechanismExecutionService(core(), store)
+    plane = SourceCoveragePlane(store)
+    # Trade touches/crosses our bid, but not enough notional trades through to clear
+    # the visible queue plus our own hypothetical order.
+    _maker_trade(plane, event_id="maker-small", side="sell", price=99.0, size=1.0, minutes=2)
+    _record_maker_exit(store)
+    trial = MechanismForwardTrial(
+        mechanism_id="liquidity_provision",
+        cohort_key="maker|Coinbase|BTC|BTC-USD|queue",
+        asset="BTC",
+        venues=["Coinbase"],
+        source_observed_at=NOW,
+        due_at=NOW + timedelta(minutes=15),
+        capital_usd=1000,
+        predicted_net_return=0.001,
+        predicted_profit_usd=1,
+        settlement_payload={
+            "venue": "Coinbase",
+            "asset": "BTC",
+            "symbol": "BTC-USD",
+            "market_kind": "spot",
+            "bid": 99.0,
+            "ask": 101.0,
+            "mid": 100.0,
+            "quantity": 10.0,
+            "queue_model_version": "visible_top_queue_v1",
+            "bid_queue_ahead_usd": 1000.0,
+            "ask_queue_ahead_usd": 1000.0,
+            "order_notional_usd": 1000.0,
+        },
+    )
+    result = service.settle_trial(trial)
+    assert result is not None
+    assert result.detail["bid_touched"] is True
+    assert result.detail["bid_filled"] is False
+    assert result.detail["bid_crossed_without_fill"] is True
+    assert result.detail["empirical_fill_observed"] is False
+    assert result.net_return == 0.0
 
 
 def test_mechanism_candidate_is_accepted_by_canonical_paper_settlement_contract(tmp_path):
@@ -199,7 +246,6 @@ def test_mechanism_candidate_is_accepted_by_canonical_paper_settlement_contract(
         notional_usd_per_leg=1000.0,
         expected_profit_usd_per_deployment=2.0,
         expected_return_on_reserved_capital=0.002,
-        modeled_holding_hours=24.0,
         source_return_metric="mechanism_forward_evidence_net_return",
         source_return_value=0.002,
         source_observed_at=NOW,

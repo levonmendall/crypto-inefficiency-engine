@@ -15,9 +15,6 @@ VALID_STATES = {
     "certified",
 }
 
-# A lane remains economically alive when at least one underlying strategy is still
-# progressing. This mirrors the existing strategy-attribution presentation rule and
-# prevents one failed strategy from vetoing an otherwise viable mechanism family.
 STATE_PRIORITY = {
     "certified": 0,
     "certifying": 1,
@@ -90,14 +87,6 @@ def _strategy_reason(rows: list[dict[str, Any]], state: str) -> str:
 
 
 def _blocked_state_cleared(source_state: str, rows: list[dict[str, Any]]) -> bool:
-    """Require durable downstream evidence before clearing a cached blocked state.
-
-    Strategy evidence currently reconstructs forward statistics and realized allocator
-    outcomes. It does not reconstruct the transient current-candidate promotion probe.
-    Therefore an old execution/settlement block is retained until a realized allocator
-    outcome proves that the blocked boundary was crossed, or until newer evidence moves
-    the strategy to a terminal economics/statistical conclusion.
-    """
     if source_state not in {"execution_blocked", "settlement_blocked"}:
         return True
     states = {str(row.get("state") or "") for row in rows}
@@ -121,19 +110,61 @@ def _source_wait_reason(row: dict[str, Any], source_wait: str) -> str:
     return "source sufficiency is incomplete under the existing fail-closed source contract"
 
 
+def _lane_funnel(row: dict[str, Any], strategy_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Read-only funnel using only durable counts already produced by the runtime."""
+    if strategy_rows:
+        forward_signals = sum(_int(item.get("forward_signal_count")) for item in strategy_rows)
+        forward_outcomes = sum(_int(item.get("independent_forward_outcome_count")) for item in strategy_rows)
+        statistical = sum(_int(item.get("current_statistically_qualified_count")) for item in strategy_rows)
+        promoted = sum(_int(item.get("current_promoted_count")) for item in strategy_rows)
+        settled = sum(_int(item.get("settled_allocator_outcome_count")) for item in strategy_rows)
+    else:
+        forward_signals = _int(row.get("forward_signal_count"))
+        forward_outcomes = _int(row.get("independent_forward_outcome_count"))
+        statistical = _int(row.get("current_statistically_qualified_count"))
+        promoted = _int(row.get("current_promoted_count"))
+        settled = _int(row.get("settled_allocator_outcome_count"))
+    return {
+        "authoritative_observations": _int(row.get("authoritative_observation_count")),
+        "economic_forward_signals": forward_signals,
+        "independent_forward_outcomes": forward_outcomes,
+        "currently_statistically_qualified": statistical,
+        "currently_execution_promoted": promoted,
+        "settled_allocator_outcomes": settled,
+        "source_layer_sufficient": not str(row.get("stage") or "").startswith(_SOURCE_WAIT_PREFIX),
+        "diagnostic_only": True,
+        "authority": False,
+    }
+
+
+def _strategy_attribution(strategy_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Preserve cohort-level attribution so one failed variant cannot hide another."""
+    result: list[dict[str, Any]] = []
+    for item in strategy_rows:
+        result.append({
+            "strategy_id": item.get("strategy_id") or item.get("strategy"),
+            "state": item.get("state"),
+            "forward_signal_count": _int(item.get("forward_signal_count")),
+            "independent_forward_outcome_count": _int(item.get("independent_forward_outcome_count")),
+            "mean_forward_net_return": _number(item.get("mean_forward_net_return")),
+            "mean_forward_net_return_ci_lower": _number(item.get("mean_forward_net_return_ci_lower")),
+            "forward_hit_rate": _number(item.get("forward_hit_rate")),
+            "current_statistically_qualified_count": _int(item.get("current_statistically_qualified_count")),
+            "current_promoted_count": _int(item.get("current_promoted_count")),
+            "settled_allocator_outcome_count": _int(item.get("settled_allocator_outcome_count")),
+            "primary_reason": item.get("primary_reason"),
+            "diagnostic_only": True,
+        })
+    return result
+
+
 def _derive_non_strategy_state(row: dict[str, Any], settings) -> tuple[str | None, str | None]:
-    """Recompute states that are fully determined by fields already projected live."""
     source_wait = _source_wait_state(row)
     if source_wait is not None:
         if source_wait == "provider_gap":
             return "provider_gap", _source_wait_reason(row, source_wait)
-        # A connected-but-insufficient source layer blocks downstream interpretation.
-        # Keep the operating headline at COLLECTING while stage carries the exact
-        # evidence-class/redundancy/freshness reason.
         return "collecting", _source_wait_reason(row, source_wait)
 
-    # Legacy snapshots without the newer source stage retain the old fail-closed
-    # behavior so backward compatibility does not accidentally loosen a gate.
     if row.get("provider_ready") is False:
         return "provider_gap", "required authoritative provider evidence is not currently fresh and admitted"
 
@@ -193,10 +224,6 @@ def _derive_non_strategy_state(row: dict[str, Any], settings) -> tuple[str | Non
     if best_net is not None and best_net <= 0 and _int(row.get("authoritative_observation_count")) > 0:
         return "poor_economics", "latest authoritative observations show non-positive conservative net economics"
 
-    # If a provider gap was just closed, or a previous terminal state no longer has
-    # evidence supporting it, move back to evidence accumulation. We intentionally do
-    # not manufacture CERTIFYING for research-only lanes that lack a defined forward
-    # certification contract.
     source_state = str(row.get("state") or "")
     if source_state == "provider_gap" and row.get("provider_ready") is True:
         return "collecting", "authoritative provider evidence is available and downstream evidence is accumulating"
@@ -207,13 +234,7 @@ def reconcile_live_operating_states(
     mechanism_payload: dict[str, Any],
     settings,
 ) -> dict[str, Any]:
-    """Reconcile every displayed lane state from the newest durable read-plane facts.
-
-    Provider connectivity, source sufficiency, and downstream qualification remain
-    distinct. This function is presentation-only: it never writes evidence, creates
-    candidates, changes qualification thresholds, or grants allocation/execution
-    authority.
-    """
+    """Reconcile every displayed lane state from the newest durable read-plane facts."""
     result = dict(mechanism_payload or {})
     rows: list[dict[str, Any]] = []
 
@@ -232,14 +253,10 @@ def reconcile_live_operating_states(
         new_state: str | None = None
         reason: str | None = None
 
-        # An explicit source-sufficiency blocker precedes downstream strategy
-        # interpretation. A redundancy/evidence/freshness gap is not a provider gap.
         if source_wait is not None:
             new_state = "provider_gap" if source_wait == "provider_gap" else "collecting"
             reason = _source_wait_reason(row, source_wait)
         elif row.get("provider_ready") is False:
-            # Backward-compatible handling for old snapshots that predate the
-            # waiting_for_source taxonomy.
             new_state = "provider_gap"
             reason = "required authoritative provider evidence is not currently fresh and admitted"
         elif strategy_rows:
@@ -270,8 +287,6 @@ def reconcile_live_operating_states(
             row["state"] = new_state
             if reason:
                 row["primary_reason"] = reason
-            # Preserve precise source remediation written by the worker. Generic
-            # operating next-actions apply only once the source layer is not the gate.
             if source_wait is None:
                 if new_state == "provider_gap":
                     row["next_action"] = "restore fresh authoritative provider evidence; downstream gates remain fail-closed"
@@ -290,6 +305,8 @@ def reconcile_live_operating_states(
                 elif new_state == "certified":
                     row["next_action"] = "maintain forward monitoring and revoke automatically if later evidence degrades"
 
+        row["decision_funnel"] = _lane_funnel(row, strategy_rows)
+        row["strategy_attribution"] = _strategy_attribution(strategy_rows)
         row["live_operating_state_reconciled"] = True
         row["live_operating_state_source"] = "latest durable dashboard/provider/strategy evidence"
         row["live_operating_state_presentation_only"] = True
@@ -298,6 +315,8 @@ def reconcile_live_operating_states(
     result["mechanisms"] = rows
     result["live_operating_state_reconciled"] = True
     result["live_operating_state_presentation_only"] = True
+    result["decision_funnel_diagnostics"] = True
+    result["strategy_level_attribution"] = True
     return result
 
 
@@ -320,6 +339,8 @@ def rebuild_live_action_queue(mechanism_payload: dict[str, Any]) -> dict[str, An
                 "worker_state": row.get("forward_evidence_worker_state"),
                 "dominant_rejection_gate": row.get("dominant_rejection_gate"),
                 "strategy_evidence": list(row.get("strategy_evidence") or []),
+                "decision_funnel": row.get("decision_funnel"),
+                "strategy_attribution": row.get("strategy_attribution"),
             }
         )
     actions.sort(
@@ -333,4 +354,5 @@ def rebuild_live_action_queue(mechanism_payload: dict[str, Any]) -> dict[str, An
         "count": len(actions),
         "actions": actions,
         "live_operating_state_reconciled": True,
+        "decision_funnel_diagnostics": True,
     }

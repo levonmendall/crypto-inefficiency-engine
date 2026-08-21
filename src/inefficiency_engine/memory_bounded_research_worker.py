@@ -13,6 +13,11 @@ SleepFn = Callable[[float], Awaitable[None]]
 Runner = Callable[[], Awaitable[object]]
 FrontierRunner = Callable[[], Awaitable[list[object]]]
 Publisher = Callable[[], None]
+DEFAULT_RESEARCH_STAGE_TIMEOUT_SECONDS = 120.0
+
+
+class ResearchStageTimeoutError(TimeoutError):
+    """A bounded auxiliary research stage exceeded its wall-clock allowance."""
 
 
 def _offset_due(attempted: int, every_cycles: int, offset: int) -> bool:
@@ -51,9 +56,23 @@ async def _interruptible_sleep(seconds: float, stop_event: asyncio.Event, sleep:
             task.result()
 
 
-async def _capture(runner: Runner) -> object | BaseException:
+async def _capture(
+    runner: Runner,
+    *,
+    timeout_seconds: float | None = None,
+    stage_name: str = "research",
+) -> object | BaseException:
     try:
-        return await runner()
+        if timeout_seconds is None or timeout_seconds <= 0:
+            return await runner()
+        try:
+            return await asyncio.wait_for(runner(), timeout=max(0.001, float(timeout_seconds)))
+        except TimeoutError as exc:
+            error = ResearchStageTimeoutError(
+                f"research stage {stage_name!r} exceeded {float(timeout_seconds):.1f}s"
+            )
+            error.__cause__ = exc
+            return error
     except BaseException as exc:
         return exc
 
@@ -145,16 +164,62 @@ def _frontier_summary(detail: dict[str, object], value: object | BaseException |
         detail["dex_route_frontier_capacity_claimed"] = False
 
 
+def _source_refresh_summary(detail: dict[str, object], value: object | BaseException | None) -> None:
+    if isinstance(value, BaseException):
+        detail["source_refresh_error_type"] = type(value).__name__
+        detail["source_refresh_complete"] = False
+        return
+    detail["source_refresh_complete"] = True
+    if isinstance(value, dict):
+        refresh = value.get("source_refresh")
+        coverage = value.get("source_coverage")
+        if isinstance(refresh, dict):
+            detail["source_refresh_state"] = refresh.get("state")
+            detail["source_refresh_memory_deferred_count"] = len(refresh.get("memory_deferred_sources") or [])
+            detail["source_refresh_failed_count"] = len(refresh.get("failed_sources") or [])
+        if isinstance(coverage, dict):
+            detail["source_coverage_sufficient_lane_count"] = coverage.get("sufficient_lane_count")
+
+
 async def _run_and_release(
     runner: Runner | None,
     detail: dict[str, object],
     summarizer: Callable[[dict[str, object], object | BaseException | None], None],
+    *,
+    timeout_seconds: float,
+    stage_name: str,
 ) -> None:
     if runner is None:
         return
-    value = await _capture(runner)
+    value = await _capture(
+        runner,
+        timeout_seconds=timeout_seconds,
+        stage_name=stage_name,
+    )
     summarizer(detail, value)
     _release(value)
+
+
+def _stage_heartbeat(
+    store: EvidenceStore,
+    *,
+    worker_id: str,
+    attempted: int,
+    stage_name: str,
+    timeout_seconds: float,
+) -> None:
+    store.record_worker_heartbeat(
+        worker_id=worker_id,
+        state="running",
+        detail={
+            "cycle_attempt": attempted,
+            "stage": stage_name,
+            "stage_timeout_seconds": timeout_seconds,
+            "memory_bounded": True,
+            "sequential_research_surfaces": True,
+            "paper_only": True,
+        },
+    )
 
 
 async def run_memory_bounded_research_worker(
@@ -165,6 +230,8 @@ async def run_memory_bounded_research_worker(
     stop_event: asyncio.Event,
     sleep: SleepFn = asyncio.sleep,
     max_cycles: int | None = None,
+    source_refresh_runner: Runner | None = None,
+    source_refresh_every_cycles: int = 1,
     route_shadow_runner: Runner | None = None,
     tier_shadow_runner: Runner | None = None,
     tier_shadow_every_cycles: int = 10,
@@ -179,33 +246,42 @@ async def run_memory_bounded_research_worker(
     frontier_runner: FrontierRunner | None = None,
     frontier_every_cycles: int = 10,
     post_success_publisher: Publisher | None = None,
+    stage_timeout_seconds: float = DEFAULT_RESEARCH_STAGE_TIMEOUT_SECONDS,
 ) -> WorkerRunStats:
-    """Run every research surface sequentially and release each result before the next.
+    """Run research surfaces sequentially with bounded stage wall-clock time.
 
-    A lock around coroutines scheduled by ``asyncio.gather`` is insufficient for a
-    512 MB worker: completed task results remain strongly referenced by the gather
-    operation until all sibling tasks finish. This loop preserves the same cadence
-    and durable evidence writes but never retains more than one heavyweight research
-    result at a time. A lightweight post-success publisher may project already-durable
-    research state; publisher failures never change research success/failure authority.
+    Fresh source collection is a first-class stage and runs before heavy market/L2
+    work. Each stage publishes its name before entering the await so the outer
+    supervisor can distinguish a healthy long cycle from an alive-but-wedged thread.
+    Completed heavyweight results are released before the next stage begins.
     """
 
     attempted = succeeded = failed = 0
+    source_refresh_every_cycles = max(1, source_refresh_every_cycles)
     tier_shadow_every_cycles = max(1, tier_shadow_every_cycles)
     composite_shadow_every_cycles = max(1, composite_shadow_every_cycles)
     stablecoin_shadow_every_cycles = max(1, stablecoin_shadow_every_cycles)
     alpha_every_cycles = max(1, alpha_every_cycles)
     allocation_certification_every_cycles = max(1, allocation_certification_every_cycles)
     frontier_every_cycles = max(1, frontier_every_cycles)
+    stage_timeout_seconds = max(1.0, float(stage_timeout_seconds))
 
     store.record_worker_heartbeat(
         worker_id=worker_id,
         state="starting",
-        detail={"paper_only": True, "backend": store.backend, "memory_bounded": True},
+        detail={
+            "paper_only": True,
+            "backend": store.backend,
+            "memory_bounded": True,
+            "stage_deadlines": True,
+            "stage_timeout_seconds": stage_timeout_seconds,
+            "independent_source_refresh": source_refresh_runner is not None,
+        },
     )
 
     while not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
         attempted += 1
+        run_source_refresh = source_refresh_runner is not None and attempted % source_refresh_every_cycles == 0
         run_frontier = frontier_runner is not None and attempted % frontier_every_cycles == 0
         run_tier_shadow = tier_shadow_runner is not None and attempted % tier_shadow_every_cycles == 0
         run_composite_shadow = composite_shadow_runner is not None and _staggered_due(
@@ -221,23 +297,48 @@ async def run_memory_bounded_research_worker(
         run_alpha = alpha_runner is not None and _three_quarter_staggered_due(
             attempted, alpha_every_cycles
         )
-        store.record_worker_heartbeat(
-            worker_id=worker_id,
-            state="running",
-            detail={
-                "cycle_attempt": attempted,
-                "memory_bounded": True,
-                "sequential_research_surfaces": True,
-                "dex_frontier_probe_due": run_frontier,
-                "dex_tier_shadow_due": run_tier_shadow,
-                "cex_dex_composite_shadow_due": run_composite_shadow,
-                "stablecoin_depth_shadow_due": run_stablecoin_shadow,
-                "allocation_forward_certification_due": run_allocation_certification,
-                "alpha_forward_evidence_due": run_alpha,
-            },
-        )
+        detail: dict[str, object] = {
+            "cycle_attempt": attempted,
+            "memory_bounded": True,
+            "sequential_research_surfaces": True,
+            "stage_deadlines": True,
+            "source_refresh_due": run_source_refresh,
+            "dex_frontier_probe_due": run_frontier,
+            "dex_tier_shadow_due": run_tier_shadow,
+            "cex_dex_composite_shadow_due": run_composite_shadow,
+            "stablecoin_depth_shadow_due": run_stablecoin_shadow,
+            "allocation_forward_certification_due": run_allocation_certification,
+            "alpha_forward_evidence_due": run_alpha,
+        }
 
-        core_value = await _capture(service.run_shadow_cycle)
+        if run_source_refresh:
+            _stage_heartbeat(
+                store,
+                worker_id=worker_id,
+                attempted=attempted,
+                stage_name="source_refresh",
+                timeout_seconds=stage_timeout_seconds,
+            )
+            await _run_and_release(
+                source_refresh_runner,
+                detail,
+                _source_refresh_summary,
+                timeout_seconds=stage_timeout_seconds,
+                stage_name="source_refresh",
+            )
+
+        _stage_heartbeat(
+            store,
+            worker_id=worker_id,
+            attempted=attempted,
+            stage_name="core_shadow",
+            timeout_seconds=stage_timeout_seconds,
+        )
+        core_value = await _capture(
+            service.run_shadow_cycle,
+            timeout_seconds=stage_timeout_seconds,
+            stage_name="core_shadow",
+        )
         core_error_type: str | None = None
         core_error_message: str | None = None
         cycle_id = None
@@ -245,36 +346,36 @@ async def run_memory_bounded_research_worker(
         if isinstance(core_value, BaseException):
             core_error_type = type(core_value).__name__
             core_error_message = str(core_value)[:500]
-            detail: dict[str, object] = {
-                "cycle_attempt": attempted,
-                "message": core_error_message,
-                "memory_bounded": True,
-            }
+            detail["message"] = core_error_message
         else:
             observations = getattr(core_value, "observations", [])
-            detail = {
-                "cycle_attempt": attempted,
-                "observation_count": len(observations),
-                "survived_count": sum(1 for obs in observations if getattr(obs, "survived", False)),
-                "memory_bounded": True,
-            }
+            detail["observation_count"] = len(observations)
+            detail["survived_count"] = sum(1 for obs in observations if getattr(obs, "survived", False))
             cycle_id = getattr(core_value, "cycle_id", None)
             scan_id = getattr(core_value, "verification_scan_id", None)
         _release(core_value)
 
-        await _run_and_release(route_shadow_runner, detail, _route_summary)
+        if route_shadow_runner is not None:
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="dex_route_shadow", timeout_seconds=stage_timeout_seconds)
+            await _run_and_release(route_shadow_runner, detail, _route_summary, timeout_seconds=stage_timeout_seconds, stage_name="dex_route_shadow")
         if run_tier_shadow:
-            await _run_and_release(tier_shadow_runner, detail, _tier_summary)
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="dex_tier_shadow", timeout_seconds=stage_timeout_seconds)
+            await _run_and_release(tier_shadow_runner, detail, _tier_summary, timeout_seconds=stage_timeout_seconds, stage_name="dex_tier_shadow")
         if run_composite_shadow:
-            await _run_and_release(composite_shadow_runner, detail, _composite_summary)
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="cex_dex_composite_shadow", timeout_seconds=stage_timeout_seconds)
+            await _run_and_release(composite_shadow_runner, detail, _composite_summary, timeout_seconds=stage_timeout_seconds, stage_name="cex_dex_composite_shadow")
         if run_stablecoin_shadow:
-            await _run_and_release(stablecoin_shadow_runner, detail, _stablecoin_summary)
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="stablecoin_depth_shadow", timeout_seconds=stage_timeout_seconds)
+            await _run_and_release(stablecoin_shadow_runner, detail, _stablecoin_summary, timeout_seconds=stage_timeout_seconds, stage_name="stablecoin_depth_shadow")
         if run_allocation_certification:
-            await _run_and_release(allocation_certification_runner, detail, _allocation_summary)
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="allocation_operating_certification", timeout_seconds=stage_timeout_seconds)
+            await _run_and_release(allocation_certification_runner, detail, _allocation_summary, timeout_seconds=stage_timeout_seconds, stage_name="allocation_operating_certification")
         if run_alpha:
-            await _run_and_release(alpha_runner, detail, _alpha_summary)
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="alpha_forward_evidence", timeout_seconds=stage_timeout_seconds)
+            await _run_and_release(alpha_runner, detail, _alpha_summary, timeout_seconds=stage_timeout_seconds, stage_name="alpha_forward_evidence")
         if run_frontier:
-            await _run_and_release(frontier_runner, detail, _frontier_summary)  # type: ignore[arg-type]
+            _stage_heartbeat(store, worker_id=worker_id, attempted=attempted, stage_name="dex_route_frontier", timeout_seconds=stage_timeout_seconds)
+            await _run_and_release(frontier_runner, detail, _frontier_summary, timeout_seconds=stage_timeout_seconds, stage_name="dex_route_frontier")  # type: ignore[arg-type]
 
         if core_error_type is not None:
             failed += 1
@@ -293,6 +394,7 @@ async def run_memory_bounded_research_worker(
             continue
 
         succeeded += 1
+        detail["stage"] = "cycle_complete"
         store.record_worker_heartbeat(
             worker_id=worker_id,
             state="success",
@@ -304,8 +406,8 @@ async def run_memory_bounded_research_worker(
             try:
                 post_success_publisher()
             except Exception:
-                # Presentation projection is explicitly fail-contained. The durable
-                # research cycle has already succeeded and cannot be reclassified.
+                # Presentation projection is explicitly fail-contained. Durable
+                # research success cannot be reclassified by a UI projection error.
                 pass
         if not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
             await _interruptible_sleep(
@@ -323,6 +425,7 @@ async def run_memory_bounded_research_worker(
             "cycles_succeeded": succeeded,
             "cycles_failed": failed,
             "memory_bounded": True,
+            "stage_deadlines": True,
         },
     )
     return WorkerRunStats(worker_id, attempted, succeeded, failed)
