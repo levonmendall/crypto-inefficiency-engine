@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 
+from inefficiency_engine.evidence_velocity import stagnation_diagnostics
 from inefficiency_engine.memory_budget import memory_budget_exceeded
 from inefficiency_engine.priority_source_collection import (
     PrioritySourceCollectionService,
@@ -28,9 +29,6 @@ class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService)
                 "refresh_ttl_seconds": PUBLIC_TRADE_FLOW_REFRESH_TTL_SECONDS,
             }
         elif memory_budget_exceeded(self.memory_soft_limit_mb):
-            # Internal memory pressure is not provider-health evidence. Preserve the
-            # prior truthful observation and allow normal source-age logic to move it
-            # to stale if the refresh plane cannot recover in time.
             trade_flow = {
                 "healthy": None,
                 "item_count": 0,
@@ -46,7 +44,9 @@ class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService)
             try:
                 probe = await collect_bybit_trade_flow(self.source_coverage)
                 if probe.item_count <= 0:
-                    raise ValueError("public trade-flow subscription produced no point-in-time trades")
+                    raise ValueError(
+                        "public trade-flow subscription produced no point-in-time trades"
+                    )
                 self._record_probe(probe)
                 trade_flow = {
                     "healthy": True,
@@ -74,13 +74,32 @@ class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService)
         refresh = dict(result.get("source_refresh") or {})
         refresh["public_trade_flow"] = trade_flow
         coverage = self.source_coverage.snapshot()
+        stagnation = stagnation_diagnostics(
+            self.store,
+            lane_ids=[row.lane_id for row in coverage.lanes],
+        )
+        refresh["dynamic_lane_priority_order"] = coverage.priority_order
         result["priority_sources"] = priority
         result["source_refresh"] = refresh
         result["source_coverage"] = {
             "lane_count": coverage.lane_count,
             "sufficient_lane_count": coverage.sufficient_lane_count,
             "insufficient_lane_count": coverage.insufficient_lane_count,
+            "research_eligible_lane_count": coverage.research_eligible_lane_count,
+            "forward_test_eligible_lane_count": coverage.forward_test_eligible_lane_count,
+            "allocation_source_qualified_lane_count": (
+                coverage.allocation_source_qualified_lane_count
+            ),
             "priority_order": coverage.priority_order,
+        }
+        result["stagnation_control"] = {
+            "window_snapshots": 50,
+            "automatic_priority_only": True,
+            "qualification_thresholds_unchanged": True,
+            "lanes": {
+                lane_id: diagnostic.as_dict()
+                for lane_id, diagnostic in stagnation.items()
+            },
         }
         return result
 
