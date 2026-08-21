@@ -30,12 +30,13 @@ def publish_alpha_funnel_projection(
     *,
     observed_at: datetime,
 ) -> bool:
-    """Merge the latest alpha discovery funnel into dashboard-facing closure truth.
+    """Merge latest alpha funnels without refreshing structural closure freshness.
 
     The structural closure cycle runs earlier than alpha on the disposable cadence.
-    Rather than reorder heavy research work, append a new compact closure projection
-    after alpha completes. Existing structural/capital-location/maker diagnostics are
-    preserved exactly; only the five alpha-only lane funnels are refreshed.
+    Rather than reorder heavy research work, append a compact projection after alpha
+    completes. Existing structural/capital-location/maker diagnostics and the parent
+    closure timestamp are preserved exactly. Each refreshed alpha funnel carries its
+    own observation timestamp so the dashboard can distinguish their freshness.
 
     This function has no allocation authority and never changes qualification state.
     """
@@ -57,7 +58,9 @@ def publish_alpha_funnel_projection(
         row = diagnostics.get(lane)
         if not isinstance(row, dict):
             continue
-        merged[lane] = dict(row)
+        projected_row = dict(row)
+        projected_row["alpha_funnel_observed_at"] = observed_at.isoformat()
+        merged[lane] = projected_row
         changed = True
     if not changed:
         return False
@@ -66,7 +69,6 @@ def publish_alpha_funnel_projection(
         deep=True,
         update={
             "summary_id": uuid.uuid4().hex,
-            "observed_at": observed_at,
             "rejection_funnels": merged,
         },
     )
