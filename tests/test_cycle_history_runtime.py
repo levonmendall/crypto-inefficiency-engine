@@ -55,6 +55,31 @@ class FakeHistoricalResearch:
         }
 
 
+class FakeBlockedHistoricalResearch:
+    backfill_days = 365
+
+    async def ensure_backfilled(self, assets, *, now=None):
+        return SimpleNamespace(
+            errors=("WBT:ProviderBlocked",),
+            fetched_assets=(),
+            stored_quote_count=0,
+            provider_diagnostics={
+                "WBT": (
+                    "Coinbase:NotListed",
+                    "OKX:rows=0",
+                    "Bybit:HTTP403",
+                    "CoinGecko:MissingAssetId",
+                )
+            },
+        )
+
+    def _coverage(self, asset):
+        return 0, None, None
+
+    def replay_summaries(self, strategy, settings, *, total_capital_usd, now=None):
+        return {}
+
+
 def test_cycle_history_status_persists_and_incomplete_assets_can_retry(tmp_path):
     store = EvidenceStore(tmp_path / "evidence.db")
     now = datetime(2026, 8, 20, 16, 0, tzinfo=timezone.utc)
@@ -103,3 +128,31 @@ def test_cycle_history_status_persists_and_incomplete_assets_can_retry(tmp_path)
     assert heartbeat is not None
     assert heartbeat.state == "success"
     assert heartbeat.detail["historical_counts_as_forward"] is False
+
+
+def test_cycle_history_distinguishes_provider_block_from_generic_retry(tmp_path):
+    store = EvidenceStore(tmp_path / "blocked.db")
+    now = datetime(2026, 8, 20, 16, 0, tzinfo=timezone.utc)
+
+    summary = asyncio.run(
+        maintain_cycle_history_once(
+            store,
+            settings=Settings(),
+            assets=("WBT",),
+            now=now,
+            research=FakeBlockedHistoricalResearch(),
+        )
+    )
+
+    row = summary["assets"][0]
+    assert row["status"] == "provider_blocked"
+    assert row["last_error_type"] == "ProviderBlocked"
+    assert row["provider_attempts"] == [
+        "Coinbase:NotListed",
+        "OKX:rows=0",
+        "Bybit:HTTP403",
+        "CoinGecko:MissingAssetId",
+    ]
+    assert summary["provider_blocked_asset_count"] == 1
+    assert row["historical_counts_as_forward"] is False
+    assert row["live_execution_authority"] is False

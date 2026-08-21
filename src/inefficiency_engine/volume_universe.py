@@ -19,9 +19,12 @@ from inefficiency_engine.evidence import EvidenceStore, build_evidence_store
 
 TOP_VOLUME_ASSET_COUNT = 40
 VOLUME_UNIVERSE_TABLE = "liquid_volume_universe_snapshots"
+# Membership is a market-state input, not slow research. Keep a bounded cache to
+# protect CoinGecko, but refresh quickly enough that the internal cohort does not
+# trail a separately observed market-wide top-40 for most of an hour.
 VOLUME_UNIVERSE_REFRESH_SECONDS = max(
-    900.0,
-    float(os.getenv("CIE_VOLUME_UNIVERSE_REFRESH_SECONDS", "3600")),
+    300.0,
+    float(os.getenv("CIE_VOLUME_UNIVERSE_REFRESH_SECONDS", "900")),
 )
 COINGECKO_PUBLIC_API_URL = "https://api.coingecko.com/api/v3"
 COINGECKO_PRO_API_URL = "https://pro-api.coingecko.com/api/v3"

@@ -17,6 +17,7 @@ from inefficiency_engine.volume_universe import (
     STRICT_VOLUME_METHOD,
     STRICT_VOLUME_SOURCE,
     TOP_VOLUME_ASSET_COUNT,
+    VOLUME_UNIVERSE_REFRESH_SECONDS,
     VolumeUniverseLedger,
 )
 
@@ -101,8 +102,14 @@ def test_active_volume_status_exposes_freshness(tmp_path):
     now = datetime(2026, 8, 21, tzinfo=timezone.utc)
     VolumeUniverseLedger(store).record(_volume_snapshot(now))
 
-    fresh = read_active_volume_universe_status(store, now=now + timedelta(minutes=30))
-    stale = read_active_volume_universe_status(store, now=now + timedelta(hours=2))
+    fresh = read_active_volume_universe_status(
+        store,
+        now=now + timedelta(seconds=VOLUME_UNIVERSE_REFRESH_SECONDS / 2),
+    )
+    stale = read_active_volume_universe_status(
+        store,
+        now=now + timedelta(seconds=VOLUME_UNIVERSE_REFRESH_SECONDS + 1),
+    )
 
     assert fresh["stale"] is False
     assert stale["stale"] is True

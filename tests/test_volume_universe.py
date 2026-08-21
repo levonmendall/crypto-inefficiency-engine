@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -11,12 +11,14 @@ from inefficiency_engine.volume_universe import (
     STRICT_VOLUME_METHOD,
     STRICT_VOLUME_SOURCE,
     TOP_VOLUME_ASSET_COUNT,
+    VOLUME_UNIVERSE_REFRESH_SECONDS,
     VolumeUniverseLedger,
     VolumeUniverseUnavailableError,
     parse_bybit_turnover,
     parse_coingecko_markets,
     parse_hyperliquid_turnover,
     rank_marketwide_volume,
+    read_latest_volume_universe,
     resolve_top_volume_assets,
     validated_volume_assets,
 )
@@ -153,6 +155,27 @@ async def test_resolver_uses_recent_valid_snapshot_and_last_known_good_on_failur
         collector=failed_refresh,
     )
     assert assets == TEST_ASSETS
+
+
+@pytest.mark.asyncio
+async def test_resolver_refreshes_membership_after_bounded_cache_interval(tmp_path):
+    store = EvidenceStore(tmp_path / "membership-refresh.db")
+    now = datetime(2026, 8, 20, 16, 0, tzinfo=timezone.utc)
+    VolumeUniverseLedger(store).record(_snapshot(now))
+    changed = (*TEST_ASSETS[:-1], "NEWCOIN")
+    later = now + timedelta(seconds=VOLUME_UNIVERSE_REFRESH_SECONDS + 1)
+    calls = 0
+
+    async def changed_snapshot(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return _snapshot(later, changed)
+
+    assets = await resolve_top_volume_assets(store, now=later, collector=changed_snapshot)
+
+    assert calls == 1
+    assert assets == changed
+    assert validated_volume_assets(read_latest_volume_universe(store)) == changed
 
 
 @pytest.mark.asyncio

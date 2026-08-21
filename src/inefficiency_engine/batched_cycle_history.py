@@ -5,7 +5,7 @@ from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from inefficiency_engine.cycle_probation import (
     HISTORICAL_REPLAY_MIN_HIT_RATE,
@@ -14,6 +14,7 @@ from inefficiency_engine.cycle_probation import (
     CycleHistoricalResearch,
     CycleReplaySummary,
     _iso,
+    _utc_day_start,
 )
 from inefficiency_engine.evidence import ScanSnapshot
 from inefficiency_engine.models import MarketKind, MarketQuote
@@ -23,9 +24,10 @@ class BatchedCycleHistoricalResearch(CycleHistoricalResearch):
     """Cycle history projection that never materializes the full 40-asset archive.
 
     Backfill remains append-only and unchanged. Coverage, history reads and historical
-    walk-forward replay are filtered in SQL to the current small asset batch so the
-    history subprocess has a peak working set tied to batch size rather than universe
-    size.
+    walk-forward replay are filtered to the current small asset batch so the history
+    subprocess has a peak working set tied to batch size rather than universe size.
+    Provider fallback rows retain lineage, but only the best continuous provider for
+    each asset is admitted to replay.
     """
 
     def __init__(self, *args, active_assets: Iterable[str] | None = None, **kwargs):
@@ -41,20 +43,14 @@ class BatchedCycleHistoricalResearch(CycleHistoricalResearch):
         self._replay_cache_key = None
         self._replay_cache = {}
 
-    def _coverage(self, asset: str) -> tuple[int, datetime | None, datetime | None]:
-        with self.store.engine.connect() as db:
-            count, earliest, latest = db.execute(
-                select(
-                    func.count(self.quotes.c.quote_id),
-                    func.min(self.quotes.c.observed_at),
-                    func.max(self.quotes.c.observed_at),
-                ).where(self.quotes.c.asset == asset.upper())
-            ).one()
-        return (
-            int(count or 0),
-            datetime.fromisoformat(str(earliest)) if earliest else None,
-            datetime.fromisoformat(str(latest)) if latest else None,
-        )
+    def _coverage(
+        self,
+        asset: str,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> tuple[int, datetime | None, datetime | None]:
+        return super()._coverage(asset, start=start, end=end)
 
     def history(
         self,
@@ -66,6 +62,7 @@ class BatchedCycleHistoricalResearch(CycleHistoricalResearch):
         allowed = tuple(
             sorted({str(item).upper() for item in (assets or self.active_assets) if str(item).strip()})
         )
+        preferred = self._preferred_venue_by_asset(allowed, start=start, end=end)
         query = (
             select(self.quotes.c.payload_json)
             .where(self.quotes.c.observed_at >= _iso(start))
@@ -79,7 +76,10 @@ class BatchedCycleHistoricalResearch(CycleHistoricalResearch):
             grouped: dict[tuple[str, str, MarketKind], list[MarketQuote]] = {}
             for payload in payloads:
                 quote = MarketQuote.model_validate_json(payload)
-                key = (quote.venue, quote.asset.upper(), quote.market_kind)
+                asset = quote.asset.upper()
+                if preferred.get(asset) not in (None, quote.venue):
+                    continue
+                key = (quote.venue, asset, quote.market_kind)
                 grouped.setdefault(key, []).append(quote)
         return grouped
 
@@ -102,8 +102,24 @@ class BatchedCycleHistoricalResearch(CycleHistoricalResearch):
             return {}
 
         quotes = [MarketQuote.model_validate_json(payload) for payload in payloads]
+        target_end = _utc_day_start(now)
+        target_start = target_end - timedelta(days=self.backfill_days)
+        quotes = self._filter_preferred_quotes(quotes, start=target_start, end=target_end)
+        if not quotes:
+            return {}
+
         latest = max(item.observed_at for item in quotes)
-        cache_key = (len(quotes), f"{latest.isoformat()}|{','.join(allowed)}")
+        preferred_key = ",".join(
+            f"{asset}:{venue}"
+            for asset, venue in sorted(
+                self._preferred_venue_by_asset(
+                    allowed,
+                    start=target_start,
+                    end=target_end,
+                ).items()
+            )
+        )
+        cache_key = (len(quotes), f"{latest.isoformat()}|{','.join(allowed)}|{preferred_key}")
         if self._replay_cache_key == cache_key:
             return dict(self._replay_cache)
 
@@ -165,12 +181,10 @@ class BatchedCycleHistoricalResearch(CycleHistoricalResearch):
                     directional = raw if candidate.direction == "long" else -raw
                     fee_floor = 0.0
                     if candidate.market_kind == MarketKind.SPOT:
-                        if candidate.venue == "Coinbase":
-                            taker_fee_bps = settings.coinbase_spot_taker_fee_bps
-                        elif candidate.venue == "Bybit":
-                            taker_fee_bps = settings.bybit_spot_taker_fee_bps
-                        else:
-                            taker_fee_bps = 0.0
+                        taker_fee_bps = self._historical_spot_taker_fee_bps(
+                            settings,
+                            candidate.venue,
+                        )
                         fee_floor = (
                             2.0 * taker_fee_bps + settings.alpha_execution_risk_floor_bps
                         ) / 10_000.0
