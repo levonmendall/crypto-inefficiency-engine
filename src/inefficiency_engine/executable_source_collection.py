@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import gc
 
-from inefficiency_engine.memory_budget import MemoryBudgetDeferred, memory_budget_exceeded
+from inefficiency_engine.memory_budget import memory_budget_exceeded
 from inefficiency_engine.priority_source_collection import (
     PrioritySourceCollectionService,
     SourceCoverageAwareOperatingCertificationService,
 )
 from inefficiency_engine.trade_flow import BYBIT_LINEAR_WS, collect_bybit_trade_flow
+
+
+PUBLIC_TRADE_FLOW_REFRESH_TTL_SECONDS = 45.0
 
 
 class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService):
@@ -17,17 +20,28 @@ class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService)
         result = await super().run_cycle()
         source_id = "public-trade-flow"
         lanes = ["microstructure", "liquidity_provision"]
-        if memory_budget_exceeded(self.memory_soft_limit_mb):
-            exc = MemoryBudgetDeferred(
-                f"public trade-flow probe deferred above {self.memory_soft_limit_mb:.0f} MiB RSS soft limit"
-            )
-            self._record_failure(source_id, lanes, BYBIT_LINEAR_WS, exc)
+
+        if self._source_is_fresh(source_id, lanes, PUBLIC_TRADE_FLOW_REFRESH_TTL_SECONDS):
             trade_flow = {
-                "healthy": False,
+                "healthy": True,
+                "refresh_state": "fresh_cached",
+                "refresh_ttl_seconds": PUBLIC_TRADE_FLOW_REFRESH_TTL_SECONDS,
+            }
+        elif memory_budget_exceeded(self.memory_soft_limit_mb):
+            # Internal memory pressure is not provider-health evidence. Preserve the
+            # prior truthful observation and allow normal source-age logic to move it
+            # to stale if the refresh plane cannot recover in time.
+            trade_flow = {
+                "healthy": None,
                 "item_count": 0,
                 "error_type": "MemoryBudgetDeferred",
                 "memory_deferred": True,
+                "refresh_state": "memory_deferred",
+                "preserved_previous_source_observation": True,
+                "refresh_ttl_seconds": PUBLIC_TRADE_FLOW_REFRESH_TTL_SECONDS,
             }
+            gc.collect()
+            self._record_memory("public_trade_flow_deferred", source_id=source_id)
         else:
             try:
                 probe = await collect_bybit_trade_flow(self.source_coverage)
@@ -39,6 +53,8 @@ class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService)
                     "item_count": probe.item_count,
                     "source_reference": probe.source_reference,
                     "authoritative": probe.authoritative,
+                    "refresh_state": "refreshed",
+                    "refresh_ttl_seconds": PUBLIC_TRADE_FLOW_REFRESH_TTL_SECONDS,
                 }
             except Exception as exc:
                 self._record_failure(source_id, lanes, BYBIT_LINEAR_WS, exc)
@@ -46,6 +62,8 @@ class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService)
                     "healthy": False,
                     "item_count": 0,
                     "error_type": type(exc).__name__,
+                    "refresh_state": "provider_failed",
+                    "refresh_ttl_seconds": PUBLIC_TRADE_FLOW_REFRESH_TTL_SECONDS,
                 }
             finally:
                 gc.collect()
@@ -53,8 +71,11 @@ class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService)
 
         priority = dict(result.get("priority_sources") or {})
         priority[source_id] = trade_flow
+        refresh = dict(result.get("source_refresh") or {})
+        refresh["public_trade_flow"] = trade_flow
         coverage = self.source_coverage.snapshot()
         result["priority_sources"] = priority
+        result["source_refresh"] = refresh
         result["source_coverage"] = {
             "lane_count": coverage.lane_count,
             "sufficient_lane_count": coverage.sufficient_lane_count,
