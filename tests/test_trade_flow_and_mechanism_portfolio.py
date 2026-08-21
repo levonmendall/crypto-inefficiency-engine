@@ -71,12 +71,23 @@ def test_public_trade_flow_generates_real_forward_testable_alpha_without_maker_f
         market_quotes=[q],
         opportunities=[],
     )
-    settings = Settings(
+    # Microstructure controls live in the expanded settings view rather than the
+    # base Settings dataclass. The strategy intentionally uses getattr defaults, so
+    # this fixture supplies only the controls under test.
+    settings = SimpleNamespace(
         alpha_microstructure_min_abs_imbalance=0.20,
         alpha_microstructure_return_scale=0.012,
         alpha_microstructure_max_expected_return=0.006,
         alpha_research_cost_floor_bps=1.0,
         alpha_min_current_net_return=0.0001,
+        alpha_microstructure_lookback_hours=6.0,
+        alpha_microstructure_horizon_hours=0.25,
+        alpha_microstructure_max_candidates=6,
+        alpha_min_notional_usd=100.0,
+        alpha_candidate_capital_fraction=0.02,
+        spot_collateral_fraction=1.0,
+        perp_collateral_fraction=0.25,
+        alpha_min_history_points=8,
     )
     rows = strategy.discover(
         snapshot,
