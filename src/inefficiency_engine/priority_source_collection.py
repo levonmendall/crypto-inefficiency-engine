@@ -4,6 +4,7 @@ import gc
 import os
 from datetime import datetime, timezone
 
+from inefficiency_engine.evidence_velocity import prioritize_source_probes, stagnation_diagnostics
 from inefficiency_engine.memory_budget import (
     DEFAULT_RESEARCH_MEMORY_SOFT_LIMIT_MB,
     memory_budget_exceeded,
@@ -34,8 +35,8 @@ from inefficiency_engine.source_coverage import SourceCoverageObservation, Sourc
 
 
 SOURCE_REFRESH_WORKER_ID = "priority-source-refresh-plane"
-# Source-specific refresh cadences keep fast market/event evidence fresh without
-# repeatedly spending memory and network budget on slower-changing fundamentals.
+# Collection TTLs remain deliberately faster than the source-coverage validity
+# windows. They control refresh effort, not qualification authority.
 SOURCE_REFRESH_TTL_SECONDS: dict[str, float] = {
     "bybit-liquidations": 90.0,
     "aave-liquidations": 180.0,
@@ -52,12 +53,12 @@ def _now() -> datetime:
 
 
 class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
-    """Refresh priority evidence independently, sequentially, and fail closed.
+    """Refresh priority evidence independently, dynamically, and fail closed.
 
-    Memory pressure is an internal scheduling condition, not evidence that an
-    external provider failed. A memory-deferred probe therefore preserves the last
-    truthful source observation until its normal source-coverage freshness window
-    expires. Real provider errors are still written as unhealthy observations.
+    Memory pressure is an internal scheduling condition, not provider-health evidence.
+    Source ordering is now driven by distance to the next evidence gate and durable
+    stagnation signals. Poor economics/statistical failure never trigger threshold
+    relaxation; they deliberately receive no automatic repair priority boost.
     """
 
     def __init__(self, *, source_coverage: SourceCoveragePlane, yield_service, **kwargs):
@@ -66,42 +67,59 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
         self.yield_service = yield_service
         self.memory_soft_limit_mb = max(
             128.0,
-            float(os.getenv(
-                "CIE_RESEARCH_MEMORY_SOFT_LIMIT_MB",
-                str(DEFAULT_RESEARCH_MEMORY_SOFT_LIMIT_MB),
-            )),
+            float(
+                os.getenv(
+                    "CIE_RESEARCH_MEMORY_SOFT_LIMIT_MB",
+                    str(DEFAULT_RESEARCH_MEMORY_SOFT_LIMIT_MB),
+                )
+            ),
         )
 
     def _record_probe(self, probe: SourceProbeResult) -> None:
         for lane_id, classes in probe.evidence_by_lane.items():
-            self.source_coverage.record(SourceCoverageObservation(
-                source_id=probe.source_id,
-                lane_id=lane_id,
-                healthy=True,
-                item_count=probe.item_count,
-                evidence_classes=classes,
-                authoritative=probe.authoritative,
-                commercial_use_permitted=probe.commercial_use_permitted,
-                point_in_time=probe.point_in_time,
-                source_reference=probe.source_reference,
-                economic_fields_complete=probe.economic_fields_complete,
-                forward_testable_evidence=probe.forward_testable_evidence,
-                detail=probe.detail,
-            ))
+            self.source_coverage.record(
+                SourceCoverageObservation(
+                    source_id=probe.source_id,
+                    lane_id=lane_id,
+                    healthy=True,
+                    item_count=probe.item_count,
+                    evidence_classes=classes,
+                    authoritative=probe.authoritative,
+                    commercial_use_permitted=probe.commercial_use_permitted,
+                    point_in_time=probe.point_in_time,
+                    source_reference=probe.source_reference,
+                    economic_fields_complete=probe.economic_fields_complete,
+                    forward_testable_evidence=probe.forward_testable_evidence,
+                    detail=probe.detail,
+                )
+            )
 
-    def _record_failure(self, source_id: str, lane_ids: list[str], source_reference: str, exc: Exception) -> None:
+    def _record_failure(
+        self,
+        source_id: str,
+        lane_ids: list[str],
+        source_reference: str,
+        exc: Exception,
+    ) -> None:
         for lane_id in lane_ids:
-            self.source_coverage.record(SourceCoverageObservation(
-                source_id=source_id,
-                lane_id=lane_id,
-                healthy=False,
-                item_count=0,
-                source_reference=source_reference,
-                error_type=type(exc).__name__,
-                detail={"message": str(exc)[:300]},
-            ))
+            self.source_coverage.record(
+                SourceCoverageObservation(
+                    source_id=source_id,
+                    lane_id=lane_id,
+                    healthy=False,
+                    item_count=0,
+                    source_reference=source_reference,
+                    error_type=type(exc).__name__,
+                    detail={"message": str(exc)[:300]},
+                )
+            )
 
-    def _source_is_fresh(self, source_id: str, lane_ids: list[str], ttl_seconds: float) -> bool:
+    def _source_is_fresh(
+        self,
+        source_id: str,
+        lane_ids: list[str],
+        ttl_seconds: float,
+    ) -> bool:
         latest = self.source_coverage.ledger.latest()
         now = _now()
         for lane_id in lane_ids:
@@ -143,7 +161,10 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                 state=state,
                 detail={
                     "independent_source_refresh": True,
+                    "dynamic_distance_to_gate_scheduler": True,
+                    "automatic_stagnation_remediation": True,
                     "memory_deferral_preserves_last_truthful_observation": True,
+                    "qualification_thresholds_unchanged": True,
                     "paper_only": True,
                     "allocation_authority": False,
                     "live_execution_authority": False,
@@ -158,15 +179,56 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
         base = await super().run_cycle()
         self._record_memory("base_provider_gap_complete")
         eth_source = _safe_reference(os.getenv("CIE_ETHEREUM_RPC_URL", DEFAULT_ETHEREUM_RPC_URL))
-        # Ordered by marginal expected value. TTLs are intentionally source-specific.
         probes = (
-            ("bybit-liquidations", ["liquidation_distress", "microstructure"], BYBIT_LINEAR_WS, lambda: collect_bybit_liquidations(self.source_coverage)),
-            ("aave-liquidations", ["liquidation_distress"], eth_source, lambda: collect_aave_liquidations(self.source_coverage)),
-            ("snapshot-governance", ["event_driven"], SNAPSHOT_GRAPHQL_URL, lambda: collect_snapshot_governance(self.source_coverage, self.alpha_factory)),
-            ("morpho-markets", ["yield", "fundamental_onchain"], MORPHO_GRAPHQL_URL, lambda: collect_morpho_markets(self.source_coverage, self.yield_service)),
-            ("bybit-options", ["volatility"], f"{BYBIT_BASE_URLS[0]}/v5/market/tickers", lambda: collect_bybit_options(self.volatility_service)),
-            ("okx-options", ["volatility"], f"{OKX_BASE_URL}/api/v5/public/opt-summary", lambda: collect_okx_options(self.volatility_service)),
-            ("defillama-protocols", ["fundamental_onchain"], DEFILLAMA_PROTOCOLS_URL, collect_defillama_protocols),
+            (
+                "bybit-liquidations",
+                ["liquidation_distress", "microstructure"],
+                BYBIT_LINEAR_WS,
+                lambda: collect_bybit_liquidations(self.source_coverage),
+            ),
+            (
+                "aave-liquidations",
+                ["liquidation_distress"],
+                eth_source,
+                lambda: collect_aave_liquidations(self.source_coverage),
+            ),
+            (
+                "snapshot-governance",
+                ["event_driven"],
+                SNAPSHOT_GRAPHQL_URL,
+                lambda: collect_snapshot_governance(self.source_coverage, self.alpha_factory),
+            ),
+            (
+                "morpho-markets",
+                ["yield", "fundamental_onchain"],
+                MORPHO_GRAPHQL_URL,
+                lambda: collect_morpho_markets(self.source_coverage, self.yield_service),
+            ),
+            (
+                "bybit-options",
+                ["volatility"],
+                f"{BYBIT_BASE_URLS[0]}/v5/market/tickers",
+                lambda: collect_bybit_options(self.volatility_service),
+            ),
+            (
+                "okx-options",
+                ["volatility"],
+                f"{OKX_BASE_URL}/api/v5/public/opt-summary",
+                lambda: collect_okx_options(self.volatility_service),
+            ),
+            (
+                "defillama-protocols",
+                ["fundamental_onchain"],
+                DEFILLAMA_PROTOCOLS_URL,
+                collect_defillama_protocols,
+            ),
+        )
+
+        coverage_before = self.source_coverage.snapshot()
+        ordered_probes = prioritize_source_probes(
+            self.store,
+            coverage_before.lanes,
+            probes,
         )
         priority: dict[str, object] = {}
         memory_by_source: dict[str, dict[str, float | None]] = {}
@@ -175,7 +237,7 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
         failed_sources: list[str] = []
         refreshed_sources: list[str] = []
 
-        for source_id, lane_ids, reference, collector in probes:
+        for source_id, lane_ids, reference, collector in ordered_probes:
             ttl_seconds = SOURCE_REFRESH_TTL_SECONDS[source_id]
             if self._source_is_fresh(source_id, lane_ids, ttl_seconds):
                 cached_sources.append(source_id)
@@ -187,9 +249,6 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                 continue
 
             if memory_budget_exceeded(self.memory_soft_limit_mb):
-                # Do not write an unhealthy source observation here. Memory pressure
-                # says nothing about provider health. The previous observation ages
-                # naturally into the existing stale state if refresh cannot recover.
                 deferred_sources.append(source_id)
                 priority[source_id] = {
                     "healthy": None,
@@ -221,15 +280,13 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                 }
                 del probe
             except Exception as exc:
-                # A real provider/protocol call failed; this is truthful source-health
-                # evidence and remains fail-closed.
                 self._record_failure(source_id, lane_ids, reference, exc)
                 failed_sources.append(source_id)
                 priority[source_id] = {
                     "healthy": False,
                     "item_count": 0,
-                    "refresh_state": "provider_failed",
                     "error_type": type(exc).__name__,
+                    "refresh_state": "provider_failed",
                     "refresh_ttl_seconds": ttl_seconds,
                 }
             finally:
@@ -240,19 +297,27 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                 )
 
         coverage = self.source_coverage.snapshot()
+        stagnation = stagnation_diagnostics(
+            self.store,
+            lane_ids=[row.lane_id for row in coverage.lanes],
+        )
         final_memory = self._record_memory(
             "source_coverage_snapshot_complete",
             sufficient_lane_count=coverage.sufficient_lane_count,
+            forward_test_eligible_lane_count=coverage.forward_test_eligible_lane_count,
         )
         refresh_state = "degraded" if (deferred_sources or failed_sources) else "success"
         self._record_refresh_heartbeat(
             state=refresh_state,
             stage="complete",
             sufficient_lane_count=coverage.sufficient_lane_count,
+            forward_test_eligible_lane_count=coverage.forward_test_eligible_lane_count,
+            dynamic_lane_priority_order=coverage.priority_order,
             refreshed_sources=refreshed_sources,
             fresh_cached_sources=cached_sources,
             memory_deferred_sources=deferred_sources,
             failed_sources=failed_sources,
+            stagnant_lane_count=sum(item.stagnant for item in stagnation.values()),
         )
         return {
             **base,
@@ -261,6 +326,11 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                 "lane_count": coverage.lane_count,
                 "sufficient_lane_count": coverage.sufficient_lane_count,
                 "insufficient_lane_count": coverage.insufficient_lane_count,
+                "research_eligible_lane_count": coverage.research_eligible_lane_count,
+                "forward_test_eligible_lane_count": coverage.forward_test_eligible_lane_count,
+                "allocation_source_qualified_lane_count": (
+                    coverage.allocation_source_qualified_lane_count
+                ),
                 "priority_order": coverage.priority_order,
             },
             "source_refresh": {
@@ -270,6 +340,17 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                 "memory_deferred_sources": deferred_sources,
                 "failed_sources": failed_sources,
                 "source_specific_ttls": dict(SOURCE_REFRESH_TTL_SECONDS),
+                "dynamic_distance_to_gate_scheduler": True,
+                "dynamic_lane_priority_order": coverage.priority_order,
+            },
+            "stagnation_control": {
+                "window_snapshots": 50,
+                "automatic_priority_only": True,
+                "qualification_thresholds_unchanged": True,
+                "lanes": {
+                    lane_id: diagnostic.as_dict()
+                    for lane_id, diagnostic in stagnation.items()
+                },
             },
             "memory_budget": {
                 "soft_limit_mb": self.memory_soft_limit_mb,
@@ -281,11 +362,19 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
         }
 
 
-class SourceCoverageAwareOperatingCertificationService(ResilientProviderGapAwareOperatingCertificationService):
-    """Existing operating certification plus the non-authoritative source plane."""
+class SourceCoverageAwareOperatingCertificationService(
+    ResilientProviderGapAwareOperatingCertificationService
+):
+    """Existing operating certification plus the source coverage plane."""
 
     def __init__(self, core, store, alpha_factory, allocation_certification, *, version: str):
-        super().__init__(core, store, alpha_factory, allocation_certification, version=version)
+        super().__init__(
+            core,
+            store,
+            alpha_factory,
+            allocation_certification,
+            version=version,
+        )
         self.source_coverage = SourceCoveragePlane(store)
         self.provider_gap_collection = PrioritySourceCollectionService(
             store=store,
