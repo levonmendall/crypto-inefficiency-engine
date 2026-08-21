@@ -18,7 +18,7 @@ def test_heavy_work_lease_is_cross_owner_exclusive_and_sequence_is_durable(tmp_p
     ledger = HeavyWorkLeaseLedger(store)
 
     assert ledger.try_acquire("research:1", now=NOW) is True
-    assert ledger.current_owner() == "research:1"
+    assert ledger.current_owner(now=NOW + timedelta(seconds=1)) == "research:1"
     assert ledger.try_acquire("history:1", now=NOW + timedelta(seconds=1)) is False
 
     assert ledger.next_sequence("research", now=NOW) == 1
@@ -92,7 +92,6 @@ def test_permanent_portfolio_worker_does_not_construct_research_alpha_factory():
     assert "ExpandedAlphaFactory" not in source
     assert "DisposableExpandedAlphaFactory" not in source
     assert "_DurableQualifiedStateHandle" in source
-    assert "QualifiedOpportunity" not in source or "Qualified" in source
 
 
 def test_render_supervisor_has_no_permanent_history_process():
