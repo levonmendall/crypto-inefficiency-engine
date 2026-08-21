@@ -48,13 +48,14 @@ def _unavailable_volume_status(
     last_known_good_observed_at: datetime | None = None,
     last_known_good_asset_count: int = 0,
 ) -> dict[str, Any]:
-    """Fail closed when current top-40 membership cannot be proven fresh."""
+    """Return no assets only when there is no complete validated cohort to show."""
 
     snapshot = snapshot or {}
     return {
         "available": False,
         "current_membership_available": False,
         "asset_count": 0,
+        "universe_target_count": TOP_VOLUME_ASSET_COUNT,
         "observed_at": None,
         "age_seconds": age_seconds,
         "stale": True,
@@ -75,8 +76,6 @@ def _unavailable_volume_status(
         ),
         "last_known_good_age_seconds": age_seconds,
         "last_known_good_asset_count": int(last_known_good_asset_count),
-        # Never expose stale rows through the current-membership field. The
-        # underlying append-only snapshot remains durable for internal failover.
         "assets": [],
         "paper_only": True,
         "allocation_authority": False,
@@ -88,15 +87,13 @@ def read_active_volume_universe_status(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Return only a fresh validated market-wide ranking as current membership.
+    """Return the latest complete validated market-wide top-volume cohort.
 
-    This is deliberately a database-only read. The API never performs a public
-    market request. Refresh authority remains with the worker/history processes.
-
-    Last-known-good snapshots remain durable for internal resilience, but once a
-    snapshot exceeds the freshness interval its members are not exposed as the
-    *current* top 40. The read plane fails closed until a fresh authoritative
-    ranking has been persisted.
+    The API remains database-only. A lightweight permanent task refreshes membership
+    independently of historical/research jobs. If that source is briefly delayed,
+    the last complete validated cohort remains visible with ``stale=true`` and
+    ``current_membership_available=false`` rather than making the entire dashboard
+    disappear. No stale cohort is silently represented as fresh/current.
     """
 
     current = _aware(now or _now())
@@ -139,26 +136,16 @@ def read_active_volume_universe_status(
             last_known_good_asset_count=len(rows),
         )
 
-    stale = bool(
-        age_seconds is None or age_seconds > VOLUME_UNIVERSE_REFRESH_SECONDS
-    )
-    if stale:
-        return _unavailable_volume_status(
-            reason="stale_snapshot",
-            age_seconds=age_seconds,
-            snapshot=snapshot,
-            last_known_good_observed_at=observed_at,
-            last_known_good_asset_count=len(rows),
-        )
-
+    stale = bool(age_seconds is None or age_seconds > VOLUME_UNIVERSE_REFRESH_SECONDS)
     return {
         "available": True,
-        "current_membership_available": True,
+        "current_membership_available": not stale,
         "asset_count": len(rows),
+        "universe_target_count": TOP_VOLUME_ASSET_COUNT,
         "observed_at": observed_at.isoformat() if observed_at is not None else None,
         "age_seconds": age_seconds,
-        "stale": False,
-        "unavailable_reason": None,
+        "stale": stale,
+        "unavailable_reason": "stale_snapshot" if stale else None,
         "refresh_interval_seconds": VOLUME_UNIVERSE_REFRESH_SECONDS,
         "method": snapshot.get("method"),
         "ranking_metric": snapshot.get("ranking_metric"),
@@ -198,12 +185,11 @@ def read_active_cycle_history_status(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Project historical status onto fresh current top-40 membership only.
+    """Project historical status onto the latest complete top-volume cohort only.
 
-    Historical status rows are retained durably when an asset leaves the universe
-    because they are useful if it later re-enters. They are never allowed to
-    masquerade as current membership in the read plane, and a stale volume
-    snapshot cannot project archived rows as active top-40 assets.
+    Historical status rows remain durable if an asset leaves the cohort. When the
+    latest validated volume snapshot is temporarily stale, its history cards remain
+    visible but the payload explicitly marks the active universe stale/not-current.
     """
 
     volume = read_active_volume_universe_status(store, now=now)
@@ -217,6 +203,7 @@ def read_active_cycle_history_status(
             "available": False,
             "active_universe_available": False,
             "active_universe_stale": bool(volume.get("stale")),
+            "active_universe_current": False,
             "active_universe_unavailable_reason": volume.get("unavailable_reason"),
             "active_universe_observed_at": None,
             "active_universe_last_known_good_observed_at": volume.get(
@@ -225,6 +212,7 @@ def read_active_cycle_history_status(
             "active_universe_last_known_good_asset_count": int(
                 volume.get("last_known_good_asset_count") or 0
             ),
+            "universe_target_count": TOP_VOLUME_ASSET_COUNT,
             "maintenance_worker_id": CYCLE_HISTORY_WORKER_ID,
             "asset_count": 0,
             "complete_asset_count": 0,
@@ -250,6 +238,7 @@ def read_active_cycle_history_status(
     }
     active_rows: list[dict[str, Any]] = []
     active_assets: set[str] = set()
+    stale = bool(volume.get("stale"))
     for volume_row in volume.get("assets", []):
         if not isinstance(volume_row, dict):
             continue
@@ -263,7 +252,9 @@ def read_active_cycle_history_status(
         history_row["reported_24h_volume_usd"] = float(
             volume_row.get("reported_24h_volume_usd") or 0.0
         )
-        history_row["active_top40"] = True
+        history_row["latest_validated_top_volume"] = True
+        history_row["current_top_volume"] = not stale
+        history_row["active_top25"] = bool(not stale and TOP_VOLUME_ASSET_COUNT == 25)
         active_rows.append(history_row)
 
     complete_count = sum(bool(row.get("complete")) for row in active_rows)
@@ -284,14 +275,16 @@ def read_active_cycle_history_status(
         "available": bool(active_rows),
         "active_universe_available": True,
         "active_universe_observed_at": volume.get("observed_at"),
-        "active_universe_stale": False,
-        "active_universe_unavailable_reason": None,
+        "active_universe_stale": stale,
+        "active_universe_current": not stale,
+        "active_universe_unavailable_reason": volume.get("unavailable_reason"),
         "active_universe_last_known_good_observed_at": volume.get(
             "last_known_good_observed_at"
         ),
         "active_universe_last_known_good_asset_count": int(
             volume.get("last_known_good_asset_count") or 0
         ),
+        "universe_target_count": TOP_VOLUME_ASSET_COUNT,
         "maintenance_worker_id": CYCLE_HISTORY_WORKER_ID,
         "asset_count": len(active_rows),
         "complete_asset_count": complete_count,
@@ -320,12 +313,14 @@ async def maintain_active_cycle_history_once(
     now: datetime | None = None,
     research: CycleHistoricalResearch | None = None,
 ) -> dict[str, Any]:
-    """Refresh the canonical top 40 first, then maintain history for exactly it."""
+    """Resolve the configured volume cohort, then maintain history for exactly it."""
 
     observed_at = _aware(now or _now())
     active_assets = await resolve_top_volume_assets(store, now=observed_at)
     if len(active_assets) != TOP_VOLUME_ASSET_COUNT:
-        raise RuntimeError("active volume universe did not resolve exactly 40 assets")
+        raise RuntimeError(
+            f"active volume universe did not resolve exactly {TOP_VOLUME_ASSET_COUNT} assets"
+        )
     await maintain_cycle_history_once(
         store,
         settings=settings,
@@ -353,7 +348,8 @@ async def maintenance_loop() -> None:
         worker_id=CYCLE_HISTORY_WORKER_ID,
         state="starting",
         detail={
-            "active_top40_volume_universe": True,
+            "active_top_volume_universe": True,
+            "universe_target_count": TOP_VOLUME_ASSET_COUNT,
             "retry_interval_seconds": CYCLE_HISTORY_MAINTENANCE_SECONDS,
             "historical_counts_as_forward": False,
         },
@@ -368,7 +364,8 @@ async def maintenance_loop() -> None:
                 state="error",
                 error_type=type(exc).__name__,
                 detail={
-                    "active_top40_volume_universe": True,
+                    "active_top_volume_universe": True,
+                    "universe_target_count": TOP_VOLUME_ASSET_COUNT,
                     "retrying": True,
                     "retry_interval_seconds": CYCLE_HISTORY_MAINTENANCE_SECONDS,
                     "historical_counts_as_forward": False,
@@ -383,7 +380,8 @@ async def maintenance_loop() -> None:
         worker_id=CYCLE_HISTORY_WORKER_ID,
         state="stopped",
         detail={
-            "active_top40_volume_universe": True,
+            "active_top_volume_universe": True,
+            "universe_target_count": TOP_VOLUME_ASSET_COUNT,
             "historical_counts_as_forward": False,
         },
     )
