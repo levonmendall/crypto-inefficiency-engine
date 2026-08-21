@@ -18,6 +18,32 @@ from inefficiency_engine.source_coverage import CandidateSourceSufficiency, Sour
 from inefficiency_engine.source_coverage_catalog import LANES
 
 
+class _GovernedMechanismLedgerView:
+    """Delegate durable writes while filtering modeled liquidation shadows from reads.
+
+    The physical append-only ledger remains untouched. Governed allocation/read paths
+    see only empirical allocation-grade liquidation outcomes when they explicitly ask
+    for the liquidation mechanism, while research code can still inspect the raw
+    ledger through ``GovernedMechanismExecutionService.raw_outcomes``.
+    """
+
+    def __init__(self, base, liquidation_filter):
+        self._base = base
+        self._liquidation_filter = liquidation_filter
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+    def outcomes(self, *, cohort_key=None, mechanism_id=None):
+        rows = self._base.outcomes(
+            cohort_key=cohort_key,
+            mechanism_id=mechanism_id,
+        )
+        if mechanism_id == "liquidation_distress":
+            return [row for row in rows if self._liquidation_filter(row)]
+        return rows
+
+
 class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
     """Decouple forward learning from final allocation-grade source redundancy.
 
@@ -26,6 +52,14 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
     two-independent-source contract remains mandatory before a candidate can be
     promoted into portfolio allocation. No threshold is weakened by this class.
     """
+
+    def __init__(self, core, store):
+        super().__init__(core, store)
+        self._raw_ledger = self.ledger
+        self.ledger = _GovernedMechanismLedgerView(
+            self._raw_ledger,
+            self._liquidation_outcome_is_allocation_grade,
+        )
 
     @staticmethod
     def _primary_groups(venues: list[str], mechanism_id: str) -> set[str] | None:
@@ -170,13 +204,19 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
             return False
         return True
 
+    def raw_outcomes(self, *, cohort_key=None, mechanism_id=None):
+        return self._raw_ledger.outcomes(
+            cohort_key=cohort_key,
+            mechanism_id=mechanism_id,
+        )
+
     def allocation_grade_outcomes(
         self,
         *,
         cohort_key: str | None = None,
         mechanism_id: str | None = None,
     ):
-        rows = self.ledger.outcomes(
+        rows = self.raw_outcomes(
             cohort_key=cohort_key,
             mechanism_id=mechanism_id,
         )
