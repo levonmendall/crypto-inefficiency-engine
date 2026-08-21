@@ -21,6 +21,7 @@ def _payload(mechanism_id: str = "yield") -> dict[str, object]:
                 "mechanism_id": mechanism_id,
                 "name": "Test mechanism",
                 "state": "provider_gap",
+                "stage": "waiting_for_source:provider_gap",
                 "provider_ready": False,
                 "authoritative_observation_count": 0,
                 "economic_candidate_count": 0,
@@ -35,7 +36,7 @@ def _payload(mechanism_id: str = "yield") -> dict[str, object]:
     }
 
 
-def test_fresh_admitted_provider_closes_only_provider_gap(tmp_path):
+def test_fresh_legacy_admission_is_diagnostic_only(tmp_path):
     store = EvidenceStore(tmp_path / "evidence.sqlite")
     ledger = ProviderAdmissionLedger(store)
     ledger.record(
@@ -49,21 +50,24 @@ def test_fresh_admitted_provider_closes_only_provider_gap(tmp_path):
         )
     )
 
-    result = reconcile_provider_readiness(store, _payload(), now=NOW)
+    source = _payload()
+    result = reconcile_provider_readiness(store, source, now=NOW)
     row = result["mechanisms"][0]
 
-    assert row["provider_ready"] is True
-    assert row["state"] == "collecting"
-    assert row["authoritative_observation_count"] == 1
-    assert row["economic_candidate_count"] == 0
-    assert row["independent_forward_outcome_count"] == 0
-    assert row["current_promoted_count"] == 0
-    assert row["live_execution_authority"] is False
+    assert row["state"] == source["mechanisms"][0]["state"]
+    assert row["stage"] == source["mechanisms"][0]["stage"]
+    assert row["provider_ready"] is False
+    assert row["authoritative_observation_count"] == 0
+    assert row["primary_reason"] == source["mechanisms"][0]["primary_reason"]
+    assert row["next_action"] == source["mechanisms"][0]["next_action"]
+    assert row["provider_admission_ready"] is True
     assert row["provider_admission"]["admitted_provider_count"] == 1
-    assert row["provider_readiness_presentation_only"] is True
+    assert row["provider_readiness_state_override_applied"] is False
+    assert row["source_state_authority"] == "canonical_13_lane_source_coverage"
+    assert row["live_execution_authority"] is False
 
 
-def test_latest_failed_provider_probe_restores_provider_gap(tmp_path):
+def test_failed_legacy_probe_cannot_reopen_canonically_connected_lane(tmp_path):
     store = EvidenceStore(tmp_path / "evidence.sqlite")
     ledger = ProviderAdmissionLedger(store)
     ledger.record(
@@ -89,8 +93,16 @@ def test_latest_failed_provider_probe_restores_provider_gap(tmp_path):
     )
 
     source = _payload("volatility")
-    source["mechanisms"][0]["state"] = "collecting"
-    source["mechanisms"][0]["provider_ready"] = True
+    canonical = source["mechanisms"][0]
+    canonical["state"] = "collecting"
+    canonical["stage"] = "research_active_waiting_for_complete_forward_evidence"
+    canonical["provider_ready"] = True
+    canonical["authoritative_observation_count"] = 7
+    canonical["primary_reason"] = (
+        "authoritative research evidence is connected, but forward-test evidence is incomplete"
+    )
+    canonical["next_action"] = "collect the missing forward evidence classes"
+
     result = reconcile_provider_readiness(
         store,
         source,
@@ -98,13 +110,19 @@ def test_latest_failed_provider_probe_restores_provider_gap(tmp_path):
     )
     row = result["mechanisms"][0]
 
-    assert row["provider_ready"] is False
-    assert row["state"] == "provider_gap"
+    assert row["provider_ready"] is True
+    assert row["state"] == "collecting"
+    assert row["stage"] == "research_active_waiting_for_complete_forward_evidence"
+    assert row["authoritative_observation_count"] == 7
+    assert row["primary_reason"] == canonical["primary_reason"]
+    assert row["next_action"] == canonical["next_action"]
+    assert row["provider_admission_ready"] is False
     assert row["provider_admission"]["admitted_provider_count"] == 0
     assert row["provider_admission"]["providers"][0]["error_type"] == "TimeoutError"
+    assert row["provider_readiness_state_override_applied"] is False
 
 
-def test_stale_provider_admission_does_not_claim_readiness(tmp_path):
+def test_stale_legacy_admission_cannot_replace_canonical_freshness_state(tmp_path):
     store = EvidenceStore(tmp_path / "evidence.sqlite")
     ledger = ProviderAdmissionLedger(store)
     ledger.record(
@@ -118,16 +136,63 @@ def test_stale_provider_admission_does_not_claim_readiness(tmp_path):
         )
     )
 
-    result = reconcile_provider_readiness(
-        store,
-        _payload("fundamental_onchain"),
-        now=NOW,
+    source = _payload("fundamental_onchain")
+    canonical = source["mechanisms"][0]
+    canonical["state"] = "collecting"
+    canonical["stage"] = "waiting_for_source:stale"
+    canonical["provider_ready"] = True
+    canonical["primary_reason"] = (
+        "provider integration exists, but its authoritative evidence is stale"
     )
+    canonical["next_action"] = "refresh admitted source evidence"
+
+    result = reconcile_provider_readiness(store, source, now=NOW)
     row = result["mechanisms"][0]
 
-    assert row["provider_ready"] is False
-    assert row["state"] == "provider_gap"
+    assert row["state"] == "collecting"
+    assert row["stage"] == "waiting_for_source:stale"
+    assert row["provider_ready"] is True
+    assert row["primary_reason"] == canonical["primary_reason"]
+    assert row["provider_admission_ready"] is False
     assert row["provider_admission"]["providers"][0]["fresh"] is False
+
+
+def test_alternate_source_truth_survives_failed_primary_legacy_probe(tmp_path):
+    store = EvidenceStore(tmp_path / "evidence.sqlite")
+    ledger = ProviderAdmissionLedger(store)
+    ledger.record(
+        ProviderAdmissionObservation(
+            mechanism_id="event_driven",
+            provider="bybit-v5:instrument-catalog",
+            observed_at=NOW,
+            healthy=False,
+            item_count=0,
+            source_reference="https://example.test/bybit",
+            error_type="HTTPStatusError",
+        )
+    )
+
+    source = _payload("event_driven")
+    canonical = source["mechanisms"][0]
+    canonical["state"] = "collecting"
+    canonical["stage"] = "forward_learning_active_redundancy_pending"
+    canonical["provider_ready"] = True
+    canonical["authoritative_observation_count"] = 12
+    canonical["primary_reason"] = (
+        "complete authoritative forward evidence is connected through an alternate admitted source; "
+        "independent-source redundancy remains pending"
+    )
+    canonical["next_action"] = "restore independent source redundancy"
+
+    result = reconcile_provider_readiness(store, source, now=NOW)
+    row = result["mechanisms"][0]
+
+    assert row["state"] == "collecting"
+    assert row["stage"] == "forward_learning_active_redundancy_pending"
+    assert row["provider_ready"] is True
+    assert row["authoritative_observation_count"] == 12
+    assert row["provider_admission_ready"] is False
+    assert row["source_state_authority"] == "canonical_13_lane_source_coverage"
 
 
 def test_unprobed_mechanism_is_left_unchanged(tmp_path):
@@ -138,3 +203,5 @@ def test_unprobed_mechanism_is_left_unchanged(tmp_path):
 
     assert result["mechanisms"][0] == source["mechanisms"][0]
     assert result["provider_readiness_reconciled"] is False
+    assert result["provider_readiness_state_override_applied"] is False
+    assert result["source_state_authority"] == "canonical_13_lane_source_coverage"
