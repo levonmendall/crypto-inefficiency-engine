@@ -12,7 +12,7 @@ from inefficiency_engine.active_volume_runtime import (
 from inefficiency_engine.config import Settings
 from inefficiency_engine.cycle_history_runtime import CycleHistoryStatusLedger
 from inefficiency_engine.evidence import EvidenceStore
-from inefficiency_engine.render_combined import API_APP, child_commands
+from inefficiency_engine.render_combined import API_APP, child_commands, heavy_commands
 from inefficiency_engine.volume_universe import (
     STRICT_VOLUME_METHOD,
     STRICT_VOLUME_SOURCE,
@@ -167,7 +167,10 @@ def test_active_history_maintenance_uses_resolved_top40(monkeypatch, tmp_path):
     assert "ALGO" not in {row["asset"] for row in result["assets"]}
 
 
-def test_render_combined_uses_active_volume_runtime():
-    commands = child_commands("10000")
+def test_render_combined_keeps_active_history_disposable():
+    permanent = child_commands("10000")
+    disposable = heavy_commands()
     assert API_APP == "inefficiency_engine.read_api_active_volume_deploy:app"
-    assert commands["history"][-1] == "inefficiency_engine.active_volume_runtime"
+    assert "history" not in permanent
+    assert disposable["history"][-2] == "inefficiency_engine.disposable_heavy_job"
+    assert disposable["history"][-1] == "history"
