@@ -10,6 +10,7 @@ from inefficiency_engine.active_volume_runtime import (
     read_active_cycle_history_status,
     read_active_volume_universe_status,
 )
+from inefficiency_engine.dashboard_source_truth import overlay_dashboard_source_truth
 from inefficiency_engine.lane_readiness import build_lane_executable_readiness
 from inefficiency_engine.production_dashboard_fastpath import build_production_dashboard_snapshot
 from inefficiency_engine.service import OpportunityService
@@ -167,10 +168,21 @@ def _lane_summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
         }
 
     lane_count = len(LANES)
+    current_source_truth = payload.get("current_source_truth")
     connected_ids = {
-        lane_id for lane_id in LANES
-        if lane_id not in _PRODUCTION_EVIDENCE_DISCONNECTED
+        lane_id
+        for lane_id in LANES
+        if (
+            isinstance(current_source_truth, dict)
+            and isinstance(current_source_truth.get(lane_id), dict)
+            and bool(current_source_truth[lane_id].get("connected"))
+        )
     }
+    if not connected_ids:
+        connected_ids = {
+            lane_id for lane_id in LANES
+            if lane_id not in _PRODUCTION_EVIDENCE_DISCONNECTED
+        }
     connected_count = len(connected_ids)
     current_ids = {
         str(row.get("mechanism_id") or "")
@@ -195,9 +207,7 @@ def _lane_summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
         "architecture_executable_count": lane_count,
         "production_evidence_connected_count": connected_count,
         "all_lanes_production_evidence_connected": connected_count == lane_count,
-        "production_evidence_disconnected_lanes": sorted(
-            _PRODUCTION_EVIDENCE_DISCONNECTED
-        ),
+        "production_evidence_disconnected_lanes": sorted(set(LANES) - connected_ids),
         "decision_grade_outcome_qualified_count": len(decision_grade_ids),
         "currently_qualified_count": len(current_ids),
         "paper_execution_capable_count": len(executable_ids),
@@ -208,7 +218,11 @@ def _lane_summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
         "all_lanes_paper_execution_capable": len(executable_ids) == lane_count,
         "projection_current_for_execution": projection_current,
         "live_execution_capable": False,
-        "summary_source": "persisted_dashboard_projection_plus_static_runtime_connectivity",
+        "summary_source": (
+            "current_source_coverage_plus_persisted_dashboard_projection"
+            if isinstance(current_source_truth, dict) and current_source_truth
+            else "persisted_dashboard_projection_plus_static_runtime_connectivity"
+        ),
         "request_time_research_computation": False,
         "detail_endpoint": "/v3/lane-executability",
     }
@@ -332,6 +346,7 @@ def dashboard_snapshot():
                 ),
             ),
         )
+        payload = overlay_dashboard_source_truth(store, payload)
     except Exception as exc:
         raise HTTPException(
             status_code=503,
