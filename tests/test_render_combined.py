@@ -18,7 +18,7 @@ def test_combined_runtime_starts_worker_history_and_api_on_render_port():
     assert commands["history"] == [
         sys.executable,
         "-m",
-        "inefficiency_engine.cycle_history_runtime",
+        "inefficiency_engine.active_volume_runtime",
     ]
     assert commands["api"] == [
         sys.executable,
@@ -32,5 +32,5 @@ def test_combined_runtime_starts_worker_history_and_api_on_render_port():
     ]
 
 
-def test_combined_runtime_uses_deployment_safe_research_api():
-    assert API_APP == "inefficiency_engine.read_api_research_deploy:app"
+def test_combined_runtime_uses_active_volume_deployment_read_plane():
+    assert API_APP == "inefficiency_engine.read_api_active_volume_deploy:app"

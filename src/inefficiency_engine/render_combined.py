@@ -8,7 +8,7 @@ import time
 from collections.abc import Sequence
 
 
-API_APP = "inefficiency_engine.read_api_research_deploy:app"
+API_APP = "inefficiency_engine.read_api_active_volume_deploy:app"
 
 
 def child_commands(port: str | int) -> dict[str, list[str]]:
@@ -34,7 +34,7 @@ def child_commands(port: str | int) -> dict[str, list[str]]:
         "history": [
             sys.executable,
             "-m",
-            "inefficiency_engine.cycle_history_runtime",
+            "inefficiency_engine.active_volume_runtime",
         ],
     }
 
@@ -56,12 +56,13 @@ def _terminate_children(children: Sequence[subprocess.Popen[bytes]], *, timeout_
 
 
 def main() -> int:
-    """Run the read API, governed worker, and history maintenance in one Render service.
+    """Run the read API, governed worker, and active-universe history maintenance.
 
-    The history process is deliberately fail-contained internally: transient Coinbase
-    failures are persisted and retried instead of terminating the process. All three
-    children are supervised so an unexpected process exit still causes Render to
-    restart the complete service with one coherent durable database attachment.
+    The history child resolves the same validated market-wide top-40 volume universe
+    used by live research before each maintenance pass. Historical rows for assets
+    that later leave the top 40 remain archived in PostgreSQL, but the active read
+    plane filters them out so archived research can never masquerade as current
+    universe membership. All three children remain supervised as critical processes.
     """
     port = os.getenv("PORT", "10000")
     commands = child_commands(port)
