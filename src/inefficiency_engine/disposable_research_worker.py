@@ -66,6 +66,10 @@ async def run_disposable_research_cycle(
     Release D subtractive lane-success allocator/certification together. Final
     statistical, source, execution, risk, settlement, and profitability thresholds
     remain unchanged.
+
+    Long research cycles publish presentation truth and durable phase progress
+    incrementally. That lets the outer supervisor distinguish a healthy long-running
+    cycle from a genuinely stalled phase without weakening any decision gate.
     """
 
     sequence = max(1, int(sequence))
@@ -109,19 +113,74 @@ async def run_disposable_research_cycle(
         "sequential_research_surfaces": True,
         "all_lane_evidence_velocity_runtime": True,
         "release_d_lane_success_runtime": True,
+        "progress_heartbeat_contract": True,
         "paper_only": True,
     }
-    store.record_worker_heartbeat(
-        worker_id=RESEARCH_WORKER_ID,
-        state="running",
-        detail=detail,
-    )
+    progress_index = 0
+
+    def _record_progress(phase: str) -> None:
+        nonlocal progress_index
+        progress_index += 1
+        detail["current_phase"] = phase
+        detail["progress_index"] = progress_index
+        store.record_worker_heartbeat(
+            worker_id=RESEARCH_WORKER_ID,
+            state="running",
+            detail=detail,
+        )
+
+    def _publish_research_projection(stage: str) -> bool:
+        """Publish current durable truth without granting research/allocation authority."""
+
+        try:
+            payload = research_projection.publish(
+                forward_target=max(1, int(service.settings.alpha_min_forward_samples)),
+                settled_target=max(
+                    5,
+                    int(getattr(service.settings, "operating_certification_min_settled_trials", 20)),
+                ),
+                shadow_horizons_seconds=tuple(
+                    getattr(service.settings, "shadow_horizons_seconds", (60.0,)) or (60.0,)
+                ),
+                shadow_cycle_interval_seconds=float(service.settings.shadow_cycle_interval_seconds),
+                alpha_evidence_every_cycles=alpha_every,
+                heartbeat_stale_seconds=float(service.settings.worker_heartbeat_stale_seconds),
+            )
+            observed_at = payload.get("observed_at")
+            detail[f"research_projection_{stage}_observed_at"] = observed_at
+            store.record_worker_heartbeat(
+                worker_id=DASHBOARD_RESEARCH_PROJECTION_WORKER_ID,
+                state="success",
+                detail={
+                    "projection_observed_at": observed_at,
+                    "publication_stage": stage,
+                    "disposable_process": True,
+                    "presentation_only": True,
+                    "allocation_authority": False,
+                    "paper_only": True,
+                },
+            )
+            if stage == "cycle_complete":
+                detail.pop("research_projection_cycle_start_error_type", None)
+            return True
+        except Exception as exc:
+            detail[f"research_projection_{stage}_error_type"] = type(exc).__name__
+            return False
+
+    _record_progress("cycle_start")
+    # Publish the latest durable research truth before optional/network-heavy work.
+    # This refreshes presentation liveness only: evidence timestamps, readiness,
+    # qualification, and allocation gates inside the projection remain unchanged.
+    _record_progress("dashboard_projection_start")
+    _publish_research_projection("cycle_start")
+    _record_progress("dashboard_projection_start_complete")
 
     # Bootstrap source truth periodically. The alpha/mechanism cycle performs an
     # additional source refresh immediately before evidence generation, so short-
     # lived trade-flow/liquidation evidence cannot expire merely because of the
     # sequential disposable scheduler.
     if sequence == 1 or sequence % 10 == 1:
+        _record_progress("provider_gap_bootstrap")
         try:
             bootstrap = await operating_certification.provider_gap_collection.run_cycle()
             source_coverage = bootstrap.get("source_coverage", {}) if isinstance(bootstrap, dict) else {}
@@ -140,7 +199,9 @@ async def run_disposable_research_cycle(
             detail["provider_gap_bootstrap_complete"] = False
             detail["provider_gap_bootstrap_error_type"] = type(exc).__name__
         gc.collect()
+        _record_progress("provider_gap_bootstrap_complete")
 
+    _record_progress("core_shadow")
     try:
         cycle = await bounded_shadow.run_shadow_cycle()
         detail["cycle_id"] = cycle.cycle_id
@@ -161,7 +222,9 @@ async def run_disposable_research_cycle(
             detail=detail,
         )
         return WorkerRunStats(RESEARCH_WORKER_ID, 1, 0, 1)
+    _record_progress("core_shadow_complete")
 
+    _record_progress("qualified_bridge")
     try:
         nav_heartbeat = store.latest_worker_heartbeat("canonical-portfolio-operating-loop")
         nav_value = nav_heartbeat.detail.get("portfolio_nav_usd") if nav_heartbeat else None
@@ -172,7 +235,9 @@ async def run_disposable_research_cycle(
     except Exception as exc:
         detail["qualified_bridge_error_type"] = type(exc).__name__
     gc.collect()
+    _record_progress("qualified_bridge_complete")
 
+    _record_progress("dex_route_shadow")
     try:
         route = await universal.run_dex_route_shadow_cycle()
         detail["dex_route_observation_count"] = len(getattr(route, "observations", ()))
@@ -180,8 +245,10 @@ async def run_disposable_research_cycle(
     except Exception as exc:
         detail["dex_route_shadow_error_type"] = type(exc).__name__
     gc.collect()
+    _record_progress("dex_route_shadow_complete")
 
     if sequence % tier_every == 0:
+        _record_progress("dex_tier_shadow")
         try:
             value = await tier_shadow.run_cycle()
             detail["dex_tier_shadow_observation_count"] = len(getattr(value, "observations", ()))
@@ -189,8 +256,10 @@ async def run_disposable_research_cycle(
         except Exception as exc:
             detail["dex_tier_shadow_error_type"] = type(exc).__name__
         gc.collect()
+        _record_progress("dex_tier_shadow_complete")
 
     if _due(sequence, composite_every, 0.5):
+        _record_progress("cex_dex_composite_shadow")
         try:
             value = await composite_shadow.run_cycle()
             detail["cex_dex_composite_observation_count"] = len(getattr(value, "observations", ()))
@@ -198,8 +267,10 @@ async def run_disposable_research_cycle(
         except Exception as exc:
             detail["cex_dex_composite_shadow_error_type"] = type(exc).__name__
         gc.collect()
+        _record_progress("cex_dex_composite_shadow_complete")
 
     if _due(sequence, stablecoin_every, 0.25):
+        _record_progress("stablecoin_depth_shadow")
         try:
             value = await stablecoin_shadow.run_cycle()
             detail["stablecoin_depth_observation_count"] = len(getattr(value, "observations", ()))
@@ -207,8 +278,10 @@ async def run_disposable_research_cycle(
         except Exception as exc:
             detail["stablecoin_depth_shadow_error_type"] = type(exc).__name__
         gc.collect()
+        _record_progress("stablecoin_depth_shadow_complete")
 
     if _due(sequence, certification_every, 1.0 / 3.0):
+        _record_progress("allocation_certification")
         try:
             import asyncio
 
@@ -221,6 +294,7 @@ async def run_disposable_research_cycle(
                 stop_event=stop,
                 max_cycles=1,
             )
+            _record_progress("research_closure")
             closure = await run_research_closure_cycle(
                 service=service,
                 store=store,
@@ -235,11 +309,13 @@ async def run_disposable_research_cycle(
         except Exception as exc:
             detail["allocation_certification_error_type"] = type(exc).__name__
         gc.collect()
+        _record_progress("allocation_certification_complete")
 
     if _due(sequence, alpha_every, 0.75):
         # Refresh short-lived provider evidence at the exact decision point where
         # alpha and native mechanism forward trials consume it. Source-specific
         # collector TTLs still prevent unnecessary network requests.
+        _record_progress("pre_alpha_source_refresh")
         try:
             source_refresh = await operating_certification.provider_gap_collection.run_cycle()
             refresh_state = source_refresh.get("source_refresh", {}) if isinstance(source_refresh, dict) else {}
@@ -256,7 +332,9 @@ async def run_disposable_research_cycle(
             detail["pre_alpha_source_refresh_complete"] = False
             detail["pre_alpha_source_refresh_error_type"] = type(exc).__name__
         gc.collect()
+        _record_progress("pre_alpha_source_refresh_complete")
 
+        _record_progress("alpha_forward_evidence")
         try:
             value = await alpha_factory.run_evidence_cycle()
             detail["alpha_candidate_count"] = value.candidate_count
@@ -271,8 +349,10 @@ async def run_disposable_research_cycle(
         except Exception as exc:
             detail["alpha_forward_evidence_error_type"] = type(exc).__name__
         gc.collect()
+        _record_progress("alpha_forward_evidence_complete")
 
     if sequence % frontier_every == 0:
+        _record_progress("dex_route_frontier")
         try:
             value = await universal.probe_dex_route_size_frontiers()
             detail["dex_route_frontier_count"] = len(value)
@@ -280,11 +360,13 @@ async def run_disposable_research_cycle(
         except Exception as exc:
             detail["dex_route_frontier_error_type"] = type(exc).__name__
         gc.collect()
+        _record_progress("dex_route_frontier_complete")
 
     # Full operating certification deliberately remains staggered because it performs
     # live provider/executability work. Immediately before dashboard publication we
     # instead reconcile from durable ledgers only, so evidence generated above cannot
     # be reported through an older pre-evidence certification snapshot.
+    _record_progress("runtime_reconciliation")
     try:
         reconciled = operating_certification.reconcile_latest_runtime_truth()
         detail["post_evidence_lane_reconciliation_complete"] = reconciled is not None
@@ -295,37 +377,23 @@ async def run_disposable_research_cycle(
         detail["post_evidence_lane_reconciliation_complete"] = False
         detail["post_evidence_lane_reconciliation_error_type"] = type(exc).__name__
     gc.collect()
+    _record_progress("runtime_reconciliation_complete")
 
-    try:
-        payload = research_projection.publish(
-            forward_target=max(1, int(service.settings.alpha_min_forward_samples)),
-            settled_target=max(
-                5,
-                int(getattr(service.settings, "operating_certification_min_settled_trials", 20)),
-            ),
-            shadow_horizons_seconds=tuple(
-                getattr(service.settings, "shadow_horizons_seconds", (60.0,)) or (60.0,)
-            ),
-            shadow_cycle_interval_seconds=float(service.settings.shadow_cycle_interval_seconds),
-            alpha_evidence_every_cycles=alpha_every,
-            heartbeat_stale_seconds=float(service.settings.worker_heartbeat_stale_seconds),
+    _record_progress("dashboard_projection_complete")
+    if not _publish_research_projection("cycle_complete"):
+        # Preserve the historic key used by downstream diagnostics while retaining
+        # the stage-specific key for root-cause visibility.
+        detail["research_projection_error_type"] = str(
+            detail.get("research_projection_cycle_complete_error_type") or "ResearchProjectionError"
         )
-        store.record_worker_heartbeat(
-            worker_id=DASHBOARD_RESEARCH_PROJECTION_WORKER_ID,
-            state="success",
-            detail={
-                "projection_observed_at": payload.get("observed_at"),
-                "disposable_process": True,
-                "presentation_only": True,
-                "paper_only": True,
-            },
-        )
-    except Exception as exc:
-        detail["research_projection_error_type"] = type(exc).__name__
+    else:
+        detail.pop("research_projection_error_type", None)
+    _record_progress("dashboard_projection_complete_published")
 
     errors = _error_keys(detail)
     detail["subsystem_error_keys"] = errors
     detail["subsystem_error_count"] = len(errors)
+    detail["current_phase"] = "cycle_complete"
     final_state = "degraded" if errors else "success"
     store.record_worker_heartbeat(
         worker_id=RESEARCH_WORKER_ID,
