@@ -12,6 +12,7 @@ from inefficiency_engine.evidence import EvidenceStore
 
 
 DEFAULT_RESEARCH_PROJECTION_STALE_SECONDS = 900.0
+DEFAULT_OPERATING_PROJECTION_STALE_SECONDS = 1800.0
 
 
 def _decode(raw: object | None) -> dict[str, Any] | None:
@@ -87,17 +88,42 @@ def _parse_timestamp(value: object | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _research_projection_stale_seconds() -> float:
+def _env_stale_seconds(name: str, default: float, *, minimum: float = 180.0) -> float:
     try:
-        configured = float(
-            os.getenv(
-                "CIE_RESEARCH_PROJECTION_STALE_SECONDS",
-                str(DEFAULT_RESEARCH_PROJECTION_STALE_SECONDS),
-            )
-        )
+        configured = float(os.getenv(name, str(default)))
     except ValueError:
-        configured = DEFAULT_RESEARCH_PROJECTION_STALE_SECONDS
-    return max(180.0, configured)
+        configured = default
+    return max(minimum, configured)
+
+
+def _projection_freshness(
+    observed_value: object | None,
+    *,
+    available: bool,
+    now: datetime,
+    stale_seconds: float,
+    label: str,
+) -> dict[str, Any]:
+    observed = _parse_timestamp(observed_value)
+    if observed is None:
+        return {
+            "available": available,
+            "observed_at": None,
+            "age_seconds": None,
+            "stale_after_seconds": stale_seconds,
+            "stale": available,
+            "reason": f"{label} has no valid observed_at timestamp" if available else f"{label} is unavailable",
+        }
+    age = max(0.0, (now - observed).total_seconds())
+    stale = age > stale_seconds
+    return {
+        "available": True,
+        "observed_at": observed.isoformat(),
+        "age_seconds": age,
+        "stale_after_seconds": stale_seconds,
+        "stale": stale,
+        "reason": f"{label} is {age:.1f}s old (limit {stale_seconds:.1f}s)" if stale else None,
+    }
 
 
 def research_projection_freshness(
@@ -106,12 +132,7 @@ def research_projection_freshness(
     now: datetime | None = None,
     stale_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Evaluate a persisted research projection against the actual wall clock.
-
-    A stale research projection remains useful historical evidence, but it must not
-    be presented as current operating health. This check is deliberately read-only
-    and does not reinterpret any profitability/statistical result.
-    """
+    """Evaluate a persisted research projection against the actual wall clock."""
 
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
@@ -119,59 +140,82 @@ def research_projection_freshness(
     current = current.astimezone(timezone.utc)
     threshold = max(
         1.0,
-        float(stale_seconds if stale_seconds is not None else _research_projection_stale_seconds()),
-    )
-    observed = _parse_timestamp((research or {}).get("observed_at"))
-    if observed is None:
-        return {
-            "available": research is not None,
-            "observed_at": None,
-            "age_seconds": None,
-            "stale_after_seconds": threshold,
-            "stale": research is not None,
-            "reason": "research projection has no valid observed_at timestamp"
-            if research is not None
-            else "research projection is unavailable",
-        }
-    age = max(0.0, (current - observed).total_seconds())
-    stale = age > threshold
-    return {
-        "available": True,
-        "observed_at": observed.isoformat(),
-        "age_seconds": age,
-        "stale_after_seconds": threshold,
-        "stale": stale,
-        "reason": (
-            f"research projection is {age:.1f}s old (limit {threshold:.1f}s)"
-            if stale
-            else None
+        float(
+            stale_seconds
+            if stale_seconds is not None
+            else _env_stale_seconds(
+                "CIE_RESEARCH_PROJECTION_STALE_SECONDS",
+                DEFAULT_RESEARCH_PROJECTION_STALE_SECONDS,
+            )
         ),
-    }
+    )
+    return _projection_freshness(
+        (research or {}).get("observed_at"),
+        available=research is not None,
+        now=current,
+        stale_seconds=threshold,
+        label="research projection",
+    )
 
 
-def _stale_research_mechanisms(
+def operating_projection_freshness(
+    research: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+    stale_seconds: float | None = None,
+) -> dict[str, Any]:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    threshold = max(
+        1.0,
+        float(
+            stale_seconds
+            if stale_seconds is not None
+            else _env_stale_seconds(
+                "CIE_OPERATING_PROJECTION_STALE_SECONDS",
+                DEFAULT_OPERATING_PROJECTION_STALE_SECONDS,
+            )
+        ),
+    )
+    return _projection_freshness(
+        (research or {}).get("source_operating_observed_at"),
+        available=research is not None,
+        now=current,
+        stale_seconds=threshold,
+        label="operating certification projection",
+    )
+
+
+def reconcile_mechanism_runtime_truth(
     payload: object,
     *,
-    freshness: dict[str, Any],
+    now: datetime | None = None,
+    research_freshness: dict[str, Any] | None = None,
+    operating_freshness: dict[str, Any] | None = None,
 ) -> object:
-    """Make stale runtime status explicit without rewriting strategy economics."""
+    """Re-evaluate runtime/cadence fields at request time without changing economics.
+
+    Statistical failure, poor economics, provider gaps, and certification are durable
+    research results. This function never changes those states. It only prevents an
+    old reason string from saying a collector is healthy after its own expected
+    collection deadline or source operating projection has gone stale.
+    """
 
     if not isinstance(payload, dict):
         return payload
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    research_freshness = research_freshness or {"stale": False}
+    operating_freshness = operating_freshness or {"stale": False}
+
     result = dict(payload)
     raw_rows = result.get("mechanisms")
     if not isinstance(raw_rows, list):
-        result["research_projection_stale"] = True
-        result["research_projection_freshness"] = freshness
         return result
-
-    age = freshness.get("age_seconds")
-    observed = freshness.get("observed_at")
-    prefix = "research runtime projection is stale"
-    if isinstance(age, (int, float)):
-        prefix += f" ({float(age) / 60.0:.1f} minutes old)"
-    if observed:
-        prefix += f"; last research projection {observed}"
 
     rows: list[object] = []
     for raw in raw_rows:
@@ -180,35 +224,77 @@ def _stale_research_mechanisms(
             continue
         row = dict(raw)
         reason = str(row.get("primary_reason") or "")
-        reason = reason.replace("forward collector healthy", "forward collector degraded")
-        if prefix not in reason:
-            reason = f"{prefix} · {reason}" if reason else prefix
         next_action = str(row.get("next_action") or "")
-        stale_action = "restore successful research publication before interpreting this lane as current"
-        if stale_action not in next_action:
-            next_action = f"{stale_action}; {next_action}" if next_action else stale_action
-        row.update(
-            {
-                "primary_reason": reason,
-                "next_action": next_action,
-                "forward_evidence_worker_healthy": False,
-                "research_projection_stale": True,
-                "research_projection_age_seconds": age,
-            }
-        )
+        worker_state = str(row.get("forward_evidence_worker_state") or "")
+        expected_at = _parse_timestamp(row.get("forward_evidence_next_expected_at"))
+        expected_interval = 0.0
+        try:
+            expected_interval = max(0.0, float(row.get("forward_evidence_expected_interval_seconds") or 0.0))
+        except (TypeError, ValueError):
+            expected_interval = 0.0
+        overdue_seconds = max(0.0, (current - expected_at).total_seconds()) if expected_at else 0.0
+        overdue_grace = max(180.0, expected_interval)
+        overdue = expected_at is not None and overdue_seconds > overdue_grace
+        unhealthy_state = worker_state in {"late", "stalled", "failed", "unknown"}
+        runtime_stale = bool(research_freshness.get("stale")) or overdue or unhealthy_state
+
+        prefixes: list[str] = []
+        if bool(research_freshness.get("stale")):
+            age = research_freshness.get("age_seconds")
+            if isinstance(age, (int, float)):
+                prefixes.append(f"research runtime projection is stale ({float(age) / 60.0:.1f} minutes old)")
+            else:
+                prefixes.append("research runtime projection is stale")
+        if overdue:
+            prefixes.append(
+                f"forward evidence collection is overdue by {overdue_seconds / 60.0:.1f} minutes"
+            )
+        elif unhealthy_state:
+            prefixes.append(f"forward evidence worker state is {worker_state}")
+        if bool(operating_freshness.get("stale")):
+            age = operating_freshness.get("age_seconds")
+            if isinstance(age, (int, float)):
+                prefixes.append(
+                    f"operating certification snapshot is stale ({float(age) / 60.0:.1f} minutes old)"
+                )
+            else:
+                prefixes.append("operating certification snapshot is stale")
+
+        if runtime_stale:
+            reason = reason.replace("forward collector healthy", "forward collector degraded")
+            row["forward_evidence_worker_healthy"] = False
+            if worker_state not in {"failed", "stalled"}:
+                row["forward_evidence_worker_state"] = "stalled" if overdue else worker_state or "unknown"
+            row["forward_evidence_overdue_seconds"] = overdue_seconds if overdue else 0.0
+            stale_action = "restore successful current research publication before interpreting this lane as current"
+            if stale_action not in next_action:
+                next_action = f"{stale_action}; {next_action}" if next_action else stale_action
+
+        if prefixes:
+            prefix = "; ".join(prefixes)
+            if prefix not in reason:
+                reason = f"{prefix} · {reason}" if reason else prefix
+
+        row["primary_reason"] = reason
+        row["next_action"] = next_action
+        row["research_projection_stale"] = bool(research_freshness.get("stale"))
+        row["operating_projection_stale"] = bool(operating_freshness.get("stale"))
         rows.append(row)
 
     result["mechanisms"] = rows
-    result["research_projection_stale"] = True
-    result["research_projection_freshness"] = freshness
+    result["research_projection_stale"] = bool(research_freshness.get("stale"))
+    result["research_projection_freshness"] = research_freshness
+    result["operating_projection_stale"] = bool(operating_freshness.get("stale"))
+    result["operating_projection_freshness"] = operating_freshness
     live = result.get("live_telemetry")
     if isinstance(live, dict):
         live = dict(live)
         live.update(
             {
-                "research_projection_stale": True,
-                "research_projection_age_seconds": age,
-                "research_projection_observed_at": observed,
+                "research_projection_stale": bool(research_freshness.get("stale")),
+                "research_projection_age_seconds": research_freshness.get("age_seconds"),
+                "operating_projection_stale": bool(operating_freshness.get("stale")),
+                "operating_projection_age_seconds": operating_freshness.get("age_seconds"),
             }
         )
         result["live_telemetry"] = live
@@ -229,9 +315,9 @@ def build_production_dashboard_snapshot(
     single bounded read transaction. The read plane never fans out through the
     diagnostic endpoints and never constructs an OpportunityService here.
 
-    Persisted research is also evaluated against the actual request-time UTC clock.
-    Stale research remains visible as historical evidence, but current-health fields
-    are degraded and the payload explicitly identifies the stale projection.
+    Persisted research and each lane's own expected collection deadline are evaluated
+    against the actual request-time UTC clock. Old evidence remains visible, but it
+    cannot continue claiming current collector health.
     """
 
     base, research, compact_error = _read_compact_projections(store)
@@ -245,9 +331,6 @@ def build_production_dashboard_snapshot(
                 settled_target=max(1, int(settled_target)),
             )
         except Exception as exc:
-            # Keep HTTP semantics explicit if durable canonical state itself cannot
-            # be read. The caller can still return a controlled 503 and the browser
-            # can use its last-good session projection.
             raise RuntimeError(
                 f"durable dashboard reconstruction failed: {type(exc).__name__}"
             ) from exc
@@ -257,24 +340,31 @@ def build_production_dashboard_snapshot(
         base["presentation_fallback_reason"] = fallback_reason
 
     combined = dict(base)
-    freshness = research_projection_freshness(research)
+    current = datetime.now(timezone.utc)
+    research_freshness = research_projection_freshness(research, now=current)
+    operating_freshness = operating_projection_freshness(research, now=current)
     if research is not None:
-        stale = bool(freshness.get("stale"))
-        mechanisms = research.get("mechanisms") or combined.get("mechanisms") or {}
-        if stale:
-            mechanisms = _stale_research_mechanisms(mechanisms, freshness=freshness)
+        mechanisms = reconcile_mechanism_runtime_truth(
+            research.get("mechanisms") or combined.get("mechanisms") or {},
+            now=current,
+            research_freshness=research_freshness,
+            operating_freshness=operating_freshness,
+        )
+        any_stale = bool(research_freshness.get("stale")) or bool(operating_freshness.get("stale"))
         combined.update(
             {
                 "projection_version": max(2, int(combined.get("projection_version") or 1)),
                 "projection_mode": (
                     "portfolio_plus_stale_research"
-                    if stale
+                    if any_stale
                     else "portfolio_plus_persisted_research"
                 ),
                 "observed_at": research.get("observed_at") or combined.get("observed_at"),
                 "research_projection_observed_at": research.get("observed_at"),
-                "research_projection_stale": stale,
-                "research_projection_freshness": freshness,
+                "research_projection_stale": bool(research_freshness.get("stale")),
+                "research_projection_freshness": research_freshness,
+                "operating_projection_stale": bool(operating_freshness.get("stale")),
+                "operating_projection_freshness": operating_freshness,
                 "source_operating_observed_at": research.get("source_operating_observed_at"),
                 "source_research_closure_observed_at": research.get(
                     "source_research_closure_observed_at"
@@ -287,7 +377,9 @@ def build_production_dashboard_snapshot(
     else:
         combined.setdefault("projection_mode", "portfolio_persisted_only")
         combined["research_projection_stale"] = False
-        combined["research_projection_freshness"] = freshness
+        combined["research_projection_freshness"] = research_freshness
+        combined["operating_projection_stale"] = False
+        combined["operating_projection_freshness"] = operating_freshness
 
     combined["critical_path_persisted_only"] = True
     combined["request_time_research_computation"] = False
