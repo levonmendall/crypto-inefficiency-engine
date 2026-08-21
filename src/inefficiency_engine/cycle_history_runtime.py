@@ -140,6 +140,13 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "walk_forward_ready_asset_count": replay_ready_count,
         "historical_replay_qualified_asset_count": replay_qualified_count,
         "all_complete": bool(rows) and complete_count == len(rows),
+        "provider_blocked_asset_count": sum(row.get("status") == "provider_blocked" for row in rows),
+        "insufficient_asset_age_count": sum(
+            row.get("status") == "insufficient_asset_age" for row in rows
+        ),
+        "partial_provider_history_count": sum(
+            row.get("status") == "partial_provider_history" for row in rows
+        ),
         "total_quote_count": total_quotes,
         "expected_quote_count": total_expected,
         "overall_coverage_fraction": (
@@ -163,6 +170,9 @@ def read_cycle_history_status(store: EvidenceStore) -> dict[str, Any]:
             "complete_asset_count": 0,
             "walk_forward_ready_asset_count": 0,
             "historical_replay_qualified_asset_count": 0,
+            "provider_blocked_asset_count": 0,
+            "insufficient_asset_age_count": 0,
+            "partial_provider_history_count": 0,
             "all_complete": False,
             "total_quote_count": 0,
             "expected_quote_count": 0,
@@ -190,6 +200,49 @@ def _error_map(errors: Iterable[str]) -> dict[str, str]:
     return result
 
 
+def _status_name(*, complete: bool, last_error_type: str | None) -> str:
+    if complete:
+        return "complete"
+    return {
+        "ProviderBlocked": "provider_blocked",
+        "InsufficientAssetAge": "insufficient_asset_age",
+        "PartialProviderHistory": "partial_provider_history",
+        "NotListed": "not_listed",
+        "ProviderUnavailable": "provider_unavailable",
+    }.get(str(last_error_type or ""), "retrying")
+
+
+def _targeted_coverage(
+    research: CycleHistoricalResearch,
+    asset: str,
+    *,
+    start: datetime,
+    end: datetime,
+) -> tuple[int, datetime | None, datetime | None]:
+    try:
+        return research._coverage(asset, start=start, end=end)  # noqa: SLF001
+    except TypeError:
+        # Test doubles and older additive implementations may expose the original
+        # asset-only signature. The production implementation is target-aware.
+        return research._coverage(asset)  # type: ignore[call-arg]  # noqa: SLF001
+
+
+def _preferred_provider(
+    research: CycleHistoricalResearch,
+    asset: str,
+    *,
+    start: datetime,
+    end: datetime,
+) -> str | None:
+    preferred = getattr(research, "preferred_venue", None)
+    if not callable(preferred):
+        return None
+    try:
+        return preferred(asset, start=start, end=end)
+    except TypeError:
+        return preferred(asset)
+
+
 def _asset_status(
     *,
     research: CycleHistoricalResearch,
@@ -197,15 +250,21 @@ def _asset_status(
     settings: Settings,
     observed_at: datetime,
     last_error_type: str | None,
+    provider_attempts: Iterable[str],
     fetched_this_attempt: bool,
     stored_quote_count_this_attempt: int,
     replay,
     replay_error_type: str | None,
 ) -> dict[str, Any]:
-    count, earliest, latest = research._coverage(asset)  # noqa: SLF001 - same bounded research subsystem
     expected = research.backfill_days * (86400 // HISTORICAL_CANDLE_SECONDS)
     end = _utc_day_start(observed_at)
     start = end - timedelta(days=research.backfill_days)
+    count, earliest, latest = _targeted_coverage(
+        research,
+        asset,
+        start=start,
+        end=end,
+    )
     complete = bool(
         count >= int(expected * 0.90)
         and earliest is not None
@@ -237,8 +296,15 @@ def _asset_status(
     return {
         "asset": asset.upper(),
         "observed_at": observed_at.isoformat(),
-        "status": "complete" if complete else "retrying",
+        "status": _status_name(complete=complete, last_error_type=last_error_type),
         "complete": complete,
+        "historical_provider": _preferred_provider(
+            research,
+            asset,
+            start=start,
+            end=end,
+        ),
+        "provider_attempts": [str(item) for item in provider_attempts],
         "quote_count": count,
         "expected_quote_count": expected,
         "coverage_fraction": coverage,
@@ -309,6 +375,9 @@ async def maintain_cycle_history_once(
     errors = _error_map(getattr(report, "errors", ()) if report is not None else ())
     fetched_assets = set(getattr(report, "fetched_assets", ()) if report is not None else ())
     stored_this_attempt = int(getattr(report, "stored_quote_count", 0) if report is not None else 0)
+    diagnostics = getattr(report, "provider_diagnostics", {}) if report is not None else {}
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
 
     for asset in requested:
         payload = _asset_status(
@@ -317,6 +386,7 @@ async def maintain_cycle_history_once(
             settings=settings,
             observed_at=observed_at,
             last_error_type=errors.get(asset) or global_error_type,
+            provider_attempts=diagnostics.get(asset, ()),
             fetched_this_attempt=asset in fetched_assets,
             stored_quote_count_this_attempt=stored_this_attempt if asset in fetched_assets else 0,
             replay=replay.get((asset, "long")),
@@ -337,6 +407,9 @@ async def maintain_cycle_history_once(
             "historical_replay_qualified_asset_count": summary.get(
                 "historical_replay_qualified_asset_count", 0
             ),
+            "provider_blocked_asset_count": summary.get("provider_blocked_asset_count", 0),
+            "insufficient_asset_age_count": summary.get("insufficient_asset_age_count", 0),
+            "partial_provider_history_count": summary.get("partial_provider_history_count", 0),
             "overall_coverage_fraction": summary.get("overall_coverage_fraction", 0.0),
             "historical_counts_as_forward": False,
         },
