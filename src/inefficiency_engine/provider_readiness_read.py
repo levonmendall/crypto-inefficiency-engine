@@ -184,16 +184,23 @@ def reconcile_provider_readiness(
                     "continue source/economic/forward evidence collection under unchanged gates"
                 )
         else:
-            # Source Coverage Plane may know about authoritative sources outside this
-            # legacy provider-admission ledger. Never let the narrower ledger erase a
-            # newer explicit source classification or a provider-ready fact produced
-            # by that broader plane.
+            # Explicit source stages come from the broader Source Coverage Plane and
+            # are more specific than this legacy provider-admission ledger. Preserve
+            # them. A completed source layer is also authoritative even if one legacy
+            # primary probe fails because another independent source may be carrying
+            # the lane. Legacy/generic rows still honor the newest failed probe and
+            # fail closed exactly as before this repair.
             explicit_non_provider_gap = source_wait in {
                 "evidence_class_gap",
                 "redundancy_gap",
                 "stale",
             }
-            if not explicit_non_provider_gap and row.get("provider_ready") is not True:
+            broader_source_complete = bool(
+                source_wait is None
+                and str(row.get("stage") or "") == "profitability_certifiable"
+                and row.get("provider_ready") is True
+            )
+            if not explicit_non_provider_gap and not broader_source_complete:
                 row["provider_ready"] = False
                 row["state"] = "provider_gap"
                 row["stage"] = "waiting_for_source:provider_gap"
