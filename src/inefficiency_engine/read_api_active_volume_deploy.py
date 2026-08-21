@@ -10,7 +10,9 @@ from inefficiency_engine.active_volume_runtime import (
     read_active_volume_universe_status,
 )
 from inefficiency_engine.lane_readiness import build_lane_executable_readiness
+from inefficiency_engine.production_dashboard_fastpath import build_production_dashboard_snapshot
 from inefficiency_engine.service import OpportunityService
+from inefficiency_engine.source_coverage_catalog import LANES
 
 
 app = _base_deploy.app
@@ -44,11 +46,55 @@ def _release_commit() -> str | None:
 
 
 def _lane_readiness():
+    """Detailed diagnostic path only; never called by the dashboard fast path."""
     store = _store()
     if store is None:
         raise HTTPException(status_code=503, detail="evidence persistence is not configured")
     core = OpportunityService(settings=_base_deploy._base.settings, evidence_store=store)  # noqa: SLF001
     return build_lane_executable_readiness(core, store)
+
+
+def _lane_summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
+    """Build a non-blocking summary from already-persisted mechanism rows.
+
+    Architecture capability is a code property. Current qualification/profitability
+    counts are reported only from the compact worker-published mechanism rows already
+    present in the dashboard payload; this function performs no database or provider
+    work and cannot delay NAV/cash visibility.
+    """
+
+    mechanisms = payload.get("mechanisms")
+    rows: list[dict[str, object]] = []
+    if isinstance(mechanisms, dict):
+        raw_rows = mechanisms.get("mechanisms")
+        if isinstance(raw_rows, list):
+            rows = [row for row in raw_rows if isinstance(row, dict)]
+
+    def _qualified(row: dict[str, object]) -> bool:
+        if bool(row.get("currently_qualified")):
+            return True
+        if str(row.get("state") or "") in {"certifying", "certified"}:
+            return True
+        try:
+            return int(row.get("current_promoted_count") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    lane_count = len(LANES)
+    return {
+        "available": bool(rows),
+        "lane_count": lane_count,
+        "architecture_executable_count": lane_count,
+        "currently_qualified_count": sum(_qualified(row) for row in rows),
+        "profitability_certified_count": sum(
+            bool(row.get("profitability_certified")) for row in rows
+        ),
+        "all_lanes_paper_execution_capable": lane_count == 13,
+        "live_execution_capable": False,
+        "summary_source": "persisted_dashboard_projection",
+        "request_time_research_computation": False,
+        "detail_endpoint": "/v3/lane-executability",
+    }
 
 
 @app.get("/health")
@@ -60,6 +106,7 @@ def deployment_health():
             "volume_universe_observability": True,
             "active_cycle_history_membership": True,
             "thirteen_lane_executable_readiness": True,
+            "dashboard_critical_path_persisted_only": True,
         }
     )
     return payload
@@ -74,6 +121,7 @@ def deployment_readiness():
             "volume_universe_observability": True,
             "active_cycle_history_membership": True,
             "thirteen_lane_executable_readiness": True,
+            "dashboard_critical_path_persisted_only": True,
         }
     )
     return payload
@@ -109,7 +157,7 @@ def cycle_history_status():
 
 @app.get("/v3/lane-executability")
 def lane_executability():
-    """Separate architecture capability from real current evidence qualification."""
+    """Detailed diagnostic endpoint; intentionally outside the dashboard deadline."""
     try:
         return _lane_readiness().model_dump(mode="json")
     except HTTPException:
@@ -132,31 +180,42 @@ def lane_executability_detail(lane_id: str):
 
 @app.get("/v3/dashboard/snapshot")
 def dashboard_snapshot():
-    """Augment the established dashboard projection with exact active membership."""
+    """Return a bounded persisted-only command-center snapshot.
 
-    payload = dict(_base_deploy.dashboard_snapshot())
+    The phone refresh deadline must never include research/service construction.
+    Normal reads use worker-published compact projections; if the portfolio compact
+    row is absent, the server reconstructs the portfolio once from durable tables in
+    one bounded read path. Top-40 and history metadata remain optional DB-only
+    enrichments and cannot erase the canonical portfolio payload.
+    """
+
     store = _store()
     if store is None:
-        payload["volume_universe"] = {
-            "available": False,
-            "asset_count": 0,
-            "assets": [],
-            "volume_is_defining_metric": True,
-        }
-        payload["cycle_history"] = {
-            "available": False,
-            "asset_count": 0,
-            "assets": [],
-            "historical_counts_as_forward": False,
-            "live_execution_authority": False,
-        }
-        payload["lane_executability"] = {
-            "available": False,
-            "all_lanes_paper_execution_capable": False,
-            "live_execution_capable": False,
-        }
-        payload["release_commit"] = _release_commit()
-        return payload
+        raise HTTPException(status_code=503, detail="evidence persistence is not configured")
+
+    try:
+        payload = build_production_dashboard_snapshot(
+            store,
+            forward_target=max(
+                1,
+                int(getattr(_base_deploy._base.settings, "alpha_min_forward_samples", 30)),  # noqa: SLF001
+            ),
+            settled_target=max(
+                5,
+                int(
+                    getattr(
+                        _base_deploy._base.settings,  # noqa: SLF001
+                        "operating_certification_min_settled_trials",
+                        20,
+                    )
+                ),
+            ),
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="persisted dashboard snapshot is temporarily unavailable",
+        ) from exc
 
     try:
         volume = read_active_volume_universe_status(store)
@@ -177,28 +236,12 @@ def dashboard_snapshot():
             "historical_counts_as_forward": False,
             "live_execution_authority": False,
         }
-    try:
-        readiness = _lane_readiness()
-        lane_summary = {
-            "available": True,
-            "lane_count": readiness.lane_count,
-            "architecture_executable_count": readiness.architecture_executable_count,
-            "currently_qualified_count": readiness.currently_qualified_count,
-            "profitability_certified_count": readiness.profitability_certified_count,
-            "all_lanes_paper_execution_capable": readiness.all_lanes_paper_execution_capable,
-            "live_execution_capable": False,
-        }
-    except Exception:
-        lane_summary = {
-            "available": False,
-            "all_lanes_paper_execution_capable": False,
-            "live_execution_capable": False,
-        }
 
     payload["volume_universe"] = volume
     payload["cycle_history"] = cycle_history
-    payload["lane_executability"] = lane_summary
+    payload["lane_executability"] = _lane_summary_from_payload(payload)
     payload["release_commit"] = _release_commit()
     payload["volume_universe_observability"] = True
     payload["active_cycle_history_membership"] = True
+    payload["dashboard_critical_path_persisted_only"] = True
     return payload
