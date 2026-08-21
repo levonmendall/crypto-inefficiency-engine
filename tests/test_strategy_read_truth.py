@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from inefficiency_engine.config import Settings
+from inefficiency_engine.evidence import EvidenceStore
+from inefficiency_engine.executable_alpha_factory import ExecutableExpandedAlphaFactoryService
 from inefficiency_engine.strategy_evidence_read import (
     _CANONICAL_ALPHA_STRATEGIES,
     diagnose_alpha_strategy,
@@ -25,6 +29,15 @@ def test_strategy_inventory_exposes_all_current_executable_alpha_strategies():
     assert "public_trade_flow_lead_lag_v1" in rows
     assert "onchain_factor_breadth_v1" in rows
     assert "event_driven_surprise_v1" in rows
+
+
+def test_strategy_read_inventory_exactly_matches_executable_registry(tmp_path):
+    store = EvidenceStore(tmp_path / "strategy-registry.sqlite3")
+    core = SimpleNamespace(settings=Settings())
+    runtime = ExecutableExpandedAlphaFactoryService(core, store)
+    runtime_ids = {manifest.strategy_id for manifest in runtime.registry.manifests()}
+    read_ids = {strategy_id for _, _, strategy_id, _ in _CANONICAL_ALPHA_STRATEGIES}
+    assert runtime_ids == read_ids
 
 
 def test_read_model_does_not_treat_cross_asset_rows_as_fully_independent():

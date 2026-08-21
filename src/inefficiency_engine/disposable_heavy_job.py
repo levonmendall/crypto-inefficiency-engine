@@ -6,7 +6,10 @@ import os
 import uuid
 
 from inefficiency_engine.config import Settings
-from inefficiency_engine.disposable_research_worker import run_disposable_research_cycle
+from inefficiency_engine.disposable_research_worker import (
+    RESEARCH_WORKER_ID,
+    run_disposable_research_cycle,
+)
 from inefficiency_engine.evidence import build_evidence_store
 from inefficiency_engine.heavy_work_lease import HeavyWorkLeaseLedger, HeavyWorkLeaseUnavailable
 from inefficiency_engine.history_batch_job import maintain_history_batch_once
@@ -15,6 +18,36 @@ from inefficiency_engine.service import OpportunityService
 
 
 HEAVY_WORKER_ID = "disposable-heavy-work"
+
+
+def _research_completion_state(store) -> tuple[str, str | None, dict[str, object]]:
+    """Propagate the research worker's truthful subsystem state one level upward."""
+    try:
+        heartbeat = store.latest_worker_heartbeat(RESEARCH_WORKER_ID)
+    except Exception:
+        heartbeat = None
+    if heartbeat is None:
+        return (
+            "degraded",
+            "ResearchHeartbeatUnavailable",
+            {"research_worker_state": "unavailable"},
+        )
+    state = str(getattr(heartbeat, "state", "") or "unknown")
+    error_type = getattr(heartbeat, "error_type", None)
+    detail = getattr(heartbeat, "detail", {}) or {}
+    propagated = {
+        "research_worker_state": state,
+        "research_worker_error_type": error_type,
+        "research_subsystem_error_count": int(detail.get("subsystem_error_count") or 0)
+        if isinstance(detail, dict)
+        else 0,
+        "research_subsystem_error_keys": list(detail.get("subsystem_error_keys") or [])
+        if isinstance(detail, dict)
+        else [],
+    }
+    if state in {"degraded", "error", "stopped"}:
+        return "degraded", str(error_type or "ResearchSubsystemDegraded"), propagated
+    return "success", None, propagated
 
 
 async def _run(job: str) -> int:
@@ -74,6 +107,9 @@ async def _run(job: str) -> int:
             },
         )
 
+        completion_state = "success"
+        completion_error_type: str | None = None
+        propagated_detail: dict[str, object] = {}
         if job == "research":
             service = OpportunityService(settings=settings, evidence_store=store)
             result = await run_disposable_research_cycle(
@@ -81,10 +117,14 @@ async def _run(job: str) -> int:
                 store,
                 sequence=sequence,
             )
+            completion_state, completion_error_type, propagated_detail = (
+                _research_completion_state(store)
+            )
             result_detail: dict[str, object] = {
                 "cycles_attempted": result.cycles_attempted,
                 "cycles_succeeded": result.cycles_succeeded,
                 "cycles_failed": result.cycles_failed,
+                **propagated_detail,
             }
         elif job == "history":
             payload = await maintain_history_batch_once(store, settings=settings)
@@ -101,7 +141,8 @@ async def _run(job: str) -> int:
         after = instance_memory_snapshot()
         store.record_worker_heartbeat(
             worker_id=HEAVY_WORKER_ID,
-            state="success",
+            state=completion_state,
+            error_type=completion_error_type,
             detail={
                 "job": job,
                 "sequence": sequence,
@@ -115,6 +156,9 @@ async def _run(job: str) -> int:
                 **result_detail,
             },
         )
+        # A degraded research cycle is deliberately visible in durable telemetry but
+        # is not process-fatal: the supervisor must keep scheduling independent
+        # disposable cycles so transient providers can recover automatically.
         return 0
     except Exception as exc:
         try:
