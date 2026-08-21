@@ -121,6 +121,135 @@ def _decode_projection(raw: object | None, *, label: str) -> dict[str, object] |
     return payload
 
 
+def _safe_decode_projection(raw: object | None, *, label: str) -> dict[str, object] | None:
+    try:
+        return _decode_projection(raw, label=label)
+    except HTTPException:
+        return None
+
+
+def _read_mapping(call, fallback: dict[str, object]) -> dict[str, object]:
+    """Contain one diagnostic read so presentation fallback never hides canonical data."""
+    try:
+        payload = call()
+    except Exception:
+        return dict(fallback)
+    return dict(payload) if isinstance(payload, dict) else dict(fallback)
+
+
+def _durable_portfolio_fallback(*, reason: str) -> dict[str, object]:
+    """Reconstruct the dashboard from bounded durable reads when its cache is absent.
+
+    This is presentation-only. It never writes state, creates schema, reruns research,
+    or synthesizes portfolio economics. If canonical state itself does not exist the
+    portfolio remains explicitly unavailable; research sections degrade independently.
+    """
+
+    portfolio = _read_mapping(
+        _base.canonical_portfolio,
+        {
+            "available": False,
+            "portfolio_id": _base.CANONICAL_PORTFOLIO_ID,
+            "initial_capital_usd": _base.CANONICAL_INITIAL_CAPITAL_USD,
+            "paper_only": True,
+        },
+    )
+    performance = _read_mapping(
+        _base.canonical_portfolio_performance,
+        {
+            "available": False,
+            "portfolio_id": _base.CANONICAL_PORTFOLIO_ID,
+            "initial_capital_usd": _base.CANONICAL_INITIAL_CAPITAL_USD,
+            "paper_only": True,
+            "live_execution_authority": False,
+        },
+    )
+    runtime = _read_mapping(
+        _base.canonical_portfolio_runtime_status,
+        {
+            "portfolio_id": _base.CANONICAL_PORTFOLIO_ID,
+            "paper_only": True,
+            "operational": False,
+            "degraded": True,
+            "valuation_status": "unavailable",
+            "cycle_status": "unavailable",
+            "allocation_family_failures": [],
+        },
+    )
+    positions = _read_mapping(
+        _base.canonical_portfolio_positions,
+        {"portfolio_id": _base.CANONICAL_PORTFOLIO_ID, "paper_only": True, "count": 0, "positions": []},
+    )
+    trades = _read_mapping(
+        lambda: _base.canonical_portfolio_trades(limit=20),
+        {"portfolio_id": _base.CANONICAL_PORTFOLIO_ID, "paper_only": True, "count": 0, "trades": []},
+    )
+    history = _read_mapping(
+        lambda: _base.canonical_portfolio_history(limit=250),
+        {"portfolio_id": _base.CANONICAL_PORTFOLIO_ID, "paper_only": True, "count": 0, "snapshots": []},
+    )
+    skips = _read_mapping(
+        lambda: _base.canonical_portfolio_skips(limit=20),
+        {"portfolio_id": _base.CANONICAL_PORTFOLIO_ID, "paper_only": True, "count": 0, "skips": []},
+    )
+    attribution = _read_mapping(
+        _base.canonical_portfolio_attribution,
+        {
+            "portfolio_id": _base.CANONICAL_PORTFOLIO_ID,
+            "paper_only": True,
+            "pnl_by_mechanism_usd": {},
+            "pnl_by_strategy_usd": {},
+        },
+    )
+    requirements = {
+        "independent_forward_outcomes": max(
+            1,
+            int(getattr(_base.settings, "alpha_min_forward_samples", 30)),
+        ),
+        "settled_allocator_outcomes": max(
+            5,
+            int(getattr(_base.settings, "operating_certification_min_settled_trials", 20)),
+        ),
+    }
+    mechanisms = _read_mapping(
+        _base.operating_mechanisms,
+        {
+            "paper_only": True,
+            "count": 0,
+            "observed_at": None,
+            "requirements": requirements,
+            "live_telemetry": {"available": False},
+            "mechanisms": [],
+        },
+    )
+    queue = _read_mapping(
+        _base.operating_action_queue,
+        {"paper_only": True, "count": 0, "actions": []},
+    )
+    observed_at = portfolio.get("observed_at") or runtime.get("latest_snapshot_observed_at")
+    return {
+        "projection_version": 1,
+        "projection_kind": "portfolio",
+        "projection_mode": "durable_portfolio_fallback",
+        "presentation_fallback": True,
+        "presentation_fallback_reason": reason,
+        "observed_at": observed_at,
+        "source_portfolio_observed_at": observed_at,
+        "portfolio": portfolio,
+        "performance": performance,
+        "runtime": runtime,
+        "positions": positions,
+        "trades": trades,
+        "history": history,
+        "skips": skips,
+        "attribution": attribution,
+        "mechanisms": mechanisms,
+        "queue": queue,
+        "paper_only": True,
+        "live_execution_authority": False,
+    }
+
+
 def _attributed_sections(
     store,
     mechanisms: dict[str, object],
@@ -161,29 +290,31 @@ def cycle_history_status():
 def dashboard_snapshot():
     """Return portfolio state plus the independently refreshed research-card projection.
 
-    The browser still makes one request. The API performs bounded tail reads inside
-    one transaction: the latest portfolio-led snapshot plus, when available, the
-    research snapshot published after the latest successful research cycle. Provider,
-    strategy, and operating-state reconciliation are presentation-only and cannot
-    create economic, statistical, allocation, or execution authority. Cycle-history
-    status is read from a tiny durable per-asset status table owned by the maintenance
-    worker; historical rows remain separate from genuine forward evidence.
+    The browser still makes one request. The normal path performs bounded tail reads
+    from worker-published compact projections. If that presentation cache is absent,
+    invalid, or temporarily unreadable, the API reconstructs only the display payload
+    from bounded durable canonical reads. Research/history may degrade independently;
+    canonical portfolio visibility does not depend on their publication cadence.
     """
     store = _base.evidence_store
     if store is None:
         raise HTTPException(status_code=503, detail="evidence persistence is not configured")
+
+    base_raw = None
+    research_raw = None
+    compact_read_error: str | None = None
     try:
         with store.engine.begin() as db:
             if store.backend == "postgresql":
                 db.execute(text("SET LOCAL statement_timeout = '2500ms'"))
                 db.execute(text("SET LOCAL lock_timeout = '1000ms'"))
-            base_raw = db.execute(
-                text(
-                    "SELECT payload_json FROM dashboard_projection_snapshots "
-                    "ORDER BY id DESC LIMIT 1"
-                )
-            ).scalar_one_or_none()
-            research_raw = None
+            if _projection_table_exists(db, store.backend, "dashboard_projection_snapshots"):
+                base_raw = db.execute(
+                    text(
+                        "SELECT payload_json FROM dashboard_projection_snapshots "
+                        "ORDER BY id DESC LIMIT 1"
+                    )
+                ).scalar_one_or_none()
             if _projection_table_exists(db, store.backend, "dashboard_research_projection_snapshots"):
                 research_raw = db.execute(
                     text(
@@ -192,18 +323,15 @@ def dashboard_snapshot():
                     )
                 ).scalar_one_or_none()
     except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="dashboard projection is temporarily unavailable",
-        ) from exc
+        compact_read_error = type(exc).__name__
 
-    base = _decode_projection(base_raw, label="portfolio")
+    base = _safe_decode_projection(base_raw, label="portfolio")
     if base is None:
-        raise HTTPException(
-            status_code=503,
-            detail="dashboard projection is awaiting its first worker publication",
+        fallback_reason = compact_read_error or (
+            "compact_projection_invalid" if base_raw is not None else "compact_projection_unavailable"
         )
-    research = _decode_projection(research_raw, label="research")
+        base = _durable_portfolio_fallback(reason=fallback_reason)
+    research = _safe_decode_projection(research_raw, label="research")
 
     source_mechanisms = (
         (research or {}).get("mechanisms")

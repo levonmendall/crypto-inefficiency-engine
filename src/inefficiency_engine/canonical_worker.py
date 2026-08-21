@@ -81,7 +81,7 @@ async def run_canonical_portfolio_loop(
     Forward allocation and mechanism certification deliberately do not run here.
     A provider-heavy certification stall must never hold the canonical heartbeat
     open long enough for the process watchdog to kill the Render worker. Dashboard
-    projection is a bounded, presentation-only post-cycle publication.
+    projection is a bounded, presentation-only pre-cycle and post-cycle publication.
     """
 
     interval = (
@@ -112,6 +112,11 @@ async def run_canonical_portfolio_loop(
                 "paper_only": True,
             },
         )
+        if attempted == 1:
+            # Genesis and its cash-only integrity state are already durable. Publish
+            # them before the first potentially slow provider-backed portfolio cycle
+            # so UI visibility is never coupled to provider latency.
+            _publish_dashboard_projection(service, store, dashboard_projection)
 
         error_type: str | None = None
         cycle = None
