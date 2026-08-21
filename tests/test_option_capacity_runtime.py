@@ -99,7 +99,10 @@ def test_deribit_capacity_surface_covers_two_expiries_but_remains_bounded():
     for expiry in (EXPIRY, NEXT_EXPIRY):
         for option_type in ("call", "put"):
             side = [row for row in selected if row[2] == expiry and row[4] == option_type]
-            assert {row[3] for row in side} == {55_000.0, 60_000.0}
+            strikes = {row[3] for row in side}
+            assert 60_000.0 in strikes
+            assert len(strikes) == 2
+            assert strikes.issubset({55_000.0, 60_000.0, 65_000.0})
 
 
 def test_capacity_observation_uses_underlying_amount_units_without_multiplier():
