@@ -9,7 +9,7 @@ LANES: dict[str, dict[str, object]] = {
     "mean_reversion": {"name":"Mean reversion / reversal","required":["market_history","execution_costs"]},
     "fundamental_onchain": {"name":"On-chain / fundamental factor alpha","required":["chain_activity","protocol_fundamentals"]},
     "cross_sectional_relative_value": {"name":"Cross-sectional / statistical relative value","required":["multi_asset_market_history","execution_costs"]},
-    "volatility": {"name":"Volatility / options risk premia","required":["option_quotes","option_greeks","option_depth"],"downstream":["delta-hedge forward outcomes","gap/vega/gamma calibration"]},
+    "volatility": {"name":"Volatility / options risk premia","required":["option_quotes","option_greeks","option_depth","option_capacity"],"downstream":["delta-hedge forward outcomes","gap/vega/gamma calibration"]},
     "event_driven": {"name":"Event-driven alpha","required":["timestamped_events","event_identity"]},
     "microstructure": {"name":"Market microstructure / order-flow alpha","required":["order_book","trade_flow"]},
     "liquidation_distress": {"name":"Liquidation / distress / solver opportunities","required":["liquidation_events","distress_state"],"downstream":["capture-probability calibration","recovery/settlement outcomes"]},
