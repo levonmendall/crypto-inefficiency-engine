@@ -40,6 +40,7 @@ SOURCES: tuple[dict[str, object], ...] = (
     {"id":"ethereum-publicnode","name":"Ethereum finalized RPC","lanes":["fundamental_onchain"],"classes":["chain_activity"],"group":"ethereum-rpc","tier":"protocol_native","provider":["ethereum-mainnet:publicnode-finalized"]},
     {"id":"defillama-protocols","name":"DefiLlama protocol metrics","lanes":["fundamental_onchain"],"classes":["protocol_fundamentals"],"group":"defillama","tier":"secondary","authoritative":False},
     {"id":"deribit-options","name":"Deribit option books and Greeks","lanes":["volatility"],"classes":["option_quotes","option_greeks","option_depth"],"group":"deribit","tier":"first_party","provider":["deribit:public-option-order-book"]},
+    {"id":"deribit-option-capacity","name":"Deribit normalized visible option capacity","lanes":["volatility"],"classes":["option_capacity"],"group":"deribit","tier":"first_party"},
     {"id":"bybit-options","name":"Bybit options","lanes":["volatility"],"classes":["option_quotes","option_greeks"],"group":"bybit","tier":"first_party"},
     {"id":"okx-options","name":"OKX options","lanes":["volatility"],"classes":["option_quotes","option_greeks","option_depth"],"group":"okx","tier":"first_party"},
     {"id":"bybit-liquidations","name":"Bybit all-liquidation stream","lanes":["liquidation_distress","microstructure"],"classes":["liquidation_events","liquidation_pressure"],"group":"bybit","tier":"first_party"},
