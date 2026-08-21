@@ -137,11 +137,12 @@ def _lane_readiness():
 def _lane_summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
     """Build a non-blocking lane summary from persisted operating truth.
 
-    Architecture capability, production evidence connectivity, and decision-grade
-    qualification are separate claims. A lane is paper-execution-capable here only
-    when a worker-published operating row has reached a positive allocation-grade
-    state and the production evidence path is connected. Research shadows and code
-    presence cannot create executability. This function performs no provider work.
+    Architecture capability, production evidence connectivity, positive decision-grade
+    qualification, and current promoted opportunities are separate claims. A lane is
+    paper-execution-capable here only when a worker-published operating row has reached
+    a positive allocation-grade conclusion and the production evidence path is connected.
+    Research shadows and code presence cannot create executability. This function
+    performs no provider work.
     """
 
     mechanisms = payload.get("mechanisms")
@@ -151,15 +152,19 @@ def _lane_summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
         if isinstance(raw_rows, list):
             rows = [row for row in raw_rows if isinstance(row, dict)]
 
-    def _qualified(row: dict[str, object]) -> bool:
+    def _currently_qualified(row: dict[str, object]) -> bool:
         if bool(row.get("currently_qualified")):
-            return True
-        if str(row.get("state") or "") in {"certifying", "certified"}:
             return True
         try:
             return int(row.get("current_promoted_count") or 0) > 0
         except (TypeError, ValueError):
             return False
+
+    def _decision_grade_positive(row: dict[str, object]) -> bool:
+        return _currently_qualified(row) or str(row.get("state") or "") in {
+            "certifying",
+            "certified",
+        }
 
     lane_count = len(LANES)
     connected_ids = {
@@ -167,15 +172,22 @@ def _lane_summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
         if lane_id not in _PRODUCTION_EVIDENCE_DISCONNECTED
     }
     connected_count = len(connected_ids)
-    qualified_ids = {
+    current_ids = {
         str(row.get("mechanism_id") or "")
         for row in rows
-        if str(row.get("mechanism_id") or "") in LANES and _qualified(row)
+        if str(row.get("mechanism_id") or "") in LANES
+        and _currently_qualified(row)
+    }
+    decision_grade_ids = {
+        str(row.get("mechanism_id") or "")
+        for row in rows
+        if str(row.get("mechanism_id") or "") in LANES
+        and _decision_grade_positive(row)
     }
     projection_current = not bool(payload.get("research_projection_stale")) and not bool(
         payload.get("operating_projection_stale")
     )
-    executable_ids = qualified_ids & connected_ids if projection_current else set()
+    executable_ids = decision_grade_ids & connected_ids if projection_current else set()
 
     return {
         "available": bool(rows),
@@ -186,8 +198,8 @@ def _lane_summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
         "production_evidence_disconnected_lanes": sorted(
             _PRODUCTION_EVIDENCE_DISCONNECTED
         ),
-        "decision_grade_outcome_qualified_count": len(qualified_ids),
-        "currently_qualified_count": len(qualified_ids),
+        "decision_grade_outcome_qualified_count": len(decision_grade_ids),
+        "currently_qualified_count": len(current_ids),
         "paper_execution_capable_count": len(executable_ids),
         "paper_execution_capable_lanes": sorted(executable_ids),
         "profitability_certified_count": sum(
