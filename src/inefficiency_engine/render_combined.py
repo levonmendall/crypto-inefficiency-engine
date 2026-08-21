@@ -15,12 +15,16 @@ from inefficiency_engine.instance_memory import instance_memory_snapshot
 
 API_APP = "inefficiency_engine.read_api_active_volume_deploy:app"
 PORTFOLIO_WORKER_ID = "canonical-portfolio-operating-loop"
+RESEARCH_WORKER_ID = "shadow-research-auxiliary"
 DEFAULT_RESEARCH_INTERVAL_SECONDS = 30.0
 DEFAULT_HISTORY_INTERVAL_SECONDS = 300.0
 DEFAULT_HEAVY_STARTUP_GRACE_SECONDS = 90.0
 DEFAULT_PORTFOLIO_WATCHDOG_STARTUP_GRACE_SECONDS = 180.0
 DEFAULT_PORTFOLIO_RUNNING_STALE_SECONDS = 210.0
 DEFAULT_PORTFOLIO_HEARTBEAT_STALE_SECONDS = 600.0
+DEFAULT_RESEARCH_WATCHDOG_STARTUP_GRACE_SECONDS = 180.0
+DEFAULT_RESEARCH_HEARTBEAT_STALE_SECONDS = 900.0
+DEFAULT_RESEARCH_MEMORY_STARVATION_SECONDS = 600.0
 PORTFOLIO_WATCHDOG_CHECK_SECONDS = 15.0
 LOCAL_HEALTH_TIMEOUT_SECONDS = 2.0
 SUPERVISOR_POLL_SECONDS = 1.0
@@ -67,6 +71,33 @@ def heavy_commands() -> dict[str, list[str]]:
         "research": [*base, "research"],
         "history": [*base, "history"],
     }
+
+
+def choose_heavy_job(
+    *,
+    due_research: bool,
+    due_history: bool,
+    research_overdue: bool,
+) -> str | None:
+    """Research owns priority whenever its publication SLA is overdue or due."""
+
+    if research_overdue or due_research:
+        return "research"
+    if due_history:
+        return "history"
+    return None
+
+
+def research_memory_starvation_exceeded(
+    *,
+    research_overdue: bool,
+    blocked_since: float | None,
+    now: float,
+    limit_seconds: float,
+) -> bool:
+    if not research_overdue or blocked_since is None:
+        return False
+    return now - blocked_since >= max(1.0, float(limit_seconds))
 
 
 def _terminate_children(
@@ -164,16 +195,58 @@ def portfolio_watchdog_reason(
     return None
 
 
+def research_watchdog_reason(
+    payload: dict[str, object],
+    *,
+    runtime_age_seconds: float,
+    startup_grace_seconds: float = DEFAULT_RESEARCH_WATCHDOG_STARTUP_GRACE_SECONDS,
+    heartbeat_stale_seconds: float = DEFAULT_RESEARCH_HEARTBEAT_STALE_SECONDS,
+) -> str | None:
+    """Return why disposable research must be prioritized immediately.
+
+    Unlike the permanent portfolio worker, research is expected to exit after each
+    bounded cycle. Its liveness contract is therefore a durable publication SLA, not
+    process residency. Recent ``success`` or ``degraded`` heartbeats both prove that
+    the job executed; stale/error/stopped/unobserved heartbeats mean the scheduler
+    must prioritize a new research run.
+    """
+
+    if runtime_age_seconds < max(0.0, startup_grace_seconds):
+        return None
+    runtime = payload.get("runtime_heartbeats")
+    workers = runtime.get("workers") if isinstance(runtime, dict) else None
+    row = workers.get("research") if isinstance(workers, dict) else None
+    if not isinstance(row, dict) or not row.get("available"):
+        return "research worker has not published a durable heartbeat"
+    try:
+        age_seconds = max(0.0, float(row.get("age_seconds") or 0.0))
+    except (TypeError, ValueError):
+        return "research heartbeat age is invalid"
+    state = str(row.get("state") or "unknown")
+    if state in {"error", "stopped"}:
+        return f"research heartbeat state={state}; a new disposable research cycle is required"
+    if age_seconds > max(1.0, heartbeat_stale_seconds):
+        return (
+            f"research heartbeat is {age_seconds:.1f}s old "
+            f"(limit {heartbeat_stale_seconds:.1f}s; state={state})"
+        )
+    return None
+
+
 def main() -> int:
-    """Run a memory-bounded Render topology with disposable heavy processes.
+    """Run a memory-bounded Render topology with self-healing research/accounting.
 
     Only the read API and canonical portfolio stay resident. Research and historical
     maintenance are mutually exclusive subprocesses: one bounded cycle/batch runs,
     persists durable state, and exits so the OS reclaims its entire Python heap.
     Aggregate cgroup memory is checked before every heavy start and while a heavy job
-    is alive. The supervisor also watches the portfolio worker's durable heartbeat so
-    an alive-but-wedged child cannot leave the dashboard/account state frozen while
-    the API process continues serving stale data.
+    is alive.
+
+    Two distinct liveness contracts are enforced:
+    - canonical portfolio residency/heartbeat, so an alive-but-wedged worker restarts;
+    - disposable research publication freshness, so history cannot outrank overdue
+      research and persistent memory starvation triggers a clean Render restart to
+      reclaim the permanent-process heap rather than serving stale research forever.
     """
 
     port = os.getenv("PORT", "10000")
@@ -216,6 +289,21 @@ def main() -> int:
         DEFAULT_PORTFOLIO_HEARTBEAT_STALE_SECONDS,
         minimum=480.0,
     )
+    research_watchdog_startup_grace = _env_seconds(
+        "CIE_RESEARCH_WATCHDOG_STARTUP_GRACE_SECONDS",
+        DEFAULT_RESEARCH_WATCHDOG_STARTUP_GRACE_SECONDS,
+        minimum=60.0,
+    )
+    research_heartbeat_stale = _env_seconds(
+        "CIE_RESEARCH_HEARTBEAT_STALE_SECONDS",
+        DEFAULT_RESEARCH_HEARTBEAT_STALE_SECONDS,
+        minimum=300.0,
+    )
+    research_memory_starvation = _env_seconds(
+        "CIE_RESEARCH_MEMORY_STARVATION_SECONDS",
+        DEFAULT_RESEARCH_MEMORY_STARVATION_SECONDS,
+        minimum=300.0,
+    )
 
     def _request_stop(signum: int, _frame: object) -> None:
         nonlocal stopping
@@ -251,10 +339,14 @@ def main() -> int:
         "history": started_at + startup_grace + min(60.0, history_interval / 2.0),
     }
     intervals = {"research": research_interval, "history": history_interval}
-    next_portfolio_watchdog = started_at + min(
+    next_runtime_watchdog = started_at + min(
         PORTFOLIO_WATCHDOG_CHECK_SECONDS,
         portfolio_watchdog_startup_grace,
+        research_watchdog_startup_grace,
     )
+    research_overdue = False
+    research_overdue_reason: str | None = None
+    research_start_blocked_since: float | None = None
 
     try:
         # Canonical accounting starts first, then the read API. Heavy research waits
@@ -275,11 +367,11 @@ def main() -> int:
             now = time.monotonic()
             memory = instance_memory_snapshot()
 
-            if now >= next_portfolio_watchdog:
-                next_portfolio_watchdog = now + PORTFOLIO_WATCHDOG_CHECK_SECONDS
+            if now >= next_runtime_watchdog:
+                next_runtime_watchdog = now + PORTFOLIO_WATCHDOG_CHECK_SECONDS
                 try:
                     health = _local_health(port)
-                    reason = portfolio_watchdog_reason(
+                    portfolio_reason = portfolio_watchdog_reason(
                         health,
                         process_started_at=permanent_started_at["portfolio"],
                         process_age_seconds=max(
@@ -290,19 +382,46 @@ def main() -> int:
                         running_stale_seconds=portfolio_running_stale,
                         heartbeat_stale_seconds=portfolio_heartbeat_stale,
                     )
+                    research_reason = research_watchdog_reason(
+                        health,
+                        runtime_age_seconds=max(0.0, now - started_at),
+                        startup_grace_seconds=research_watchdog_startup_grace,
+                        heartbeat_stale_seconds=research_heartbeat_stale,
+                    )
+                    research_overdue = research_reason is not None
+                    research_overdue_reason = research_reason
                 except Exception as exc:
                     # Render's own /health probe remains the API-process authority.
-                    # Do not kill a healthy portfolio child merely because this local
-                    # diagnostic read was temporarily unavailable.
+                    # Preserve the prior research-overdue state when this local
+                    # diagnostic read is unavailable rather than declaring recovery.
                     print(
-                        f"portfolio watchdog health read unavailable: {type(exc).__name__}",
+                        f"runtime watchdog health read unavailable: {type(exc).__name__}",
                         flush=True,
                     )
-                    reason = None
-                if reason is not None:
-                    _restart_portfolio(reason)
+                    portfolio_reason = None
+                if portfolio_reason is not None:
+                    _restart_portfolio(portfolio_reason)
                     now = time.monotonic()
-                    next_portfolio_watchdog = now + PORTFOLIO_WATCHDOG_CHECK_SECONDS
+                    next_runtime_watchdog = now + PORTFOLIO_WATCHDOG_CHECK_SECONDS
+                if research_overdue:
+                    next_due["research"] = min(next_due["research"], now)
+                    next_due["history"] = max(
+                        next_due["history"],
+                        now + min(history_interval, 300.0),
+                    )
+                    if (
+                        heavy is not None
+                        and heavy_name == "history"
+                        and heavy.poll() is None
+                        and heavy_termination_requested_at is None
+                    ):
+                        print(
+                            "research publication SLA overdue; preempting disposable history "
+                            f"so research can run: {research_overdue_reason}",
+                            flush=True,
+                        )
+                        heavy.terminate()
+                        heavy_termination_requested_at = now
 
             if heavy is not None:
                 return_code = heavy.poll()
@@ -313,25 +432,30 @@ def main() -> int:
                         f"aggregate_memory={memory.as_dict()}",
                         flush=True,
                     )
-                    next_due[completed_name] = now + intervals.get(completed_name, 30.0)
+                    if completed_name == "research" and return_code != 0:
+                        next_due[completed_name] = now + min(10.0, intervals[completed_name])
+                    else:
+                        next_due[completed_name] = now + intervals.get(completed_name, 30.0)
+                    if completed_name == "research":
+                        research_start_blocked_since = None
                     heavy = None
                     heavy_name = None
                     heavy_termination_requested_at = None
-                elif memory.terminate_required:
-                    if heavy_termination_requested_at is None:
-                        heavy_termination_requested_at = now
+                elif heavy_termination_requested_at is not None:
+                    if now - heavy_termination_requested_at >= HEAVY_TERMINATE_GRACE_SECONDS:
                         print(
-                            f"aggregate memory reached terminate budget; stopping disposable {heavy_name}: "
-                            f"{memory.as_dict()}",
-                            flush=True,
-                        )
-                        heavy.terminate()
-                    elif now - heavy_termination_requested_at >= HEAVY_TERMINATE_GRACE_SECONDS:
-                        print(
-                            f"disposable {heavy_name} did not exit after memory SIGTERM; killing process",
+                            f"disposable {heavy_name} did not exit after requested SIGTERM; killing process",
                             flush=True,
                         )
                         heavy.kill()
+                elif memory.terminate_required:
+                    heavy_termination_requested_at = now
+                    print(
+                        f"aggregate memory reached terminate budget; stopping disposable {heavy_name}: "
+                        f"{memory.as_dict()}",
+                        flush=True,
+                    )
+                    heavy.terminate()
                 elif memory.soft_exceeded:
                     print(
                         f"aggregate memory above soft budget while {heavy_name} runs: {memory.as_dict()}",
@@ -340,18 +464,41 @@ def main() -> int:
             else:
                 due_history = now >= next_due["history"]
                 due_research = now >= next_due["research"]
-                next_name = "history" if due_history else "research" if due_research else None
+                next_name = choose_heavy_job(
+                    due_research=due_research,
+                    due_history=due_history,
+                    research_overdue=research_overdue,
+                )
                 if next_name is not None:
                     if memory.start_blocked:
-                        # Do not start another Python heap while the permanent service
-                        # is already close to Render's aggregate memory boundary.
-                        next_due[next_name] = now + min(30.0, intervals[next_name])
+                        if next_name == "research" and research_overdue:
+                            if research_start_blocked_since is None:
+                                research_start_blocked_since = now
+                            blocked_for = now - research_start_blocked_since
+                            if research_memory_starvation_exceeded(
+                                research_overdue=True,
+                                blocked_since=research_start_blocked_since,
+                                now=now,
+                                limit_seconds=research_memory_starvation,
+                            ):
+                                print(
+                                    "research remained overdue while aggregate memory blocked every start "
+                                    f"for {blocked_for:.1f}s; restarting Render to reclaim permanent heap; "
+                                    f"reason={research_overdue_reason}; memory={memory.as_dict()}",
+                                    flush=True,
+                                )
+                                return 1
+                            next_due["research"] = now + min(10.0, research_interval)
+                        else:
+                            next_due[next_name] = now + min(30.0, intervals[next_name])
                         print(
                             f"deferring disposable {next_name}; aggregate memory start-blocked: "
                             f"{memory.as_dict()}",
                             flush=True,
                         )
                     else:
+                        if next_name == "research":
+                            research_start_blocked_since = None
                         command = disposable_commands[next_name]
                         print(
                             f"starting disposable heavy child {next_name}: {' '.join(command)}; "
