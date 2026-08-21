@@ -281,6 +281,21 @@ async def run_disposable_research_cycle(
             detail["dex_route_frontier_error_type"] = type(exc).__name__
         gc.collect()
 
+    # Full operating certification deliberately remains staggered because it performs
+    # live provider/executability work. Immediately before dashboard publication we
+    # instead reconcile from durable ledgers only, so evidence generated above cannot
+    # be reported through an older pre-evidence certification snapshot.
+    try:
+        reconciled = operating_certification.reconcile_latest_runtime_truth()
+        detail["post_evidence_lane_reconciliation_complete"] = reconciled is not None
+        if reconciled is not None:
+            detail["post_evidence_operating_snapshot_id"] = reconciled.snapshot_id
+            detail["post_evidence_operating_observed_at"] = reconciled.observed_at.isoformat()
+    except Exception as exc:
+        detail["post_evidence_lane_reconciliation_complete"] = False
+        detail["post_evidence_lane_reconciliation_error_type"] = type(exc).__name__
+    gc.collect()
+
     try:
         payload = research_projection.publish(
             forward_target=max(1, int(service.settings.alpha_min_forward_samples)),
