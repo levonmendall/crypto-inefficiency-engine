@@ -53,13 +53,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Keep the mature watchdog/memory-bounded runtime, but route every deployed
-    # worker entrypoint through the all-lane evidence/allocation/settlement layer.
+    # Keep the mature watchdog/memory-bounded runtime and its exact provider-free
+    # main-thread bootstrap. The all-lane installer swaps only worker child concrete
+    # classes before threaded_worker imports/binds them.
     if args.command == "worker":
         settings, store = _settings_and_store()
         if store is None:
             raise RuntimeError("worker requires CIE_DATABASE_URL/DATABASE_URL or CIE_EVIDENCE_DB_PATH")
-        from inefficiency_engine.threaded_worker_all_lanes import run_threaded_worker
+        from inefficiency_engine.worker_children_all_lanes import _install_all_lane_runtime
+
+        _install_all_lane_runtime()
+        from inefficiency_engine.threaded_worker import run_threaded_worker
 
         asyncio.run(run_threaded_worker(store, settings=settings))
         return
