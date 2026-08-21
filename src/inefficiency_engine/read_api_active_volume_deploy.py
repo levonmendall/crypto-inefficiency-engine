@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
@@ -35,6 +36,16 @@ app.router.routes[:] = [
 ]
 app.openapi_schema = None
 
+_PRODUCTION_EVIDENCE_DISCONNECTED = {"capital_location_settlement"}
+_RUNTIME_HEARTBEATS = {
+    "portfolio": "canonical-portfolio-operating-loop",
+    "research": "shadow-research-auxiliary",
+    "heavy_worker": "disposable-heavy-work",
+    "source_refresh": "priority-source-refresh-plane",
+    "mechanism_forward": "mechanism-forward-evidence",
+    "alpha_l2_sampling": "alpha-l2-research-sampling",
+}
+
 
 def _store():
     return _base_deploy._base.evidence_store  # noqa: SLF001 - deploy-layer composition
@@ -43,6 +54,75 @@ def _store():
 def _release_commit() -> str | None:
     value = os.getenv("RENDER_GIT_COMMIT") or os.getenv("CIE_RELEASE_COMMIT")
     return value.strip() if value and value.strip() else None
+
+
+def _runtime_heartbeats() -> dict[str, object]:
+    """Best-effort durable runtime truth without changing liveness semantics.
+
+    Render uses /health as a process liveness probe. A transient provider or research
+    degradation must therefore remain visible in the payload without converting the
+    endpoint into a restart trigger. Each worker's durable heartbeat is reported with
+    age/staleness so a healthy web process can no longer be mistaken for a healthy
+    research engine.
+    """
+
+    store = _store()
+    if store is None:
+        return {
+            "available": False,
+            "workers": {},
+            "reason": "evidence persistence is not configured",
+        }
+    now = datetime.now(timezone.utc)
+    stale_seconds = max(
+        1.0,
+        float(
+            getattr(
+                _base_deploy._base.settings,  # noqa: SLF001
+                "worker_heartbeat_stale_seconds",
+                180.0,
+            )
+        ),
+    )
+    workers: dict[str, object] = {}
+    for label, worker_id in _RUNTIME_HEARTBEATS.items():
+        try:
+            heartbeat = store.latest_worker_heartbeat(worker_id)
+        except Exception as exc:
+            workers[label] = {
+                "worker_id": worker_id,
+                "available": False,
+                "state": "unavailable",
+                "error_type": type(exc).__name__,
+            }
+            continue
+        if heartbeat is None:
+            workers[label] = {
+                "worker_id": worker_id,
+                "available": False,
+                "state": "unobserved",
+            }
+            continue
+        observed_at = heartbeat.observed_at
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        age_seconds = max(0.0, (now - observed_at).total_seconds())
+        workers[label] = {
+            "worker_id": worker_id,
+            "available": True,
+            "state": heartbeat.state,
+            "error_type": heartbeat.error_type,
+            "observed_at": observed_at.isoformat(),
+            "age_seconds": age_seconds,
+            "stale": age_seconds > stale_seconds,
+        }
+    return {
+        "available": True,
+        "stale_after_seconds": stale_seconds,
+        "workers": workers,
+        "liveness_authority": False,
+        "diagnostic_only": True,
+    }
 
 
 def _lane_readiness():
@@ -57,10 +137,11 @@ def _lane_readiness():
 def _lane_summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
     """Build a non-blocking summary from already-persisted mechanism rows.
 
-    Architecture capability is a code property. Current qualification/profitability
-    counts are reported only from the compact worker-published mechanism rows already
-    present in the dashboard payload; this function performs no database or provider
-    work and cannot delay NAV/cash visibility.
+    Architecture capability is a code property. Production evidence connectivity is
+    separately explicit so the fast dashboard cannot imply that capital-location has
+    a transfer-telemetry producer merely because its downstream contracts exist.
+    Current qualification/profitability counts are reported only from compact worker-
+    published mechanism rows; this function performs no provider work.
     """
 
     mechanisms = payload.get("mechanisms")
@@ -81,17 +162,25 @@ def _lane_summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
             return False
 
     lane_count = len(LANES)
+    connected_count = sum(
+        lane_id not in _PRODUCTION_EVIDENCE_DISCONNECTED for lane_id in LANES
+    )
     return {
         "available": bool(rows),
         "lane_count": lane_count,
         "architecture_executable_count": lane_count,
+        "production_evidence_connected_count": connected_count,
+        "all_lanes_production_evidence_connected": connected_count == lane_count,
+        "production_evidence_disconnected_lanes": sorted(
+            _PRODUCTION_EVIDENCE_DISCONNECTED
+        ),
         "currently_qualified_count": sum(_qualified(row) for row in rows),
         "profitability_certified_count": sum(
             bool(row.get("profitability_certified")) for row in rows
         ),
         "all_lanes_paper_execution_capable": lane_count == 13,
         "live_execution_capable": False,
-        "summary_source": "persisted_dashboard_projection",
+        "summary_source": "persisted_dashboard_projection_plus_static_runtime_connectivity",
         "request_time_research_computation": False,
         "detail_endpoint": "/v3/lane-executability",
     }
@@ -106,6 +195,8 @@ def deployment_health():
             "volume_universe_observability": True,
             "active_cycle_history_membership": True,
             "thirteen_lane_executable_readiness": True,
+            "runtime_heartbeat_observability": True,
+            "runtime_heartbeats": _runtime_heartbeats(),
             "dashboard_critical_path_persisted_only": True,
         }
     )
@@ -121,6 +212,8 @@ def deployment_readiness():
             "volume_universe_observability": True,
             "active_cycle_history_membership": True,
             "thirteen_lane_executable_readiness": True,
+            "runtime_heartbeat_observability": True,
+            "runtime_heartbeats": _runtime_heartbeats(),
             "dashboard_critical_path_persisted_only": True,
         }
     )
@@ -185,7 +278,7 @@ def dashboard_snapshot():
     The phone refresh deadline must never include research/service construction.
     Normal reads use worker-published compact projections; if the portfolio compact
     row is absent, the server reconstructs the portfolio once from durable tables in
-    one bounded read path. Top-40 and history metadata remain optional DB-only
+    one bounded read path. Top-volume and history metadata remain optional DB-only
     enrichments and cannot erase the canonical portfolio payload.
     """
 
@@ -243,5 +336,7 @@ def dashboard_snapshot():
     payload["release_commit"] = _release_commit()
     payload["volume_universe_observability"] = True
     payload["active_cycle_history_membership"] = True
+    payload["runtime_heartbeat_observability"] = True
+    payload["runtime_heartbeats"] = _runtime_heartbeats()
     payload["dashboard_critical_path_persisted_only"] = True
     return payload
