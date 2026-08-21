@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import timedelta
-from types import SimpleNamespace
 
+from inefficiency_engine.alpha_funnel_projection import publish_alpha_funnel_projection
 from inefficiency_engine.executable_alpha_factory import ExecutableExpandedAlphaFactoryService
 from inefficiency_engine.governed_mechanism_execution import GovernedMechanismExecutionService
 from inefficiency_engine.memory_bounded_alpha_factory import MemoryBoundedExpandedAlphaFactoryService
@@ -337,6 +337,16 @@ class AllLaneEvidenceFactoryService(ExecutableExpandedAlphaFactoryService):
     async def run_evidence_cycle(self, *, total_capital_usd: float | None = None):
         alpha = await super().run_evidence_cycle(total_capital_usd=total_capital_usd)
         diagnostics = self.last_discovery_diagnostics()
+        dashboard_projection_published = False
+        try:
+            dashboard_projection_published = publish_alpha_funnel_projection(
+                self.store,
+                diagnostics,
+                observed_at=alpha.observed_at,
+            )
+        except Exception:
+            # Projection failure cannot suppress evidence or become authority.
+            dashboard_projection_published = False
         try:
             # The production dashboard already looks for this exact marker when
             # locating a successful alpha cycle. Emit it on the same research worker
@@ -360,6 +370,7 @@ class AllLaneEvidenceFactoryService(ExecutableExpandedAlphaFactoryService):
                         int(row.get("post_gate_candidate_count") or 0)
                         for row in diagnostics.values()
                     ),
+                    "alpha_dashboard_funnel_projected": dashboard_projection_published,
                     "qualification_thresholds_unchanged": True,
                     "paper_only": True,
                     "live_execution_authority": False,
