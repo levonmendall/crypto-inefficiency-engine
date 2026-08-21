@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from inefficiency_engine.production_dashboard_fastpath import (
     operating_projection_freshness,
@@ -9,13 +9,27 @@ from inefficiency_engine.production_dashboard_fastpath import (
 )
 from inefficiency_engine.render_combined import (
     choose_heavy_job,
-    research_memory_starvation_exceeded,
+    recovery_failure_exceeded,
     research_watchdog_reason,
 )
 
 
 def _now() -> datetime:
     return datetime(2026, 8, 21, 17, 50, tzinfo=timezone.utc)
+
+
+def _dashboard(*, age_seconds: float = 60.0, stale: bool = False) -> dict[str, object]:
+    observed = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    return {
+        "research_projection_observed_at": observed.isoformat(),
+        "research_projection_stale": stale,
+        "research_projection_freshness": {
+            "available": True,
+            "observed_at": observed.isoformat(),
+            "age_seconds": age_seconds,
+            "stale": stale,
+        },
+    }
 
 
 def test_research_projection_uses_actual_wall_clock_for_staleness():
@@ -97,6 +111,7 @@ def test_research_watchdog_detects_stale_or_missing_publication_after_grace():
     }
     reason = research_watchdog_reason(
         stale_payload,
+        _dashboard(age_seconds=60.0),
         runtime_age_seconds=1000.0,
         startup_grace_seconds=180.0,
         heartbeat_stale_seconds=900.0,
@@ -117,27 +132,40 @@ def test_research_watchdog_detects_stale_or_missing_publication_after_grace():
     }
     assert research_watchdog_reason(
         fresh_payload,
+        _dashboard(age_seconds=60.0),
         runtime_age_seconds=1000.0,
         startup_grace_seconds=180.0,
         heartbeat_stale_seconds=900.0,
     ) is None
 
+    stale_projection = research_watchdog_reason(
+        fresh_payload,
+        _dashboard(age_seconds=3600.0, stale=True),
+        runtime_age_seconds=1000.0,
+        startup_grace_seconds=180.0,
+        heartbeat_stale_seconds=900.0,
+    )
+    assert stale_projection is not None
+    assert "projection" in stale_projection
+
     missing = {"runtime_heartbeats": {"workers": {}}}
     assert research_watchdog_reason(
         missing,
+        None,
         runtime_age_seconds=120.0,
         startup_grace_seconds=180.0,
         heartbeat_stale_seconds=900.0,
     ) is None
     assert research_watchdog_reason(
         missing,
+        None,
         runtime_age_seconds=181.0,
         startup_grace_seconds=180.0,
         heartbeat_stale_seconds=900.0,
     ) is not None
 
 
-def test_overdue_research_preempts_history_and_memory_starvation_is_bounded():
+def test_overdue_research_preempts_history_and_recovery_failure_is_bounded():
     assert choose_heavy_job(
         due_research=False,
         due_history=True,
@@ -154,21 +182,21 @@ def test_overdue_research_preempts_history_and_memory_starvation_is_bounded():
         research_overdue=False,
     ) == "history"
 
-    assert research_memory_starvation_exceeded(
+    assert recovery_failure_exceeded(
         research_overdue=True,
-        blocked_since=100.0,
+        failed_since=100.0,
         now=699.0,
         limit_seconds=600.0,
     ) is False
-    assert research_memory_starvation_exceeded(
+    assert recovery_failure_exceeded(
         research_overdue=True,
-        blocked_since=100.0,
+        failed_since=100.0,
         now=700.0,
         limit_seconds=600.0,
     ) is True
-    assert research_memory_starvation_exceeded(
+    assert recovery_failure_exceeded(
         research_overdue=False,
-        blocked_since=100.0,
+        failed_since=100.0,
         now=1000.0,
         limit_seconds=600.0,
     ) is False
