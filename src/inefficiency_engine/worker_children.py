@@ -5,6 +5,7 @@ import signal
 from types import SimpleNamespace
 
 from inefficiency_engine import __version__
+from inefficiency_engine.all_lane_alpha_factory import AllLaneEvidenceFactoryService as ResearchAlphaFactoryService
 from inefficiency_engine.allocation_certification import AllocationForwardCertificationService
 from inefficiency_engine.bounded_shadow_service import MemoryBoundedShadowService
 from inefficiency_engine.canonical_worker import run_canonical_portfolio_loop
@@ -23,13 +24,13 @@ from inefficiency_engine.dashboard_projection import (
 )
 from inefficiency_engine.dex_tier_shadow import DexTierShadowService
 from inefficiency_engine.evidence import EvidenceStore
+from inefficiency_engine.executable_source_collection import (
+    ExecutableSourceCoverageAwareOperatingCertificationService as OperatingCertificationService,
+)
 from inefficiency_engine.memory_bounded_alpha_factory import (
-    MemoryBoundedExpandedAlphaFactoryService as ExpandedAlphaFactoryService,
+    MemoryBoundedExpandedAlphaFactoryService as PortfolioAlphaFactoryService,
 )
 from inefficiency_engine.memory_bounded_research_worker import run_memory_bounded_research_worker
-from inefficiency_engine.priority_source_collection import (
-    SourceCoverageAwareOperatingCertificationService as OperatingCertificationService,
-)
 from inefficiency_engine.research_closure_worker import run_research_closure_cycle
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.stablecoin_depth_service import StablecoinConversionDepthService
@@ -75,11 +76,11 @@ class _CompactCoreResearchService:
 async def run_research_child(service: OpportunityService, store: EvidenceStore) -> WorkerRunStats:
     """Run full research/certification under bounded memory and stage deadlines.
 
-    Every cycle refreshes source evidence first. Source-specific TTLs keep that
-    refresh cheap when a source is still current, while the worker-level stage
-    deadline prevents a provider call from wedging the auxiliary thread forever.
-    Heavy research surfaces remain sequential and release their results between
-    phases. The canonical portfolio remains isolated from this auxiliary work.
+    The live research path intentionally uses AllLaneEvidenceFactoryService so the
+    executable alpha refinements and five mechanism forward loops are not merely
+    present in the repository: they run in the production auxiliary worker. Source
+    collection likewise uses the executable source service, including public trade
+    flow and dynamic evidence-priority scheduling.
     """
 
     stop = _stop_event()
@@ -96,7 +97,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
         StablecoinConversionDepthService(service.settings),
         evidence_store=store,
     )
-    alpha_factory = ExpandedAlphaFactoryService(service, store)
+    alpha_factory = ResearchAlphaFactoryService(service, store)
 
     promotion = CexDexPaperPromotionService(service, composite_service, store)
     unified = UnifiedPaperAllocatorService(service, promotion, alpha_factory)
@@ -121,9 +122,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
             value = nav_heartbeat.detail.get("portfolio_nav_usd")
             if isinstance(value, (float, int)) and value > 0:
                 nav = float(value)
-        return await qualified_bridge.publish_latest(
-            total_capital_usd=nav or 250_000.0
-        )
+        return await qualified_bridge.publish_latest(total_capital_usd=nav or 250_000.0)
 
     async def route_shadow_with_bridge() -> object:
         try:
@@ -194,7 +193,13 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
                 forward_target=max(1, int(service.settings.alpha_min_forward_samples)),
                 settled_target=max(
                     5,
-                    int(getattr(service.settings, "operating_certification_min_settled_trials", 20)),
+                    int(
+                        getattr(
+                            service.settings,
+                            "operating_certification_min_settled_trials",
+                            20,
+                        )
+                    ),
                 ),
                 shadow_horizons_seconds=tuple(
                     getattr(service.settings, "shadow_horizons_seconds", (60.0,)) or (60.0,)
@@ -276,7 +281,9 @@ async def run_portfolio_child(service: OpportunityService, store: EvidenceStore)
     """Run only canonical accounting on the isolated portfolio event loop."""
 
     stop = _stop_event()
-    alpha_factory = ExpandedAlphaFactoryService(service, store)
+    # Keep the accounting thread lightweight. It consumes the durable qualified
+    # opportunity envelope and does not need to run the all-lane research engines.
+    alpha_factory = PortfolioAlphaFactoryService(service, store)
     canonical_allocator = CanonicalPortfolioAllocatorService(
         service,
         None,
@@ -301,7 +308,7 @@ async def run_certification_child(service: OpportunityService, store: EvidenceSt
     stop = _stop_event()
     universal = UniversalOpportunityService(service)
     composite_service = CexDexCompositeEvidenceService(service, universal=universal)
-    alpha_factory = ExpandedAlphaFactoryService(service, store)
+    alpha_factory = ResearchAlphaFactoryService(service, store)
     promotion = CexDexPaperPromotionService(service, composite_service, store)
     unified = UnifiedPaperAllocatorService(service, promotion, alpha_factory)
     allocation_certification = AllocationForwardCertificationService(service, unified, store)
