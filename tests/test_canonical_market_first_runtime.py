@@ -4,6 +4,9 @@ import inspect
 
 from inefficiency_engine.canonical_allocator import CanonicalPortfolioAllocatorService
 from inefficiency_engine.resilient_paper_portfolio import OperationallyResilientPaperPortfolioService
+from inefficiency_engine.universal_paper_portfolio import (
+    UniversalOperationallyResilientPaperPortfolioService,
+)
 
 
 def test_canonical_accounting_stops_before_global_opportunity_analysis_and_l2():
@@ -29,6 +32,17 @@ def test_market_provenance_is_checkpointed_before_allocator_can_timeout():
     assert checkpoint_index < allocator_index < final_snapshot_index
     assert 'cycle_status="accounting_only"' in source
     assert "market_snapshot_id=snapshot.scan_id" in source
+
+
+def test_universal_production_cycle_cannot_bypass_bounded_allocator():
+    source = inspect.getsource(UniversalOperationallyResilientPaperPortfolioService.run_cycle)
+
+    checkpoint_index = source.index('cycle_status="accounting_only"')
+    allocator_index = source.index("await self._bounded_allocation_plan")
+    final_snapshot_index = source.index("self.ledger.record_snapshot(final_state)")
+    assert checkpoint_index < allocator_index < final_snapshot_index
+    assert "await self.allocator.allocate" not in source
+    assert '"family": "canonical_allocator"' in source
 
 
 def test_canonical_allocator_accepts_fresh_market_snapshot_without_global_l2_requirement():
