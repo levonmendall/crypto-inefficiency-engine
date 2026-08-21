@@ -3,13 +3,19 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 
 from inefficiency_engine.all_lane_alpha_factory import AllLaneEvidenceFactoryService
 from inefficiency_engine.alpha_factory import AlphaCandidate, AlphaEvidenceCycle
-from inefficiency_engine.evidence import ScanSnapshot
+from inefficiency_engine.alpha_funnel_projection import publish_alpha_funnel_projection
+from inefficiency_engine.evidence import EvidenceStore, ScanSnapshot
 from inefficiency_engine.executable_alpha_factory import ExecutableExpandedAlphaFactoryService
 from inefficiency_engine.memory_bounded_alpha_factory import MemoryBoundedExpandedAlphaFactoryService
 from inefficiency_engine.models import MarketKind, MarketQuote
+from inefficiency_engine.research_closure_worker import (
+    ResearchClosureCycleSummary,
+    ResearchClosureSummaryLedger,
+)
 
 
 NOW = datetime(2026, 8, 21, 20, 0, tzinfo=timezone.utc)
@@ -209,3 +215,64 @@ def test_alpha_cycle_persists_dashboard_success_marker(monkeypatch):
     assert detail["raw_candidate_count"] == 3
     assert detail["post_gate_candidate_count"] == 2
     assert detail["qualification_thresholds_unchanged"] is True
+
+
+def test_alpha_funnel_projection_preserves_structural_funnels(tmp_path):
+    store = EvidenceStore(tmp_path / "alpha-projection.sqlite3")
+    ledger = ResearchClosureSummaryLedger(store)
+    baseline = ResearchClosureCycleSummary(
+        observed_at=NOW,
+        source_scan_id="source-scan-1",
+        source_order_book_count=4,
+        usable_order_book_count=4,
+        rejection_funnels={
+            "price_discrepancy": {
+                "raw_candidate_count": 4,
+                "dominant_rejection_gate": "net_return_hurdle",
+            },
+            "microstructure": {
+                "raw_candidate_count": 2,
+                "dominant_rejection_gate": "detector_emitted",
+            },
+        },
+        capital_location_forward={},
+        maker_shadow={"trial_count": 3},
+        canonical_capabilities={"live_execution_authority": False},
+        provider_admission={},
+    )
+    ledger.record(baseline)
+
+    projected_at = NOW + timedelta(minutes=1)
+    published = publish_alpha_funnel_projection(
+        store,
+        {
+            "trend_momentum": {
+                "raw_candidate_count": 3,
+                "emitted_candidate_count": 1,
+                "dominant_rejection_gate": "candidate_emitted",
+            },
+            # Must not overwrite the dedicated order-book funnel.
+            "microstructure": {
+                "raw_candidate_count": 999,
+                "dominant_rejection_gate": "wrong-alpha-overlay",
+            },
+        },
+        observed_at=projected_at,
+    )
+
+    assert published is True
+    with store.engine.connect() as db:
+        payload = db.execute(
+            select(ledger.table.c.payload_json)
+            .order_by(ledger.table.c.id.desc())
+            .limit(1)
+        ).scalar_one()
+    latest = ResearchClosureCycleSummary.model_validate_json(payload)
+    assert latest.summary_id != baseline.summary_id
+    assert latest.observed_at == projected_at
+    assert latest.source_scan_id == baseline.source_scan_id
+    assert latest.rejection_funnels["price_discrepancy"]["raw_candidate_count"] == 4
+    assert latest.rejection_funnels["microstructure"]["raw_candidate_count"] == 2
+    assert latest.rejection_funnels["trend_momentum"]["raw_candidate_count"] == 3
+    assert latest.maker_shadow == baseline.maker_shadow
+    assert latest.canonical_capabilities == baseline.canonical_capabilities
