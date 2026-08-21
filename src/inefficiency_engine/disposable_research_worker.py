@@ -42,6 +42,10 @@ def _due(sequence: int, every: int, offset_fraction: float = 0.0) -> bool:
     return (sequence - offset) % every == 0
 
 
+def _error_keys(detail: dict[str, object]) -> list[str]:
+    return sorted(key for key in detail if key.endswith("_error_type"))
+
+
 async def _run_release(runner):
     try:
         return await runner()
@@ -113,9 +117,10 @@ async def run_disposable_research_cycle(
         detail=detail,
     )
 
-    # Source refresh is periodic rather than repeated on every process start. The
-    # executable collector supplies multi-venue trade-flow integrity, class-specific
-    # freshness, dynamic priority and stagnation diagnostics.
+    # Bootstrap source truth periodically. The alpha/mechanism cycle performs an
+    # additional source refresh immediately before evidence generation, so short-
+    # lived trade-flow/liquidation evidence cannot expire merely because of the
+    # sequential disposable scheduler.
     if sequence == 1 or sequence % 10 == 1:
         try:
             bootstrap = await operating_certification.provider_gap_collection.run_cycle()
@@ -157,9 +162,6 @@ async def run_disposable_research_cycle(
         )
         return WorkerRunStats(RESEARCH_WORKER_ID, 1, 0, 1)
 
-    # Publish the durable bridge before route verification. The integrated allocator
-    # applies Release D subtractive calibration while mechanism promotion remains
-    # evidence-velocity source governed.
     try:
         nav_heartbeat = store.latest_worker_heartbeat("canonical-portfolio-operating-loop")
         nav_value = nav_heartbeat.detail.get("portfolio_nav_usd") if nav_heartbeat else None
@@ -235,6 +237,26 @@ async def run_disposable_research_cycle(
         gc.collect()
 
     if _due(sequence, alpha_every, 0.75):
+        # Refresh short-lived provider evidence at the exact decision point where
+        # alpha and native mechanism forward trials consume it. Source-specific
+        # collector TTLs still prevent unnecessary network requests.
+        try:
+            source_refresh = await operating_certification.provider_gap_collection.run_cycle()
+            refresh_state = source_refresh.get("source_refresh", {}) if isinstance(source_refresh, dict) else {}
+            detail["pre_alpha_source_refresh_complete"] = True
+            if isinstance(refresh_state, dict):
+                detail["pre_alpha_source_refresh_state"] = refresh_state.get("state")
+                detail["pre_alpha_source_refresh_failed_sources"] = list(
+                    refresh_state.get("failed_sources") or []
+                )
+                detail["pre_alpha_source_refresh_deferred_sources"] = list(
+                    refresh_state.get("memory_deferred_sources") or []
+                )
+        except Exception as exc:
+            detail["pre_alpha_source_refresh_complete"] = False
+            detail["pre_alpha_source_refresh_error_type"] = type(exc).__name__
+        gc.collect()
+
         try:
             value = await alpha_factory.run_evidence_cycle()
             detail["alpha_candidate_count"] = value.candidate_count
@@ -286,11 +308,19 @@ async def run_disposable_research_cycle(
     except Exception as exc:
         detail["research_projection_error_type"] = type(exc).__name__
 
+    errors = _error_keys(detail)
+    detail["subsystem_error_keys"] = errors
+    detail["subsystem_error_count"] = len(errors)
+    final_state = "degraded" if errors else "success"
     store.record_worker_heartbeat(
         worker_id=RESEARCH_WORKER_ID,
-        state="success",
+        state=final_state,
         cycle_id=cycle_id,
         scan_id=scan_id,
+        error_type="ResearchSubsystemDegraded" if errors else None,
         detail=detail,
     )
+    # Core collection is the process-fatal boundary. Optional/subsystem failures are
+    # represented truthfully as a degraded heartbeat while allowing the disposable
+    # supervisor to continue future independent cycles and recover automatically.
     return WorkerRunStats(RESEARCH_WORKER_ID, 1, 1, 0)
