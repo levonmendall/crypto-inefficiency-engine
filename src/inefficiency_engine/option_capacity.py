@@ -51,7 +51,7 @@ def _parse_name(name: str) -> tuple[str, datetime, float, Literal["call", "put"]
     return match.group("asset"), expiry, float(match.group("strike")), option_type
 
 
-def _first_level_size(levels: object) -> float | None:
+def _first_level_amount(levels: object) -> float | None:
     if not isinstance(levels, list) or not levels:
         return None
     level = levels[0]
@@ -73,8 +73,12 @@ class OptionCapacityObservation(BaseModel):
     observed_at: datetime
     contract_size_underlying: float = Field(gt=0)
     underlying_price_usd: float = Field(gt=0)
-    bid_visible_size_contracts: float = Field(gt=0)
-    ask_visible_size_contracts: float = Field(gt=0)
+    # Deribit option order-book `amount` is already denominated in the underlying
+    # base-currency coin (BTC/ETH). It is not a raw contract count. Keep contract
+    # size as separately observed instrument metadata rather than multiplying it
+    # into visible amount a second time.
+    bid_visible_amount_underlying: float = Field(gt=0)
+    ask_visible_amount_underlying: float = Field(gt=0)
     bid_capacity_usd: float = Field(gt=0)
     ask_capacity_usd: float = Field(gt=0)
     source_reference: str
@@ -180,12 +184,13 @@ class OptionCapacityLedger:
 
 
 async def collect_deribit_option_capacity(store) -> SourceProbeResult:
-    """Collect bounded ATM visible capacity with explicit Deribit contract size.
+    """Collect bounded ATM visible capacity with explicit Deribit unit lineage.
 
-    Book amount alone is not treated as USD capacity. Each selected instrument also
-    resolves first-party ``contract_size`` metadata; visible top-book size is then
-    normalized as ``contracts * contract_size * underlying_price``. This is a
-    conservative visible-capacity observation, not an assumption about hidden depth.
+    Deribit documents option order-book `amount` in the underlying base currency
+    coin. Visible USD capacity is therefore ``amount * underlying_price``. The
+    instrument's first-party ``contract_size`` is recorded independently for unit
+    lineage/validation and is deliberately *not* multiplied into the amount again.
+    Hidden depth is never assumed.
     """
 
     summary_url = f"{DERIBIT_BASE_URL}/public/get_book_summary_by_currency"
@@ -264,8 +269,8 @@ async def collect_deribit_option_capacity(store) -> SourceProbeResult:
             if not isinstance(instrument, dict):
                 continue
 
-            bid_size = _number(book.get("best_bid_amount")) or _first_level_size(book.get("bids"))
-            ask_size = _number(book.get("best_ask_amount")) or _first_level_size(book.get("asks"))
+            bid_amount = _number(book.get("best_bid_amount")) or _first_level_amount(book.get("bids"))
+            ask_amount = _number(book.get("best_ask_amount")) or _first_level_amount(book.get("asks"))
             contract_size = _number(instrument.get("contract_size"))
             underlying_price = _number(book.get("underlying_price")) or summary_underlying
             timestamp_ms = _number(book.get("timestamp"))
@@ -275,10 +280,10 @@ async def collect_deribit_option_capacity(store) -> SourceProbeResult:
                 else _now()
             )
             if (
-                bid_size is None
-                or ask_size is None
-                or bid_size <= 0
-                or ask_size <= 0
+                bid_amount is None
+                or ask_amount is None
+                or bid_amount <= 0
+                or ask_amount <= 0
                 or contract_size is None
                 or contract_size <= 0
                 or underlying_price is None
@@ -286,8 +291,8 @@ async def collect_deribit_option_capacity(store) -> SourceProbeResult:
             ):
                 continue
 
-            bid_capacity = bid_size * contract_size * underlying_price
-            ask_capacity = ask_size * contract_size * underlying_price
+            bid_capacity = bid_amount * underlying_price
+            ask_capacity = ask_amount * underlying_price
             if bid_capacity <= 0 or ask_capacity <= 0:
                 continue
             observation = OptionCapacityObservation(
@@ -304,8 +309,8 @@ async def collect_deribit_option_capacity(store) -> SourceProbeResult:
                 observed_at=observed_at,
                 contract_size_underlying=contract_size,
                 underlying_price_usd=underlying_price,
-                bid_visible_size_contracts=bid_size,
-                ask_visible_size_contracts=ask_size,
+                bid_visible_amount_underlying=bid_amount,
+                ask_visible_amount_underlying=ask_amount,
                 bid_capacity_usd=bid_capacity,
                 ask_capacity_usd=ask_capacity,
                 source_reference=f"{book_url}|{instrument_url}",
@@ -331,7 +336,9 @@ async def collect_deribit_option_capacity(store) -> SourceProbeResult:
             "venue": "Deribit",
             "underlyings": sorted({row.underlying for row in observations}),
             "visible_capacity_observation_count": len(observations),
-            "capacity_normalization": "visible_contracts * first_party_contract_size * underlying_price_usd",
+            "capacity_normalization": "visible_option_amount_underlying * underlying_price_usd",
+            "contract_size_multiplied_into_book_amount": False,
+            "contract_size_recorded_for_unit_lineage": True,
             "hidden_depth_assumed": False,
             "allocation_authority": False,
             "paper_only": True,
