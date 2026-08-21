@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import Column, Index, Integer, MetaData, String, Table, Text, insert, select
 
 from inefficiency_engine.priority_source_models import SourceProbeResult
+from inefficiency_engine.research_mechanisms import OptionQuoteObservation, VolatilityResearchService
 
 
 DERIBIT_BASE_URL = "https://www.deribit.com/api/v2"
@@ -51,7 +52,7 @@ def _parse_name(name: str) -> tuple[str, datetime, float, Literal["call", "put"]
     return match.group("asset"), expiry, float(match.group("strike")), option_type
 
 
-def _first_level_amount(levels: object) -> float | None:
+def _first_level_size(levels: object) -> float | None:
     if not isinstance(levels, list) or not levels:
         return None
     level = levels[0]
@@ -59,6 +60,29 @@ def _first_level_amount(levels: object) -> float | None:
         return None
     value = _number(level[1])
     return value if value is not None and value > 0 else None
+
+
+def _select_surface(
+    rows: list[tuple[str, str, datetime, float, Literal["call", "put"], float]],
+    *,
+    expiry_count: int = 2,
+    limit_per_side: int = 2,
+) -> list[tuple[str, str, datetime, float, Literal["call", "put"], float]]:
+    """Select a bounded ATM surface that can support skew and term structure."""
+
+    if not rows:
+        return []
+    expiries = sorted({row[2] for row in rows})[: max(1, int(expiry_count))]
+    selected: list[
+        tuple[str, str, datetime, float, Literal["call", "put"], float]
+    ] = []
+    for expiry in expiries:
+        expiry_rows = [row for row in rows if row[2] == expiry]
+        for option_type in ("call", "put"):
+            side = [row for row in expiry_rows if row[4] == option_type]
+            side.sort(key=lambda row: abs(row[3] / row[5] - 1.0))
+            selected.extend(side[: max(1, int(limit_per_side))])
+    return selected
 
 
 class OptionCapacityObservation(BaseModel):
@@ -71,12 +95,8 @@ class OptionCapacityObservation(BaseModel):
     strike: float = Field(gt=0)
     option_type: Literal["call", "put"]
     observed_at: datetime
-    contract_size_underlying: float = Field(gt=0)
+    amount_unit: Literal["underlying_base_currency"] = "underlying_base_currency"
     underlying_price_usd: float = Field(gt=0)
-    # Deribit option order-book `amount` is already denominated in the underlying
-    # base-currency coin (BTC/ETH). It is not a raw contract count. Keep contract
-    # size as separately observed instrument metadata rather than multiplying it
-    # into visible amount a second time.
     bid_visible_amount_underlying: float = Field(gt=0)
     ask_visible_amount_underlying: float = Field(gt=0)
     bid_capacity_usd: float = Field(gt=0)
@@ -124,7 +144,7 @@ class OptionCapacityLedger:
             self.rows.c.option_type,
             self.rows.c.observed_at,
         )
-        metadata.create_all(store.engine)
+        metadata.create_all(self.store.engine)
 
     def record(self, observation: OptionCapacityObservation) -> str:
         with self.store.engine.begin() as db:
@@ -184,19 +204,25 @@ class OptionCapacityLedger:
 
 
 async def collect_deribit_option_capacity(store) -> SourceProbeResult:
-    """Collect bounded ATM visible capacity with explicit Deribit unit lineage.
+    """Collect bounded first-party Deribit option price/Greek/capacity evidence.
 
-    Deribit documents option order-book `amount` in the underlying base currency
-    coin. Visible USD capacity is therefore ``amount * underlying_price``. The
-    instrument's first-party ``contract_size`` is recorded independently for unit
-    lineage/validation and is deliberately *not* multiplied into the amount again.
-    Hidden depth is never assumed.
+    Deribit option order amounts are already denominated in the underlying base
+    currency. Visible USD capacity is therefore ``book_amount * underlying_price``;
+    no contract multiplier is applied. The same bounded books are also persisted as
+    option quote/Greek observations so the selected first two expiries can support
+    ATM, skew, and term-structure research without a hidden producer mismatch.
     """
 
     summary_url = f"{DERIBIT_BASE_URL}/public/get_book_summary_by_currency"
     book_url = f"{DERIBIT_BASE_URL}/public/get_order_book"
-    instrument_url = f"{DERIBIT_BASE_URL}/public/get_instrument"
-    selected: list[tuple[str, str, datetime, float, Literal["call", "put"], float]] = []
+    selected: list[
+        tuple[str, str, datetime, float, Literal["call", "put"], float]
+    ] = []
+
+    ledger = OptionCapacityLedger(store)
+    volatility_service = VolatilityResearchService(store)
+    capacity_observations: list[OptionCapacityObservation] = []
+    quote_observations: list[OptionQuoteObservation] = []
 
     async with httpx.AsyncClient(
         timeout=8.0,
@@ -233,17 +259,8 @@ async def collect_deribit_option_capacity(store) -> SourceProbeResult:
                 parsed_rows.append(
                     (name, underlying, expiry, strike, option_type, underlying_price)
                 )
-            if not parsed_rows:
-                continue
-            nearest = min(row[2] for row in parsed_rows)
-            nearest_rows = [row for row in parsed_rows if row[2] == nearest]
-            for option_type in ("call", "put"):
-                side = [row for row in nearest_rows if row[4] == option_type]
-                side.sort(key=lambda row: abs(row[3] / row[5] - 1.0))
-                selected.extend(side[:2])
+            selected.extend(_select_surface(parsed_rows))
 
-        ledger = OptionCapacityLedger(store)
-        observations: list[OptionCapacityObservation] = []
         for name, underlying, expiry, strike, option_type, summary_underlying in selected:
             book_response = await client.get(
                 book_url,
@@ -255,23 +272,8 @@ async def collect_deribit_option_capacity(store) -> SourceProbeResult:
             if not isinstance(book, dict):
                 continue
 
-            instrument_response = await client.get(
-                instrument_url,
-                params={"instrument_name": name},
-            )
-            instrument_response.raise_for_status()
-            instrument_payload = instrument_response.json()
-            instrument = (
-                instrument_payload.get("result")
-                if isinstance(instrument_payload, dict)
-                else None
-            )
-            if not isinstance(instrument, dict):
-                continue
-
-            bid_amount = _number(book.get("best_bid_amount")) or _first_level_amount(book.get("bids"))
-            ask_amount = _number(book.get("best_ask_amount")) or _first_level_amount(book.get("asks"))
-            contract_size = _number(instrument.get("contract_size"))
+            bid_amount = _number(book.get("best_bid_amount")) or _first_level_size(book.get("bids"))
+            ask_amount = _number(book.get("best_ask_amount")) or _first_level_size(book.get("asks"))
             underlying_price = _number(book.get("underlying_price")) or summary_underlying
             timestamp_ms = _number(book.get("timestamp"))
             observed_at = (
@@ -284,8 +286,6 @@ async def collect_deribit_option_capacity(store) -> SourceProbeResult:
                 or ask_amount is None
                 or bid_amount <= 0
                 or ask_amount <= 0
-                or contract_size is None
-                or contract_size <= 0
                 or underlying_price is None
                 or underlying_price <= 0
             ):
@@ -295,7 +295,8 @@ async def collect_deribit_option_capacity(store) -> SourceProbeResult:
             ask_capacity = ask_amount * underlying_price
             if bid_capacity <= 0 or ask_capacity <= 0:
                 continue
-            observation = OptionCapacityObservation(
+
+            capacity = OptionCapacityObservation(
                 observation_id=_stable(
                     DERIBIT_OPTION_CAPACITY_PROVIDER,
                     name,
@@ -307,25 +308,75 @@ async def collect_deribit_option_capacity(store) -> SourceProbeResult:
                 strike=strike,
                 option_type=option_type,
                 observed_at=observed_at,
-                contract_size_underlying=contract_size,
                 underlying_price_usd=underlying_price,
                 bid_visible_amount_underlying=bid_amount,
                 ask_visible_amount_underlying=ask_amount,
                 bid_capacity_usd=bid_capacity,
                 ask_capacity_usd=ask_capacity,
-                source_reference=f"{book_url}|{instrument_url}",
+                source_reference=f"{book_url}?instrument_name={name}",
             )
-            ledger.record(observation)
-            observations.append(observation)
+            ledger.record(capacity)
+            capacity_observations.append(capacity)
 
-    if not observations:
+            bid = _number(book.get("best_bid_price"))
+            ask = _number(book.get("best_ask_price"))
+            greeks = book.get("greeks") if isinstance(book.get("greeks"), dict) else {}
+            delta = _number(greeks.get("delta"))
+            mark_iv = _number(book.get("mark_iv"))
+            if mark_iv is None:
+                bid_iv = _number(book.get("bid_iv"))
+                ask_iv = _number(book.get("ask_iv"))
+                if bid_iv is not None and ask_iv is not None:
+                    mark_iv = (bid_iv + ask_iv) / 2.0
+            if (
+                bid is None
+                or ask is None
+                or bid <= 0
+                or ask <= 0
+                or bid > ask
+                or delta is None
+                or mark_iv is None
+                or mark_iv <= 0
+            ):
+                continue
+            implied_volatility = mark_iv / 100.0 if mark_iv > 3.0 else mark_iv
+            quote = OptionQuoteObservation(
+                observation_id=_stable(
+                    DERIBIT_OPTION_CAPACITY_PROVIDER,
+                    "quote",
+                    name,
+                    int(observed_at.timestamp() * 1000),
+                ),
+                provider=DERIBIT_OPTION_CAPACITY_PROVIDER,
+                venue="Deribit",
+                underlying=underlying,
+                expiry=expiry,
+                strike=strike,
+                option_type=option_type,
+                bid=bid,
+                ask=ask,
+                implied_volatility=implied_volatility,
+                delta=delta,
+                gamma=_number(greeks.get("gamma")),
+                vega=_number(greeks.get("vega")),
+                observed_at=observed_at,
+                source_reference=f"{book_url}?instrument_name={name}",
+                authoritative=True,
+                commercial_use_permitted=True,
+                point_in_time=True,
+                paper_only=True,
+            )
+            volatility_service.record(quote)
+            quote_observations.append(quote)
+
+    if not capacity_observations:
         raise ValueError(
             "Deribit returned no bounded option books with normalizable visible capacity"
         )
     return SourceProbeResult(
         source_id=DERIBIT_OPTION_CAPACITY_SOURCE_ID,
-        item_count=len(observations),
-        source_reference=f"{book_url}|{instrument_url}",
+        item_count=len(capacity_observations),
+        source_reference=book_url,
         evidence_by_lane={"volatility": ["option_capacity"]},
         authoritative=True,
         commercial_use_permitted=True,
@@ -334,11 +385,14 @@ async def collect_deribit_option_capacity(store) -> SourceProbeResult:
         forward_testable_evidence=True,
         detail={
             "venue": "Deribit",
-            "underlyings": sorted({row.underlying for row in observations}),
-            "visible_capacity_observation_count": len(observations),
+            "underlyings": sorted({row.underlying for row in capacity_observations}),
+            "expiry_count": len({row.expiry for row in capacity_observations}),
+            "visible_capacity_observation_count": len(capacity_observations),
+            "option_quote_greek_observation_count": len(quote_observations),
+            "bounded_term_structure": len({row.expiry for row in capacity_observations}) >= 2,
             "capacity_normalization": "visible_option_amount_underlying * underlying_price_usd",
-            "contract_size_multiplied_into_book_amount": False,
-            "contract_size_recorded_for_unit_lineage": True,
+            "amount_unit": "underlying_base_currency",
+            "contract_multiplier_applied": False,
             "hidden_depth_assumed": False,
             "allocation_authority": False,
             "paper_only": True,
