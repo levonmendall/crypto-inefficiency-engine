@@ -39,12 +39,43 @@ class AllLaneOperatingCertificationService(
             and row.strategy.startswith(f"mechanism:{mechanism_id}:")
         ]
 
+    @staticmethod
+    def _yield_semantic_economics_incomplete(lane) -> bool:
+        """Return true when yield fields exist but protocol-risk economics are not calibrated."""
+
+        required = {"yield_rate", "capacity", "exit_liquidity"}
+        complete_source = False
+        incomplete_source = False
+        for source in list(getattr(lane, "sources", []) or []):
+            if not bool(source.get("admitted")):
+                continue
+            classes = {str(item) for item in list(source.get("classes") or [])}
+            if not required.issubset(classes):
+                continue
+            if bool(source.get("economic_fields_complete")):
+                complete_source = True
+            else:
+                incomplete_source = True
+        return incomplete_source and not complete_source
+
     def _mechanism_status(self, existing: MechanismOperatingStatus) -> MechanismOperatingStatus:
         mechanism_id = existing.mechanism_id
         readiness = self.mechanism_execution.readiness_summary()[mechanism_id]
         lane = self.source_coverage.lane(mechanism_id)
         source = classify_lane_source_dimensions(lane)
-        outcomes = self.mechanism_execution.ledger.outcomes(mechanism_id=mechanism_id)
+
+        # Research ledgers may intentionally contain modeled or otherwise incomplete
+        # settlement shadows. Preserve them for learning/diagnostics, but operating
+        # qualification statistics must use only settlement-complete outcomes.
+        all_outcomes = self.mechanism_execution.ledger.outcomes(
+            mechanism_id=mechanism_id
+        )
+        outcomes = [
+            row
+            for row in all_outcomes
+            if bool(getattr(row, "settlement_evidence_complete", True))
+        ]
+        research_shadow_count = max(0, len(all_outcomes) - len(outcomes))
         values = [row.realized_net_return for row in outcomes]
         positive = sum(value > 0 for value in values)
         mean = statistics.fmean(values) if values else None
@@ -53,6 +84,17 @@ class AllLaneOperatingCertificationService(
         current_promoted = int(readiness["current_promoted_candidate_count"])
         full_qualified = int(readiness["full_qualified_cohort_count"])
         incremental_qualified = int(readiness["incremental_qualified_cohort_count"])
+
+        yield_semantic_incomplete = (
+            mechanism_id == "yield"
+            and self._yield_semantic_economics_incomplete(lane)
+        )
+        if yield_semantic_incomplete:
+            # Never let a generic reader reinterpret yield research shadows as
+            # ordinary qualification merely because their numerical returns look good.
+            current_promoted = 0
+            full_qualified = 0
+            incremental_qualified = 0
 
         allocator = self._allocator_outcomes(mechanism_id)
         allocator_values = [row.realized_net_return for row in allocator]
@@ -69,6 +111,8 @@ class AllLaneOperatingCertificationService(
             and allocator_hit_lower >= self.min_allocator_profitable_rate_lower
             and allocator_profit > 0
         )
+        if yield_semantic_incomplete:
+            certified = False
 
         # Provider connectivity and complete source sufficiency are deliberately
         # separate. ``provider_gap`` now means exactly that no fresh admitted
@@ -113,22 +157,42 @@ class AllLaneOperatingCertificationService(
                 next_action = (
                     "collect the missing evidence classes; do not add duplicate providers or lower source requirements"
                 )
+        elif yield_semantic_incomplete:
+            stage = "research_shadow_active_protocol_risk_uncalibrated"
+            state = "collecting"
+            reason = (
+                "source-complete yield rate/capacity/exit-liquidity evidence is connected; "
+                f"{research_shadow_count} research-shadow outcomes are preserved, but protocol-loss economics "
+                f"remain uncalibrated and only {len(values)} allocation-grade settlement outcomes are admissible"
+            )
+            next_action = (
+                "continue realized-yield/exit-liquidity research and calibrate protocol-loss economics from "
+                "authoritative evidence; never convert unknown protocol risk into a zero haircut"
+            )
         elif len(values) < 3:
             stage = "profitability_certifiable"
             state = "collecting"
-            reason = f"native forward settlement is operating ({len(values)}/3 outcomes before incremental paper eligibility)"
+            if research_shadow_count > 0:
+                reason = (
+                    f"{research_shadow_count} research-only settlement outcomes are preserved but excluded from "
+                    f"capital qualification; native allocation-grade settlement is {len(values)}/3 outcomes"
+                )
+            else:
+                reason = (
+                    f"native forward settlement is operating ({len(values)}/3 outcomes before incremental paper eligibility)"
+                )
             next_action = "continue native forward settlement without lowering economic or statistical gates"
         elif full_qualified <= 0 and incremental_qualified <= 0:
             stage = "profitability_certifiable"
             state = "statistical_failure" if len(values) >= 30 else "collecting"
             reason = (
-                "forward outcomes exist, but no cohort currently clears the incremental/full statistical gate"
+                "allocation-grade forward outcomes exist, but no cohort currently clears the incremental/full statistical gate"
             )
             next_action = "continue independent forward outcomes; 3→30 sizing remains unchanged"
         elif current_promoted <= 0:
             stage = "profitability_certifiable"
             state = "collecting"
-            reason = "forward evidence is qualified, but no fresh current mechanism candidate is present"
+            reason = "allocation-grade forward evidence is qualified, but no fresh current mechanism candidate is present"
             next_action = "wait for a fresh after-cost opportunity under the unchanged qualification policy"
         elif certified:
             stage = "profitability_certifiable"
@@ -148,6 +212,15 @@ class AllLaneOperatingCertificationService(
             *lane.missing_evidence_classes,
             *lane.downstream_evidence_gaps,
         ]
+        if yield_semantic_incomplete:
+            blockers.insert(
+                0,
+                "protocol-loss economics are uncalibrated; yield research shadows cannot qualify capital",
+            )
+        if research_shadow_count > 0 and yield_semantic_incomplete:
+            blockers.append(
+                f"{research_shadow_count} research-shadow outcomes are excluded from allocation-grade statistics"
+            )
         if source.source_sufficiency_state == "redundancy_gap":
             blockers.insert(0, "authoritative source redundancy target is not satisfied")
         elif source.source_sufficiency_state == "stale":
@@ -166,8 +239,10 @@ class AllLaneOperatingCertificationService(
                     existing.authoritative_observation_count,
                     lane.healthy_source_count,
                 ),
-                "forward_signal_count": max(existing.forward_signal_count, len(values)),
-                "independent_forward_outcome_count": len(values),
+                # Signal/activity count may include research shadows; the independent
+                # outcome count below is strictly decision-grade settlement evidence.
+                "forward_signal_count": max(existing.forward_signal_count, len(all_outcomes)),
+                "independent_forward_outcome_count": len(outcomes),
                 "current_candidate_count": current_promoted,
                 "current_statistically_qualified_count": incremental_qualified + full_qualified,
                 "current_promoted_count": current_promoted,
