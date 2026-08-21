@@ -113,7 +113,7 @@ def configured_service(history):
     )
     service._snapshot_book = lambda candidate, snapshot: None
     service._fallback_research_cost = lambda candidate: (
-        0.012 if candidate.venue == "Coinbase" else 0.002
+        0.011 if candidate.venue == "Coinbase" else 0.002
     )
     service._holding_carry_cost = lambda candidate: 0.0
     service._discovery_cost_floor_bps = lambda: 1.0
