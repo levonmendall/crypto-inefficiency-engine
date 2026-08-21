@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from inefficiency_engine.dashboard_research_closure import build_research_closure_dashboard_router
-from inefficiency_engine.read_api import _latest_payload, _require_store
+from inefficiency_engine.read_api import _latest_payload, _payload_history, _require_store
 from inefficiency_engine.read_api_fast import app
 
 
@@ -59,6 +59,42 @@ def research_closure_status():
         "available": True,
         **latest,
         "runtime": runtime,
+        "paper_only": True,
+        "live_execution_authority": False,
+    }
+
+
+@app.get("/v3/research/candidate-observatory")
+def candidate_observatory_status(limit: int = 50):
+    """Expose raw signals, near misses, and diagnostic-only shadow learning.
+
+    Priority scores, near-miss ranks, and diagnostic shadow outcomes are research
+    telemetry only; they cannot qualify a strategy or authorize allocation.
+    """
+
+    store = _require_store()
+    bounded = max(1, min(200, int(limit)))
+    latest = _latest_payload(store, "candidate_observatory_snapshots")
+    recent_candidates = _payload_history(store, "candidate_observatory_events", limit=bounded)
+    recent_shadow_events = _payload_history(store, "candidate_observatory_shadow_events", limit=bounded)
+    if latest is None:
+        return {
+            "available": False,
+            "recent_candidates": recent_candidates,
+            "recent_diagnostic_shadow_events": recent_shadow_events,
+            "qualification_thresholds_unchanged": True,
+            "allocation_authority": False,
+            "paper_only": True,
+            "live_execution_authority": False,
+            "message": "no candidate observatory snapshot has been recorded yet",
+        }
+    return {
+        "available": True,
+        **latest,
+        "recent_candidates": recent_candidates,
+        "recent_diagnostic_shadow_events": recent_shadow_events,
+        "qualification_thresholds_unchanged": True,
+        "allocation_authority": False,
         "paper_only": True,
         "live_execution_authority": False,
     }
