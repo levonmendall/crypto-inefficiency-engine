@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
@@ -23,11 +22,14 @@ VOLUME_UNIVERSE_REFRESH_SECONDS = max(
     900.0,
     float(os.getenv("CIE_VOLUME_UNIVERSE_REFRESH_SECONDS", "3600")),
 )
-BYBIT_URL = "https://api.bybit.com"
-HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
+COINGECKO_PUBLIC_API_URL = "https://api.coingecko.com/api/v3"
+COINGECKO_PRO_API_URL = "https://pro-api.coingecko.com/api/v3"
+STRICT_VOLUME_METHOD = "marketwide_24h_trading_volume_usd"
+STRICT_VOLUME_SOURCE = "coingecko:coins_markets:total_volume"
 
-# Stable-value instruments have their own dedicated mechanisms. Letting them
-# consume directional/cross-venue top-volume slots would crowd out risk assets.
+# Stable-value instruments already have dedicated stablecoin/depeg/conversion
+# mechanisms. They are an eligibility exclusion, not an alternate ranking input.
+# Among eligible risk assets, 24-hour traded volume is the sole ranking metric.
 STABLE_VALUE_ASSETS = frozenset(
     {
         "USDT",
@@ -44,21 +46,17 @@ STABLE_VALUE_ASSETS = frozenset(
         "USDS",
         "GUSD",
         "EURC",
+        "USDG",
+        "RLUSD",
+        "U",
     }
 )
-_ASSET_RE = re.compile(r"^[A-Z0-9]{2,15}$")
-_MULTIPLIER_RE = re.compile(r"^(?:1000000|10000|1000)([A-Z][A-Z0-9]{1,14})$")
+_ASSET_RE = re.compile(r"^[A-Z][A-Z0-9]{1,19}$")
+_MULTIPLIER_RE = re.compile(r"^(?:1000000|10000|1000)([A-Z][A-Z0-9]{1,18})$")
 
 
-# Used only before a first durable volume snapshot exists or during a total
-# ranking-provider outage. Normal production operation replaces this list with
-# the rolling top 40 by 24-hour traded notional.
-BOOTSTRAP_LIQUID_ASSETS: tuple[str, ...] = (
-    "BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "ADA", "TRX", "AVAX", "LINK",
-    "SUI", "BCH", "LTC", "XLM", "DOT", "HYPE", "PEPE", "UNI", "AAVE", "NEAR",
-    "ATOM", "ETC", "FIL", "ICP", "APT", "ARB", "OP", "INJ", "SEI", "WIF",
-    "BONK", "SHIB", "TAO", "RENDER", "ENA", "ONDO", "CRO", "POL", "ALGO", "FET",
-)
+class VolumeUniverseUnavailableError(RuntimeError):
+    """Raised when no validated market-wide top-40 volume ranking is available."""
 
 
 def _now() -> datetime:
@@ -93,6 +91,7 @@ def _asset_from_bybit_symbol(symbol: object) -> str | None:
 
 
 def parse_bybit_turnover(payload: object, *, source: str) -> list[dict[str, object]]:
+    """Compatibility parser retained for provider diagnostics, not universe ranking."""
     if not isinstance(payload, dict) or int(payload.get("retCode", -1)) != 0:
         raise ValueError("Bybit ticker response did not return retCode=0")
     result = payload.get("result")
@@ -114,6 +113,7 @@ def parse_bybit_turnover(payload: object, *, source: str) -> list[dict[str, obje
 
 
 def parse_hyperliquid_turnover(payload: object) -> list[dict[str, object]]:
+    """Compatibility parser retained for provider diagnostics, not universe ranking."""
     if not isinstance(payload, list) or len(payload) != 2:
         raise ValueError("Hyperliquid metaAndAssetCtxs must be [meta, contexts]")
     meta, contexts = payload
@@ -141,6 +141,7 @@ def rank_volume_observations(
     *,
     limit: int = TOP_VOLUME_ASSET_COUNT,
 ) -> list[dict[str, object]]:
+    """Aggregate direct-venue observations by underlying for diagnostics/tests."""
     totals: dict[str, float] = defaultdict(float)
     sources: dict[str, set[str]] = defaultdict(set)
     for row in observations:
@@ -152,8 +153,7 @@ def rank_volume_observations(
         if asset is None or notional <= 0:
             continue
         totals[asset] += notional
-        source = str(row.get("source") or "unknown")
-        sources[asset].add(source)
+        sources[asset].add(str(row.get("source") or "unknown"))
     ordered = sorted(totals.items(), key=lambda item: (-item[1], item[0]))[: max(1, int(limit))]
     return [
         {
@@ -163,6 +163,79 @@ def rank_volume_observations(
             "sources": sorted(sources[asset]),
         }
         for index, (asset, notional) in enumerate(ordered, start=1)
+    ]
+
+
+def parse_coingecko_markets(payload: object) -> list[dict[str, object]]:
+    """Parse market-wide 24h volume rows from CoinGecko /coins/markets.
+
+    CoinGecko's `total_volume` is the authoritative ranking metric. Duplicate
+    symbols are kept here and resolved by highest reported volume below rather
+    than summed, because two CoinGecko IDs can share a ticker without being the
+    same economic asset.
+    """
+    if not isinstance(payload, list):
+        raise ValueError("CoinGecko coins/markets response must be a list")
+    rows: list[dict[str, object]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        asset = _normalize_asset(item.get("symbol"))
+        try:
+            volume = float(item.get("total_volume") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        coin_id = str(item.get("id") or "").strip()
+        if asset and volume > 0 and coin_id:
+            rows.append(
+                {
+                    "asset": asset,
+                    "notional_usd": volume,
+                    "source": STRICT_VOLUME_SOURCE,
+                    "source_asset_id": coin_id,
+                }
+            )
+    return rows
+
+
+def rank_marketwide_volume(
+    observations: Iterable[dict[str, object]],
+    *,
+    limit: int = TOP_VOLUME_ASSET_COUNT,
+) -> list[dict[str, object]]:
+    """Rank eligible assets strictly by market-wide 24h USD trading volume."""
+    best_by_asset: dict[str, dict[str, object]] = {}
+    for row in observations:
+        asset = _normalize_asset(row.get("asset"))
+        try:
+            volume = float(row.get("notional_usd") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if asset is None or volume <= 0:
+            continue
+        current = best_by_asset.get(asset)
+        current_volume = float(current.get("notional_usd") or 0.0) if current else -1.0
+        if volume > current_volume:
+            best_by_asset[asset] = {
+                "asset": asset,
+                "notional_usd": volume,
+                "source_asset_id": str(row.get("source_asset_id") or ""),
+            }
+    ordered = sorted(
+        best_by_asset.values(),
+        key=lambda item: (-float(item["notional_usd"]), str(item["asset"])),
+    )[: max(1, int(limit))]
+    return [
+        {
+            "rank": index,
+            "asset": str(row["asset"]),
+            "reported_24h_volume_usd": float(row["notional_usd"]),
+            # Keep the prior field name for downstream/read compatibility.
+            "aggregate_24h_notional_usd": float(row["notional_usd"]),
+            "sources": [STRICT_VOLUME_SOURCE],
+            "source_asset_id": str(row.get("source_asset_id") or ""),
+        }
+        for index, row in enumerate(ordered, start=1)
     ]
 
 
@@ -176,22 +249,46 @@ def _table(metadata: MetaData) -> Table:
     )
 
 
-def _snapshot_assets(payload: dict[str, Any] | None) -> tuple[str, ...]:
+def _row_volume(row: dict[str, Any]) -> float:
+    raw = row.get("reported_24h_volume_usd", row.get("aggregate_24h_notional_usd"))
+    try:
+        return float(raw or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def validated_volume_assets(payload: dict[str, Any] | None) -> tuple[str, ...]:
+    """Accept only a provably strict, descending market-wide volume snapshot."""
     if not isinstance(payload, dict):
         return ()
-    rows = payload.get("assets")
-    if not isinstance(rows, list):
+    if payload.get("method") != STRICT_VOLUME_METHOD:
         return ()
+    if payload.get("ranking_metric") != "reported_24h_trading_volume_usd":
+        return ()
+    if payload.get("ranking_source") != STRICT_VOLUME_SOURCE:
+        return ()
+    rows = payload.get("assets")
+    if not isinstance(rows, list) or len(rows) != TOP_VOLUME_ASSET_COUNT:
+        return ()
+
     result: list[str] = []
-    for row in rows:
-        asset = _normalize_asset(row.get("asset") if isinstance(row, dict) else row)
-        if asset and asset not in result:
-            result.append(asset)
-    return tuple(result[:TOP_VOLUME_ASSET_COUNT])
+    previous_volume: float | None = None
+    for expected_rank, row in enumerate(rows, start=1):
+        if not isinstance(row, dict) or int(row.get("rank") or 0) != expected_rank:
+            return ()
+        asset = _normalize_asset(row.get("asset"))
+        volume = _row_volume(row)
+        if asset is None or asset in result or volume <= 0:
+            return ()
+        if previous_volume is not None and volume > previous_volume:
+            return ()
+        previous_volume = volume
+        result.append(asset)
+    return tuple(result)
 
 
 class VolumeUniverseLedger:
-    """Append-only record of the liquidity universe used by research collectors."""
+    """Append-only record of the exact market-wide volume universe used by research."""
 
     def __init__(self, store: EvidenceStore):
         self.store = store
@@ -200,6 +297,8 @@ class VolumeUniverseLedger:
         self.metadata.create_all(store.engine)
 
     def record(self, payload: dict[str, Any]) -> None:
+        if len(validated_volume_assets(payload)) != TOP_VOLUME_ASSET_COUNT:
+            raise ValueError("refusing to persist a non-authoritative top-40 volume snapshot")
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         lineage = hashlib.sha256(encoded.encode()).hexdigest()
         row = {
@@ -222,26 +321,12 @@ class VolumeUniverseLedger:
             db.execute(statement)
 
     def latest(self) -> dict[str, Any] | None:
-        with self.store.engine.connect() as db:
-            raw = db.execute(
-                select(self.snapshots.c.payload_json)
-                .order_by(self.snapshots.c.observed_at.desc())
-                .limit(1)
-            ).scalar_one_or_none()
-        if not raw:
-            return None
-        try:
-            payload = json.loads(str(raw))
-        except json.JSONDecodeError:
-            return None
-        return payload if isinstance(payload, dict) else None
+        return read_latest_volume_universe(self.store)
 
 
 def read_latest_volume_universe(store: EvidenceStore | None = None) -> dict[str, Any] | None:
-    owned = False
     if store is None:
         store = build_evidence_store()
-        owned = store is not None
     if store is None or VOLUME_UNIVERSE_TABLE not in set(inspect(store.engine).get_table_names()):
         return None
     metadata = MetaData()
@@ -261,43 +346,19 @@ def read_latest_volume_universe(store: EvidenceStore | None = None) -> dict[str,
 
 def persisted_volume_assets() -> tuple[str, ...]:
     try:
-        return _snapshot_assets(read_latest_volume_universe())
+        return validated_volume_assets(read_latest_volume_universe())
     except Exception:
         return ()
 
 
-async def _collect_bybit(client: httpx.AsyncClient) -> tuple[list[dict[str, object]], dict[str, object]]:
-    observations: list[dict[str, object]] = []
-    health: dict[str, object] = {}
-    for category in ("spot", "linear"):
-        key = f"bybit:{category}"
-        try:
-            response = await client.get(f"{BYBIT_URL}/v5/market/tickers", params={"category": category})
-            response.raise_for_status()
-            rows = parse_bybit_turnover(response.json(), source=f"bybit:{category}:turnover24h")
-            observations.extend(rows)
-            health[key] = {"ok": bool(rows), "observation_count": len(rows), "error_type": None}
-        except Exception as exc:
-            health[key] = {"ok": False, "observation_count": 0, "error_type": type(exc).__name__}
-    return observations, health
-
-
-async def _collect_hyperliquid(client: httpx.AsyncClient) -> tuple[list[dict[str, object]], dict[str, object]]:
-    try:
-        response = await client.post(HYPERLIQUID_INFO_URL, json={"type": "metaAndAssetCtxs"})
-        response.raise_for_status()
-        rows = parse_hyperliquid_turnover(response.json())
-        return rows, {
-            "hyperliquid:perpetual": {"ok": bool(rows), "observation_count": len(rows), "error_type": None}
-        }
-    except Exception as exc:
-        return [], {
-            "hyperliquid:perpetual": {
-                "ok": False,
-                "observation_count": 0,
-                "error_type": type(exc).__name__,
-            }
-        }
+def _coingecko_client_config() -> tuple[str, dict[str, str]]:
+    pro_key = os.getenv("CIE_COINGECKO_API_KEY", "").strip()
+    demo_key = os.getenv("CIE_COINGECKO_DEMO_API_KEY", "").strip()
+    if pro_key:
+        return COINGECKO_PRO_API_URL, {"x-cg-pro-api-key": pro_key}
+    if demo_key:
+        return COINGECKO_PUBLIC_API_URL, {"x-cg-demo-api-key": demo_key}
+    return COINGECKO_PUBLIC_API_URL, {}
 
 
 async def collect_top_volume_snapshot(
@@ -305,37 +366,65 @@ async def collect_top_volume_snapshot(
     now: datetime | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
+    """Collect the authoritative top 40 using only market-wide 24h volume rank."""
     observed_at = _aware(now or _now())
+    base_url, auth_headers = _coingecko_client_config()
     owns_client = client is None
     client = client or httpx.AsyncClient(
-        timeout=10.0,
-        headers={"User-Agent": "crypto-inefficiency-engine/volume-universe", "Cache-Control": "no-cache"},
+        timeout=15.0,
+        headers={
+            "User-Agent": "crypto-inefficiency-engine/volume-universe",
+            "Cache-Control": "no-cache",
+            **auth_headers,
+        },
     )
     try:
-        bybit_result, hyper_result = await asyncio.gather(
-            _collect_bybit(client),
-            _collect_hyperliquid(client),
+        response = await client.get(
+            f"{base_url}/coins/markets",
+            params={
+                "vs_currency": "usd",
+                "order": "volume_desc",
+                "per_page": 250,
+                "page": 1,
+                "sparkline": "false",
+                "include_rehypothecated": "false",
+            },
         )
+        response.raise_for_status()
+        observations = parse_coingecko_markets(response.json())
     finally:
         if owns_client:
             await client.aclose()
-    observations = [*bybit_result[0], *hyper_result[0]]
-    source_health = {**bybit_result[1], **hyper_result[1]}
-    ranked = rank_volume_observations(observations, limit=TOP_VOLUME_ASSET_COUNT)
-    if len(ranked) < TOP_VOLUME_ASSET_COUNT:
-        raise RuntimeError(
-            f"volume universe requires {TOP_VOLUME_ASSET_COUNT} eligible assets; observed {len(ranked)}"
+
+    ranked = rank_marketwide_volume(observations, limit=TOP_VOLUME_ASSET_COUNT)
+    if len(ranked) != TOP_VOLUME_ASSET_COUNT:
+        raise VolumeUniverseUnavailableError(
+            f"market-wide volume source produced {len(ranked)} eligible assets, expected 40"
         )
-    return {
+    payload: dict[str, Any] = {
         "observed_at": observed_at.isoformat(),
-        "method": "aggregate_24h_traded_notional",
+        "method": STRICT_VOLUME_METHOD,
+        "ranking_metric": "reported_24h_trading_volume_usd",
+        "ranking_source": STRICT_VOLUME_SOURCE,
+        "ranking_scope": "marketwide",
+        "volume_is_defining_metric": True,
         "asset_count": TOP_VOLUME_ASSET_COUNT,
         "stable_value_assets_excluded": True,
-        "source_health": source_health,
+        "eligibility_note": "stable-value assets and non-canonical ticker symbols excluded before volume ranking",
+        "source_health": {
+            "coingecko:coins_markets": {
+                "ok": True,
+                "observation_count": len(observations),
+                "error_type": None,
+            }
+        },
         "assets": ranked,
         "paper_only": True,
         "allocation_authority": False,
     }
+    if len(validated_volume_assets(payload)) != TOP_VOLUME_ASSET_COUNT:
+        raise VolumeUniverseUnavailableError("market-wide volume snapshot failed strict ordering validation")
+    return payload
 
 
 async def resolve_top_volume_assets(
@@ -345,17 +434,22 @@ async def resolve_top_volume_assets(
     force_refresh: bool = False,
     collector=collect_top_volume_snapshot,
 ) -> tuple[str, ...]:
-    """Return the rolling top-40 universe with durable last-known-good fallback."""
+    """Return only a validated market-wide top-40 volume universe.
+
+    A prior validated market-wide snapshot may be used as last-known-good during
+    a transient source outage. A static coin list is never returned. With no
+    validated snapshot, source failure is fail-closed.
+    """
     observed_at = _aware(now or _now())
     latest = read_latest_volume_universe(store) if store is not None else None
-    latest_assets = _snapshot_assets(latest)
+    latest_assets = validated_volume_assets(latest)
     latest_at: datetime | None = None
     if latest and latest.get("observed_at"):
         try:
-            latest_at = datetime.fromisoformat(str(latest["observed_at"]))
-            latest_at = _aware(latest_at)
+            latest_at = _aware(datetime.fromisoformat(str(latest["observed_at"])))
         except ValueError:
             latest_at = None
+
     if (
         not force_refresh
         and len(latest_assets) == TOP_VOLUME_ASSET_COUNT
@@ -366,13 +460,15 @@ async def resolve_top_volume_assets(
 
     try:
         snapshot = await collector(now=observed_at)
-        assets = _snapshot_assets(snapshot)
+        assets = validated_volume_assets(snapshot)
         if len(assets) != TOP_VOLUME_ASSET_COUNT:
-            raise RuntimeError("volume selector did not produce exactly 40 assets")
+            raise VolumeUniverseUnavailableError("collector did not return a validated top-40 volume ranking")
         if store is not None:
             VolumeUniverseLedger(store).record(snapshot)
         return assets
-    except Exception:
+    except Exception as exc:
         if len(latest_assets) == TOP_VOLUME_ASSET_COUNT:
             return latest_assets
-        return BOOTSTRAP_LIQUID_ASSETS
+        raise VolumeUniverseUnavailableError(
+            "no validated market-wide top-40 volume ranking is available"
+        ) from exc
