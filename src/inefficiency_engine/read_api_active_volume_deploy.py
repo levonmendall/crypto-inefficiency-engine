@@ -135,13 +135,13 @@ def _lane_readiness():
 
 
 def _lane_summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
-    """Build a non-blocking summary from already-persisted mechanism rows.
+    """Build a non-blocking lane summary from persisted operating truth.
 
-    Architecture capability is a code property. Production evidence connectivity is
-    separately explicit so the fast dashboard cannot imply that capital-location has
-    a transfer-telemetry producer merely because its downstream contracts exist.
-    Current qualification/profitability counts are reported only from compact worker-
-    published mechanism rows; this function performs no provider work.
+    Architecture capability, production evidence connectivity, and decision-grade
+    qualification are separate claims. A lane is paper-execution-capable here only
+    when a worker-published operating row has reached a positive allocation-grade
+    state and the production evidence path is connected. Research shadows and code
+    presence cannot create executability. This function performs no provider work.
     """
 
     mechanisms = payload.get("mechanisms")
@@ -162,9 +162,21 @@ def _lane_summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
             return False
 
     lane_count = len(LANES)
-    connected_count = sum(
-        lane_id not in _PRODUCTION_EVIDENCE_DISCONNECTED for lane_id in LANES
+    connected_ids = {
+        lane_id for lane_id in LANES
+        if lane_id not in _PRODUCTION_EVIDENCE_DISCONNECTED
+    }
+    connected_count = len(connected_ids)
+    qualified_ids = {
+        str(row.get("mechanism_id") or "")
+        for row in rows
+        if str(row.get("mechanism_id") or "") in LANES and _qualified(row)
+    }
+    projection_current = not bool(payload.get("research_projection_stale")) and not bool(
+        payload.get("operating_projection_stale")
     )
+    executable_ids = qualified_ids & connected_ids if projection_current else set()
+
     return {
         "available": bool(rows),
         "lane_count": lane_count,
@@ -174,11 +186,15 @@ def _lane_summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
         "production_evidence_disconnected_lanes": sorted(
             _PRODUCTION_EVIDENCE_DISCONNECTED
         ),
-        "currently_qualified_count": sum(_qualified(row) for row in rows),
+        "decision_grade_outcome_qualified_count": len(qualified_ids),
+        "currently_qualified_count": len(qualified_ids),
+        "paper_execution_capable_count": len(executable_ids),
+        "paper_execution_capable_lanes": sorted(executable_ids),
         "profitability_certified_count": sum(
             bool(row.get("profitability_certified")) for row in rows
         ),
-        "all_lanes_paper_execution_capable": lane_count == 13,
+        "all_lanes_paper_execution_capable": len(executable_ids) == lane_count,
+        "projection_current_for_execution": projection_current,
         "live_execution_capable": False,
         "summary_source": "persisted_dashboard_projection_plus_static_runtime_connectivity",
         "request_time_research_computation": False,
