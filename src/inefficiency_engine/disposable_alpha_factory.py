@@ -207,10 +207,14 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
         One cached bounded snapshot now serves both research entry points for the same
         evidence cycle. This removes that accidental dependency without increasing the
         L2 batch size or weakening any qualification gate.
+
+        Small unit-test/fallback cores that expose only ``collect_live_evidence`` remain
+        supported; production cores expose both entry points and therefore receive the
+        shared native-mechanism wiring.
         """
 
         original_evidence = self.core.collect_live_evidence
-        original_executability = self.core.collect_live_executability
+        original_executability = getattr(self.core, "collect_live_executability", None)
         cached_snapshot = None
 
         async def collect_with_l2():
@@ -220,11 +224,13 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
             return cached_snapshot
 
         self.core.collect_live_evidence = collect_with_l2
-        self.core.collect_live_executability = collect_with_l2
+        if original_executability is not None:
+            self.core.collect_live_executability = collect_with_l2
         try:
             return await super().run_evidence_cycle(
                 total_capital_usd=total_capital_usd
             )
         finally:
             self.core.collect_live_evidence = original_evidence
-            self.core.collect_live_executability = original_executability
+            if original_executability is not None:
+                self.core.collect_live_executability = original_executability
