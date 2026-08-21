@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+from inefficiency_engine.all_lane_alpha_factory import AllLaneEvidenceFactoryService
 from inefficiency_engine.batched_cycle_history import BatchedCycleHistoricalResearch
-from inefficiency_engine.memory_bounded_alpha_factory import MemoryBoundedExpandedAlphaFactoryService
+from inefficiency_engine.lane_success_runtime import LaneSuccessMechanismExecutionService
 
 
-class DisposableExpandedAlphaFactoryService(MemoryBoundedExpandedAlphaFactoryService):
-    """Research alpha factory that consumes persisted history but never backfills it.
+class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
+    """Production disposable all-lane research factory.
 
-    Historical backfill/replay maintenance is a separate disposable heavy job. Keeping
-    that authority out of the research process prevents two distinct heavyweight
-    domains from materializing during one subprocess lifetime.
+    Research consumes persisted history but never performs network backfill in the
+    disposable research process. It does, however, run the executable alpha
+    refinements and all five native mechanism forward loops. Mechanism outcomes are
+    also fed into the Release D subtractive lane-success calibration plane.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._historical_research = BatchedCycleHistoricalResearch(self.store)
+        self.mechanism_execution = LaneSuccessMechanismExecutionService(
+            self.core,
+            self.store,
+        )
 
     async def _ensure_historical_research(self) -> None:
         # A separate history subprocess owns all network backfill. Research may read
