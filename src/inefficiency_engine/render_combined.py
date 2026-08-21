@@ -94,11 +94,47 @@ def research_job_timed_out(
     now: float,
     timeout_seconds: float,
 ) -> bool:
+    """Legacy total-runtime predicate retained for compatibility tests/callers.
+
+    Production supervision no longer uses this predicate because a valid integrated
+    research cycle can legitimately exceed the old 300-second wall-clock budget.
+    """
+
     return bool(
         heavy_name == "research"
         and heavy_started_at is not None
         and now - heavy_started_at > max(1.0, float(timeout_seconds))
     )
+
+
+def research_job_stalled(
+    *,
+    heavy_name: str | None,
+    last_progress_at: float | None,
+    now: float,
+    timeout_seconds: float,
+) -> bool:
+    """Kill only a research child that made no durable progress for the timeout."""
+
+    return bool(
+        heavy_name == "research"
+        and last_progress_at is not None
+        and now - last_progress_at > max(1.0, float(timeout_seconds))
+    )
+
+
+def research_heartbeat_marker(health: dict[str, object]) -> str | None:
+    """Return the durable research heartbeat timestamp used as a progress marker."""
+
+    runtime = health.get("runtime_heartbeats")
+    workers = runtime.get("workers") if isinstance(runtime, dict) else None
+    row = workers.get("research") if isinstance(workers, dict) else None
+    if not isinstance(row, dict) or not row.get("available"):
+        return None
+    observed_at = row.get("observed_at")
+    if observed_at in (None, ""):
+        return None
+    return str(observed_at)
 
 
 def _terminate_children(children: Sequence[subprocess.Popen[bytes]], *, timeout_seconds: float = 20.0) -> None:
@@ -233,6 +269,9 @@ def main() -> int:
     heavy: subprocess.Popen[bytes] | None = None
     heavy_name: str | None = None
     heavy_started_at: float | None = None
+    heavy_last_progress_at: float | None = None
+    heavy_research_heartbeat_marker: str | None = None
+    latest_research_heartbeat_marker: str | None = None
     heavy_termination_requested_at: float | None = None
     stopping = False
 
@@ -316,6 +355,16 @@ def main() -> int:
                 next_runtime_watchdog = now + PORTFOLIO_WATCHDOG_CHECK_SECONDS
                 try:
                     health = _local_json(port, "/health")
+                    marker = research_heartbeat_marker(health)
+                    if marker is not None:
+                        if (
+                            heavy is not None
+                            and heavy_name == "research"
+                            and marker != heavy_research_heartbeat_marker
+                        ):
+                            heavy_research_heartbeat_marker = marker
+                            heavy_last_progress_at = now
+                        latest_research_heartbeat_marker = marker
                     portfolio_reason = portfolio_watchdog_reason(
                         health,
                         process_started_at=permanent_started_at["portfolio"],
@@ -378,21 +427,27 @@ def main() -> int:
                     heavy = None
                     heavy_name = None
                     heavy_started_at = None
+                    heavy_last_progress_at = None
+                    heavy_research_heartbeat_marker = None
                     heavy_termination_requested_at = None
                 elif heavy_termination_requested_at is not None:
                     if now - heavy_termination_requested_at >= HEAVY_TERMINATE_GRACE_SECONDS:
                         print(f"disposable {heavy_name} ignored SIGTERM; killing process", flush=True)
                         heavy.kill()
-                elif research_job_timed_out(
+                elif research_job_stalled(
                     heavy_name=heavy_name,
-                    heavy_started_at=heavy_started_at,
+                    last_progress_at=heavy_last_progress_at,
                     now=now,
                     timeout_seconds=research_job_timeout,
                 ):
                     if research_recovery_failed_since is None:
                         research_recovery_failed_since = now
+                    runtime_seconds = (
+                        now - heavy_started_at if heavy_started_at is not None else research_job_timeout
+                    )
                     print(
-                        f"research disposable exceeded {research_job_timeout:.1f}s runtime; terminating stuck job",
+                        f"research disposable made no durable progress for {research_job_timeout:.1f}s; "
+                        f"terminating stuck job after {runtime_seconds:.1f}s total runtime",
                         flush=True,
                     )
                     heavy_termination_requested_at = now
@@ -417,12 +472,16 @@ def main() -> int:
                 ):
                     failed_for = now - float(research_recovery_failed_since or now)
                     print(
-                        "research publication remained overdue through repeated failed recovery attempts "
-                        f"for {failed_for:.1f}s; restarting Render; reason={research_overdue_reason}; "
+                        "research publication remains overdue through isolated recovery attempts "
+                        f"for {failed_for:.1f}s; continuing fail-closed research recovery without "
+                        f"restarting healthy permanent children; reason={research_overdue_reason}; "
                         f"memory={memory.as_dict()}",
                         flush=True,
                     )
-                    return 1
+                    # Rate-limit this durability warning while allowing another
+                    # disposable research attempt. A stale isolated research plane is
+                    # not a reason to take down a healthy API or portfolio child.
+                    research_recovery_failed_since = now
 
                 due_history = now >= next_due["history"]
                 due_research = now >= next_due["research"]
@@ -453,6 +512,10 @@ def main() -> int:
                         heavy = subprocess.Popen(command)
                         heavy_name = next_name
                         heavy_started_at = now
+                        heavy_last_progress_at = now if next_name == "research" else None
+                        heavy_research_heartbeat_marker = (
+                            latest_research_heartbeat_marker if next_name == "research" else None
+                        )
                         heavy_termination_requested_at = None
 
             time.sleep(SUPERVISOR_POLL_SECONDS)
