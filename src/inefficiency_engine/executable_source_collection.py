@@ -7,14 +7,18 @@ from inefficiency_engine.priority_source_collection import (
     PrioritySourceCollectionService,
     SourceCoverageAwareOperatingCertificationService,
 )
-from inefficiency_engine.trade_flow import BYBIT_LINEAR_WS, collect_bybit_trade_flow
+from inefficiency_engine.trade_flow_integrity import (
+    BYBIT_TRADE_WS,
+    OKX_TRADE_WS,
+    collect_multi_venue_trade_flow,
+)
 
 
-PUBLIC_TRADE_FLOW_REFRESH_TTL_SECONDS = 45.0
+PUBLIC_TRADE_FLOW_REFRESH_TTL_SECONDS = 30.0
 
 
 class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService):
-    """Priority source collection plus empirical public taker-flow evidence."""
+    """Priority source collection plus bounded multi-venue public taker-flow evidence."""
 
     async def run_cycle(self) -> dict[str, object]:
         result = await super().run_cycle()
@@ -44,9 +48,9 @@ class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService)
             self._record_memory("public_trade_flow_deferred", source_id=source_id)
         else:
             try:
-                probe = await collect_bybit_trade_flow(self.source_coverage)
+                probe = await collect_multi_venue_trade_flow(self.source_coverage)
                 if probe.item_count <= 0:
-                    raise ValueError("public trade-flow subscription produced no point-in-time trades")
+                    raise ValueError("public trade-flow streams produced no point-in-time trades")
                 self._record_probe(probe)
                 trade_flow = {
                     "healthy": True,
@@ -55,9 +59,17 @@ class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService)
                     "authoritative": probe.authoritative,
                     "refresh_state": "refreshed",
                     "refresh_ttl_seconds": PUBLIC_TRADE_FLOW_REFRESH_TTL_SECONDS,
+                    "stream_integrity": probe.detail.get("stream_integrity"),
+                    "venues_healthy": probe.detail.get("venues_healthy"),
+                    "venue_errors": probe.detail.get("venue_errors"),
                 }
             except Exception as exc:
-                self._record_failure(source_id, lanes, BYBIT_LINEAR_WS, exc)
+                self._record_failure(
+                    source_id,
+                    lanes,
+                    f"{BYBIT_TRADE_WS};{OKX_TRADE_WS}",
+                    exc,
+                )
                 trade_flow = {
                     "healthy": False,
                     "item_count": 0,
@@ -88,7 +100,7 @@ class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService)
 class ExecutableSourceCoverageAwareOperatingCertificationService(
     SourceCoverageAwareOperatingCertificationService
 ):
-    """Source-aware certification with real public trade flow wired in."""
+    """Source-aware certification with event-integrity trade flow wired in."""
 
     def __init__(self, core, store, alpha_factory, allocation_certification, *, version: str):
         super().__init__(
