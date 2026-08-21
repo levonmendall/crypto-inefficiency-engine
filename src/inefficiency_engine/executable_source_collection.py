@@ -4,6 +4,11 @@ import gc
 
 from inefficiency_engine.evidence_velocity import stagnation_diagnostics
 from inefficiency_engine.memory_budget import memory_budget_exceeded
+from inefficiency_engine.option_capacity import (
+    DERIBIT_BASE_URL,
+    DERIBIT_OPTION_CAPACITY_SOURCE_ID,
+    collect_deribit_option_capacity,
+)
 from inefficiency_engine.priority_source_collection import (
     PrioritySourceCollectionService,
     SourceCoverageAwareOperatingCertificationService,
@@ -16,13 +21,88 @@ from inefficiency_engine.trade_flow_integrity import (
 
 
 PUBLIC_TRADE_FLOW_REFRESH_TTL_SECONDS = 30.0
+OPTION_CAPACITY_REFRESH_TTL_SECONDS = 300.0
 
 
 class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService):
-    """Priority collection plus bounded multi-venue public taker-flow evidence."""
+    """Priority collection plus bounded executable event/capacity evidence."""
 
     async def run_cycle(self) -> dict[str, object]:
         result = await super().run_cycle()
+        priority = dict(result.get("priority_sources") or {})
+        refresh = dict(result.get("source_refresh") or {})
+
+        # Normalize visible Deribit option size with first-party contract metadata.
+        # This is separate from quotes/Greeks so the volatility lane cannot infer
+        # capacity merely because a best bid/ask exists.
+        capacity_source = DERIBIT_OPTION_CAPACITY_SOURCE_ID
+        capacity_lanes = ["volatility"]
+        if self._source_is_fresh(
+            capacity_source,
+            capacity_lanes,
+            OPTION_CAPACITY_REFRESH_TTL_SECONDS,
+        ):
+            option_capacity = {
+                "healthy": True,
+                "refresh_state": "fresh_cached",
+                "refresh_ttl_seconds": OPTION_CAPACITY_REFRESH_TTL_SECONDS,
+            }
+        elif memory_budget_exceeded(self.memory_soft_limit_mb):
+            option_capacity = {
+                "healthy": None,
+                "item_count": 0,
+                "error_type": "MemoryBudgetDeferred",
+                "memory_deferred": True,
+                "refresh_state": "memory_deferred",
+                "preserved_previous_source_observation": True,
+                "refresh_ttl_seconds": OPTION_CAPACITY_REFRESH_TTL_SECONDS,
+            }
+            gc.collect()
+            self._record_memory(
+                "option_capacity_deferred",
+                source_id=capacity_source,
+            )
+        else:
+            try:
+                probe = await collect_deribit_option_capacity(self.store)
+                if probe.item_count <= 0:
+                    raise ValueError(
+                        "Deribit option-capacity collector produced no normalized books"
+                    )
+                self._record_probe(probe)
+                option_capacity = {
+                    "healthy": True,
+                    "item_count": probe.item_count,
+                    "source_reference": probe.source_reference,
+                    "authoritative": probe.authoritative,
+                    "refresh_state": "refreshed",
+                    "refresh_ttl_seconds": OPTION_CAPACITY_REFRESH_TTL_SECONDS,
+                    "capacity_normalization": probe.detail.get("capacity_normalization"),
+                    "hidden_depth_assumed": probe.detail.get("hidden_depth_assumed"),
+                }
+            except Exception as exc:
+                self._record_failure(
+                    capacity_source,
+                    capacity_lanes,
+                    f"{DERIBIT_BASE_URL}/public/get_order_book",
+                    exc,
+                )
+                option_capacity = {
+                    "healthy": False,
+                    "item_count": 0,
+                    "error_type": type(exc).__name__,
+                    "refresh_state": "provider_failed",
+                    "refresh_ttl_seconds": OPTION_CAPACITY_REFRESH_TTL_SECONDS,
+                }
+            finally:
+                gc.collect()
+                self._record_memory(
+                    "option_capacity_complete",
+                    source_id=capacity_source,
+                )
+        priority[capacity_source] = option_capacity
+        refresh["deribit_option_capacity"] = option_capacity
+
         source_id = "public-trade-flow"
         lanes = ["microstructure", "liquidity_provision"]
 
@@ -81,9 +161,7 @@ class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService)
                 gc.collect()
                 self._record_memory("public_trade_flow_complete", source_id=source_id)
 
-        priority = dict(result.get("priority_sources") or {})
         priority[source_id] = trade_flow
-        refresh = dict(result.get("source_refresh") or {})
         refresh["public_trade_flow"] = trade_flow
         coverage = self.source_coverage.snapshot()
         stagnation = stagnation_diagnostics(
@@ -119,7 +197,7 @@ class ExecutablePrioritySourceCollectionService(PrioritySourceCollectionService)
 class ExecutableSourceCoverageAwareOperatingCertificationService(
     SourceCoverageAwareOperatingCertificationService
 ):
-    """Source-aware certification with event-integrity trade flow wired in."""
+    """Source-aware certification with event-integrity and capacity evidence wired in."""
 
     def __init__(self, core, store, alpha_factory, allocation_certification, *, version: str):
         super().__init__(
