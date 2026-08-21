@@ -2,6 +2,8 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from inefficiency_engine.all_lane_alpha_factory import AllLaneEvidenceFactoryService
 from inefficiency_engine.alpha_factory import AlphaCandidate, AlphaEvidenceCycle
 from inefficiency_engine.evidence import ScanSnapshot
@@ -105,7 +107,7 @@ def test_current_economics_choose_execution_venue_after_raw_signal(monkeypatch):
 
     assert len(emitted) == 1
     assert emitted[0].venue == "OKX"
-    assert emitted[0].expected_net_return == 0.008
+    assert emitted[0].expected_net_return == pytest.approx(0.008)
     assert emitted[0].features["venue_selected_after_current_economics"] is True
     funnel = service.last_discovery_diagnostics()["trend_momentum"]
     assert funnel["raw_candidate_count"] == 1
@@ -147,7 +149,7 @@ def test_named_24h_signal_rejects_dense_but_short_history(monkeypatch):
     assert funnel["history_coverage_rejected_count"] == 1
     assert funnel["emitted_candidate_count"] == 0
     assert funnel["dominant_rejection_gate"] == "history_coverage"
-    assert funnel["minimum_required_history_span_hours"] == 19.2
+    assert funnel["minimum_required_history_span_hours"] == pytest.approx(19.2)
     assert funnel["best_observed_history_span_hours"] < 4.0
 
 
