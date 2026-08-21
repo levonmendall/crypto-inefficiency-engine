@@ -162,6 +162,7 @@ class EvidenceVelocityAllLaneOperatingCertificationService(
             pool,
             key=lambda row: (
                 int(row.get("independent_forward_outcome_count") or 0),
+                int(row.get("settled_allocator_outcome_count") or 0),
                 int(row.get("candidate_local_forward_outcome_count") or 0),
                 int(row.get("forward_signal_count") or 0),
             ),
@@ -265,6 +266,9 @@ class EvidenceVelocityAllLaneOperatingCertificationService(
             "primary_reason": reason,
             "next_action": next_action,
             "blockers": blockers,
+            "profitability_certified": bool(
+                state == "certified" and source.allocation_source_qualified
+            ),
         }
         if rows:
             update["forward_signal_count"] = sum(
@@ -286,16 +290,25 @@ class EvidenceVelocityAllLaneOperatingCertificationService(
                     "forward_hit_rate_ci_lower": representative.get(
                         "forward_hit_rate_ci_lower"
                     ),
+                    "settled_allocator_outcome_count": int(
+                        representative.get("settled_allocator_outcome_count") or 0
+                    ),
                 }
             )
         return existing.model_copy(update=update)
 
-    def _source_reconciled_status(self, existing, lane):
-        """Refresh structural-lane source truth without recomputing economics."""
+    def _source_reconciled_status(
+        self,
+        existing,
+        lane,
+        strategy_rows: list[dict[str, object]] | None = None,
+    ):
+        """Refresh structural-lane source truth and current durable allocator state."""
 
         source = classify_lane_source_dimensions(lane)
         source_count = self._authoritative_source_observation_count(lane)
         authoritative_count = max(existing.authoritative_observation_count, source_count)
+        rows = [dict(row) for row in list(strategy_rows or [])]
         blockers: list[str] = []
         if not source.research_eligible:
             state = "provider_gap"
@@ -321,13 +334,57 @@ class EvidenceVelocityAllLaneOperatingCertificationService(
             )
             next_action = "restore independent source redundancy while preserving all qualification thresholds"
             blockers.append("authoritative source redundancy target is not satisfied")
-        else:
-            return existing.model_copy(
-                update={
-                    "provider_ready": source.provider_ready,
-                    "authoritative_observation_count": authoritative_count,
-                }
+        elif rows:
+            state = _mixed_lane_state(rows)
+            stage = "profitability_certifiable"
+            reason = (
+                f"current allocator strategy evidence: {_state_counts(rows)}; each structural strategy keeps "
+                "its own settlement/profitability conclusion rather than being pooled into a synthetic lane cohort"
             )
+            next_action = (
+                "continue allocator settlement under unchanged gates"
+                if state in {"collecting", "certifying", "certified"}
+                else "continue observation and preserve the failed strategy cohort without lowering thresholds"
+            )
+            representative = self._strategy_representative(rows, state)
+            update: dict[str, object] = {
+                "state": state,
+                "stage": stage,
+                "provider_ready": source.provider_ready,
+                "authoritative_observation_count": authoritative_count,
+                "primary_reason": reason,
+                "next_action": next_action,
+                "blockers": [] if state in {"certifying", "certified"} else list(existing.blockers),
+                "profitability_certified": state == "certified",
+            }
+            if representative is not None:
+                update.update(
+                    {
+                        "forward_signal_count": int(
+                            representative.get("forward_signal_count") or 0
+                        ),
+                        "settled_allocator_outcome_count": int(
+                            representative.get("settled_allocator_outcome_count") or 0
+                        ),
+                        "allocator_realized_profit_usd": representative.get(
+                            "allocator_realized_profit_usd"
+                        ),
+                        "allocator_mean_net_return_ci_lower": representative.get(
+                            "allocator_mean_net_return_ci_lower"
+                        ),
+                        "allocator_profitable_rate_ci_lower": representative.get(
+                            "allocator_profitable_rate_ci_lower"
+                        ),
+                    }
+                )
+            return existing.model_copy(update=update)
+        else:
+            # A newly recovered complete source plane with no current allocator rows
+            # must not retain a stale provider-gap label from an older snapshot.
+            state = "collecting"
+            stage = "profitability_certifiable"
+            reason = "complete authoritative source evidence is connected and awaiting an eligible allocator cohort"
+            next_action = "continue current evidence collection and allocator settlement under unchanged gates"
 
         return existing.model_copy(
             update={
@@ -338,6 +395,7 @@ class EvidenceVelocityAllLaneOperatingCertificationService(
                 "primary_reason": reason,
                 "next_action": next_action,
                 "blockers": blockers,
+                "profitability_certified": False,
             }
         )
 
@@ -360,14 +418,11 @@ class EvidenceVelocityAllLaneOperatingCertificationService(
                 status = self._mechanism_status(existing)
             else:
                 lane = self.source_coverage.lane(existing.mechanism_id)
+                strategy_rows = list(strategy_evidence.get(existing.mechanism_id, []))
                 if existing.mechanism_id in _ALPHA_LANES:
-                    status = self._alpha_runtime_status(
-                        existing,
-                        lane,
-                        list(strategy_evidence.get(existing.mechanism_id, [])),
-                    )
+                    status = self._alpha_runtime_status(existing, lane, strategy_rows)
                 else:
-                    status = self._source_reconciled_status(existing, lane)
+                    status = self._source_reconciled_status(existing, lane, strategy_rows)
             statuses.append(status)
 
         corrected = latest.model_copy(
@@ -381,9 +436,6 @@ class EvidenceVelocityAllLaneOperatingCertificationService(
                 "blocked_count": sum(row.state in _BLOCKED_STATES for row in statuses),
                 "certifying_count": sum(row.state == "certifying" for row in statuses),
                 "certified_count": sum(row.state == "certified" for row in statuses),
-                "all_mechanisms_decision_grade": all(
-                    row.state == "certified" for row in statuses
-                ),
             }
         )
         self.ledger.record(corrected)
