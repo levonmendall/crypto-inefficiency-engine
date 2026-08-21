@@ -7,12 +7,18 @@ from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.evidence_velocity import EVIDENCE_CLASS_FRESHNESS_SECONDS
 from inefficiency_engine.governed_mechanism_execution import GovernedMechanismExecutionService
 from inefficiency_engine.mechanism_execution import MechanismTrialSpec
-from inefficiency_engine.option_capacity import OptionCapacityLedger, OptionCapacityObservation
+from inefficiency_engine.option_capacity import (
+    OptionCapacityLedger,
+    OptionCapacityObservation,
+    _select_surface,
+)
 from inefficiency_engine.source_coverage_catalog import LANES, SOURCES
 
 
 NOW = datetime(2026, 8, 21, 20, 0, tzinfo=timezone.utc)
 EXPIRY = datetime(2026, 8, 28, 8, 0, tzinfo=timezone.utc)
+NEXT_EXPIRY = datetime(2026, 9, 4, 8, 0, tzinfo=timezone.utc)
+THIRD_EXPIRY = datetime(2026, 9, 11, 8, 0, tzinfo=timezone.utc)
 
 
 def _capacity(observation_id: str = "cap-1") -> OptionCapacityObservation:
@@ -24,10 +30,9 @@ def _capacity(observation_id: str = "cap-1") -> OptionCapacityObservation:
         strike=60_000.0,
         option_type="call",
         observed_at=NOW,
-        contract_size_underlying=1.0,
         underlying_price_usd=60_000.0,
-        bid_visible_size_contracts=1.0,
-        ask_visible_size_contracts=0.8,
+        bid_visible_amount_underlying=1.0,
+        ask_visible_amount_underlying=0.8,
         bid_capacity_usd=60_000.0,
         ask_capacity_usd=48_000.0,
         source_reference="deribit:test",
@@ -69,6 +74,43 @@ def test_option_capacity_is_explicit_source_class_with_short_freshness():
     assert EVIDENCE_CLASS_FRESHNESS_SECONDS["option_capacity"] == 900.0
 
 
+def test_deribit_capacity_surface_covers_two_expiries_but_remains_bounded():
+    rows = []
+    for expiry in (EXPIRY, NEXT_EXPIRY, THIRD_EXPIRY):
+        for option_type, suffix in (("call", "C"), ("put", "P")):
+            for strike in (55_000.0, 60_000.0, 65_000.0):
+                rows.append(
+                    (
+                        f"BTC-{expiry:%d%b%y}-{int(strike)}-{suffix}".upper(),
+                        "BTC",
+                        expiry,
+                        strike,
+                        option_type,
+                        60_000.0,
+                    )
+                )
+
+    selected = _select_surface(rows)
+
+    assert {row[2] for row in selected} == {EXPIRY, NEXT_EXPIRY}
+    assert THIRD_EXPIRY not in {row[2] for row in selected}
+    # Two expiries x two option sides x two near-ATM strikes.
+    assert len(selected) == 8
+    for expiry in (EXPIRY, NEXT_EXPIRY):
+        for option_type in ("call", "put"):
+            side = [row for row in selected if row[2] == expiry and row[4] == option_type]
+            assert {row[3] for row in side} == {55_000.0, 60_000.0}
+
+
+def test_capacity_observation_uses_underlying_amount_units_without_multiplier():
+    row = _capacity()
+
+    assert row.amount_unit == "underlying_base_currency"
+    assert row.contract_size_underlying is None
+    assert row.bid_capacity_usd == row.bid_visible_amount_underlying * row.underlying_price_usd
+    assert row.ask_capacity_usd == row.ask_visible_amount_underlying * row.underlying_price_usd
+
+
 def test_volatility_trial_is_bounded_to_five_percent_visible_capacity(tmp_path):
     store = EvidenceStore(tmp_path / "option-capacity.sqlite3")
     ledger = OptionCapacityLedger(store)
@@ -89,7 +131,9 @@ def test_volatility_trial_is_bounded_to_five_percent_visible_capacity(tmp_path):
     assert bounded.settlement_payload["visible_option_capacity_usd"] == 48_000.0
     assert bounded.settlement_payload["option_capacity_fraction_used"] == 0.05
     assert bounded.settlement_payload["hidden_option_depth_assumed"] is False
-    assert bounded.settlement_payload["option_capacity_evidence"][0]["observation_id"] == "cap-1"
+    evidence = bounded.settlement_payload["option_capacity_evidence"][0]
+    assert evidence["observation_id"] == "cap-1"
+    assert evidence["contract_size_underlying"] is None
 
 
 def test_volatility_trial_fails_closed_without_exact_contract_capacity(tmp_path):
