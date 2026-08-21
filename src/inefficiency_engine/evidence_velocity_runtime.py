@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from inefficiency_engine.executable_operating_certification import (
     AllLaneOperatingCertificationService,
 )
@@ -103,6 +105,15 @@ class EvidenceVelocityAllLaneOperatingCertificationService(
         self.mechanism_execution = EvidenceVelocityLaneSuccessMechanismExecutionService(
             core,
             store,
+        )
+
+    def _forward_evidence_heartbeat(self, family: str, *, now: datetime):
+        """Always evaluate worker health against wall-clock UTC, never a stale scan time."""
+
+        del now
+        return super()._forward_evidence_heartbeat(
+            family,
+            now=datetime.now(timezone.utc),
         )
 
     def _mechanism_status(self, existing):
