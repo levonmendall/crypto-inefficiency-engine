@@ -11,11 +11,10 @@ def _classes_for_lane(lane_id: str) -> set[str]:
     }
 
 
-def test_yield_requires_protocol_risk_calibration_before_forward_testing():
+def test_yield_keeps_source_learning_contract_and_exposes_risk_calibration_downstream():
     required = set(LANES["yield"]["required"])
-    available = _classes_for_lane("yield")
-    assert "protocol_risk_calibration" in required
-    assert "protocol_risk_calibration" not in available
+    assert required == {"yield_rate", "capacity", "exit_liquidity"}
+    assert "protocol-loss statistical calibration" in LANES["yield"]["downstream"]
     assert "realized-yield forward cohort" in LANES["yield"]["downstream"]
 
 
