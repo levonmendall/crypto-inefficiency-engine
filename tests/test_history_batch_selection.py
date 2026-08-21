@@ -6,13 +6,14 @@ import pytest
 
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.history_batch_job import maintain_history_batch_once, select_history_batch
+from inefficiency_engine.volume_universe import TOP_VOLUME_ASSET_COUNT
 
 
 NOW = datetime(2026, 8, 20, 19, 30, tzinfo=timezone.utc)
 
 
-def test_top40_history_selection_never_expands_beyond_requested_batch():
-    assets = tuple(f"ASSET{index:02d}" for index in range(40))
+def test_top_volume_history_selection_never_expands_beyond_requested_batch():
+    assets = tuple(f"ASSET{index:02d}" for index in range(TOP_VOLUME_ASSET_COUNT))
     status = {
         "assets": [
             {
@@ -26,6 +27,7 @@ def test_top40_history_selection_never_expands_beyond_requested_batch():
 
     selected = select_history_batch(assets, status, batch_size=4)
 
+    assert TOP_VOLUME_ASSET_COUNT == 25
     assert len(selected) == 4
     assert set(selected).issubset(set(assets))
     assert all(
@@ -40,7 +42,7 @@ async def test_history_batch_force_refreshes_membership_and_prioritizes_new_entr
     monkeypatch,
 ):
     store = EvidenceStore(tmp_path / "history-membership.db")
-    active = tuple(f"ASSET{index:02d}" for index in range(40))
+    active = tuple(f"ASSET{index:02d}" for index in range(TOP_VOLUME_ASSET_COUNT))
     seen: dict[str, object] = {}
 
     async def fake_resolve(_store, *, now=None, force_refresh=False):
@@ -100,5 +102,6 @@ async def test_history_batch_force_refreshes_membership_and_prioritizes_new_entr
 
     assert seen["force_refresh"] is True
     assert seen["batch"] == active[:4]
-    assert result["top40_force_refreshed"] is True
+    assert result["top_volume_force_refreshed"] is True
+    assert result["universe_target_count"] == TOP_VOLUME_ASSET_COUNT == 25
     assert result["batch_assets"] == list(active[:4])

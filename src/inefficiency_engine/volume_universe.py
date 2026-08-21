@@ -17,20 +17,22 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from inefficiency_engine.evidence import EvidenceStore, build_evidence_store
 
 
-TOP_VOLUME_ASSET_COUNT = 40
+# Start with the 25 most-liquid eligible assets and prove this cohort is reliable
+# end-to-end before expanding the production research universe again.
+TOP_VOLUME_ASSET_COUNT = 25
 VOLUME_UNIVERSE_TABLE = "liquid_volume_universe_snapshots"
 # Membership is a market-state input, not slow research. Keep a bounded cache to
-# protect CoinGecko, but refresh quickly enough that the internal cohort does not
-# trail a separately observed market-wide top-40 for most of an hour.
+# protect CoinGecko while leaving multiple lightweight refresh opportunities before
+# the read plane considers a snapshot stale.
 VOLUME_UNIVERSE_REFRESH_SECONDS = max(
     300.0,
     float(os.getenv("CIE_VOLUME_UNIVERSE_REFRESH_SECONDS", "900")),
 )
 COINGECKO_PUBLIC_API_URL = "https://api.coingecko.com/api/v3"
 COINGECKO_PRO_API_URL = "https://pro-api.coingecko.com/api/v3"
-# Version the method so pre-repair snapshots that relied only on a static stablecoin
-# blacklist cannot be accepted as the current authoritative top-40 universe.
-STRICT_VOLUME_METHOD = "marketwide_24h_trading_volume_usd_dynamic_stable_v2"
+# Version both the classification method and cohort size. This deliberately makes
+# persisted 40-asset v2 snapshots ineligible as current top-25 state after rollout.
+STRICT_VOLUME_METHOD = "marketwide_24h_trading_volume_usd_dynamic_stable_top25_v3"
 STRICT_VOLUME_SOURCE = "coingecko:coins_markets:total_volume"
 STRICT_STABLE_VALUE_SOURCE = "coingecko:coins_markets:category=stablecoins"
 
@@ -63,7 +65,7 @@ _MULTIPLIER_RE = re.compile(r"^(?:1000000|10000|1000)([A-Z][A-Z0-9]{1,18})$")
 
 
 class VolumeUniverseUnavailableError(RuntimeError):
-    """Raised when no validated market-wide top-40 volume ranking is available."""
+    """Raised when no validated market-wide top-volume ranking is available."""
 
 
 def _now() -> datetime:
@@ -286,6 +288,12 @@ def validated_volume_assets(payload: dict[str, Any] | None) -> tuple[str, ...]:
         return ()
     if payload.get("ranking_source") != STRICT_VOLUME_SOURCE:
         return ()
+    try:
+        target_count = int(payload.get("universe_target_count") or 0)
+    except (TypeError, ValueError):
+        return ()
+    if target_count != TOP_VOLUME_ASSET_COUNT:
+        return ()
     rows = payload.get("assets")
     if not isinstance(rows, list) or len(rows) != TOP_VOLUME_ASSET_COUNT:
         return ()
@@ -317,7 +325,9 @@ class VolumeUniverseLedger:
 
     def record(self, payload: dict[str, Any]) -> None:
         if len(validated_volume_assets(payload)) != TOP_VOLUME_ASSET_COUNT:
-            raise ValueError("refusing to persist a non-authoritative top-40 volume snapshot")
+            raise ValueError(
+                f"refusing to persist a non-authoritative top-{TOP_VOLUME_ASSET_COUNT} volume snapshot"
+            )
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         lineage = hashlib.sha256(encoded.encode()).hexdigest()
         row = {
@@ -385,7 +395,7 @@ async def collect_top_volume_snapshot(
     now: datetime | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
-    """Collect the top 40 by volume after live stable-value classification.
+    """Collect the configured top-volume cohort after live stable-value classification.
 
     Volume remains the only ordering metric. Eligibility is determined first by
     requiring CoinGecko's live ``stablecoins`` category and excluding matching
@@ -440,7 +450,8 @@ async def collect_top_volume_snapshot(
     ranked = rank_marketwide_volume(eligible_observations, limit=TOP_VOLUME_ASSET_COUNT)
     if len(ranked) != TOP_VOLUME_ASSET_COUNT:
         raise VolumeUniverseUnavailableError(
-            f"market-wide volume source produced {len(ranked)} eligible assets, expected 40"
+            f"market-wide volume source produced {len(ranked)} eligible assets, "
+            f"expected {TOP_VOLUME_ASSET_COUNT}"
         )
 
     dynamically_excluded = sum(
@@ -455,6 +466,7 @@ async def collect_top_volume_snapshot(
         "ranking_source": STRICT_VOLUME_SOURCE,
         "ranking_scope": "marketwide",
         "volume_is_defining_metric": True,
+        "universe_target_count": TOP_VOLUME_ASSET_COUNT,
         "asset_count": TOP_VOLUME_ASSET_COUNT,
         "stable_value_assets_excluded": True,
         "dynamic_stable_value_classification": True,
@@ -493,12 +505,12 @@ async def resolve_top_volume_assets(
     force_refresh: bool = False,
     collector=collect_top_volume_snapshot,
 ) -> tuple[str, ...]:
-    """Return only a validated market-wide top-40 volume universe.
+    """Return only a validated market-wide top-volume universe.
 
-    A prior snapshot from this dynamic-classification version may be used as
-    last-known-good during a transient source outage. Pre-repair snapshots and
-    static coin lists are never accepted. With no validated snapshot, failure is
-    fail-closed.
+    A prior snapshot from this exact dynamic-classification/cohort version may be
+    used as last-known-good during a transient source outage. Older cohort versions
+    and static coin lists are never accepted. With no validated snapshot, failure
+    is fail-closed.
     """
     observed_at = _aware(now or _now())
     latest = read_latest_volume_universe(store) if store is not None else None
@@ -522,7 +534,9 @@ async def resolve_top_volume_assets(
         snapshot = await collector(now=observed_at)
         assets = validated_volume_assets(snapshot)
         if len(assets) != TOP_VOLUME_ASSET_COUNT:
-            raise VolumeUniverseUnavailableError("collector did not return a validated top-40 volume ranking")
+            raise VolumeUniverseUnavailableError(
+                f"collector did not return a validated top-{TOP_VOLUME_ASSET_COUNT} volume ranking"
+            )
         if store is not None:
             VolumeUniverseLedger(store).record(snapshot)
         return assets
@@ -530,5 +544,5 @@ async def resolve_top_volume_assets(
         if len(latest_assets) == TOP_VOLUME_ASSET_COUNT:
             return latest_assets
         raise VolumeUniverseUnavailableError(
-            "no validated market-wide top-40 volume ranking is available"
+            f"no validated market-wide top-{TOP_VOLUME_ASSET_COUNT} volume ranking is available"
         ) from exc

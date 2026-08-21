@@ -33,6 +33,7 @@ def _volume_snapshot(now: datetime) -> dict[str, object]:
         "ranking_source": STRICT_VOLUME_SOURCE,
         "ranking_scope": "marketwide",
         "volume_is_defining_metric": True,
+        "universe_target_count": TOP_VOLUME_ASSET_COUNT,
         "asset_count": TOP_VOLUME_ASSET_COUNT,
         "stable_value_assets_excluded": True,
         "eligibility_note": "test",
@@ -82,23 +83,30 @@ def test_active_cycle_history_filters_archived_assets_and_preserves_volume_rank(
     volume = read_active_volume_universe_status(store, now=now + timedelta(minutes=10))
     assert volume["available"] is True
     assert volume["current_membership_available"] is True
-    assert volume["asset_count"] == TOP_VOLUME_ASSET_COUNT
+    assert volume["asset_count"] == TOP_VOLUME_ASSET_COUNT == 25
+    assert volume["universe_target_count"] == 25
     assert volume["volume_is_defining_metric"] is True
     assert [row["asset"] for row in volume["assets"]] == list(ACTIVE_ASSETS)
-    assert [row["rank"] for row in volume["assets"]] == list(range(1, 41))
+    assert [row["rank"] for row in volume["assets"]] == list(
+        range(1, TOP_VOLUME_ASSET_COUNT + 1)
+    )
 
     history = read_active_cycle_history_status(store, now=now + timedelta(minutes=10))
     assert history["asset_count"] == TOP_VOLUME_ASSET_COUNT
+    assert history["universe_target_count"] == TOP_VOLUME_ASSET_COUNT
     assert [row["asset"] for row in history["assets"]] == list(ACTIVE_ASSETS)
-    assert [row["active_rank"] for row in history["assets"]] == list(range(1, 41))
+    assert [row["active_rank"] for row in history["assets"]] == list(
+        range(1, TOP_VOLUME_ASSET_COUNT + 1)
+    )
     assert "ALGO" not in {row["asset"] for row in history["assets"]}
     assert history["archived_status_asset_count"] == 1
     assert history["assets"][0]["status"] == "complete"
+    assert history["assets"][0]["active_top25"] is True
     assert history["assets"][1]["status"] == "pending"
     assert history["assets"][5]["status"] == "retrying"
 
 
-def test_stale_top40_fails_closed_but_retains_last_known_good_metadata(tmp_path):
+def test_stale_top25_remains_visible_but_is_not_reported_current(tmp_path):
     store = EvidenceStore(tmp_path / "freshness.db")
     now = datetime(2026, 8, 21, tzinfo=timezone.utc)
     VolumeUniverseLedger(store).record(_volume_snapshot(now))
@@ -116,20 +124,21 @@ def test_stale_top40_fails_closed_but_retains_last_known_good_metadata(tmp_path)
     assert fresh["current_membership_available"] is True
     assert fresh["stale"] is False
 
-    assert stale["available"] is False
+    # A short refresh delay should never blank a complete validated cohort.
+    assert stale["available"] is True
     assert stale["current_membership_available"] is False
     assert stale["stale"] is True
     assert stale["unavailable_reason"] == "stale_snapshot"
-    assert stale["asset_count"] == 0
-    assert stale["assets"] == []
-    assert stale["observed_at"] is None
+    assert stale["asset_count"] == TOP_VOLUME_ASSET_COUNT
+    assert [row["asset"] for row in stale["assets"]] == list(ACTIVE_ASSETS)
+    assert stale["observed_at"] == now.isoformat()
     assert stale["last_known_good_retained"] is True
     assert stale["last_known_good_observed_at"] == now.isoformat()
     assert stale["last_known_good_asset_count"] == TOP_VOLUME_ASSET_COUNT
     assert stale["fresh_snapshot_required_for_current_membership"] is True
 
 
-def test_stale_top40_cannot_masquerade_archived_history_as_active_membership(tmp_path):
+def test_stale_top25_history_remains_visible_and_explicitly_stale(tmp_path):
     store = EvidenceStore(tmp_path / "stale-history.db")
     now = datetime(2026, 8, 21, tzinfo=timezone.utc)
     VolumeUniverseLedger(store).record(_volume_snapshot(now))
@@ -145,15 +154,20 @@ def test_stale_top40_cannot_masquerade_archived_history_as_active_membership(tmp
         now=now + timedelta(seconds=VOLUME_UNIVERSE_REFRESH_SECONDS + 1),
     )
 
-    assert status["available"] is False
-    assert status["active_universe_available"] is False
+    assert status["available"] is True
+    assert status["active_universe_available"] is True
     assert status["active_universe_stale"] is True
+    assert status["active_universe_current"] is False
     assert status["active_universe_unavailable_reason"] == "stale_snapshot"
     assert status["active_universe_last_known_good_observed_at"] == now.isoformat()
     assert status["active_universe_last_known_good_asset_count"] == TOP_VOLUME_ASSET_COUNT
-    assert status["asset_count"] == 0
-    assert status["assets"] == []
-    assert status["archived_status_asset_count"] == 4
+    assert status["asset_count"] == TOP_VOLUME_ASSET_COUNT
+    assert [row["asset"] for row in status["assets"]] == list(ACTIVE_ASSETS)
+    assert all(row["current_top_volume"] is False for row in status["assets"])
+    assert status["archived_status_asset_count"] == 3
+    assert {"ACE", "BOME", "JOHN"}.isdisjoint(
+        {row["asset"] for row in status["assets"]}
+    )
 
 
 class _CompleteHistoricalResearch:
@@ -179,7 +193,7 @@ class _CompleteHistoricalResearch:
         return {}
 
 
-def test_active_history_maintenance_uses_resolved_top40(monkeypatch, tmp_path):
+def test_active_history_maintenance_uses_resolved_top25(monkeypatch, tmp_path):
     store = EvidenceStore(tmp_path / "maintenance.db")
     now = datetime(2026, 8, 21, tzinfo=timezone.utc)
     VolumeUniverseLedger(store).record(_volume_snapshot(now))
@@ -205,10 +219,8 @@ def test_active_history_maintenance_uses_resolved_top40(monkeypatch, tmp_path):
     )
 
     assert calls == [ACTIVE_ASSETS]
-    # The existing history subsystem canonicalizes request order internally; the
-    # active read plane restores exact volume rank order from the strict snapshot.
     assert set(research.requested) == set(ACTIVE_ASSETS)
-    assert len(research.requested) == TOP_VOLUME_ASSET_COUNT
+    assert len(research.requested) == TOP_VOLUME_ASSET_COUNT == 25
     assert result["asset_count"] == TOP_VOLUME_ASSET_COUNT
     assert [row["asset"] for row in result["assets"]] == list(ACTIVE_ASSETS)
     assert "ALGO" not in {row["asset"] for row in result["assets"]}

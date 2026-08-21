@@ -34,9 +34,9 @@ def select_history_batch(
 ) -> tuple[str, ...]:
     """Choose the least-recently-maintained active assets, incomplete first.
 
-    A new top-40 entrant has no archived status row, so its epoch fallback makes it
-    naturally outrank old incomplete rows and begin backfill on the first batch after
-    membership changes.
+    A new top-volume entrant has no archived status row, so its epoch fallback makes
+    it naturally outrank old incomplete rows and begin backfill on the first batch
+    after membership changes.
     """
 
     rows = status.get("assets") if isinstance(status, dict) else []
@@ -65,12 +65,11 @@ async def maintain_history_batch_once(
     batch_size: int | None = None,
     now: datetime | None = None,
 ) -> dict[str, object]:
-    """Maintain only a bounded slice of the current authoritative top-40 and exit.
+    """Maintain a bounded slice of the authoritative top-volume cohort and exit.
 
-    The history job is already a bounded five-minute disposable process, so it also
-    acts as the membership-change synchronizer. It forces one fresh CoinGecko ranking
-    before choosing the batch; resolver last-known-good behavior still contains a
-    transient CoinGecko outage without replacing a validated cohort with static data.
+    Membership now has an independent lightweight refresher, but this disposable
+    history job still force-refreshes once before choosing its batch so research and
+    the persisted ranking converge quickly after membership changes.
     """
 
     settings = settings or Settings.from_env()
@@ -81,7 +80,9 @@ async def maintain_history_batch_once(
         force_refresh=True,
     )
     if len(active_assets) != TOP_VOLUME_ASSET_COUNT:
-        raise RuntimeError("history batch requires an exact validated top-40 universe")
+        raise RuntimeError(
+            f"history batch requires an exact validated top-{TOP_VOLUME_ASSET_COUNT} universe"
+        )
 
     if batch_size is None:
         try:
@@ -111,8 +112,9 @@ async def maintain_history_batch_once(
             "disposable_process": True,
             "batch_size": len(batch),
             "batch_assets": list(batch),
-            "active_top40": True,
-            "top40_force_refreshed": True,
+            "active_top_volume": True,
+            "universe_target_count": TOP_VOLUME_ASSET_COUNT,
+            "top_volume_force_refreshed": True,
             "asset_count": summary.get("asset_count", 0),
             "complete_asset_count": summary.get("complete_asset_count", 0),
             "overall_coverage_fraction": summary.get("overall_coverage_fraction", 0.0),
@@ -124,6 +126,7 @@ async def maintain_history_batch_once(
         **summary,
         "batch_assets": list(batch),
         "batch_size": len(batch),
-        "top40_force_refreshed": True,
+        "universe_target_count": TOP_VOLUME_ASSET_COUNT,
+        "top_volume_force_refreshed": True,
         "disposable_process": True,
     }
