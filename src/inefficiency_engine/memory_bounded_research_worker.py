@@ -68,9 +68,11 @@ async def _capture(
         try:
             return await asyncio.wait_for(runner(), timeout=max(0.1, float(timeout_seconds)))
         except TimeoutError as exc:
-            return ResearchStageTimeoutError(
+            error = ResearchStageTimeoutError(
                 f"research stage {stage_name!r} exceeded {float(timeout_seconds):.1f}s"
-            ) from exc
+            )
+            error.__cause__ = exc
+            return error
     except BaseException as exc:
         return exc
 
