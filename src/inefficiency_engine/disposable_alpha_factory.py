@@ -181,6 +181,7 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
                     "provider_status_count": len(book_statuses),
                     "rotating_top_volume_sample": True,
                     "structural_opportunity_required": False,
+                    "shared_with_native_mechanism_research": True,
                     "qualification_thresholds_unchanged": True,
                     "paper_only": True,
                     "live_execution_authority": False,
@@ -197,17 +198,39 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
         )
 
     async def run_evidence_cycle(self, *, total_capital_usd: float | None = None):
-        """Run alpha + mechanism evidence with independent bounded L2 coverage."""
+        """Run alpha + native mechanisms against one independent bounded L2 snapshot.
 
-        original = self.core.collect_live_evidence
+        The earlier production repair routed only ``collect_live_evidence`` through
+        the independent L2 sampler. Native maker/liquidity-provision research calls
+        ``collect_live_executability`` internally, so it could still receive zero books
+        whenever structural arbitrage/carry discovery produced no opportunity first.
+        One cached bounded snapshot now serves both research entry points for the same
+        evidence cycle. This removes that accidental dependency without increasing the
+        L2 batch size or weakening any qualification gate.
+
+        Small unit-test/fallback cores that expose only ``collect_live_evidence`` remain
+        supported; production cores expose both entry points and therefore receive the
+        shared native-mechanism wiring.
+        """
+
+        original_evidence = self.core.collect_live_evidence
+        original_executability = getattr(self.core, "collect_live_executability", None)
+        cached_snapshot = None
 
         async def collect_with_l2():
-            return await self._collect_alpha_l2_snapshot(original)
+            nonlocal cached_snapshot
+            if cached_snapshot is None:
+                cached_snapshot = await self._collect_alpha_l2_snapshot(original_evidence)
+            return cached_snapshot
 
         self.core.collect_live_evidence = collect_with_l2
+        if original_executability is not None:
+            self.core.collect_live_executability = collect_with_l2
         try:
             return await super().run_evidence_cycle(
                 total_capital_usd=total_capital_usd
             )
         finally:
-            self.core.collect_live_evidence = original
+            self.core.collect_live_evidence = original_evidence
+            if original_executability is not None:
+                self.core.collect_live_executability = original_executability

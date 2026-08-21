@@ -1,9 +1,47 @@
 from __future__ import annotations
 
+import statistics
+
 from inefficiency_engine.evidence_velocity import source_group_for_venue
 from inefficiency_engine.executable_lane_runtime import ExecutableMechanismExecutionService
+from inefficiency_engine.incremental_forward_sizing import forward_evidence_allocation_fraction
+from inefficiency_engine.mechanism_execution import (
+    FULL_FORWARD_TARGET,
+    MAX_INCREMENTAL_DRAWDOWN,
+    MIN_FORWARD_START,
+    MIN_HIT_RATE,
+    MechanismQualification,
+    _max_drawdown,
+    _mean_lower,
+)
 from inefficiency_engine.source_coverage import CandidateSourceSufficiency, SourceCoverageSnapshot
 from inefficiency_engine.source_coverage_catalog import LANES
+
+
+class _GovernedMechanismLedgerView:
+    """Delegate durable writes while filtering modeled liquidation shadows from reads.
+
+    The physical append-only ledger remains untouched. Governed allocation/read paths
+    see only empirical allocation-grade liquidation outcomes when they explicitly ask
+    for the liquidation mechanism, while research code can still inspect the raw
+    ledger through ``GovernedMechanismExecutionService.raw_outcomes``.
+    """
+
+    def __init__(self, base, liquidation_filter):
+        self._base = base
+        self._liquidation_filter = liquidation_filter
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+    def outcomes(self, *, cohort_key=None, mechanism_id=None):
+        rows = self._base.outcomes(
+            cohort_key=cohort_key,
+            mechanism_id=mechanism_id,
+        )
+        if mechanism_id == "liquidation_distress":
+            return [row for row in rows if self._liquidation_filter(row)]
+        return rows
 
 
 class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
@@ -14,6 +52,14 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
     two-independent-source contract remains mandatory before a candidate can be
     promoted into portfolio allocation. No threshold is weakened by this class.
     """
+
+    def __init__(self, core, store):
+        super().__init__(core, store)
+        self._raw_ledger = self.ledger
+        self.ledger = _GovernedMechanismLedgerView(
+            self._raw_ledger,
+            self._liquidation_outcome_is_allocation_grade,
+        )
 
     @staticmethod
     def _primary_groups(venues: list[str], mechanism_id: str) -> set[str] | None:
@@ -113,9 +159,10 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
         Yield is the clearest case: rate, capacity and exit-liquidity fields can all be
         present while protocol-loss/withdrawal economics are explicitly uncalibrated.
         Unknown risk must never be converted into zero risk simply because numeric
-        placeholders exist. Other mechanism lanes construct their forward economics
-        from the event/book surface inside the mechanism service and therefore keep
-        their existing gates unchanged.
+        placeholders exist. Other mechanism lanes construct research economics from
+        their event/book surfaces. Liquidation is handled separately below because its
+        current recovery shadows are useful learning evidence but not allocation-grade
+        capture/settlement evidence.
         """
 
         if mechanism_id != "yield":
@@ -128,6 +175,140 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
             if required.issubset(classes) and bool(source.get("economic_fields_complete")):
                 return True
         return False
+
+    @staticmethod
+    def _liquidation_outcome_is_allocation_grade(row) -> bool:
+        """Reject modeled capture/recovery shadows from capital qualification.
+
+        Production liquidation settlement currently estimates capture probability from
+        observation latency/event size and then marks the future price recovery. The
+        outcome explicitly says ``capture_assumed=False`` and
+        ``paper_capture_probability_model=True``. That is valuable forward research,
+        but it is not empirical evidence that our order won selection, filled, and
+        settled. Keep it in the append-only research ledger while excluding it from
+        the 3->30 allocation gate.
+        """
+
+        if not bool(getattr(row, "settlement_evidence_complete", True)):
+            return False
+        detail = dict(getattr(row, "detail", {}) or {})
+        if bool(detail.get("paper_capture_probability_model")):
+            return False
+        if detail.get("capture_assumed") is False:
+            return False
+        method = str(getattr(row, "settlement_method", "") or "")
+        if method in {
+            "observed_liquidation_price_to_recovery_mark",
+            "latency_adjusted_capture_probability_recovery_shadow",
+        }:
+            return False
+        return True
+
+    def raw_outcomes(self, *, cohort_key=None, mechanism_id=None):
+        return self._raw_ledger.outcomes(
+            cohort_key=cohort_key,
+            mechanism_id=mechanism_id,
+        )
+
+    def allocation_grade_outcomes(
+        self,
+        *,
+        cohort_key: str | None = None,
+        mechanism_id: str | None = None,
+    ):
+        rows = self.raw_outcomes(
+            cohort_key=cohort_key,
+            mechanism_id=mechanism_id,
+        )
+        if mechanism_id != "liquidation_distress":
+            return rows
+        return [row for row in rows if self._liquidation_outcome_is_allocation_grade(row)]
+
+    def qualification(self, cohort_key, mechanism_id):
+        if mechanism_id != "liquidation_distress":
+            return super().qualification(cohort_key, mechanism_id)
+
+        outcomes = self.allocation_grade_outcomes(
+            cohort_key=cohort_key,
+            mechanism_id=mechanism_id,
+        )
+        values = [row.realized_net_return for row in outcomes]
+        positive = sum(value > 0 for value in values)
+        hit = positive / len(values) if values else None
+        mean = statistics.fmean(values) if values else None
+        lower = _mean_lower(values)
+        drawdown = _max_drawdown(values) if values else None
+        fraction = forward_evidence_allocation_fraction(
+            len(values),
+            full_target=FULL_FORWARD_TARGET,
+        )
+        blockers: list[str] = []
+        if len(values) < MIN_FORWARD_START:
+            blockers.append("fewer than three independent allocation-grade forward outcomes")
+        if not values:
+            blockers.append(
+                "liquidation recovery shadows are research-only until empirical capture/selection and settlement evidence is connected"
+            )
+        if mean is None or mean <= 0:
+            blockers.append("mean realized net return is non-positive")
+        if hit is None or hit < MIN_HIT_RATE:
+            blockers.append("forward hit rate is below 55%")
+        if drawdown is None or drawdown > MAX_INCREMENTAL_DRAWDOWN:
+            blockers.append("forward drawdown exceeds mechanism paper-risk limit")
+        full = bool(
+            len(values) >= FULL_FORWARD_TARGET
+            and lower is not None
+            and lower > 0
+            and hit is not None
+            and hit >= MIN_HIT_RATE
+            and drawdown is not None
+            and drawdown <= MAX_INCREMENTAL_DRAWDOWN
+        )
+        incremental = bool(
+            MIN_FORWARD_START <= len(values) < FULL_FORWARD_TARGET
+            and not blockers
+            and fraction > 0
+        )
+        if len(values) >= FULL_FORWARD_TARGET and not full:
+            blockers.append("full 30-outcome statistical gate is not satisfied")
+        return MechanismQualification(
+            mechanism_id=mechanism_id,
+            cohort_key=cohort_key,
+            sample_count=len(values),
+            positive_count=positive,
+            hit_rate=hit,
+            mean_net_return=mean,
+            mean_net_return_ci_lower=lower,
+            max_drawdown=drawdown,
+            allocation_fraction=1.0 if full else fraction if incremental else 0.0,
+            incremental_eligible=incremental,
+            fully_statistically_qualified=full,
+            blockers=blockers,
+        )
+
+    async def run_evidence_cycle(self, *, total_capital_usd: float | None = None):
+        """Preserve research-shadow visibility while qualification uses stricter truth."""
+
+        cycle = await super().run_evidence_cycle(total_capital_usd=total_capital_usd)
+        raw = self.raw_outcomes(mechanism_id="liquidation_distress")
+        allocation_grade = self.allocation_grade_outcomes(
+            mechanism_id="liquidation_distress"
+        )
+        by_mechanism = dict(cycle.by_mechanism)
+        row = dict(by_mechanism.get("liquidation_distress") or {})
+        row.update(
+            {
+                "research_shadow_outcome_count": len(raw),
+                "allocation_grade_outcome_count": len(allocation_grade),
+                "modeled_recovery_shadow_count": max(
+                    0, len(raw) - len(allocation_grade)
+                ),
+                "research_shadow_learning_active": bool(raw),
+                "allocation_requires_empirical_capture_and_settlement": True,
+            }
+        )
+        by_mechanism["liquidation_distress"] = row
+        return cycle.model_copy(update={"by_mechanism": by_mechanism})
 
     def discover_specs(self, snapshot, *, total_capital_usd: float):
         rows = super().discover_specs(snapshot, total_capital_usd=total_capital_usd)
