@@ -97,7 +97,7 @@ async def test_substage_failure_is_visible_but_does_not_suppress_summary(tmp_pat
 
     assert summary is not None
     assert summary.diagnostic_errors == {"capital_location_forward": "RuntimeError"}
-    assert summary.capital_location_forward["available"] is False
+    assert summary.capital_location_forward == {}
     assert set(summary.rejection_funnels) == {
         "price_discrepancy",
         "carry",
