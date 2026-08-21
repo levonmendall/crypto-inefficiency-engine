@@ -139,10 +139,8 @@ def test_source_freshness_depends_on_evidence_class(tmp_path):
     fundamental = next(row for row in snapshot.lanes if row.lane_id == "fundamental_onchain")
     coinbase = next(row for row in trend.sources if row["source_id"] == "coinbase-market")
     morpho = next(row for row in fundamental.sources if row["source_id"] == "morpho-markets")
-    # Market history/cost evidence remains usable for hours, unlike live quotes/L2.
     assert coinbase["fresh"] is True
     assert coinbase["freshness_ttl_seconds"] >= 21_600.0
-    # Protocol fundamentals deliberately age much more slowly.
     assert morpho["fresh"] is True
     assert morpho["freshness_ttl_seconds"] >= 86_400.0
 
@@ -317,7 +315,7 @@ def test_executable_alpha_refinements_are_on_the_actual_fast_registry(tmp_path):
     ids = {item.strategy_id for item in service._base_registry.manifests()}
     assert "mean_reversion_cross_venue_residual_v1" in ids
     assert "mean_reversion_multi_horizon_v1" in ids
-    assert "trade_flow_lead_lag_v1" in ids
+    assert "public_trade_flow_lead_lag_v1" in ids
     assert "onchain_factor_breadth_v1" in ids
 
 
