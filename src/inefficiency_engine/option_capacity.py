@@ -96,6 +96,7 @@ class OptionCapacityObservation(BaseModel):
     option_type: Literal["call", "put"]
     observed_at: datetime
     amount_unit: Literal["underlying_base_currency"] = "underlying_base_currency"
+    contract_size_underlying: float | None = Field(default=None, gt=0)
     underlying_price_usd: float = Field(gt=0)
     bid_visible_amount_underlying: float = Field(gt=0)
     ask_visible_amount_underlying: float = Field(gt=0)
@@ -208,9 +209,10 @@ async def collect_deribit_option_capacity(store) -> SourceProbeResult:
 
     Deribit option order amounts are already denominated in the underlying base
     currency. Visible USD capacity is therefore ``book_amount * underlying_price``;
-    no contract multiplier is applied. The same bounded books are also persisted as
-    option quote/Greek observations so the selected first two expiries can support
-    ATM, skew, and term-structure research without a hidden producer mismatch.
+    no contract multiplier is applied. The nullable contract-size field exists only
+    for backward-compatible telemetry and is never used in the capacity calculation.
+    The same bounded books are also persisted as option quote/Greek observations so
+    the selected first two expiries can support ATM, skew, and term-structure research.
     """
 
     summary_url = f"{DERIBIT_BASE_URL}/public/get_book_summary_by_currency"
