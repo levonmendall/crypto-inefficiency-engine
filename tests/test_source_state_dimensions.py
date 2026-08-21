@@ -224,7 +224,7 @@ def test_provider_admission_reconciler_preserves_broader_source_plane_gap(monkey
     assert row["stage"] == "waiting_for_source:redundancy_gap"
 
 
-def test_provider_admission_reconciler_still_fails_closed_for_legacy_missing_provider(monkeypatch):
+def test_provider_admission_reconciler_is_diagnostic_before_fail_closed_state_read(monkeypatch):
     monkeypatch.setattr(
         provider_readiness_read,
         "provider_readiness_snapshot",
@@ -244,11 +244,19 @@ def test_provider_admission_reconciler_still_fails_closed_for_legacy_missing_pro
             "provider_ready": False,
         }]
     }
-    result = provider_readiness_read.reconcile_provider_readiness(None, payload)
-    row = result["mechanisms"][0]
+    reconciled = provider_readiness_read.reconcile_provider_readiness(None, payload)
+    row = reconciled["mechanisms"][0]
     assert row["provider_ready"] is False
-    assert row["state"] == "provider_gap"
-    assert row["stage"] == "waiting_for_source:provider_gap"
+    assert row["state"] == "collecting"
+    assert row["stage"] == "research"
+    assert row["provider_admission_ready"] is False
+    assert row["provider_readiness_state_override_applied"] is False
+
+    final = reconcile_live_operating_states(reconciled, SimpleNamespace())
+    final_row = final["mechanisms"][0]
+    assert final_row["provider_ready"] is False
+    assert final_row["state"] == "provider_gap"
+    assert final_row["stage"] == "research"
 
 
 def test_research_dashboard_exposes_three_source_dimensions():
