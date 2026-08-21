@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from inefficiency_engine import provider_readiness_read
 from inefficiency_engine.executable_operating_certification import (
     AllLaneOperatingCertificationService,
 )
 from inefficiency_engine.operating_certification import MechanismOperatingStatus
+from inefficiency_engine.operating_state_read import reconcile_live_operating_states
 from inefficiency_engine.source_state_dimensions import classify_lane_source_dimensions
 
 
@@ -152,3 +154,98 @@ def test_operating_status_keeps_true_missing_provider_as_provider_gap():
     assert result.provider_ready is False
     assert result.state == "provider_gap"
     assert result.stage == "waiting_for_source:provider_gap"
+
+
+def test_live_reconciliation_does_not_flatten_redundancy_gap():
+    payload = {
+        "mechanisms": [{
+            "mechanism_id": "yield",
+            "state": "collecting",
+            "stage": "waiting_for_source:redundancy_gap",
+            "provider_ready": True,
+            "primary_reason": "connected but needs independent redundancy",
+            "next_action": "collect second authority",
+            "strategy_evidence": [],
+        }]
+    }
+    result = reconcile_live_operating_states(payload, SimpleNamespace())
+    row = result["mechanisms"][0]
+    assert row["state"] == "collecting"
+    assert row["stage"] == "waiting_for_source:redundancy_gap"
+    assert row["primary_reason"] == "connected but needs independent redundancy"
+    assert row["next_action"] == "collect second authority"
+
+
+def test_live_reconciliation_does_not_flatten_stale_source_to_provider_gap():
+    payload = {
+        "mechanisms": [{
+            "mechanism_id": "yield",
+            "state": "collecting",
+            "stage": "waiting_for_source:stale",
+            "provider_ready": False,
+            "primary_reason": "provider integration exists but evidence is stale",
+            "next_action": "refresh source evidence",
+            "strategy_evidence": [],
+        }]
+    }
+    result = reconcile_live_operating_states(payload, SimpleNamespace())
+    row = result["mechanisms"][0]
+    assert row["state"] == "collecting"
+    assert row["stage"] == "waiting_for_source:stale"
+    assert row["next_action"] == "refresh source evidence"
+
+
+def test_provider_admission_reconciler_preserves_broader_source_plane_gap(monkeypatch):
+    monkeypatch.setattr(
+        provider_readiness_read,
+        "provider_readiness_snapshot",
+        lambda store, now=None: {
+            "yield": {
+                "mechanism_id": "yield",
+                "admitted_provider_count": 0,
+                "providers": [],
+            }
+        },
+    )
+    payload = {
+        "mechanisms": [{
+            "mechanism_id": "yield",
+            "state": "collecting",
+            "stage": "waiting_for_source:redundancy_gap",
+            "provider_ready": True,
+            "primary_reason": "broader source plane has one admitted authority",
+            "next_action": "collect independent redundancy",
+        }]
+    }
+    result = provider_readiness_read.reconcile_provider_readiness(None, payload)
+    row = result["mechanisms"][0]
+    assert row["provider_ready"] is True
+    assert row["state"] == "collecting"
+    assert row["stage"] == "waiting_for_source:redundancy_gap"
+
+
+def test_provider_admission_reconciler_still_fails_closed_for_legacy_missing_provider(monkeypatch):
+    monkeypatch.setattr(
+        provider_readiness_read,
+        "provider_readiness_snapshot",
+        lambda store, now=None: {
+            "yield": {
+                "mechanism_id": "yield",
+                "admitted_provider_count": 0,
+                "providers": [],
+            }
+        },
+    )
+    payload = {
+        "mechanisms": [{
+            "mechanism_id": "yield",
+            "state": "collecting",
+            "stage": "research",
+            "provider_ready": False,
+        }]
+    }
+    result = provider_readiness_read.reconcile_provider_readiness(None, payload)
+    row = result["mechanisms"][0]
+    assert row["provider_ready"] is False
+    assert row["state"] == "provider_gap"
+    assert row["stage"] == "waiting_for_source:provider_gap"
