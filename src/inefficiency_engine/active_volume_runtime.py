@@ -40,35 +40,70 @@ def _parse_observed_at(raw: object) -> datetime | None:
         return None
 
 
+def _unavailable_volume_status(
+    *,
+    reason: str,
+    age_seconds: float | None = None,
+    snapshot: dict[str, Any] | None = None,
+    last_known_good_observed_at: datetime | None = None,
+    last_known_good_asset_count: int = 0,
+) -> dict[str, Any]:
+    """Fail closed when current top-40 membership cannot be proven fresh."""
+
+    snapshot = snapshot or {}
+    return {
+        "available": False,
+        "current_membership_available": False,
+        "asset_count": 0,
+        "observed_at": None,
+        "age_seconds": age_seconds,
+        "stale": True,
+        "unavailable_reason": reason,
+        "refresh_interval_seconds": VOLUME_UNIVERSE_REFRESH_SECONDS,
+        "method": snapshot.get("method") or "marketwide_24h_trading_volume_usd",
+        "ranking_metric": snapshot.get("ranking_metric") or "reported_24h_trading_volume_usd",
+        "ranking_source": snapshot.get("ranking_source"),
+        "ranking_scope": snapshot.get("ranking_scope"),
+        "volume_is_defining_metric": True,
+        "stable_value_assets_excluded": bool(snapshot.get("stable_value_assets_excluded")),
+        "fresh_snapshot_required_for_current_membership": True,
+        "last_known_good_retained": bool(last_known_good_asset_count),
+        "last_known_good_observed_at": (
+            last_known_good_observed_at.isoformat()
+            if last_known_good_observed_at is not None
+            else None
+        ),
+        "last_known_good_age_seconds": age_seconds,
+        "last_known_good_asset_count": int(last_known_good_asset_count),
+        # Never expose stale rows through the current-membership field. The
+        # underlying append-only snapshot remains durable for internal failover.
+        "assets": [],
+        "paper_only": True,
+        "allocation_authority": False,
+    }
+
+
 def read_active_volume_universe_status(
     store: EvidenceStore,
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Return the exact validated market-wide ranking used by live research.
+    """Return only a fresh validated market-wide ranking as current membership.
 
     This is deliberately a database-only read. The API never performs a public
     market request. Refresh authority remains with the worker/history processes.
+
+    Last-known-good snapshots remain durable for internal resilience, but once a
+    snapshot exceeds the freshness interval its members are not exposed as the
+    *current* top 40. The read plane fails closed until a fresh authoritative
+    ranking has been persisted.
     """
 
     current = _aware(now or _now())
     snapshot = read_latest_volume_universe(store)
     assets = validated_volume_assets(snapshot)
     if len(assets) != TOP_VOLUME_ASSET_COUNT or not isinstance(snapshot, dict):
-        return {
-            "available": False,
-            "asset_count": 0,
-            "observed_at": None,
-            "age_seconds": None,
-            "stale": True,
-            "refresh_interval_seconds": VOLUME_UNIVERSE_REFRESH_SECONDS,
-            "method": "marketwide_24h_trading_volume_usd",
-            "ranking_metric": "reported_24h_trading_volume_usd",
-            "volume_is_defining_metric": True,
-            "assets": [],
-            "paper_only": True,
-            "allocation_authority": False,
-        }
+        return _unavailable_volume_status(reason="no_validated_snapshot")
 
     observed_at = _parse_observed_at(snapshot.get("observed_at"))
     age_seconds = (
@@ -95,14 +130,35 @@ def read_active_volume_universe_status(
                 }
             )
 
+    if len(rows) != TOP_VOLUME_ASSET_COUNT:
+        return _unavailable_volume_status(
+            reason="validated_snapshot_projection_incomplete",
+            age_seconds=age_seconds,
+            snapshot=snapshot,
+            last_known_good_observed_at=observed_at,
+            last_known_good_asset_count=len(rows),
+        )
+
+    stale = bool(
+        age_seconds is None or age_seconds > VOLUME_UNIVERSE_REFRESH_SECONDS
+    )
+    if stale:
+        return _unavailable_volume_status(
+            reason="stale_snapshot",
+            age_seconds=age_seconds,
+            snapshot=snapshot,
+            last_known_good_observed_at=observed_at,
+            last_known_good_asset_count=len(rows),
+        )
+
     return {
-        "available": len(rows) == TOP_VOLUME_ASSET_COUNT,
+        "available": True,
+        "current_membership_available": True,
         "asset_count": len(rows),
         "observed_at": observed_at.isoformat() if observed_at is not None else None,
         "age_seconds": age_seconds,
-        "stale": bool(
-            age_seconds is None or age_seconds > VOLUME_UNIVERSE_REFRESH_SECONDS
-        ),
+        "stale": False,
+        "unavailable_reason": None,
         "refresh_interval_seconds": VOLUME_UNIVERSE_REFRESH_SECONDS,
         "method": snapshot.get("method"),
         "ranking_metric": snapshot.get("ranking_metric"),
@@ -110,6 +166,11 @@ def read_active_volume_universe_status(
         "ranking_scope": snapshot.get("ranking_scope"),
         "volume_is_defining_metric": bool(snapshot.get("volume_is_defining_metric")),
         "stable_value_assets_excluded": bool(snapshot.get("stable_value_assets_excluded")),
+        "fresh_snapshot_required_for_current_membership": True,
+        "last_known_good_retained": True,
+        "last_known_good_observed_at": observed_at.isoformat() if observed_at is not None else None,
+        "last_known_good_age_seconds": age_seconds,
+        "last_known_good_asset_count": len(rows),
         "assets": rows,
         "paper_only": True,
         "allocation_authority": False,
@@ -137,11 +198,12 @@ def read_active_cycle_history_status(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Project historical status onto current top-40 membership only.
+    """Project historical status onto fresh current top-40 membership only.
 
     Historical status rows are retained durably when an asset leaves the universe
     because they are useful if it later re-enters. They are never allowed to
-    masquerade as current membership in the read plane.
+    masquerade as current membership in the read plane, and a stale volume
+    snapshot cannot project archived rows as active top-40 assets.
     """
 
     volume = read_active_volume_universe_status(store, now=now)
@@ -154,6 +216,15 @@ def read_active_cycle_history_status(
         return {
             "available": False,
             "active_universe_available": False,
+            "active_universe_stale": bool(volume.get("stale")),
+            "active_universe_unavailable_reason": volume.get("unavailable_reason"),
+            "active_universe_observed_at": None,
+            "active_universe_last_known_good_observed_at": volume.get(
+                "last_known_good_observed_at"
+            ),
+            "active_universe_last_known_good_asset_count": int(
+                volume.get("last_known_good_asset_count") or 0
+            ),
             "maintenance_worker_id": CYCLE_HISTORY_WORKER_ID,
             "asset_count": 0,
             "complete_asset_count": 0,
@@ -165,6 +236,7 @@ def read_active_cycle_history_status(
             "overall_coverage_fraction": 0.0,
             "archived_status_asset_count": len(archived_rows),
             "retry_interval_seconds": CYCLE_HISTORY_MAINTENANCE_SECONDS,
+            "fresh_snapshot_required_for_current_membership": True,
             "historical_counts_as_forward": False,
             "full_forward_promotion_gate_unchanged": True,
             "live_execution_authority": False,
@@ -212,7 +284,14 @@ def read_active_cycle_history_status(
         "available": bool(active_rows),
         "active_universe_available": True,
         "active_universe_observed_at": volume.get("observed_at"),
-        "active_universe_stale": bool(volume.get("stale")),
+        "active_universe_stale": False,
+        "active_universe_unavailable_reason": None,
+        "active_universe_last_known_good_observed_at": volume.get(
+            "last_known_good_observed_at"
+        ),
+        "active_universe_last_known_good_asset_count": int(
+            volume.get("last_known_good_asset_count") or 0
+        ),
         "maintenance_worker_id": CYCLE_HISTORY_WORKER_ID,
         "asset_count": len(active_rows),
         "complete_asset_count": complete_count,
@@ -226,6 +305,7 @@ def read_active_cycle_history_status(
         ),
         "archived_status_asset_count": archived_only,
         "retry_interval_seconds": CYCLE_HISTORY_MAINTENANCE_SECONDS,
+        "fresh_snapshot_required_for_current_membership": True,
         "historical_counts_as_forward": False,
         "full_forward_promotion_gate_unchanged": True,
         "live_execution_authority": False,
