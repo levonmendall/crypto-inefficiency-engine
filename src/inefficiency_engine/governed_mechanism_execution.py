@@ -286,6 +286,30 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
             blockers=blockers,
         )
 
+    async def run_evidence_cycle(self, *, total_capital_usd: float | None = None):
+        """Preserve research-shadow visibility while qualification uses stricter truth."""
+
+        cycle = await super().run_evidence_cycle(total_capital_usd=total_capital_usd)
+        raw = self.raw_outcomes(mechanism_id="liquidation_distress")
+        allocation_grade = self.allocation_grade_outcomes(
+            mechanism_id="liquidation_distress"
+        )
+        by_mechanism = dict(cycle.by_mechanism)
+        row = dict(by_mechanism.get("liquidation_distress") or {})
+        row.update(
+            {
+                "research_shadow_outcome_count": len(raw),
+                "allocation_grade_outcome_count": len(allocation_grade),
+                "modeled_recovery_shadow_count": max(
+                    0, len(raw) - len(allocation_grade)
+                ),
+                "research_shadow_learning_active": bool(raw),
+                "allocation_requires_empirical_capture_and_settlement": True,
+            }
+        )
+        by_mechanism["liquidation_distress"] = row
+        return cycle.model_copy(update={"by_mechanism": by_mechanism})
+
     def discover_specs(self, snapshot, *, total_capital_usd: float):
         rows = super().discover_specs(snapshot, total_capital_usd=total_capital_usd)
         coverage = self.source_plane.snapshot(now=snapshot.completed_at)
