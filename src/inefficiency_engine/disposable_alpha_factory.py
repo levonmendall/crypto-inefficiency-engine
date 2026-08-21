@@ -8,10 +8,10 @@ from sqlalchemy import func, select
 
 from inefficiency_engine.all_lane_alpha_factory import AllLaneEvidenceFactoryService
 from inefficiency_engine.batched_cycle_history import BatchedCycleHistoricalResearch
-from inefficiency_engine.evidence_velocity_runtime import (
-    EvidenceVelocityLaneSuccessMechanismExecutionService,
-)
 from inefficiency_engine.models import MarketKind, OpportunityLeg, Side
+from inefficiency_engine.yield_shadow_runtime import (
+    YieldResearchShadowMechanismExecutionService,
+)
 
 
 ALPHA_L2_WORKER_ID = "alpha-l2-research-sampling"
@@ -37,7 +37,7 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._historical_research = BatchedCycleHistoricalResearch(self.store)
-        self.mechanism_execution = EvidenceVelocityLaneSuccessMechanismExecutionService(
+        self.mechanism_execution = YieldResearchShadowMechanismExecutionService(
             self.core,
             self.store,
         )
