@@ -4,13 +4,27 @@ import asyncio
 import signal
 
 from inefficiency_engine.canonical_worker import run_canonical_portfolio_loop
+from inefficiency_engine.cex_dex_canonical_runtime import (
+    CexDexFreshnessSeparatedQualifiedOpportunityAllocatorService,
+)
 from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import EvidenceStore, build_evidence_store
 from inefficiency_engine.evidence_velocity_runtime import (
-    EvidenceVelocityLaneSuccessOperationallyResilientPaperPortfolioService as CanonicalPaperPortfolioService,
-    EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService as CanonicalPortfolioAllocatorService,
+    EvidenceVelocityLaneSuccessOperationallyResilientPaperPortfolioService,
+    EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService,
 )
 from inefficiency_engine.service import OpportunityService
+
+
+# Preserve the permanent worker's durable-bridge lineage explicitly while installing
+# the integrated evidence-velocity + Release D subclasses. This remains provider-free:
+# the permanent process consumes persisted qualified candidates and settlement state.
+CanonicalPortfolioAllocatorService = EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService
+CanonicalPaperPortfolioService = EvidenceVelocityLaneSuccessOperationallyResilientPaperPortfolioService
+assert issubclass(
+    CanonicalPortfolioAllocatorService,
+    CexDexFreshnessSeparatedQualifiedOpportunityAllocatorService,
+)
 
 
 class _DurableQualifiedStateHandle:
