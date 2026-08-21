@@ -95,12 +95,12 @@ const [portfolio,performance,runtime,positions,trades,history,skips,attribution,
     html = _replace_once(
         html,
         "    const stage=order[r.stage]??0,obs=+r.authoritative_observation_count||0,signals=+r.forward_signal_count||0,outcomes=+r.independent_forward_outcome_count||0,q=+r.current_statistically_qualified_count||0,p=+r.current_promoted_count||0,settled=+r.settled_allocator_outcome_count||0;",
-        "    const stage=order[r.stage]??0,obs=+r.authoritative_observation_count||0,signals=+r.forward_signal_count||0,outcomes=+r.independent_forward_outcome_count||0,q=+r.current_statistically_qualified_count||0,p=+r.current_promoted_count||0,settled=+r.settled_allocator_outcome_count||0,paperReady=paperCapableIds.has(r.mechanism_id),projectionCurrent=laneTruth?.projection_current_for_execution!==false;",
+        "    const stage=order[r.stage]??0,obs=+r.authoritative_observation_count||0,signals=+r.forward_signal_count||0,outcomes=+r.independent_forward_outcome_count||0,q=+r.current_statistically_qualified_count||0,p=+r.current_promoted_count||0,settled=+r.settled_allocator_outcome_count||0,paperReady=paperCapableIds.has(r.mechanism_id),projectionCurrent=laneTruth?.projection_current_for_execution===true;",
     )
     html = _replace_once(
         html,
         "${evidenceStep('Executable',stage>=4?num(p):'—','current L2 / cost / capacity',executionCls)}",
-        "${evidenceStep('Paper-capable',laneTruth?.available?(paperReady?'Yes':'No'):'—',!projectionCurrent?'stale projection · fail closed':(paperReady?'decision-grade + source-connected':'not decision-grade/currently executable'),paperReady?'done':(projectionCurrent?'active':'blocked'))}",
+        "${evidenceStep('Paper-capable',laneTruth?.available?(paperReady?'Yes':'No'):'—',!projectionCurrent?'stale or unavailable projection · fail closed':(paperReady?'decision-grade + source-connected':'not decision-grade/currently executable'),paperReady?'done':(projectionCurrent?'active':'blocked'))}",
     )
     html = _replace_once(
         html,
@@ -149,7 +149,7 @@ async function refresh(){""",
   const set=(id,text,color)=>{const el=$(id);if(!el)return;el.textContent=text;el.style.color=color};
   set('sourceConnectedCount',connected===null?'Unavailable':`${num(connected)} / ${num(laneCount)}`,connected===laneCount?'#4ade80':(connected===null?'#fb7185':'#facc15'));
   set('decisionGradeCount',decision===null?'Unavailable':`${num(decision)} / ${num(laneCount)}`,decision>0?'#4ade80':(decision===null?'#fb7185':'#8ea7b5'));
-  const projectionCurrent=lane.projection_current_for_execution!==false;
+  const projectionCurrent=lane.projection_current_for_execution===true;
   set('paperCapableCount',paper===null?'Unavailable':`${num(paper)} / ${num(laneCount)}${projectionCurrent?'':' · fail-closed'}`,paper>0&&projectionCurrent?'#4ade80':(paper===null?'#fb7185':projectionCurrent?'#8ea7b5':'#facc15'));
   const staleReasons=[];if(snapshot?.__stale)staleReasons.push('showing a cached snapshot after an API failure');if(snapshot?.research_projection_stale)staleReasons.push(snapshot?.research_projection_freshness?.reason||'research projection is stale');if(snapshot?.operating_projection_stale)staleReasons.push(snapshot?.operating_projection_freshness?.reason||'operating certification projection is stale');
   const current=available&&projectionCurrent&&!snapshot?.__stale&&!staleReasons.length;const release=snapshot?.release_commit?` · ${String(snapshot.release_commit).slice(0,7)}`:'';
@@ -161,7 +161,12 @@ async function refresh(){""",
     html = _replace_once(
         html,
         'renderChart(history.snapshots);renderAttribution(attribution);renderPositions(positions.positions);renderTrades(trades.trades);renderSkips(skips.skips);renderEvidenceProgress(mechRows,mechanisms.requirements||{},mechanisms.observed_at);renderMechanisms(mechRows);renderQueue(queue.actions);',
-        'renderChart(history.snapshots);renderAttribution(attribution);renderPositions(positions.positions);renderTrades(trades.trades);renderSkips(skips.skips);renderCycleHistory(cycleHistory);renderEvidenceProgress(mechRows,mechanisms.requirements||{},mechanisms.observed_at,dashboardMeta.lane_executability||{});renderMechanisms(mechRows);renderQueue(queue.actions);renderDashboardTruth(dashboardMeta);',
+        'window.__dashboardHistory=history.snapshots||[];renderChart(window.__dashboardHistory);renderAttribution(attribution);renderPositions(positions.positions);renderTrades(trades.trades);renderSkips(skips.skips);renderCycleHistory(cycleHistory);renderEvidenceProgress(mechRows,mechanisms.requirements||{},mechanisms.observed_at,dashboardMeta.lane_executability||{});renderMechanisms(mechRows);renderQueue(queue.actions);renderDashboardTruth(dashboardMeta);',
+    )
+    html = _replace_once(
+        html,
+        "$('refreshBtn').addEventListener('click',refresh);window.addEventListener('resize',()=>refresh());refresh();setInterval(refresh,30000);",
+        "$('refreshBtn').addEventListener('click',refresh);window.addEventListener('resize',()=>renderChart(window.__dashboardHistory||[]));refresh();setInterval(refresh,30000);",
     )
     return html
 
