@@ -101,6 +101,8 @@ def _canonical_capabilities() -> dict[str, bool]:
         "perpetual_short_observed_funding_settlement": True,
         "realized_two_leg_cex_settlement": True,
         "capital_location_forward_testing": True,
+        "capital_location_transfer_evidence_connected": False,
+        "capital_location_allocation_grade": False,
         "maker_shadow_cross_through_learning": True,
         "maker_queue_priority_observable": False,
         "live_execution_authority": False,
@@ -130,6 +132,24 @@ def _empty_location_summary() -> dict[str, object]:
         "transfer_evidence_complete": False,
         "decision_grade": False,
     }
+
+
+def _decision_grade_location_projection(location: dict[str, object]) -> dict[str, object]:
+    """Expose capital-location closure to the dashboard only when it is decision-grade.
+
+    Research-only capital-location trials are already persisted in dedicated append-only
+    tables. Publishing them through ``capital_location_forward`` makes the dashboard
+    override the operating lane stage to ``forward_testable`` even though transfer
+    cost/latency evidence is explicitly incomplete. Keep that research durable, but
+    publish an empty dashboard-facing projection until both transfer evidence and
+    decision-grade status are true.
+    """
+
+    if not bool(location.get("transfer_evidence_complete")):
+        return {}
+    if not bool(location.get("decision_grade")):
+        return {}
+    return dict(location)
 
 
 def _empty_maker_summary() -> dict[str, object]:
@@ -285,7 +305,10 @@ async def run_research_closure_cycle(
             for key, value in rejection_rows.items()
             if hasattr(value, "model_dump")
         },
-        capital_location_forward=location,
+        # The detailed research remains in capital_location_forward_trials/outcomes.
+        # This compact field is dashboard-facing and therefore stays empty until the
+        # transfer evidence itself is decision-grade.
+        capital_location_forward=_decision_grade_location_projection(location),
         maker_shadow=maker,
         canonical_capabilities=_canonical_capabilities(),
         provider_admission=_provider_admission(latest_operating),
@@ -319,6 +342,12 @@ async def run_research_closure_cycle(
             "summary_recorded": True,
             "source_order_book_count": len(snapshot.order_books),
             "usable_order_book_count": len(usable_order_books),
+            "capital_location_research_trial_count": int(location.get("trial_count") or 0),
+            "capital_location_research_outcome_count": int(location.get("outcome_count") or 0),
+            "capital_location_transfer_evidence_complete": bool(
+                location.get("transfer_evidence_complete")
+            ),
+            "capital_location_decision_grade": bool(location.get("decision_grade")),
             "diagnostic_errors": diagnostic_errors,
         },
     )
