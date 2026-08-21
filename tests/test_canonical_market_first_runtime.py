@@ -24,8 +24,9 @@ def test_market_provenance_is_checkpointed_before_allocator_can_timeout():
     source = inspect.getsource(OperationallyResilientPaperPortfolioService.run_cycle)
 
     checkpoint_index = source.index("self.integrity.record(checkpoint)")
-    allocator_index = source.index("await self.allocator.allocate")
-    assert checkpoint_index < allocator_index
+    allocator_index = source.index("await self._bounded_allocation_plan")
+    final_snapshot_index = source.index("self.ledger.record_snapshot(final_state)")
+    assert checkpoint_index < allocator_index < final_snapshot_index
     assert 'cycle_status="accounting_only"' in source
     assert "market_snapshot_id=snapshot.scan_id" in source
 
