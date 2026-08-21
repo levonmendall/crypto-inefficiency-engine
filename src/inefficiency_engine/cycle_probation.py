@@ -374,8 +374,9 @@ class CycleHistoricalResearch:
             raise ValueError("CoinGecko market-chart response must contain prices")
 
         # CoinGecko supplies hourly observations for sub-90-day range requests.
-        # Collapse them deterministically to one UTC-aligned six-hour reference
-        # observation so this source is comparable with exchange 6h candles.
+        # Keep the earliest real observation from each six-hour UTC bucket and retain
+        # its actual timestamp. Never relabel a later observation as the bucket start:
+        # doing so would leak future information into point-in-time replay.
         buckets: dict[int, tuple[float, float]] = {}
         for item in raw_prices:
             if not isinstance(item, list) or len(item) < 2:
@@ -390,7 +391,7 @@ class CycleHistoricalResearch:
             raw_seconds = raw_ms / 1000.0
             bucket = int(raw_seconds // HISTORICAL_CANDLE_SECONDS) * HISTORICAL_CANDLE_SECONDS
             current = buckets.get(bucket)
-            if current is None or raw_ms > current[0]:
+            if current is None or raw_ms < current[0]:
                 buckets[bucket] = (raw_ms, price)
 
         rows = [
@@ -402,13 +403,13 @@ class CycleHistoricalResearch:
                 quote_currency="USD",
                 contract_key="spot-reference",
                 mid=price,
-                observed_at=datetime.fromtimestamp(bucket, tz=timezone.utc),
+                observed_at=datetime.fromtimestamp(raw_ms / 1000.0, tz=timezone.utc),
                 source=(
-                    f"coingecko:coins/{coin_id}/market_chart/range:hourly-downsampled-6h:"
+                    f"coingecko:coins/{coin_id}/market_chart/range:hourly-first-in-6h-bucket:"
                     "historical-backfill"
                 ),
             )
-            for bucket, (_raw_ms, price) in buckets.items()
+            for _bucket, (raw_ms, price) in buckets.items()
         ]
         rows.sort(key=lambda item: item.observed_at)
         return rows
@@ -456,6 +457,9 @@ class CycleHistoricalResearch:
     def _provider_coverage_rows(
         self,
         assets: Iterable[str] | None = None,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> list[tuple[str, str, int, datetime, datetime]]:
         query = select(
             self.quotes.c.asset,
@@ -463,10 +467,15 @@ class CycleHistoricalResearch:
             func.count(self.quotes.c.quote_id),
             func.min(self.quotes.c.observed_at),
             func.max(self.quotes.c.observed_at),
-        ).group_by(self.quotes.c.asset, self.quotes.c.venue)
+        )
         allowed = tuple(sorted({str(asset).upper() for asset in (assets or ()) if str(asset).strip()}))
         if allowed:
             query = query.where(self.quotes.c.asset.in_(allowed))
+        if start is not None:
+            query = query.where(self.quotes.c.observed_at >= _iso(start))
+        if end is not None:
+            query = query.where(self.quotes.c.observed_at < _iso(end))
+        query = query.group_by(self.quotes.c.asset, self.quotes.c.venue)
         with self.store.engine.connect() as db:
             raw_rows = list(db.execute(query).all())
         rows: list[tuple[str, str, int, datetime, datetime]] = []
@@ -491,7 +500,7 @@ class CycleHistoricalResearch:
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> dict[str, str]:
-        rows = self._provider_coverage_rows(assets)
+        rows = self._provider_coverage_rows(assets, start=start, end=end)
         expected = (
             max(1, int((end - start).total_seconds() // HISTORICAL_CANDLE_SECONDS))
             if start is not None and end is not None and end > start
@@ -546,7 +555,11 @@ class CycleHistoricalResearch:
         preferred = self.preferred_venue(asset, start=start, end=end)
         if preferred is None:
             return 0, None, None
-        for row_asset, venue, count, earliest, latest in self._provider_coverage_rows((asset,)):
+        for row_asset, venue, count, earliest, latest in self._provider_coverage_rows(
+            (asset,),
+            start=start,
+            end=end,
+        ):
             if row_asset == asset.upper() and venue == preferred:
                 return count, earliest, latest
         return 0, None, None
