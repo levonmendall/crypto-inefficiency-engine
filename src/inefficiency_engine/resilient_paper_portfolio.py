@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 
@@ -11,6 +13,9 @@ from inefficiency_engine.canonical_paper_portfolio import (
 )
 from inefficiency_engine.evidence import ScanSnapshot
 from inefficiency_engine.portfolio_integrity import PortfolioIntegrityLedger, PortfolioIntegritySnapshot, ValuationStatus
+
+
+CANONICAL_ALLOCATION_TIMEOUT_SECONDS = 30.0
 
 
 class OperationallyResilientPaperPortfolioService(CanonicalPaperPortfolioService):
@@ -27,6 +32,16 @@ class OperationallyResilientPaperPortfolioService(CanonicalPaperPortfolioService
     def __init__(self, core, allocator, store):
         super().__init__(core, allocator, store)
         self.integrity = PortfolioIntegrityLedger(store)
+        # Release-D/all-lane allocation is durable DB + CPU work. Keep exactly one
+        # isolated worker so that synchronous qualification/ranking can never pin the
+        # canonical asyncio loop and defeat its outer stage deadline. A timed-out
+        # allocation is allowed to finish in the background, but no replacement is
+        # submitted until that single worker completes, preventing thread buildup.
+        self._allocation_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="canonical-allocation",
+        )
+        self._allocation_future: Future | None = None
 
     def _latest_position_evidence_times(self) -> dict[str, datetime]:
         latest: dict[str, datetime] = {}
@@ -47,6 +62,55 @@ class OperationallyResilientPaperPortfolioService(CanonicalPaperPortfolioService
             elif event.event_type == "close":
                 latest.pop(event.position_id, None)
         return latest
+
+    async def _bounded_allocation_plan(self, *, total_capital_usd: float):
+        """Return a plan without allowing sync allocator work to block accounting.
+
+        Production's lane-success allocator exposes ``allocate_sync`` because its
+        work is synchronous durable-state analysis despite an async compatibility
+        surface. Run that core in one dedicated thread and enforce a 30-second
+        liveness budget. If an older/test allocator has no sync core, preserve the
+        existing async behavior.
+        """
+
+        allocate_sync = getattr(self.allocator, "allocate_sync", None)
+        if not callable(allocate_sync):
+            try:
+                return await self.allocator.allocate(total_capital_usd=total_capital_usd), None
+            except Exception as exc:
+                return None, type(exc).__name__
+
+        previous = self._allocation_future
+        if previous is not None:
+            if not previous.done():
+                return None, "AllocationStageStillRunning"
+            # A result that completed after the prior deadline is intentionally
+            # discarded: its point-in-time candidate evidence may already be stale.
+            try:
+                previous.result()
+            except Exception:
+                pass
+            self._allocation_future = None
+
+        future = self._allocation_executor.submit(
+            allocate_sync,
+            total_capital_usd=total_capital_usd,
+        )
+        self._allocation_future = future
+        try:
+            wrapped = asyncio.wrap_future(future)
+            plan = await asyncio.wait_for(
+                asyncio.shield(wrapped),
+                timeout=CANONICAL_ALLOCATION_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            return None, "AllocationStageTimeout"
+        except Exception as exc:
+            self._allocation_future = None
+            return None, type(exc).__name__
+
+        self._allocation_future = None
+        return plan, None
 
     async def _collect_canonical_market_snapshot(self) -> ScanSnapshot:
         """Persist the public quote/funding surface without synchronous opportunity analysis.
@@ -198,11 +262,21 @@ class OperationallyResilientPaperPortfolioService(CanonicalPaperPortfolioService
             allocation_error_type = "StaleOpenPositionValuation"
 
         if cash_available > 0 and allow_new_allocations:
-            try:
-                plan = await self.allocator.allocate(total_capital_usd=cash_available)
-            except Exception as exc:
-                plan = None
-                allocation_error_type = type(exc).__name__
+            plan, bounded_error = await self._bounded_allocation_plan(
+                total_capital_usd=cash_available
+            )
+            if bounded_error is not None:
+                allocation_error_type = bounded_error
+                family_failures = [
+                    {
+                        "family": "canonical_allocator",
+                        "error_type": bounded_error,
+                        "reason": (
+                            "canonical accounting remained live while the durable "
+                            "allocation stage failed its bounded liveness contract"
+                        ),
+                    }
+                ]
             if plan is not None:
                 family_failures = [dict(item) for item in getattr(plan, "family_failures", [])]
                 remaining_cash = cash_available
