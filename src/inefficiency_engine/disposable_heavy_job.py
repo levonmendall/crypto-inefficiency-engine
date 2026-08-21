@@ -18,6 +18,7 @@ from inefficiency_engine.service import OpportunityService
 
 
 HEAVY_WORKER_ID = "disposable-heavy-work"
+TEMPORARY_ADMISSION_EXIT_CODE = 75
 
 
 def _research_completion_state(store) -> tuple[str, str | None, dict[str, object]]:
@@ -50,6 +51,23 @@ def _research_completion_state(store) -> tuple[str, str | None, dict[str, object
     return "success", None, propagated
 
 
+def child_memory_admission_reason(memory) -> str | None:
+    """Reject only when the already-started child is at the hard terminate boundary.
+
+    The combined supervisor is the pre-spawn admission authority and deliberately
+    checks ``start_blocked`` before creating this process. Re-applying that same
+    threshold after Python/import startup double-counts the child's own bootstrap
+    footprint and can create an infinite spawn -> code 75 -> retry loop. Once this
+    child exists, the only safe local admission failure is the harder aggregate
+    terminate boundary; the supervisor continues monitoring that boundary while the
+    job runs.
+    """
+
+    if getattr(memory, "terminate_required", False):
+        return "InstanceMemoryTerminateBlocked"
+    return None
+
+
 async def _run(job: str) -> int:
     settings = Settings.from_env()
     store = build_evidence_store(settings.evidence_db_path)
@@ -70,27 +88,31 @@ async def _run(job: str) -> int:
                 "job": job,
                 "owner": owner,
                 "lease_acquired": False,
+                "temporary_admission_failure": True,
                 "paper_only": True,
             },
         )
-        return 75
+        return TEMPORARY_ADMISSION_EXIT_CODE
 
     try:
         before = instance_memory_snapshot()
-        if before.start_blocked:
+        memory_block = child_memory_admission_reason(before)
+        if memory_block is not None:
             store.record_worker_heartbeat(
                 worker_id=HEAVY_WORKER_ID,
                 state="degraded",
-                error_type="InstanceMemoryStartBlocked",
+                error_type=memory_block,
                 detail={
                     "job": job,
                     "owner": owner,
                     "lease_acquired": True,
                     "memory": before.as_dict(),
+                    "temporary_admission_failure": True,
+                    "pre_spawn_admission_owned_by_supervisor": True,
                     "paper_only": True,
                 },
             )
-            return 75
+            return TEMPORARY_ADMISSION_EXIT_CODE
 
         sequence = lease.next_sequence(job)
         store.record_worker_heartbeat(
@@ -102,6 +124,8 @@ async def _run(job: str) -> int:
                 "owner": owner,
                 "lease_acquired": True,
                 "memory_before": before.as_dict(),
+                "memory_start_blocked_after_import": bool(before.start_blocked),
+                "pre_spawn_admission_owned_by_supervisor": True,
                 "disposable_process": True,
                 "paper_only": True,
             },
