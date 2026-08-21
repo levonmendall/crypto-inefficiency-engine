@@ -29,16 +29,27 @@ def _bybit_result(payload: object) -> dict[str, Any]:
     return payload["result"]
 
 
-def _pick_options(rows: list[tuple[dict[str,Any], tuple[str,datetime,float,str], float]], limit_per_side: int = 2) -> list[tuple[dict[str,Any], tuple[str,datetime,float,str], float]]:
+def _pick_options(
+    rows: list[tuple[dict[str,Any], tuple[str,datetime,float,str], float]],
+    limit_per_side: int = 2,
+    expiry_count: int = 2,
+) -> list[tuple[dict[str,Any], tuple[str,datetime,float,str], float]]:
+    """Keep a bounded ATM surface across the nearest two expiries.
+
+    The previous collector retained only one expiry, which made term-structure
+    research impossible. Two expiries preserve a useful near/next surface while
+    keeping memory and downstream book fanout tightly bounded.
+    """
     if not rows:
         return []
-    nearest = min(row[1][1] for row in rows)
-    expiry_rows = [row for row in rows if row[1][1] == nearest]
+    expiries = sorted({row[1][1] for row in rows})[:max(1, int(expiry_count))]
     selected: list[tuple[dict[str,Any], tuple[str,datetime,float,str], float]] = []
-    for option_type in ("call","put"):
-        side = [row for row in expiry_rows if row[1][3] == option_type]
-        side.sort(key=lambda row: abs(row[1][2]/row[2]-1.0))
-        selected.extend(side[:limit_per_side])
+    for expiry in expiries:
+        expiry_rows = [row for row in rows if row[1][1] == expiry]
+        for option_type in ("call","put"):
+            side = [row for row in expiry_rows if row[1][3] == option_type]
+            side.sort(key=lambda row: abs(row[1][2]/row[2]-1.0))
+            selected.extend(side[:limit_per_side])
     return selected
 
 
@@ -81,7 +92,11 @@ async def collect_bybit_options(volatility_service) -> SourceProbeResult:
     return SourceProbeResult(
         source_id="bybit-options", item_count=len(observations), source_reference=source,
         evidence_by_lane={"volatility":["option_quotes","option_greeks"]}, economic_fields_complete=True,
-        detail={"underlyings":sorted({row.underlying for row in observations})},
+        detail={
+            "underlyings":sorted({row.underlying for row in observations}),
+            "expiry_count":len({row.expiry for row in observations}),
+            "bounded_term_structure":True,
+        },
     )
 
 
@@ -136,5 +151,11 @@ async def collect_okx_options(volatility_service) -> SourceProbeResult:
     return SourceProbeResult(
         source_id="okx-options", item_count=len(observations), source_reference=summary_url,
         evidence_by_lane={"volatility":["option_quotes","option_greeks","option_depth"]},
-        economic_fields_complete=True, detail={"underlyings":sorted({row.underlying for row in observations}),"book_depth":5},
+        economic_fields_complete=True,
+        detail={
+            "underlyings":sorted({row.underlying for row in observations}),
+            "book_depth":5,
+            "expiry_count":len({row.expiry for row in observations}),
+            "bounded_term_structure":True,
+        },
     )
