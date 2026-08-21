@@ -31,6 +31,8 @@ class LaneExecutableReadiness(BaseModel):
     statistical_gate_implemented: bool
     allocation_bridge_implemented: bool
     settlement_contract_implemented: bool
+    architecture_execution_capable: bool
+    decision_grade_outcome_qualified: bool = False
     paper_execution_capable: bool
     provisional_forward_positive: bool = False
     currently_qualified: bool
@@ -55,7 +57,9 @@ class LaneExecutableReadinessSnapshot(BaseModel):
     research_eligible_count: int = 0
     forward_test_eligible_count: int = 0
     provisional_forward_positive_count: int = 0
+    decision_grade_outcome_qualified_count: int = 0
     currently_qualified_count: int
+    paper_execution_capable_count: int = 0
     profitability_certified_count: int
     all_lanes_paper_execution_capable: bool
     lanes: list[LaneExecutableReadiness]
@@ -104,6 +108,11 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
     for lane_id, definition in LANES.items():
         architecture = _ARCHITECTURE[lane_id]
         evidence_producer = bool(architecture["evidence_producer"])
+        architecture_capable = all(
+            bool(architecture[key])
+            for key in ("economics", "forward", "statistics", "allocation", "settlement")
+        )
+        production_connected = architecture_capable and evidence_producer
         source = source_by_id.get(lane_id)
         dimensions = classify_lane_source_dimensions(source) if source is not None else None
         source_ready = bool(
@@ -163,11 +172,20 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
         profitability_certified = bool(
             operating_row is not None and operating_row.profitability_certified
         )
-        paper_capable = all(
-            bool(architecture[key])
-            for key in ("economics", "forward", "statistics", "allocation", "settlement")
+
+        # Decision-grade qualification is deliberately narrower than research or
+        # architecture readiness. ``currently_qualified`` is derived from the same
+        # canonical promotion/operating state that can feed the allocator. It cannot
+        # be satisfied by a research shadow, a provisional positive result, or code
+        # presence alone.
+        decision_grade_outcome_qualified = bool(currently_qualified)
+        paper_capable = bool(
+            architecture_capable
+            and production_connected
+            and allocation_source_qualified
+            and decision_grade_outcome_qualified
         )
-        production_connected = paper_capable and evidence_producer
+
         blockers: list[str] = []
         if not evidence_producer:
             blockers.append(_CAPITAL_LOCATION_PRODUCER_BLOCKER)
@@ -193,35 +211,35 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
             qualification_stage = f"waiting_for_source:{source_sufficiency_state}"
         elif not forward_test_eligible:
             qualification_stage = "research_active_waiting_for_complete_forward_evidence"
-        elif provisional and not currently_qualified:
+        elif provisional and not decision_grade_outcome_qualified:
             qualification_stage = "provisional_forward_positive"
         elif not allocation_source_qualified:
             qualification_stage = "forward_learning_active_redundancy_pending"
         elif operating_row is not None:
             qualification_stage = operating_row.stage
-        elif currently_qualified:
+        elif decision_grade_outcome_qualified:
             qualification_stage = "qualified_for_paper_allocation"
         else:
             qualification_stage = "awaiting_operating_snapshot"
 
         if not evidence_producer:
             execution_state = "execution_code_present_upstream_evidence_missing"
-        elif not paper_capable:
+        elif not architecture_capable:
             execution_state = "architecture_incomplete"
-        elif currently_qualified:
+        elif paper_capable:
             execution_state = "qualified_for_paper_allocation"
         elif not research_eligible:
-            execution_state = "execution_capable_source_blocked"
+            execution_state = "source_blocked"
         elif not forward_test_eligible:
             execution_state = "research_active_forward_evidence_incomplete"
         elif provisional:
-            execution_state = "execution_capable_provisional_forward_positive"
+            execution_state = "research_active_provisional_forward_positive"
         elif not allocation_source_qualified:
             execution_state = "research_active_allocation_source_redundancy_pending"
         elif forward_count < 3:
-            execution_state = "execution_capable_collecting_forward_evidence"
+            execution_state = "collecting_forward_evidence"
         else:
-            execution_state = "execution_capable_awaiting_qualification"
+            execution_state = "awaiting_decision_grade_qualification"
 
         rows.append(
             LaneExecutableReadiness(
@@ -242,6 +260,8 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
                 statistical_gate_implemented=bool(architecture["statistics"]),
                 allocation_bridge_implemented=bool(architecture["allocation"]),
                 settlement_contract_implemented=bool(architecture["settlement"]),
+                architecture_execution_capable=architecture_capable,
+                decision_grade_outcome_qualified=decision_grade_outcome_qualified,
                 paper_execution_capable=paper_capable,
                 provisional_forward_positive=provisional,
                 currently_qualified=currently_qualified,
@@ -257,7 +277,9 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
     return LaneExecutableReadinessSnapshot(
         observed_at=datetime.now(timezone.utc),
         lane_count=len(rows),
-        architecture_executable_count=sum(row.paper_execution_capable for row in rows),
+        architecture_executable_count=sum(
+            row.architecture_execution_capable for row in rows
+        ),
         production_evidence_connected_count=sum(
             row.production_evidence_path_connected for row in rows
         ),
@@ -269,16 +291,21 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
         provisional_forward_positive_count=sum(
             row.provisional_forward_positive for row in rows
         ),
+        decision_grade_outcome_qualified_count=sum(
+            row.decision_grade_outcome_qualified for row in rows
+        ),
         currently_qualified_count=sum(row.currently_qualified for row in rows),
+        paper_execution_capable_count=sum(row.paper_execution_capable for row in rows),
         profitability_certified_count=sum(row.profitability_certified for row in rows),
         all_lanes_paper_execution_capable=all(row.paper_execution_capable for row in rows),
         lanes=rows,
         interpretation=(
-            "paper_execution_capable describes downstream code capability; production_evidence_path_connected separately "
-            "requires a real upstream evidence producer. research_eligible and forward_test_eligible show evidence-learning "
-            "progress; allocation_source_qualified/source_layer_sufficient preserve the decision-grade two-source gate. "
-            "capital-location remains fail-closed until authoritative transfer cost/latency evidence is genuinely produced. "
-            "provisional_forward_positive is diagnostic only and grants no portfolio authority. Final qualification, execution, "
-            "risk, settlement and profitability thresholds remain unchanged."
+            "architecture_execution_capable describes downstream code capability only. "
+            "paper_execution_capable is stricter: it requires that architecture, a connected production evidence path, "
+            "allocation-grade source qualification, and a current decision-grade qualified outcome/candidate. "
+            "research_eligible and forward_test_eligible show evidence-learning progress; provisional_forward_positive is "
+            "diagnostic only and grants no portfolio authority. Capital-location remains fail-closed until authoritative "
+            "transfer cost/latency evidence is genuinely produced. Final economic, statistical, execution, risk, settlement "
+            "and profitability thresholds remain unchanged."
         ),
     )
