@@ -81,7 +81,7 @@ async def run_canonical_portfolio_loop(
     Forward allocation and mechanism certification deliberately do not run here.
     A provider-heavy certification stall must never hold the canonical heartbeat
     open long enough for the process watchdog to kill the Render worker. Dashboard
-    projection is a bounded, presentation-only post-cycle publication.
+    projection is a bounded, presentation-only startup and post-cycle publication.
     """
 
     interval = (
@@ -97,6 +97,23 @@ async def run_canonical_portfolio_loop(
     latest_account = portfolio.ledger.latest_snapshot()
     if latest_account is not None:
         portfolio.integrity.ensure_initial(latest_account)
+        # Make the canonical cash account visible before the first provider-backed
+        # portfolio cycle starts. A slow or degraded first cycle must never leave the
+        # dashboard blank when durable genesis already exists.
+        store.record_worker_heartbeat(
+            worker_id=PORTFOLIO_WORKER_ID,
+            state="starting",
+            detail={
+                "cycle_attempt": 0,
+                "portfolio_cycle_interval_seconds": interval,
+                "stage": "genesis_ready",
+                "certification_decoupled": True,
+                "portfolio_nav_usd": latest_account.nav_usd,
+                "portfolio_snapshot_observed_at": latest_account.observed_at.isoformat(),
+                "paper_only": True,
+            },
+        )
+        _publish_dashboard_projection(service, store, dashboard_projection)
 
     attempted = 0
     while not stop_event.is_set() and (max_cycles is None or attempted < max_cycles):
