@@ -18,12 +18,23 @@ def test_yield_keeps_source_learning_contract_and_exposes_risk_calibration_downs
     assert "realized-yield forward cohort" in LANES["yield"]["downstream"]
 
 
-def test_volatility_requires_normalized_option_capacity_before_forward_testing():
+def test_volatility_requires_explicit_normalized_option_capacity_before_forward_testing():
     required = set(LANES["volatility"]["required"])
     available = _classes_for_lane("volatility")
-    assert "option_capacity" in required
-    assert "option_capacity" not in available
-    assert {"option_quotes", "option_greeks", "option_depth"}.issubset(available)
+    assert required == {
+        "option_quotes",
+        "option_greeks",
+        "option_depth",
+        "option_capacity",
+    }
+    assert required.issubset(available)
+    capacity_sources = [
+        source
+        for source in SOURCES
+        if "volatility" in list(source["lanes"])
+        and "option_capacity" in list(source["classes"])
+    ]
+    assert [source["id"] for source in capacity_sources] == ["deribit-option-capacity"]
 
 
 def test_other_core_lane_requirements_are_not_relaxed():
