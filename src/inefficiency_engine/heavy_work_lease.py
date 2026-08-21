@@ -154,14 +154,19 @@ class HeavyWorkLeaseLedger:
                 )
         return next_value
 
-    def current_owner(self, *, lease_name: str = HEAVY_WORK_LEASE_NAME) -> str | None:
-        now = _now().isoformat()
+    def current_owner(
+        self,
+        *,
+        lease_name: str = HEAVY_WORK_LEASE_NAME,
+        now: datetime | None = None,
+    ) -> str | None:
+        observed_at = (now or _now()).isoformat()
         with self.store.engine.connect() as db:
             row = db.execute(
                 select(self.leases.c.owner, self.leases.c.expires_at)
                 .where(self.leases.c.lease_name == lease_name)
             ).first()
-        if row is None or row.expires_at <= now:
+        if row is None or row.expires_at <= observed_at:
             return None
         return str(row.owner)
 
