@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httpx
+import pytest
+
 from inefficiency_engine.cycle_probation import (
     CycleHistoricalResearch,
     CycleReplaySummary,
@@ -52,6 +55,57 @@ def test_parse_coinbase_candles_uses_close_price():
     assert rows[0].mid == 105.0
     assert rows[0].asset == "BTC"
     assert rows[0].market_kind == MarketKind.SPOT
+
+
+def test_parse_bybit_candles_uses_close_price_and_usdt_spot_identity():
+    payload = {
+        "retCode": 0,
+        "result": {
+            "list": [["1735689600000", "90", "110", "95", "105", "1234", "9999"]]
+        },
+    }
+    rows = CycleHistoricalResearch._parse_bybit_candles(payload, asset="PEPE")
+
+    assert len(rows) == 1
+    assert rows[0].mid == 105.0
+    assert rows[0].venue == "Bybit"
+    assert rows[0].symbol == "PEPEUSDT"
+    assert rows[0].quote_currency == "USDT"
+
+
+@pytest.mark.asyncio
+async def test_coinbase_not_listed_falls_back_to_bybit_without_touching_live_evidence(
+    tmp_path, monkeypatch
+):
+    store = EvidenceStore(tmp_path / "fallback.db")
+    research = CycleHistoricalResearch(store, backfill_days=260)
+
+    async def coinbase_missing(*_args, **_kwargs):
+        request = httpx.Request("GET", "https://api.exchange.coinbase.com/products/PEPE-USD/candles")
+        response = httpx.Response(404, request=request)
+        raise httpx.HTTPStatusError("not listed", request=request, response=response)
+
+    async def bybit_history(*, params):
+        observed = int(int(params["start"]) + 6 * 60 * 60 * 1000)
+        return {
+            "retCode": 0,
+            "result": {
+                "list": [[str(observed), "1", "1.1", "0.9", "1.05", "100", "105"]]
+            },
+        }
+
+    monkeypatch.setattr(research, "_get", coinbase_missing)
+    monkeypatch.setattr(research, "_get_bybit", bybit_history)
+
+    now = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    report = await research.ensure_backfilled(["PEPE"], now=now)
+
+    assert report.fetched_assets == ("PEPE",)
+    assert not report.errors
+    history = research.history(start=now - timedelta(days=261), end=now)
+    assert ("Bybit", "PEPE", MarketKind.SPOT) in history
+    with store.engine.connect() as db:
+        assert list(db.execute(store.market_quotes.select()).mappings()) == []
 
 
 def test_probationary_policy_requires_history_and_real_forward_learning():

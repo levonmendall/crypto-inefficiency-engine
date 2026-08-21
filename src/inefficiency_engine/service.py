@@ -5,6 +5,7 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 
+from inefficiency_engine.adapters.dynamic_registry import DynamicVolumePublicAdapterRegistry
 from inefficiency_engine.adapters.registry import ProviderDiagnosticReport, PublicAdapterRegistry
 from inefficiency_engine.config import Settings
 from inefficiency_engine.detectors.registry import DetectorContext, DetectorManifest, OpportunityDetectorRegistry
@@ -92,7 +93,9 @@ class OpportunityService:
     ):
         self.settings = settings or Settings.from_env()
         self.evidence_store = evidence_store
-        self.adapter_registry = adapter_registry or PublicAdapterRegistry()
+        self.adapter_registry = adapter_registry or DynamicVolumePublicAdapterRegistry(
+            evidence_store=evidence_store
+        )
         self.detector_registry = OpportunityDetectorRegistry.default(self.settings)
         self.risk_gate = RiskGate(self.settings)
 

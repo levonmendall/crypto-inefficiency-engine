@@ -17,6 +17,7 @@ from inefficiency_engine.models import MarketKind, MarketQuote
 
 
 COINBASE_EXCHANGE_URL = "https://api.exchange.coinbase.com"
+BYBIT_URL = "https://api.bybit.com"
 HISTORICAL_BACKFILL_DAYS = 365
 HISTORICAL_CANDLE_SECONDS = 21600
 HISTORICAL_REQUEST_CHUNK_DAYS = 60
@@ -151,6 +152,7 @@ class CycleHistoricalResearch:
         self._replay_cache: dict[tuple[str, str], CycleReplaySummary] = {}
 
     async def _get(self, path: str, *, params: dict[str, object]) -> object:
+        """Coinbase request retained as the primary historical source."""
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(
             timeout=20.0,
@@ -161,6 +163,23 @@ class CycleHistoricalResearch:
         )
         try:
             response = await client.get(f"{COINBASE_EXCHANGE_URL}{path}", params=params)
+            response.raise_for_status()
+            return response.json()
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    async def _get_bybit(self, *, params: dict[str, object]) -> object:
+        owns_client = self._client is None
+        client = self._client or httpx.AsyncClient(
+            timeout=20.0,
+            headers={
+                "User-Agent": "crypto-inefficiency-engine/cycle-history",
+                "Cache-Control": "no-cache",
+            },
+        )
+        try:
+            response = await client.get(f"{BYBIT_URL}/v5/market/kline", params=params)
             response.raise_for_status()
             return response.json()
         finally:
@@ -199,10 +218,46 @@ class CycleHistoricalResearch:
         rows.sort(key=lambda item: item.observed_at)
         return rows
 
+    @staticmethod
+    def _parse_bybit_candles(payload: object, *, asset: str) -> list[MarketQuote]:
+        if not isinstance(payload, dict) or int(payload.get("retCode", -1)) != 0:
+            raise ValueError("Bybit kline response did not return retCode=0")
+        result = payload.get("result")
+        raw_rows = result.get("list") if isinstance(result, dict) else None
+        if not isinstance(raw_rows, list):
+            raise ValueError("Bybit kline response must contain result.list")
+        rows: list[MarketQuote] = []
+        symbol = f"{asset.upper()}USDT"
+        for item in raw_rows:
+            if not isinstance(item, list) or len(item) < 5:
+                continue
+            try:
+                observed_at = datetime.fromtimestamp(float(item[0]) / 1000.0, tz=timezone.utc)
+                close = float(item[4])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if close <= 0:
+                continue
+            rows.append(
+                MarketQuote(
+                    venue="Bybit",
+                    asset=asset.upper(),
+                    market_kind=MarketKind.SPOT,
+                    symbol=symbol,
+                    quote_currency="USDT",
+                    contract_key="spot",
+                    mid=close,
+                    observed_at=observed_at,
+                    source="bybit-v5:kline:spot:6h:historical-backfill",
+                )
+            )
+        rows.sort(key=lambda item: item.observed_at)
+        return rows
+
     def record_quotes(self, quotes: Iterable[MarketQuote]) -> int:
         rows = []
         for quote in quotes:
-            if quote.market_kind != MarketKind.SPOT or quote.venue != "Coinbase":
+            if quote.market_kind != MarketKind.SPOT or quote.venue not in {"Coinbase", "Bybit"}:
                 continue
             rows.append(
                 {
@@ -252,6 +307,31 @@ class CycleHistoricalResearch:
             return 0, None, None
         return len(payloads), datetime.fromisoformat(payloads[0]), datetime.fromisoformat(payloads[-1])
 
+    async def _fetch_bybit_history(
+        self,
+        *,
+        asset: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[MarketQuote]:
+        rows: list[MarketQuote] = []
+        cursor = start
+        while cursor < end:
+            chunk_end = min(end, cursor + timedelta(days=HISTORICAL_REQUEST_CHUNK_DAYS))
+            payload = await self._get_bybit(
+                params={
+                    "category": "spot",
+                    "symbol": f"{asset.upper()}USDT",
+                    "interval": "360",
+                    "start": int(cursor.timestamp() * 1000),
+                    "end": int(chunk_end.timestamp() * 1000),
+                    "limit": 1000,
+                }
+            )
+            rows.extend(self._parse_bybit_candles(payload, asset=asset))
+            cursor = chunk_end
+        return rows
+
     async def ensure_backfilled(
         self,
         assets: Iterable[str],
@@ -281,6 +361,7 @@ class CycleHistoricalResearch:
 
             asset_rows: list[MarketQuote] = []
             cursor = start
+            use_bybit_fallback = False
             while cursor < end:
                 chunk_end = min(end, cursor + timedelta(days=HISTORICAL_REQUEST_CHUNK_DAYS))
                 try:
@@ -294,15 +375,29 @@ class CycleHistoricalResearch:
                     )
                     asset_rows.extend(self._parse_candles(payload, asset=asset))
                 except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code == 404:
-                        errors.append(f"{asset}:NotListed")
+                    if exc.response.status_code == 404 and count == 0 and not asset_rows:
+                        use_bybit_fallback = True
                         break
-                    errors.append(f"{asset}:HTTP{exc.response.status_code}")
+                    errors.append(
+                        f"{asset}:NotListed" if exc.response.status_code == 404 else f"{asset}:HTTP{exc.response.status_code}"
+                    )
                     break
                 except Exception as exc:
                     errors.append(f"{asset}:{type(exc).__name__}")
                     break
                 cursor = chunk_end
+
+            if use_bybit_fallback:
+                try:
+                    asset_rows = await self._fetch_bybit_history(asset=asset, start=start, end=end)
+                    if not asset_rows:
+                        errors.append(f"{asset}:BybitEmptyResult")
+                except httpx.HTTPStatusError as exc:
+                    errors.append(f"{asset}:BybitHTTP{exc.response.status_code}")
+                    asset_rows = []
+                except Exception as exc:
+                    errors.append(f"{asset}:Bybit{type(exc).__name__}")
+                    asset_rows = []
 
             if asset_rows:
                 stored += self.record_quotes(asset_rows)
@@ -436,10 +531,15 @@ class CycleHistoricalResearch:
                     raw = exit_quote.mid / candidate.entry_reference_price - 1.0
                     directional = raw if candidate.direction == "long" else -raw
                     fee_floor = 0.0
-                    if candidate.venue == "Coinbase" and candidate.market_kind == MarketKind.SPOT:
+                    if candidate.market_kind == MarketKind.SPOT:
+                        if candidate.venue == "Coinbase":
+                            taker_fee_bps = settings.coinbase_spot_taker_fee_bps
+                        elif candidate.venue == "Bybit":
+                            taker_fee_bps = settings.bybit_spot_taker_fee_bps
+                        else:
+                            taker_fee_bps = 0.0
                         fee_floor = (
-                            2.0 * settings.coinbase_spot_taker_fee_bps
-                            + settings.alpha_execution_risk_floor_bps
+                            2.0 * taker_fee_bps + settings.alpha_execution_risk_floor_bps
                         ) / 10_000.0
                     cost = max(candidate.estimated_cost_return, fee_floor)
                     outcomes.setdefault((candidate.asset.upper(), candidate.direction), []).append(
