@@ -57,7 +57,7 @@ class LaneSuccessQualifiedOpportunityAllocatorService(AllLaneQualifiedOpportunit
         self.lane_success = LaneSuccessController(store)
         self.mechanisms = LaneSuccessMechanismExecutionService(core, store)
 
-    async def allocate(
+    def allocate_sync(
         self,
         *,
         total_capital_usd: float,
@@ -65,6 +65,15 @@ class LaneSuccessQualifiedOpportunityAllocatorService(AllLaneQualifiedOpportunit
         max_asset_fraction: float | None = None,
         max_allocations: int | None = None,
     ) -> UnifiedPaperAllocationPlan:
+        """Run the lane-success allocator as explicit synchronous durable-state work.
+
+        The allocation logic has always been database/CPU bound even though its
+        public API is async for compatibility with the broader allocator interface.
+        Exposing the synchronous core lets the liveness-critical canonical portfolio
+        isolate this work from its asyncio event loop and apply a real wall-clock
+        deadline without changing any qualification, ranking, or risk rule.
+        """
+
         if total_capital_usd <= 0:
             raise ValueError("total_capital_usd must be positive")
         bridge_candidates, failures, bridge_stale = self._active_candidates_with_diagnostics()
@@ -154,6 +163,23 @@ class LaneSuccessQualifiedOpportunityAllocatorService(AllLaneQualifiedOpportunit
                     *plan.skipped,
                 ],
             }
+        )
+
+    async def allocate(
+        self,
+        *,
+        total_capital_usd: float,
+        max_venue_fraction: float | None = None,
+        max_asset_fraction: float | None = None,
+        max_allocations: int | None = None,
+    ) -> UnifiedPaperAllocationPlan:
+        # Compatibility surface for research/certification callers. The canonical
+        # account detects allocate_sync and moves it off its event loop.
+        return self.allocate_sync(
+            total_capital_usd=total_capital_usd,
+            max_venue_fraction=max_venue_fraction,
+            max_asset_fraction=max_asset_fraction,
+            max_allocations=max_allocations,
         )
 
 
