@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import statistics
 from datetime import datetime, timezone
 
 import httpx
+from sqlalchemy import select
 
 from inefficiency_engine.alpha_coverage_strategies import EventObservation
+from inefficiency_engine.alpha_extensions import FundamentalFactorLedger, FundamentalFactorObservation
 from inefficiency_engine.priority_source_models import SourceProbeResult
 from inefficiency_engine.priority_source_parsers import parse_morpho_markets, parse_snapshot_proposals, stable_id
 from inefficiency_engine.research_mechanisms import YieldObservation
@@ -13,10 +16,71 @@ from inefficiency_engine.source_coverage import SourceCoveragePlane, SourceEvent
 SNAPSHOT_GRAPHQL_URL = "https://hub.snapshot.org/graphql"
 MORPHO_GRAPHQL_URL = "https://api.morpho.org/graphql"
 DEFILLAMA_PROTOCOLS_URL = "https://api.llama.fi/protocols"
+ETHEREUM_FACTOR_PROVIDER_PREFIX = "ethereum-mainnet:"
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _alpha_asset(symbol: str) -> str:
+    """Normalize protocol wrappers only when they represent the same underlying asset."""
+
+    value = str(symbol).upper().strip()
+    return {"WETH": "ETH", "WBTC": "BTC"}.get(value, value)
+
+
+def _liquidity_coverage_score(*, liquidity_usd: float, supply_usd: float) -> float:
+    """Normalize immediately withdrawable liquidity coverage to [-1, 1].
+
+    This is an explicit research factor, not a profitability claim. 50% liquidity
+    coverage is neutral, full coverage is +1, and zero coverage is -1. Forward alpha
+    testing determines whether this protocol-health factor has predictive value.
+    """
+
+    if supply_usd <= 0:
+        return -1.0
+    ratio = max(0.0, min(1.0, liquidity_usd / supply_usd))
+    return max(-1.0, min(1.0, 2.0 * ratio - 1.0))
+
+
+def _latest_raw_chain_factor(
+    ledger: FundamentalFactorLedger,
+    *,
+    asset: str,
+    before: datetime,
+    max_age_hours: float = 24.0,
+) -> FundamentalFactorObservation | None:
+    """Read a raw protocol-native chain observation, never a previous composite.
+
+    Without this provider constraint each Morpho refresh could recursively use the
+    prior Ethereum+Morpho composite as its chain input. That would repeatedly feed a
+    derived protocol factor back into itself and obscure point-in-time lineage.
+    """
+
+    query = (
+        select(ledger.observations.c.payload_json)
+        .where(ledger.observations.c.asset == asset.upper())
+        .where(ledger.observations.c.as_of_at <= before.isoformat())
+        .where(ledger.observations.c.provider.like(f"{ETHEREUM_FACTOR_PROVIDER_PREFIX}%"))
+        .order_by(ledger.observations.c.as_of_at.desc(), ledger.observations.c.id.desc())
+        .limit(20)
+    )
+    with ledger.store.engine.connect() as db:
+        payloads = list(db.execute(query).scalars())
+    for payload in payloads:
+        observation = FundamentalFactorObservation.model_validate_json(payload)
+        age = max(0.0, (before - observation.as_of_at).total_seconds() / 3600.0)
+        if age > max_age_hours:
+            continue
+        if not (
+            observation.authoritative
+            and observation.commercial_use_permitted
+            and observation.point_in_time
+        ):
+            continue
+        return observation
+    return None
 
 
 async def collect_snapshot_governance(coverage: SourceCoveragePlane, alpha_factory) -> SourceProbeResult:
@@ -74,6 +138,7 @@ async def collect_morpho_markets(coverage: SourceCoveragePlane, yield_service) -
         raise ValueError("Morpho GraphQL returned errors")
     markets = parse_morpho_markets(payload)
     observed_at = _now()
+    by_alpha_asset: dict[str, list[dict[str, object]]] = {}
     for row in markets[:25]:
         yield_service.record(YieldObservation(
             observation_id=stable_id("morpho-markets",row["market_id"],observed_at.strftime("%Y-%m-%dT%H")),
@@ -85,10 +150,68 @@ async def collect_morpho_markets(coverage: SourceCoveragePlane, yield_service) -
             withdrawal_or_lockup_hours=0.0, source_reference=MORPHO_GRAPHQL_URL,
             authoritative=True, commercial_use_permitted=True, point_in_time=True, paper_only=True,
         ))
+        by_alpha_asset.setdefault(_alpha_asset(str(row["asset"])), []).append(row)
+
+    # Source coverage previously counted Morpho protocol fundamentals while the alpha
+    # ledger consumed only Ethereum chain factors. Persist a conservative normalized
+    # protocol-health factor and, when a recent raw authoritative chain observation
+    # exists, combine both evidence classes into one point-in-time signal input.
+    factor_ledger = FundamentalFactorLedger(coverage.store)
+    protocol_factor_count = 0
+    for asset, asset_rows in by_alpha_asset.items():
+        chain = _latest_raw_chain_factor(
+            factor_ledger,
+            asset=asset,
+            before=observed_at,
+            max_age_hours=24.0,
+        )
+        if chain is None:
+            continue
+        coverage_scores = [
+            _liquidity_coverage_score(
+                liquidity_usd=float(row["liquidity_usd"]),
+                supply_usd=float(row["supply_usd"]),
+            )
+            for row in asset_rows
+            if float(row["supply_usd"]) > 0
+        ]
+        if not coverage_scores:
+            continue
+        factors = dict(chain.factor_scores)
+        factors["morpho_liquidity_coverage"] = statistics.median(coverage_scores)
+        combined = FundamentalFactorObservation(
+            observation_id=stable_id(
+                "ethereum-morpho-composite",
+                asset,
+                chain.observation_id,
+                observed_at.strftime("%Y-%m-%dT%H:%M"),
+            ),
+            provider="ethereum+morpho:composite",
+            asset=asset,
+            observed_at=observed_at,
+            as_of_at=min(observed_at, chain.as_of_at),
+            factor_scores=factors,
+            source_reference=f"{chain.source_reference}|{MORPHO_GRAPHQL_URL}",
+            authoritative=True,
+            commercial_use_permitted=True,
+            point_in_time=True,
+            paper_only=True,
+        )
+        factor_ledger.record(combined)
+        protocol_factor_count += 1
+
     return SourceProbeResult(
         source_id="morpho-markets", item_count=len(markets), source_reference=MORPHO_GRAPHQL_URL,
         evidence_by_lane={"yield":["yield_rate","capacity","exit_liquidity"],"fundamental_onchain":["protocol_fundamentals"]},
-        economic_fields_complete=True, detail={"risk_calibration_complete":False,"paper_allocation_authority":False},
+        # Capacity/liquidity are real, but protocol-loss calibration is still unknown;
+        # do not describe the yield economics as complete merely because the API fields exist.
+        economic_fields_complete=False,
+        detail={
+            "risk_calibration_complete":False,
+            "protocol_factor_observation_count":protocol_factor_count,
+            "fundamental_signal_consumes_protocol_evidence":True,
+            "paper_allocation_authority":False,
+        },
     )
 
 
