@@ -131,7 +131,7 @@ def reconcile_provider_readiness(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Attach legacy provider-admission telemetry without changing lane source truth.
+    """Attach legacy provider-probe telemetry without changing lane source truth.
 
     The canonical 13-lane Source Coverage Plane is the sole authority for displayed
     source state. Its persisted operating row owns ``state``, ``stage``,
@@ -140,10 +140,14 @@ def reconcile_provider_readiness(
     it covers only five provider-dependent mechanisms and can disagree when an
     alternate authoritative source is carrying a lane.
 
-    This read-plane helper therefore exposes the admission ledger only as diagnostic
-    metadata. A fresh legacy probe cannot close a canonical source gap, and a failed or
-    stale legacy probe cannot reopen one. Qualification, allocation, and execution
-    authority remain unchanged and fail closed through the canonical source plane.
+    The research-closure plane also publishes a ``provider_admission`` object with a
+    different schema. Preserve that object verbatim. Legacy probe telemetry is exposed
+    under ``legacy_provider_admission`` so presentation code can inspect it without a
+    field collision or accidental source-state override.
+
+    A fresh legacy probe cannot close a canonical source gap, and a failed or stale
+    legacy probe cannot reopen one. Qualification, allocation, and execution authority
+    remain unchanged and fail closed through the canonical source plane.
     """
     readiness = provider_readiness_snapshot(store, now=now)
     result = dict(mechanism_payload or {})
@@ -159,7 +163,7 @@ def reconcile_provider_readiness(
             mechanisms.append(row)
             continue
 
-        row["provider_admission"] = status
+        row["legacy_provider_admission"] = status
         row["provider_admission_ready"] = bool(
             int(status.get("admitted_provider_count") or 0) > 0
         )

@@ -61,10 +61,38 @@ def test_fresh_legacy_admission_is_diagnostic_only(tmp_path):
     assert row["primary_reason"] == source["mechanisms"][0]["primary_reason"]
     assert row["next_action"] == source["mechanisms"][0]["next_action"]
     assert row["provider_admission_ready"] is True
-    assert row["provider_admission"]["admitted_provider_count"] == 1
+    assert row["legacy_provider_admission"]["admitted_provider_count"] == 1
     assert row["provider_readiness_state_override_applied"] is False
     assert row["source_state_authority"] == "canonical_13_lane_source_coverage"
     assert row["live_execution_authority"] is False
+
+
+def test_reconciler_preserves_research_provider_admission_schema(tmp_path):
+    store = EvidenceStore(tmp_path / "evidence.sqlite")
+    ledger = ProviderAdmissionLedger(store)
+    ledger.record(
+        ProviderAdmissionObservation(
+            mechanism_id="yield",
+            provider="lido:steth-apr-sma",
+            observed_at=NOW,
+            healthy=True,
+            item_count=1,
+            source_reference="https://example.test/lido",
+        )
+    )
+    source = _payload()
+    source["mechanisms"][0]["provider_admission"] = {
+        "observation_contract": "YieldObservation",
+        "authoritative_provider_connected": True,
+        "admission_contract_ready": True,
+    }
+
+    result = reconcile_provider_readiness(store, source, now=NOW)
+    row = result["mechanisms"][0]
+
+    assert row["provider_admission"] == source["mechanisms"][0]["provider_admission"]
+    assert row["provider_admission"]["authoritative_provider_connected"] is True
+    assert row["legacy_provider_admission"]["admitted_provider_count"] == 1
 
 
 def test_failed_legacy_probe_cannot_reopen_canonically_connected_lane(tmp_path):
@@ -117,8 +145,8 @@ def test_failed_legacy_probe_cannot_reopen_canonically_connected_lane(tmp_path):
     assert row["primary_reason"] == canonical["primary_reason"]
     assert row["next_action"] == canonical["next_action"]
     assert row["provider_admission_ready"] is False
-    assert row["provider_admission"]["admitted_provider_count"] == 0
-    assert row["provider_admission"]["providers"][0]["error_type"] == "TimeoutError"
+    assert row["legacy_provider_admission"]["admitted_provider_count"] == 0
+    assert row["legacy_provider_admission"]["providers"][0]["error_type"] == "TimeoutError"
     assert row["provider_readiness_state_override_applied"] is False
 
 
@@ -154,7 +182,7 @@ def test_stale_legacy_admission_cannot_replace_canonical_freshness_state(tmp_pat
     assert row["provider_ready"] is True
     assert row["primary_reason"] == canonical["primary_reason"]
     assert row["provider_admission_ready"] is False
-    assert row["provider_admission"]["providers"][0]["fresh"] is False
+    assert row["legacy_provider_admission"]["providers"][0]["fresh"] is False
 
 
 def test_alternate_source_truth_survives_failed_primary_legacy_probe(tmp_path):
