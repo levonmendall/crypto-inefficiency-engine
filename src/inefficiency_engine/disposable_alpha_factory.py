@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from inefficiency_engine.all_lane_alpha_factory import AllLaneEvidenceFactoryService
 from inefficiency_engine.batched_cycle_history import BatchedCycleHistoricalResearch
-from inefficiency_engine.lane_success_runtime import LaneSuccessMechanismExecutionService
+from inefficiency_engine.evidence_velocity_runtime import (
+    EvidenceVelocityLaneSuccessMechanismExecutionService,
+)
 
 
 class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
@@ -17,7 +19,7 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._historical_research = BatchedCycleHistoricalResearch(self.store)
-        self.mechanism_execution = LaneSuccessMechanismExecutionService(
+        self.mechanism_execution = EvidenceVelocityLaneSuccessMechanismExecutionService(
             self.core,
             self.store,
         )
