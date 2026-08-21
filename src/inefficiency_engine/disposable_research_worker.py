@@ -129,6 +129,23 @@ async def run_disposable_research_cycle(
             detail=detail,
         )
 
+    # Preserve the existing dashboard truth invariant: every projection must follow
+    # a durable-ledger runtime reconciliation. This is local/read-only reconciliation,
+    # so it can safely precede the early presentation publication without doing live
+    # provider work or granting allocation authority.
+    _record_progress("initial_runtime_reconciliation")
+    try:
+        initial_reconciled = operating_certification.reconcile_latest_runtime_truth()
+        detail["initial_lane_reconciliation_complete"] = initial_reconciled is not None
+        if initial_reconciled is not None:
+            detail["initial_operating_snapshot_id"] = initial_reconciled.snapshot_id
+            detail["initial_operating_observed_at"] = initial_reconciled.observed_at.isoformat()
+    except Exception as exc:
+        detail["initial_lane_reconciliation_complete"] = False
+        detail["initial_lane_reconciliation_error_type"] = type(exc).__name__
+    gc.collect()
+    _record_progress("initial_runtime_reconciliation_complete")
+
     def _publish_research_projection(stage: str) -> bool:
         """Publish current durable truth without granting research/allocation authority."""
 
