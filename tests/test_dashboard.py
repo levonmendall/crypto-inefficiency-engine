@@ -24,7 +24,8 @@ def test_dashboard_is_available_at_root_and_dashboard_path():
         assert "independent_forward_outcomes" in response.text
         assert "settled_allocator_outcomes" in response.text
         assert "Authoritative data" in response.text
-        assert "Executable now" in response.text
+        assert "Paper-capable" in response.text
+        assert "Executable now" not in response.text
 
         # Production presentation consumes one worker-published compact projection;
         # detailed endpoints remain API diagnostics but are not fanned out by the UI.
@@ -45,6 +46,11 @@ def test_dashboard_is_available_at_root_and_dashboard_path():
         assert "controller.abort()" in response.text
         assert "timed out after ${timeoutMs}ms" in response.text
         assert "One compact worker-published snapshot per refresh" in response.text
+
+        # Mobile viewport changes redraw cached chart history without another API read.
+        assert "window.__dashboardHistory=history.snapshots||[]" in response.text
+        assert "window.addEventListener('resize',()=>renderChart(window.__dashboardHistory||[]))" in response.text
+        assert "window.addEventListener('resize',()=>refresh())" not in response.text
 
 
 def test_dashboard_routes_are_hidden_from_openapi_but_portfolio_api_remains_visible():
