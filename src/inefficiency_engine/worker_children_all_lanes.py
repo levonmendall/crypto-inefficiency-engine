@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from inefficiency_engine import worker_children as _base
-from inefficiency_engine.research_reset_runtime import (
-    ResearchResetAllLaneEvidenceFactoryService as AllLaneEvidenceFactoryService,
+from inefficiency_engine.research_reset_guardrails import (
+    BoundedResearchResetAllLaneEvidenceFactoryService as AllLaneEvidenceFactoryService,
 )
 from inefficiency_engine.lane_success_runtime import (
     LaneSuccessAllocationForwardCertificationService,
@@ -21,7 +21,7 @@ def _install_all_lane_runtime() -> None:
     # worker_children resolves these names at call time. Replacing them once keeps
     # its mature memory-bounded scheduling and failure isolation while adding the
     # subtractive lane-success calibration/risk feedback plane, candidate observatory,
-    # and the research qualification reset. Provisional authority remains paper-only.
+    # and the bounded research qualification reset. Provisional authority remains paper-only.
     _base.ExpandedAlphaFactoryService = AllLaneEvidenceFactoryService
     _base.OperatingCertificationService = AllLaneOperatingCertificationService
     _base.UnifiedPaperAllocatorService = LaneSuccessQualifiedOpportunityAllocatorService
