@@ -106,12 +106,38 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
             raise KeyError(mechanism_id)
         return self._gate_from_lane(lane, required=required, primary_groups=primary)
 
+    @staticmethod
+    def _semantic_economics_ready(mechanism_id: str, lane) -> bool:
+        """Require truthful economics where raw evidence classes alone are insufficient.
+
+        Yield is the clearest case: rate, capacity and exit-liquidity fields can all be
+        present while protocol-loss/withdrawal economics are explicitly uncalibrated.
+        Unknown risk must never be converted into zero risk simply because numeric
+        placeholders exist. Other mechanism lanes construct their forward economics
+        from the event/book surface inside the mechanism service and therefore keep
+        their existing gates unchanged.
+        """
+
+        if mechanism_id != "yield":
+            return True
+        required = set(str(item) for item in LANES["yield"]["required"])
+        for source in list(lane.sources or []):
+            if not bool(source.get("admitted")):
+                continue
+            classes = {str(item) for item in list(source.get("classes") or [])}
+            if required.issubset(classes) and bool(source.get("economic_fields_complete")):
+                return True
+        return False
+
     def discover_specs(self, snapshot, *, total_capital_usd: float):
         rows = super().discover_specs(snapshot, total_capital_usd=total_capital_usd)
         coverage = self.source_plane.snapshot(now=snapshot.completed_at)
         eligible = []
         for row in rows:
             try:
+                lane = next(
+                    item for item in coverage.lanes if item.lane_id == row.mechanism_id
+                )
                 gate = self._source_gate(
                     mechanism_id=row.mechanism_id,
                     venues=list(row.venues),
@@ -120,6 +146,8 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
             except Exception:
                 continue
             if not gate.forward_test_eligible:
+                continue
+            if not self._semantic_economics_ready(row.mechanism_id, lane):
                 continue
             payload = dict(row.settlement_payload)
             payload["source_evidence_gate"] = {
@@ -130,6 +158,7 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
                 "missing_evidence_classes": gate.missing_evidence_classes,
                 "admitted_source_groups": gate.admitted_source_groups,
                 "primary_source_groups": gate.primary_source_groups,
+                "semantic_economics_complete": True,
                 "allocation_authority": False,
                 "paper_only": True,
             }
@@ -142,6 +171,8 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
         gate_payload = spec.settlement_payload.get("source_evidence_gate")
         if isinstance(gate_payload, dict):
             if not bool(gate_payload.get("allocation_source_qualified")):
+                return None
+            if not bool(gate_payload.get("semantic_economics_complete", True)):
                 return None
             return super()._candidate_from_spec(spec)
 
@@ -162,6 +193,9 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
         qualified = []
         for row in rows:
             try:
+                lane = next(
+                    item for item in coverage.lanes if item.lane_id == row.mechanism_id
+                )
                 gate = self._source_gate(
                     mechanism_id=row.mechanism_id,
                     venues=list(row.venues),
@@ -169,6 +203,9 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
                 )
             except Exception:
                 continue
-            if gate.allocation_source_qualified:
+            if (
+                gate.allocation_source_qualified
+                and self._semantic_economics_ready(row.mechanism_id, lane)
+            ):
                 qualified.append(row)
         return qualified
