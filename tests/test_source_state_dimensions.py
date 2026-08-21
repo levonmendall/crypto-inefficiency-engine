@@ -249,3 +249,15 @@ def test_provider_admission_reconciler_still_fails_closed_for_legacy_missing_pro
     assert row["provider_ready"] is False
     assert row["state"] == "provider_gap"
     assert row["stage"] == "waiting_for_source:provider_gap"
+
+
+def test_research_dashboard_exposes_three_source_dimensions():
+    # Importing the overlay also proves its guarded string replacements still match
+    # the current resilient dashboard template.
+    from inefficiency_engine.dashboard_research_closure import (
+        RESEARCH_CLOSURE_DASHBOARD_HTML,
+    )
+
+    assert "sourceDimensions" in RESEARCH_CLOSURE_DASHBOARD_HTML
+    assert "provider healthy" in RESEARCH_CLOSURE_DASHBOARD_HTML
+    assert "qualification blocked" in RESEARCH_CLOSURE_DASHBOARD_HTML
