@@ -173,12 +173,19 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
             operating_row is not None and operating_row.profitability_certified
         )
 
-        # Decision-grade qualification is deliberately narrower than research or
-        # architecture readiness. ``currently_qualified`` is derived from the same
-        # canonical promotion/operating state that can feed the allocator. It cannot
-        # be satisfied by a research shadow, a provisional positive result, or code
-        # presence alone.
-        decision_grade_outcome_qualified = bool(currently_qualified)
+        # A positive decision-grade lane conclusion is broader than the presence of
+        # a candidate right now, but narrower than research/code readiness. A
+        # certifying/certified operating state means the durable qualification plane
+        # has reached a positive allocation-grade conclusion; a currently promoted
+        # candidate is also sufficient proof because promotion itself is gated by
+        # the canonical statistical/economic qualification path.
+        operating_positive = bool(
+            operating_row is not None
+            and operating_row.state in {"certifying", "certified"}
+        )
+        decision_grade_outcome_qualified = bool(
+            currently_qualified or operating_positive
+        )
         paper_capable = bool(
             architecture_capable
             and production_connected
@@ -301,11 +308,12 @@ def build_lane_executable_readiness(core, store) -> LaneExecutableReadinessSnaps
         lanes=rows,
         interpretation=(
             "architecture_execution_capable describes downstream code capability only. "
-            "paper_execution_capable is stricter: it requires that architecture, a connected production evidence path, "
-            "allocation-grade source qualification, and a current decision-grade qualified outcome/candidate. "
-            "research_eligible and forward_test_eligible show evidence-learning progress; provisional_forward_positive is "
-            "diagnostic only and grants no portfolio authority. Capital-location remains fail-closed until authoritative "
-            "transfer cost/latency evidence is genuinely produced. Final economic, statistical, execution, risk, settlement "
-            "and profitability thresholds remain unchanged."
+            "decision_grade_outcome_qualified means the durable qualification plane has reached a positive allocation-grade "
+            "conclusion; currently_qualified separately reports whether a current promoted opportunity/candidate exists. "
+            "paper_execution_capable requires the architecture, a connected production evidence path, allocation-grade source "
+            "qualification, and a positive decision-grade outcome. Research eligibility, forward-test eligibility, and "
+            "provisional positive evidence are diagnostic only and grant no portfolio authority. Capital-location remains "
+            "fail-closed until authoritative transfer cost/latency evidence is genuinely produced. Final economic, statistical, "
+            "execution, risk, settlement and profitability thresholds remain unchanged."
         ),
     )
