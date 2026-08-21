@@ -158,8 +158,12 @@ def test_active_history_maintenance_uses_resolved_top40(monkeypatch, tmp_path):
     )
 
     assert calls == [ACTIVE_ASSETS]
-    assert research.requested == ACTIVE_ASSETS
+    # The existing history subsystem canonicalizes request order internally; the
+    # active read plane restores exact volume rank order from the strict snapshot.
+    assert set(research.requested) == set(ACTIVE_ASSETS)
+    assert len(research.requested) == TOP_VOLUME_ASSET_COUNT
     assert result["asset_count"] == TOP_VOLUME_ASSET_COUNT
+    assert [row["asset"] for row in result["assets"]] == list(ACTIVE_ASSETS)
     assert "ALGO" not in {row["asset"] for row in result["assets"]}
 
 
