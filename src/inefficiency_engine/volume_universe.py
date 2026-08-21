@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -24,12 +25,15 @@ VOLUME_UNIVERSE_REFRESH_SECONDS = max(
 )
 COINGECKO_PUBLIC_API_URL = "https://api.coingecko.com/api/v3"
 COINGECKO_PRO_API_URL = "https://pro-api.coingecko.com/api/v3"
-STRICT_VOLUME_METHOD = "marketwide_24h_trading_volume_usd"
+# Version the method so pre-repair snapshots that relied only on a static stablecoin
+# blacklist cannot be accepted as the current authoritative top-40 universe.
+STRICT_VOLUME_METHOD = "marketwide_24h_trading_volume_usd_dynamic_stable_v2"
 STRICT_VOLUME_SOURCE = "coingecko:coins_markets:total_volume"
+STRICT_STABLE_VALUE_SOURCE = "coingecko:coins_markets:category=stablecoins"
 
-# Stable-value instruments already have dedicated stablecoin/depeg/conversion
-# mechanisms. They are an eligibility exclusion, not an alternate ranking input.
-# Among eligible risk assets, 24-hour traded volume is the sole ranking metric.
+# Defense-in-depth only. This set is no longer the authority for stable-value
+# classification. New snapshots additionally require CoinGecko's live stablecoin
+# category to succeed and exclude those CoinGecko asset IDs before ranking.
 STABLE_VALUE_ASSETS = frozenset(
     {
         "USDT",
@@ -169,10 +173,9 @@ def rank_volume_observations(
 def parse_coingecko_markets(payload: object) -> list[dict[str, object]]:
     """Parse market-wide 24h volume rows from CoinGecko /coins/markets.
 
-    CoinGecko's `total_volume` is the authoritative ranking metric. Duplicate
-    symbols are kept here and resolved by highest reported volume below rather
-    than summed, because two CoinGecko IDs can share a ticker without being the
-    same economic asset.
+    CoinGecko's ``total_volume`` is the sole ranking metric. Duplicate symbols
+    are retained here and later resolved by the highest reported volume rather
+    than summed because different CoinGecko IDs can share a ticker.
     """
     if not isinstance(payload, list):
         raise ValueError("CoinGecko coins/markets response must be a list")
@@ -196,6 +199,20 @@ def parse_coingecko_markets(payload: object) -> list[dict[str, object]]:
                 }
             )
     return rows
+
+
+def parse_coingecko_stablecoin_ids(payload: object) -> frozenset[str]:
+    """Return CoinGecko IDs dynamically classified in its stablecoin category."""
+    if not isinstance(payload, list):
+        raise ValueError("CoinGecko stablecoin category response must be a list")
+    ids = {
+        str(item.get("id") or "").strip()
+        for item in payload
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    if not ids:
+        raise ValueError("CoinGecko stablecoin category returned no classified assets")
+    return frozenset(ids)
 
 
 def rank_marketwide_volume(
@@ -230,7 +247,6 @@ def rank_marketwide_volume(
             "rank": index,
             "asset": str(row["asset"]),
             "reported_24h_volume_usd": float(row["notional_usd"]),
-            # Keep the prior field name for downstream/read compatibility.
             "aggregate_24h_notional_usd": float(row["notional_usd"]),
             "sources": [STRICT_VOLUME_SOURCE],
             "source_asset_id": str(row.get("source_asset_id") or ""),
@@ -258,7 +274,7 @@ def _row_volume(row: dict[str, Any]) -> float:
 
 
 def validated_volume_assets(payload: dict[str, Any] | None) -> tuple[str, ...]:
-    """Accept only a provably strict, descending market-wide volume snapshot."""
+    """Accept only a strict, descending, dynamically classified market-wide snapshot."""
     if not isinstance(payload, dict):
         return ()
     if payload.get("method") != STRICT_VOLUME_METHOD:
@@ -366,7 +382,12 @@ async def collect_top_volume_snapshot(
     now: datetime | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
-    """Collect the authoritative top 40 using only market-wide 24h volume rank."""
+    """Collect the top 40 by volume after live stable-value classification.
+
+    Volume remains the only ordering metric. Eligibility is determined first by
+    requiring CoinGecko's live ``stablecoins`` category and excluding matching
+    CoinGecko asset IDs. Both feeds must succeed before a new snapshot is accepted.
+    """
     observed_at = _aware(now or _now())
     base_url, auth_headers = _coingecko_client_config()
     owns_client = client is None
@@ -378,29 +399,52 @@ async def collect_top_volume_snapshot(
             **auth_headers,
         },
     )
-    try:
-        response = await client.get(
-            f"{base_url}/coins/markets",
-            params={
-                "vs_currency": "usd",
-                "order": "volume_desc",
-                "per_page": 250,
-                "page": 1,
-                "sparkline": "false",
-                "include_rehypothecated": "false",
-            },
-        )
+
+    market_params = {
+        "vs_currency": "usd",
+        "order": "volume_desc",
+        "per_page": 250,
+        "page": 1,
+        "sparkline": "false",
+        "include_rehypothecated": "false",
+    }
+    stable_params = {
+        **market_params,
+        "category": "stablecoins",
+    }
+
+    async def fetch(params: dict[str, object]):
+        response = await client.get(f"{base_url}/coins/markets", params=params)
         response.raise_for_status()
-        observations = parse_coingecko_markets(response.json())
+        return response.json()
+
+    try:
+        market_payload, stable_payload = await asyncio.gather(
+            fetch(market_params),
+            fetch(stable_params),
+        )
+        observations = parse_coingecko_markets(market_payload)
+        stablecoin_ids = parse_coingecko_stablecoin_ids(stable_payload)
     finally:
         if owns_client:
             await client.aclose()
 
-    ranked = rank_marketwide_volume(observations, limit=TOP_VOLUME_ASSET_COUNT)
+    eligible_observations = [
+        row
+        for row in observations
+        if str(row.get("source_asset_id") or "") not in stablecoin_ids
+    ]
+    ranked = rank_marketwide_volume(eligible_observations, limit=TOP_VOLUME_ASSET_COUNT)
     if len(ranked) != TOP_VOLUME_ASSET_COUNT:
         raise VolumeUniverseUnavailableError(
             f"market-wide volume source produced {len(ranked)} eligible assets, expected 40"
         )
+
+    dynamically_excluded = sum(
+        1
+        for row in observations
+        if str(row.get("source_asset_id") or "") in stablecoin_ids
+    )
     payload: dict[str, Any] = {
         "observed_at": observed_at.isoformat(),
         "method": STRICT_VOLUME_METHOD,
@@ -410,13 +454,25 @@ async def collect_top_volume_snapshot(
         "volume_is_defining_metric": True,
         "asset_count": TOP_VOLUME_ASSET_COUNT,
         "stable_value_assets_excluded": True,
-        "eligibility_note": "stable-value assets and non-canonical ticker symbols excluded before volume ranking",
+        "dynamic_stable_value_classification": True,
+        "stable_value_classification_source": STRICT_STABLE_VALUE_SOURCE,
+        "stable_value_classified_id_count": len(stablecoin_ids),
+        "stable_value_observations_excluded": dynamically_excluded,
+        "eligibility_note": (
+            "CoinGecko stablecoin-category assets and non-canonical ticker symbols "
+            "are excluded before ranking; 24h total_volume alone orders eligible assets"
+        ),
         "source_health": {
             "coingecko:coins_markets": {
                 "ok": True,
                 "observation_count": len(observations),
                 "error_type": None,
-            }
+            },
+            "coingecko:coins_markets:stablecoins": {
+                "ok": True,
+                "classified_asset_count": len(stablecoin_ids),
+                "error_type": None,
+            },
         },
         "assets": ranked,
         "paper_only": True,
@@ -436,9 +492,10 @@ async def resolve_top_volume_assets(
 ) -> tuple[str, ...]:
     """Return only a validated market-wide top-40 volume universe.
 
-    A prior validated market-wide snapshot may be used as last-known-good during
-    a transient source outage. A static coin list is never returned. With no
-    validated snapshot, source failure is fail-closed.
+    A prior snapshot from this dynamic-classification version may be used as
+    last-known-good during a transient source outage. Pre-repair snapshots and
+    static coin lists are never accepted. With no validated snapshot, failure is
+    fail-closed.
     """
     observed_at = _aware(now or _now())
     latest = read_latest_volume_universe(store) if store is not None else None
