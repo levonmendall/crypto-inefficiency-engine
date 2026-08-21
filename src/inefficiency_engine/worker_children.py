@@ -27,8 +27,8 @@ from inefficiency_engine.memory_bounded_alpha_factory import (
     MemoryBoundedExpandedAlphaFactoryService as ExpandedAlphaFactoryService,
 )
 from inefficiency_engine.memory_bounded_research_worker import run_memory_bounded_research_worker
-from inefficiency_engine.provider_gap_resilience import (
-    ResilientProviderGapAwareOperatingCertificationService as OperatingCertificationService,
+from inefficiency_engine.priority_source_collection import (
+    SourceCoverageAwareOperatingCertificationService as OperatingCertificationService,
 )
 from inefficiency_engine.research_closure_worker import run_research_closure_cycle
 from inefficiency_engine.service import OpportunityService
@@ -142,6 +142,7 @@ async def run_research_child(service: OpportunityService, store: EvidenceStore) 
                 "provider_gap_bootstrap_complete": True,
                 "provider_gap_bootstrap_healthy_count": healthy_count,
                 "provider_gap_bootstrap_mechanism_count": len(mechanisms) if isinstance(mechanisms, dict) else 0,
+                "source_coverage_sufficient_lane_count": int((bootstrap.get("source_coverage") or {}).get("sufficient_lane_count") or 0) if isinstance(bootstrap, dict) else 0,
                 "paper_only": True,
             },
         )
