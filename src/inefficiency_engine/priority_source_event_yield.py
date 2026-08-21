@@ -4,6 +4,7 @@ import statistics
 from datetime import datetime, timezone
 
 import httpx
+from sqlalchemy import select
 
 from inefficiency_engine.alpha_coverage_strategies import EventObservation
 from inefficiency_engine.alpha_extensions import FundamentalFactorLedger, FundamentalFactorObservation
@@ -15,6 +16,7 @@ from inefficiency_engine.source_coverage import SourceCoveragePlane, SourceEvent
 SNAPSHOT_GRAPHQL_URL = "https://hub.snapshot.org/graphql"
 MORPHO_GRAPHQL_URL = "https://api.morpho.org/graphql"
 DEFILLAMA_PROTOCOLS_URL = "https://api.llama.fi/protocols"
+ETHEREUM_FACTOR_PROVIDER_PREFIX = "ethereum-mainnet:"
 
 
 def _now() -> datetime:
@@ -40,6 +42,45 @@ def _liquidity_coverage_score(*, liquidity_usd: float, supply_usd: float) -> flo
         return -1.0
     ratio = max(0.0, min(1.0, liquidity_usd / supply_usd))
     return max(-1.0, min(1.0, 2.0 * ratio - 1.0))
+
+
+def _latest_raw_chain_factor(
+    ledger: FundamentalFactorLedger,
+    *,
+    asset: str,
+    before: datetime,
+    max_age_hours: float = 24.0,
+) -> FundamentalFactorObservation | None:
+    """Read a raw protocol-native chain observation, never a previous composite.
+
+    Without this provider constraint each Morpho refresh could recursively use the
+    prior Ethereum+Morpho composite as its chain input. That would repeatedly feed a
+    derived protocol factor back into itself and obscure point-in-time lineage.
+    """
+
+    query = (
+        select(ledger.observations.c.payload_json)
+        .where(ledger.observations.c.asset == asset.upper())
+        .where(ledger.observations.c.as_of_at <= before.isoformat())
+        .where(ledger.observations.c.provider.like(f"{ETHEREUM_FACTOR_PROVIDER_PREFIX}%"))
+        .order_by(ledger.observations.c.as_of_at.desc(), ledger.observations.c.id.desc())
+        .limit(20)
+    )
+    with ledger.store.engine.connect() as db:
+        payloads = list(db.execute(query).scalars())
+    for payload in payloads:
+        observation = FundamentalFactorObservation.model_validate_json(payload)
+        age = max(0.0, (before - observation.as_of_at).total_seconds() / 3600.0)
+        if age > max_age_hours:
+            continue
+        if not (
+            observation.authoritative
+            and observation.commercial_use_permitted
+            and observation.point_in_time
+        ):
+            continue
+        return observation
+    return None
 
 
 async def collect_snapshot_governance(coverage: SourceCoveragePlane, alpha_factory) -> SourceProbeResult:
@@ -113,19 +154,16 @@ async def collect_morpho_markets(coverage: SourceCoveragePlane, yield_service) -
 
     # Source coverage previously counted Morpho protocol fundamentals while the alpha
     # ledger consumed only Ethereum chain factors. Persist a conservative normalized
-    # protocol-health factor and, when a recent authoritative chain observation exists,
-    # combine it into one point-in-time observation. This makes the strategy actually
-    # digest both evidence classes required by the lane instead of satisfying a source
-    # checkbox with data that never enters the signal.
+    # protocol-health factor and, when a recent raw authoritative chain observation
+    # exists, combine both evidence classes into one point-in-time signal input.
     factor_ledger = FundamentalFactorLedger(coverage.store)
     protocol_factor_count = 0
     for asset, asset_rows in by_alpha_asset.items():
-        chain = factor_ledger.latest(
-            asset,
+        chain = _latest_raw_chain_factor(
+            factor_ledger,
+            asset=asset,
             before=observed_at,
             max_age_hours=24.0,
-            require_authoritative=True,
-            require_commercial_use=True,
         )
         if chain is None:
             continue
