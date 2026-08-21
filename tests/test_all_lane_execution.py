@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from inefficiency_engine.config import Settings
-from inefficiency_engine.evidence import EvidenceStore, ScanSnapshot
+from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.executable_lane_runtime import ExecutableMechanismExecutionService
 from inefficiency_engine.lane_readiness import build_lane_executable_readiness
 from inefficiency_engine.mechanism_execution import (
@@ -194,8 +194,12 @@ def test_volatility_native_forward_settlement_requires_option_and_underlying_evi
             "option_type": "call",
             "entry_mid": 3000.0,
             "entry_delta": 0.50,
+            "entry_iv": 0.62,
+            "entry_gamma": 0.0002,
+            "entry_vega": 10.0,
             "underlying_entry_price": 60_000.0,
             "direction": "long_volatility",
+            "structure_kind": "atm_volatility_risk_premium",
             "spread_fraction": 0.001,
             "hedge_cost_return": 0.001,
         },
@@ -204,26 +208,35 @@ def test_volatility_native_forward_settlement_requires_option_and_underlying_evi
     assert settled is not None
     assert "option_mark_forward" in settled.settlement_method
     assert settled.detail["underlying_exit_venue"] == "Coinbase"
+    assert "delta_turnover" in settled.detail
+    assert "gamma_gap_penalty" in settled.detail
 
 
-def test_liquidation_native_forward_settlement_uses_observed_recovery_mark(tmp_path):
+def test_liquidation_native_forward_settlement_uses_latency_adjusted_reachable_entry(tmp_path):
     store = EvidenceStore(tmp_path / "liq-settlement.sqlite3")
     service = ExecutableMechanismExecutionService(core(), store)
     record_quotes(store, [
+        quote(
+            NOW + timedelta(minutes=1),
+            60_200,
+            venue="Bybit",
+            kind=MarketKind.PERPETUAL,
+            symbol="BTCUSDT",
+        ),
         quote(
             NOW + timedelta(hours=2),
             61_000,
             venue="Bybit",
             kind=MarketKind.PERPETUAL,
             symbol="BTCUSDT",
-        )
+        ),
     ])
     trial = MechanismForwardTrial(
         mechanism_id="liquidation_distress",
         cohort_key="liquidation|Bybit|BTC|long",
         asset="BTC",
         venues=["Bybit"],
-        source_observed_at=NOW,
+        source_observed_at=NOW + timedelta(seconds=2),
         due_at=NOW + timedelta(hours=1),
         capital_usd=1000,
         predicted_net_return=0.005,
@@ -236,12 +249,20 @@ def test_liquidation_native_forward_settlement_uses_observed_recovery_mark(tmp_p
             "entry_price": 60_000.0,
             "direction": "long",
             "cost_return": 0.001,
+            "event_at": NOW.isoformat(),
+            "observed_at": (NOW + timedelta(seconds=2)).isoformat(),
+            "observation_latency_seconds": 2.0,
+            "capture_probability": 0.50,
+            "entry_reference": "first_reachable_quote_after_observation",
         },
     )
     settled = service.settle_trial(trial)
     assert settled is not None
     assert settled.net_return > 0
     assert settled.detail["capture_assumed"] is False
+    assert settled.detail["first_reachable_price"] == pytest.approx(60_200)
+    assert settled.detail["capture_probability"] == pytest.approx(0.50)
+    assert settled.settlement_method == "latency_adjusted_capture_probability_recovery_shadow"
 
 
 def test_capital_location_native_forward_settlement_uses_future_incidence_and_transfer_telemetry(tmp_path):
