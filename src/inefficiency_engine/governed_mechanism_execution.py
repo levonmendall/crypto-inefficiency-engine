@@ -14,6 +14,7 @@ from inefficiency_engine.mechanism_execution import (
     _max_drawdown,
     _mean_lower,
 )
+from inefficiency_engine.option_capacity import OptionCapacityLedger
 from inefficiency_engine.source_coverage import CandidateSourceSufficiency, SourceCoverageSnapshot
 from inefficiency_engine.source_coverage_catalog import LANES
 
@@ -60,6 +61,7 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
             self._raw_ledger,
             self._liquidation_outcome_is_allocation_grade,
         )
+        self.option_capacity = OptionCapacityLedger(store)
 
     @staticmethod
     def _primary_groups(venues: list[str], mechanism_id: str) -> set[str] | None:
@@ -310,11 +312,105 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
         by_mechanism["liquidation_distress"] = row
         return cycle.model_copy(update={"by_mechanism": by_mechanism})
 
+    def _capacity_for_option_leg(self, leg: dict[str, object], *, before):
+        try:
+            return self.option_capacity.latest(
+                venue=str(leg.get("venue") or ""),
+                underlying=str(leg.get("underlying") or ""),
+                expiry=str(leg.get("expiry") or ""),
+                strike=float(leg.get("strike") or 0.0),
+                option_type=str(leg.get("option_type") or ""),
+                before=before,
+                max_age_minutes=15.0,
+            )
+        except Exception:
+            return None
+
+    def _capacity_bounded_volatility_spec(self, spec, *, before):
+        """Require contract-specific capacity and cap paper size to 5% of visible depth."""
+
+        if spec.mechanism_id != "volatility":
+            return spec
+        payload = dict(spec.settlement_payload)
+        raw_legs = payload.get("legs")
+        if isinstance(raw_legs, list) and raw_legs:
+            legs = [dict(item) for item in raw_legs if isinstance(item, dict)]
+            if len(legs) != len(raw_legs):
+                return None
+        else:
+            legs = [
+                {
+                    "venue": payload.get("venue"),
+                    "underlying": payload.get("underlying") or spec.asset,
+                    "expiry": payload.get("expiry"),
+                    "strike": payload.get("strike"),
+                    "option_type": payload.get("option_type"),
+                }
+            ]
+
+        capacity_rows = []
+        for leg in legs:
+            observation = self._capacity_for_option_leg(leg, before=before)
+            if observation is None:
+                return None
+            capacity_rows.append(observation)
+        if not capacity_rows:
+            return None
+
+        visible_capacity = min(
+            min(row.bid_capacity_usd, row.ask_capacity_usd)
+            for row in capacity_rows
+        )
+        conservative_fraction = 0.05
+        bounded_capital = min(
+            float(spec.capital_usd),
+            visible_capacity * conservative_fraction,
+        )
+        minimum = max(
+            1.0,
+            float(getattr(self.settings, "alpha_min_notional_usd", 100.0)),
+        )
+        if bounded_capital < minimum:
+            return None
+
+        payload["option_capacity_evidence"] = [
+            {
+                "observation_id": row.observation_id,
+                "venue": row.venue,
+                "instrument_name": row.instrument_name,
+                "observed_at": row.observed_at.isoformat(),
+                "bid_capacity_usd": row.bid_capacity_usd,
+                "ask_capacity_usd": row.ask_capacity_usd,
+                "contract_size_underlying": row.contract_size_underlying,
+                "underlying_price_usd": row.underlying_price_usd,
+            }
+            for row in capacity_rows
+        ]
+        payload["visible_option_capacity_usd"] = visible_capacity
+        payload["option_capacity_fraction_used"] = conservative_fraction
+        payload["hidden_option_depth_assumed"] = False
+        observed_at = max(
+            [spec.source_observed_at, *[row.observed_at for row in capacity_rows]]
+        )
+        return spec.model_copy(
+            update={
+                "source_observed_at": observed_at,
+                "capital_usd": bounded_capital,
+                "settlement_payload": payload,
+            }
+        )
+
     def discover_specs(self, snapshot, *, total_capital_usd: float):
         rows = super().discover_specs(snapshot, total_capital_usd=total_capital_usd)
         coverage = self.source_plane.snapshot(now=snapshot.completed_at)
         eligible = []
-        for row in rows:
+        for raw_row in rows:
+            row = self._capacity_bounded_volatility_spec(
+                raw_row,
+                before=snapshot.completed_at,
+            )
+            if row is None:
+                continue
             try:
                 lane = next(
                     item for item in coverage.lanes if item.lane_id == row.mechanism_id

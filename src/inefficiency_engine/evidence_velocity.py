@@ -29,6 +29,7 @@ EVIDENCE_CLASS_FRESHNESS_SECONDS: dict[str, float] = {
     "option_quotes": 900.0,
     "option_greeks": 900.0,
     "option_depth": 900.0,
+    "option_capacity": 900.0,
     "timestamped_events": 86_400.0,
     "event_identity": 86_400.0,
     "liquidation_events": 300.0,
