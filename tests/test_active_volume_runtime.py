@@ -81,6 +81,7 @@ def test_active_cycle_history_filters_archived_assets_and_preserves_volume_rank(
 
     volume = read_active_volume_universe_status(store, now=now + timedelta(minutes=10))
     assert volume["available"] is True
+    assert volume["current_membership_available"] is True
     assert volume["asset_count"] == TOP_VOLUME_ASSET_COUNT
     assert volume["volume_is_defining_metric"] is True
     assert [row["asset"] for row in volume["assets"]] == list(ACTIVE_ASSETS)
@@ -97,7 +98,7 @@ def test_active_cycle_history_filters_archived_assets_and_preserves_volume_rank(
     assert history["assets"][5]["status"] == "retrying"
 
 
-def test_active_volume_status_exposes_freshness(tmp_path):
+def test_stale_top40_fails_closed_but_retains_last_known_good_metadata(tmp_path):
     store = EvidenceStore(tmp_path / "freshness.db")
     now = datetime(2026, 8, 21, tzinfo=timezone.utc)
     VolumeUniverseLedger(store).record(_volume_snapshot(now))
@@ -111,9 +112,48 @@ def test_active_volume_status_exposes_freshness(tmp_path):
         now=now + timedelta(seconds=VOLUME_UNIVERSE_REFRESH_SECONDS + 1),
     )
 
+    assert fresh["available"] is True
+    assert fresh["current_membership_available"] is True
     assert fresh["stale"] is False
+
+    assert stale["available"] is False
+    assert stale["current_membership_available"] is False
     assert stale["stale"] is True
-    assert stale["observed_at"] == now.isoformat()
+    assert stale["unavailable_reason"] == "stale_snapshot"
+    assert stale["asset_count"] == 0
+    assert stale["assets"] == []
+    assert stale["observed_at"] is None
+    assert stale["last_known_good_retained"] is True
+    assert stale["last_known_good_observed_at"] == now.isoformat()
+    assert stale["last_known_good_asset_count"] == TOP_VOLUME_ASSET_COUNT
+    assert stale["fresh_snapshot_required_for_current_membership"] is True
+
+
+def test_stale_top40_cannot_masquerade_archived_history_as_active_membership(tmp_path):
+    store = EvidenceStore(tmp_path / "stale-history.db")
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    VolumeUniverseLedger(store).record(_volume_snapshot(now))
+
+    ledger = CycleHistoryStatusLedger(store)
+    ledger.upsert(_history_status(ACTIVE_ASSETS[0], now))
+    ledger.upsert(_history_status("ACE", now))
+    ledger.upsert(_history_status("BOME", now))
+    ledger.upsert(_history_status("JOHN", now))
+
+    status = read_active_cycle_history_status(
+        store,
+        now=now + timedelta(seconds=VOLUME_UNIVERSE_REFRESH_SECONDS + 1),
+    )
+
+    assert status["available"] is False
+    assert status["active_universe_available"] is False
+    assert status["active_universe_stale"] is True
+    assert status["active_universe_unavailable_reason"] == "stale_snapshot"
+    assert status["active_universe_last_known_good_observed_at"] == now.isoformat()
+    assert status["active_universe_last_known_good_asset_count"] == TOP_VOLUME_ASSET_COUNT
+    assert status["asset_count"] == 0
+    assert status["assets"] == []
+    assert status["archived_status_asset_count"] == 4
 
 
 class _CompleteHistoricalResearch:
