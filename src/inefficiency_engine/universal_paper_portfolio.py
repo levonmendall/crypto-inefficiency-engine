@@ -173,11 +173,21 @@ class UniversalOperationallyResilientPaperPortfolioService(
             allocation_error_type = "StaleOpenPositionValuation"
 
         if cash_available > 0 and stale_positions == 0:
-            try:
-                plan = await self.allocator.allocate(total_capital_usd=cash_available)
-            except Exception as exc:
-                plan = None
-                allocation_error_type = type(exc).__name__
+            plan, bounded_error = await self._bounded_allocation_plan(
+                total_capital_usd=cash_available
+            )
+            if bounded_error is not None:
+                allocation_error_type = bounded_error
+                family_failures = [
+                    {
+                        "family": "canonical_allocator",
+                        "error_type": bounded_error,
+                        "reason": (
+                            "universal canonical accounting remained live while the durable "
+                            "allocation stage failed its bounded liveness contract"
+                        ),
+                    }
+                ]
             if plan is not None:
                 family_failures = [
                     dict(item) for item in getattr(plan, "family_failures", [])
