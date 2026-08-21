@@ -35,6 +35,7 @@ def _snapshot(now: datetime, assets: tuple[str, ...] = TEST_ASSETS) -> dict[str,
         "ranking_source": STRICT_VOLUME_SOURCE,
         "ranking_scope": "marketwide",
         "volume_is_defining_metric": True,
+        "universe_target_count": TOP_VOLUME_ASSET_COUNT,
         "asset_count": TOP_VOLUME_ASSET_COUNT,
         "stable_value_assets_excluded": True,
         "eligibility_note": "test",
@@ -53,6 +54,10 @@ def _snapshot(now: datetime, assets: tuple[str, ...] = TEST_ASSETS) -> dict[str,
         "paper_only": True,
         "allocation_authority": False,
     }
+
+
+def test_production_volume_target_is_top25_during_stability_phase():
+    assert TOP_VOLUME_ASSET_COUNT == 25
 
 
 def test_marketwide_volume_is_the_defining_rank_and_low_volume_algo_is_excluded():
@@ -122,7 +127,7 @@ def test_bybit_and_hyperliquid_volume_parsers_remain_available_for_diagnostics()
     assert {row["asset"] for row in hyper} == {"BTC", "PEPE"}
 
 
-def test_legacy_or_static_snapshot_cannot_be_validated_as_current_top40():
+def test_legacy_or_wrong_sized_snapshot_cannot_validate_as_current_cohort():
     legacy = {
         "observed_at": datetime.now(timezone.utc).isoformat(),
         "method": "aggregate_24h_traded_notional",
@@ -130,6 +135,11 @@ def test_legacy_or_static_snapshot_cannot_be_validated_as_current_top40():
         "assets": [{"rank": i, "asset": asset} for i, asset in enumerate(TEST_ASSETS, start=1)],
     }
     assert validated_volume_assets(legacy) == ()
+
+    old_v2 = _snapshot(datetime.now(timezone.utc))
+    old_v2["method"] = "marketwide_24h_trading_volume_usd_dynamic_stable_v2"
+    old_v2["universe_target_count"] = 40
+    assert validated_volume_assets(old_v2) == ()
 
 
 @pytest.mark.asyncio
@@ -179,7 +189,7 @@ async def test_resolver_refreshes_membership_after_bounded_cache_interval(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_resolver_fails_closed_instead_of_returning_static_40(tmp_path):
+async def test_resolver_fails_closed_instead_of_returning_static_universe(tmp_path):
     store = EvidenceStore(tmp_path / "empty-volume.db")
 
     async def failed_refresh(**_kwargs):
