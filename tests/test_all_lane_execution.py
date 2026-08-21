@@ -23,6 +23,7 @@ from inefficiency_engine.models import (
     Strategy,
 )
 from inefficiency_engine.research_mechanisms import OptionQuoteObservation, YieldObservation
+from inefficiency_engine.source_coverage_catalog import LANES
 
 
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
@@ -326,12 +327,16 @@ def test_capital_location_native_forward_settlement_uses_future_incidence_and_tr
     assert settled.settlement_method.startswith("forward_location_opportunity_incidence")
 
 
-def test_all_thirteen_lanes_have_separate_architecture_and_current_qualification_flags(tmp_path):
+def test_all_thirteen_lanes_separate_architecture_from_decision_grade_executability(tmp_path):
     store = EvidenceStore(tmp_path / "readiness.sqlite3")
     snapshot = build_lane_executable_readiness(core(), store)
     assert snapshot.lane_count == 13
+    assert {row.lane_id for row in snapshot.lanes} == set(LANES)
     assert snapshot.architecture_executable_count == 13
-    assert snapshot.all_lanes_paper_execution_capable is True
-    assert all(row.paper_execution_capable for row in snapshot.lanes)
-    assert all(row.live_execution_capable is False for row in snapshot.lanes)
+    assert all(row.architecture_execution_capable for row in snapshot.lanes)
+    assert snapshot.decision_grade_outcome_qualified_count == 0
     assert snapshot.currently_qualified_count == 0
+    assert snapshot.paper_execution_capable_count == 0
+    assert snapshot.all_lanes_paper_execution_capable is False
+    assert not any(row.paper_execution_capable for row in snapshot.lanes)
+    assert all(row.live_execution_capable is False for row in snapshot.lanes)

@@ -11,7 +11,7 @@ def core():
     return SimpleNamespace(settings=Settings())
 
 
-def test_capital_location_distinguishes_downstream_code_from_missing_producer(tmp_path):
+def test_capital_location_distinguishes_architecture_from_decision_grade_executability(tmp_path):
     store = EvidenceStore(tmp_path / "capital-location-readiness.sqlite3")
     snapshot = build_lane_executable_readiness(core(), store)
     lane = next(
@@ -21,7 +21,10 @@ def test_capital_location_distinguishes_downstream_code_from_missing_producer(tm
 
     # The economics/forward/settlement code exists and remains testable if genuine
     # transfer telemetry is supplied, but production does not currently generate it.
-    assert lane.paper_execution_capable is True
+    # Code presence therefore must never be reported as decision-grade executability.
+    assert lane.architecture_execution_capable is True
+    assert lane.paper_execution_capable is False
+    assert lane.decision_grade_outcome_qualified is False
     assert lane.evidence_producer_implemented is False
     assert lane.production_evidence_path_connected is False
     assert lane.qualification_stage == "upstream_evidence_producer_missing"
@@ -31,5 +34,7 @@ def test_capital_location_distinguishes_downstream_code_from_missing_producer(tm
     assert snapshot.lane_count == 13
     assert snapshot.architecture_executable_count == 13
     assert snapshot.production_evidence_connected_count == 12
-    assert snapshot.all_lanes_paper_execution_capable is True
+    assert snapshot.decision_grade_outcome_qualified_count == 0
+    assert snapshot.paper_execution_capable_count == 0
+    assert snapshot.all_lanes_paper_execution_capable is False
     assert snapshot.all_lanes_production_evidence_connected is False

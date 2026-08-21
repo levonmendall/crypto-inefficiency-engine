@@ -22,7 +22,9 @@ def test_lane_fast_summary_reports_production_connectivity_separately():
     assert summary["lane_count"] == 13
     assert summary["architecture_executable_count"] == 13
     assert summary["production_evidence_connected_count"] == 12
-    assert summary["all_lanes_paper_execution_capable"] is True
+    assert summary["decision_grade_outcome_qualified_count"] == 0
+    assert summary["paper_execution_capable_count"] == 0
+    assert summary["all_lanes_paper_execution_capable"] is False
     assert summary["all_lanes_production_evidence_connected"] is False
     assert summary["production_evidence_disconnected_lanes"] == [
         "capital_location_settlement"
