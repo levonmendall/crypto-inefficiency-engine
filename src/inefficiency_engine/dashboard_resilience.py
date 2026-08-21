@@ -49,7 +49,7 @@ async function safeJSON(url,fallback){try{return await getJSON(url,5000)}catch(e
     html = _replace_once(
         html,
         "const [portfolio,performance,runtime,positions,trades,history,skips,attribution,mechanisms,queue]=await Promise.all([",
-        """const dashboardSnapshot=resilientJSON('/v3/dashboard/snapshot','dashboard',{portfolio:{available:false},performance:{},runtime:{operational:false,degraded:true,valuation_status:'unavailable',allocation_family_failures:[],cycle_status:'unavailable'},positions:{positions:[]},trades:{trades:[]},history:{count:0,snapshots:[]},skips:{skips:[]},attribution:{pnl_by_mechanism_usd:{},pnl_by_strategy_usd:{}},mechanisms:{mechanisms:[],requirements:{}},queue:{actions:[]},cycle_history:{available:false,assets:[]}});
+        """const dashboardSnapshot=resilientJSON('/v3/dashboard/snapshot','dashboard',{portfolio:{available:false},performance:{},runtime:{operational:false,degraded:true,valuation_status:'unavailable',allocation_family_failures:[],cycle_status:'unavailable'},positions:{positions:[]},trades:{trades:[]},history:{count:0,snapshots:[]},skips:{skips:[]},attribution:{pnl_by_mechanism_usd:{},pnl_by_strategy_usd:{}},mechanisms:{mechanisms:[],requirements:{}},queue:{actions:[]},cycle_history:{available:false,assets:[]},lane_executability:{available:false,lane_count:13,paper_execution_capable_lanes:[]}});
 const projectionSection=(payload,key,fallback,reportError=false)=>{const section={...fallback,...(payload?.[key]||{})};if(reportError&&payload?.__error){section.__error=payload.__error;section.__stale=payload.__stale}return section};
 const [portfolio,performance,runtime,positions,trades,history,skips,attribution,mechanisms,queue,cycleHistory]=await Promise.all([""",
     )
@@ -60,8 +60,47 @@ const [portfolio,performance,runtime,positions,trades,history,skips,attribution,
     )
     html = _replace_once(
         html,
+        "const [portfolio,performance,runtime,positions,trades,history,skips,attribution,mechanisms,queue,cycleHistory]=await Promise.all([",
+        "const dashboardMeta=await dashboardSnapshot;\nconst [portfolio,performance,runtime,positions,trades,history,skips,attribution,mechanisms,queue,cycleHistory]=await Promise.all([",
+    )
+    html = _replace_once(
+        html,
         "const partial=[positions,trades,history,skips,attribution,mechanisms,queue].filter(x=>x&&x.__error).map(x=>x.__error);if(partial.length){$('error').textContent=`Partial dashboard data unavailable: ${partial.join(' · ')}`;$('error').classList.add('show')}",
         "const partial=[portfolio,performance,runtime,positions,trades,history,skips,attribution,mechanisms,queue].filter(x=>x&&x.__error).map(x=>x.__error);if(partial.length){const stale=[portfolio,performance,runtime].some(x=>x&&x.__stale);$('error').textContent=`${stale?'Temporary API issue; showing last known dashboard projection':'Dashboard projection temporarily unavailable'}: ${[...new Set(partial)].join(' · ')}`;$('error').classList.add('show')}",
+    )
+    html = _replace_once(
+        html,
+        '<div class="status-row"><span class="muted">Mechanisms certified</span><span id="certifiedCount" class="status-val">—</span></div>',
+        '<div class="status-row"><span class="muted">Mechanisms certified</span><span id="certifiedCount" class="status-val">—</span></div>'
+        '<div class="status-row"><span class="muted">Evidence-connected lanes</span><span id="sourceConnectedCount" class="status-val">—</span></div>'
+        '<div class="status-row"><span class="muted">Decision-grade lanes</span><span id="decisionGradeCount" class="status-val">—</span></div>'
+        '<div class="status-row"><span class="muted">Paper-capable lanes</span><span id="paperCapableCount" class="status-val">—</span></div>'
+        '<div class="status-row"><span class="muted">Card data</span><span id="cardTruthStatus" class="status-val">—</span></div>',
+    )
+    html = _replace_once(
+        html,
+        "function renderEvidenceProgress(rows,requirements,observedAt){",
+        "function renderEvidenceProgress(rows,requirements,observedAt,laneTruth){",
+    )
+    html = _replace_once(
+        html,
+        "  const providerReady=rows.filter(r=>r.provider_ready).length,observed=rows.filter(r=>+r.authoritative_observation_count>0).length,forwardMature=rows.filter(r=>+r.independent_forward_outcome_count>=forwardTarget).length,qualified=rows.filter(r=>+r.current_statistically_qualified_count>0).length,promoted=rows.filter(r=>+r.current_promoted_count>0).length,certified=rows.filter(r=>r.state==='certified').length;",
+        "  const providerReady=rows.filter(r=>r.provider_ready).length,observed=rows.filter(r=>+r.authoritative_observation_count>0).length,forwardMature=rows.filter(r=>+r.independent_forward_outcome_count>=forwardTarget).length,qualified=rows.filter(r=>+r.current_statistically_qualified_count>0).length,promoted=rows.filter(r=>+r.current_promoted_count>0).length,certified=rows.filter(r=>r.state==='certified').length;const laneCount=Math.max(1,+laneTruth?.lane_count||rows.length||13),paperCapableIds=new Set(laneTruth?.paper_execution_capable_lanes||[]),paperCapableCount=laneTruth?.available?(+laneTruth.paper_execution_capable_count||0):null;",
+    )
+    html = _replace_once(
+        html,
+        "stat('Qualified now',num(qualified)),stat('Executable now',num(promoted)),stat('Certified',`${certified} / ${rows.length}`)",
+        "stat('Qualified now',num(qualified)),stat('Paper-capable',paperCapableCount===null?'—':`${num(paperCapableCount)} / ${num(laneCount)}`),stat('Certified',`${certified} / ${rows.length}`)",
+    )
+    html = _replace_once(
+        html,
+        "    const stage=order[r.stage]??0,obs=+r.authoritative_observation_count||0,signals=+r.forward_signal_count||0,outcomes=+r.independent_forward_outcome_count||0,q=+r.current_statistically_qualified_count||0,p=+r.current_promoted_count||0,settled=+r.settled_allocator_outcome_count||0;",
+        "    const stage=order[r.stage]??0,obs=+r.authoritative_observation_count||0,signals=+r.forward_signal_count||0,outcomes=+r.independent_forward_outcome_count||0,q=+r.current_statistically_qualified_count||0,p=+r.current_promoted_count||0,settled=+r.settled_allocator_outcome_count||0,paperReady=paperCapableIds.has(r.mechanism_id),projectionCurrent=laneTruth?.projection_current_for_execution!==false;",
+    )
+    html = _replace_once(
+        html,
+        "${evidenceStep('Executable',stage>=4?num(p):'—','current L2 / cost / capacity',executionCls)}",
+        "${evidenceStep('Paper-capable',laneTruth?.available?(paperReady?'Yes':'No'):'—',!projectionCurrent?'stale projection · fail closed':(paperReady?'decision-grade + source-connected':'not decision-grade/currently executable'),paperReady?'done':(projectionCurrent?'active':'blocked'))}",
     )
     html = _replace_once(
         html,
@@ -103,8 +142,26 @@ async function refresh(){""",
     )
     html = _replace_once(
         html,
+        "async function refresh(){",
+        """function renderDashboardTruth(snapshot){
+  const lane=snapshot?.lane_executability||{},laneCount=Math.max(1,+lane.lane_count||13),available=!!lane.available;
+  const connected=available?(+lane.production_evidence_connected_count||0):null,decision=available?(+lane.decision_grade_outcome_qualified_count||0):null,paper=available?(+lane.paper_execution_capable_count||0):null;
+  const set=(id,text,color)=>{const el=$(id);if(!el)return;el.textContent=text;el.style.color=color};
+  set('sourceConnectedCount',connected===null?'Unavailable':`${num(connected)} / ${num(laneCount)}`,connected===laneCount?'#4ade80':(connected===null?'#fb7185':'#facc15'));
+  set('decisionGradeCount',decision===null?'Unavailable':`${num(decision)} / ${num(laneCount)}`,decision>0?'#4ade80':(decision===null?'#fb7185':'#8ea7b5'));
+  const projectionCurrent=lane.projection_current_for_execution!==false;
+  set('paperCapableCount',paper===null?'Unavailable':`${num(paper)} / ${num(laneCount)}${projectionCurrent?'':' · fail-closed'}`,paper>0&&projectionCurrent?'#4ade80':(paper===null?'#fb7185':projectionCurrent?'#8ea7b5':'#facc15'));
+  const staleReasons=[];if(snapshot?.__stale)staleReasons.push('showing a cached snapshot after an API failure');if(snapshot?.research_projection_stale)staleReasons.push(snapshot?.research_projection_freshness?.reason||'research projection is stale');if(snapshot?.operating_projection_stale)staleReasons.push(snapshot?.operating_projection_freshness?.reason||'operating certification projection is stale');
+  const current=available&&projectionCurrent&&!snapshot?.__stale&&!staleReasons.length;const release=snapshot?.release_commit?` · ${String(snapshot.release_commit).slice(0,7)}`:'';
+  set('cardTruthStatus',current?`Current${release}`:(available?`Stale / fail-closed${release}`:'Unavailable'),current?'#4ade80':(available?'#facc15':'#fb7185'));
+  const notice=$('notice');if(staleReasons.length){notice.textContent=`Card data is not current: ${staleReasons.join(' · ')}. Paper-capable lane status remains fail-closed until the audited projections are current.`;notice.classList.add('show')}else if(notice?.textContent?.startsWith('Card data is not current:')){notice.textContent='';notice.classList.remove('show')}
+}
+async function refresh(){""",
+    )
+    html = _replace_once(
+        html,
         'renderChart(history.snapshots);renderAttribution(attribution);renderPositions(positions.positions);renderTrades(trades.trades);renderSkips(skips.skips);renderEvidenceProgress(mechRows,mechanisms.requirements||{},mechanisms.observed_at);renderMechanisms(mechRows);renderQueue(queue.actions);',
-        'renderChart(history.snapshots);renderAttribution(attribution);renderPositions(positions.positions);renderTrades(trades.trades);renderSkips(skips.skips);renderCycleHistory(cycleHistory);renderEvidenceProgress(mechRows,mechanisms.requirements||{},mechanisms.observed_at);renderMechanisms(mechRows);renderQueue(queue.actions);',
+        'renderChart(history.snapshots);renderAttribution(attribution);renderPositions(positions.positions);renderTrades(trades.trades);renderSkips(skips.skips);renderCycleHistory(cycleHistory);renderEvidenceProgress(mechRows,mechanisms.requirements||{},mechanisms.observed_at,dashboardMeta.lane_executability||{});renderMechanisms(mechRows);renderQueue(queue.actions);renderDashboardTruth(dashboardMeta);',
     )
     return html
 
