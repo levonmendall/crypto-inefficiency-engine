@@ -6,20 +6,32 @@ from types import SimpleNamespace
 from inefficiency_engine.all_lane_alpha_factory import AllLaneEvidenceFactoryService
 from inefficiency_engine.alpha_factory import AlphaCandidate, AlphaForwardOutcome
 from inefficiency_engine.config import Settings
+from inefficiency_engine.disposable_alpha_factory import DisposableExpandedAlphaFactoryService
+from inefficiency_engine.disposable_research_worker import (
+    AllocationForwardCertificationService as ProductionAllocationCertificationService,
+    OperatingCertificationService as ProductionOperatingCertificationService,
+    UnifiedPaperAllocatorService as ProductionAllocatorService,
+)
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.evidence_velocity import (
     _stagnation_remediation,
     provisional_forward_positive,
 )
-from inefficiency_engine.executable_alpha_factory import ExecutableExpandedAlphaFactoryService
-from inefficiency_engine.executable_source_collection import (
-    ExecutableSourceCoverageAwareOperatingCertificationService,
+from inefficiency_engine.evidence_velocity_runtime import (
+    EvidenceVelocityAllLaneOperatingCertificationService,
+    EvidenceVelocityLaneSuccessAllocationForwardCertificationService,
+    EvidenceVelocityLaneSuccessOperationallyResilientPaperPortfolioService,
+    EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService,
 )
+from inefficiency_engine.executable_alpha_factory import ExecutableExpandedAlphaFactoryService
 from inefficiency_engine.governed_mechanism_execution import GovernedMechanismExecutionService
+from inefficiency_engine.lightweight_portfolio_worker import (
+    CanonicalPaperPortfolioService,
+    CanonicalPortfolioAllocatorService,
+)
 from inefficiency_engine.mechanism_execution import MechanismForwardOutcome, MechanismTrialSpec
 from inefficiency_engine.models import MarketKind
 from inefficiency_engine.source_coverage import SourceCoverageObservation, SourceCoveragePlane
-from inefficiency_engine.worker_children import OperatingCertificationService, ResearchAlphaFactoryService
 
 
 NOW = datetime(2026, 8, 21, 15, 0, tzinfo=timezone.utc)
@@ -155,7 +167,12 @@ def test_mechanism_forward_trial_can_learn_before_source_redundancy_but_not_prom
         lane_id="yield",
         classes=["yield_rate", "capacity", "exit_liquidity"],
     )
-    gate = service._source_gate(mechanism_id="yield", venues=["Morpho"])
+    coverage = service.source_plane.snapshot(now=NOW)
+    gate = service._source_gate(
+        mechanism_id="yield",
+        venues=["Morpho"],
+        coverage=coverage,
+    )
     assert gate.forward_test_eligible is True
     assert gate.allocation_source_qualified is False
 
@@ -202,7 +219,12 @@ def test_mechanism_forward_trial_can_learn_before_source_redundancy_but_not_prom
         lane_id="yield",
         classes=["yield_rate"],
     )
-    qualified_gate = service._source_gate(mechanism_id="yield", venues=["Morpho"])
+    coverage = service.source_plane.snapshot(now=NOW)
+    qualified_gate = service._source_gate(
+        mechanism_id="yield",
+        venues=["Morpho"],
+        coverage=coverage,
+    )
     assert qualified_gate.allocation_source_qualified is True
     qualified_spec = spec.model_copy(
         update={
@@ -319,9 +341,22 @@ def test_executable_alpha_refinements_are_on_the_actual_fast_registry(tmp_path):
     assert "onchain_factor_breadth_v1" in ids
 
 
-def test_production_research_worker_is_wired_to_executable_all_lane_services():
-    assert ResearchAlphaFactoryService is AllLaneEvidenceFactoryService
-    assert OperatingCertificationService is ExecutableSourceCoverageAwareOperatingCertificationService
+def test_production_disposable_runtime_uses_integrated_all_lane_services():
+    assert issubclass(DisposableExpandedAlphaFactoryService, AllLaneEvidenceFactoryService)
+    assert ProductionAllocatorService is EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService
+    assert (
+        ProductionAllocationCertificationService
+        is EvidenceVelocityLaneSuccessAllocationForwardCertificationService
+    )
+    assert ProductionOperatingCertificationService is EvidenceVelocityAllLaneOperatingCertificationService
+
+
+def test_lightweight_portfolio_runtime_preserves_integrated_all_lane_settlement():
+    assert CanonicalPortfolioAllocatorService is EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService
+    assert (
+        CanonicalPaperPortfolioService
+        is EvidenceVelocityLaneSuccessOperationallyResilientPaperPortfolioService
+    )
 
 
 def test_provisional_forward_state_is_diagnostic_only():
