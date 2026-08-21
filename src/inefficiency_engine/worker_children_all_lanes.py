@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from inefficiency_engine import worker_children as _base
-from inefficiency_engine.all_lane_alpha_factory import AllLaneEvidenceFactoryService
+from inefficiency_engine.candidate_observatory_runtime import (
+    CandidateObservedAllLaneEvidenceFactoryService as AllLaneEvidenceFactoryService,
+)
 from inefficiency_engine.lane_success_runtime import (
     LaneSuccessAllocationForwardCertificationService,
     LaneSuccessOperationallyResilientPaperPortfolioService,
@@ -18,7 +20,8 @@ RESEARCH_WORKER_ID = _base.RESEARCH_WORKER_ID
 def _install_all_lane_runtime() -> None:
     # worker_children resolves these names at call time. Replacing them once keeps
     # its mature memory-bounded scheduling and failure isolation while adding the
-    # subtractive lane-success calibration/risk feedback plane.
+    # subtractive lane-success calibration/risk feedback plane plus diagnostic-only
+    # candidate observability. The observatory cannot create allocation authority.
     _base.ExpandedAlphaFactoryService = AllLaneEvidenceFactoryService
     _base.OperatingCertificationService = AllLaneOperatingCertificationService
     _base.UnifiedPaperAllocatorService = LaneSuccessQualifiedOpportunityAllocatorService
