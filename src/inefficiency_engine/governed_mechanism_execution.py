@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from inefficiency_engine.evidence_velocity import source_group_for_venue
 from inefficiency_engine.executable_lane_runtime import ExecutableMechanismExecutionService
+from inefficiency_engine.source_coverage import CandidateSourceSufficiency, SourceCoverageSnapshot
 from inefficiency_engine.source_coverage_catalog import LANES
 
 
@@ -27,22 +28,94 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
         }
         return groups or None
 
-    def _source_gate(self, *, mechanism_id: str, venues: list[str]):
-        required = [str(item) for item in list(LANES[mechanism_id]["required"])]
-        return self.source_plane.candidate_sufficiency(
-            mechanism_id,
-            required_evidence_classes=required,
-            primary_groups=self._primary_groups(venues, mechanism_id),
+    @staticmethod
+    def _gate_from_lane(
+        lane,
+        *,
+        required: list[str],
+        primary_groups: set[str] | None,
+    ) -> CandidateSourceSufficiency:
+        admitted = [row for row in lane.sources if bool(row.get("admitted"))]
+        covered = sorted(
+            {
+                str(cls)
+                for row in admitted
+                for cls in list(row.get("classes") or [])
+                if str(cls) in required
+            }
         )
+        missing = [item for item in required if item not in covered]
+        groups = sorted(
+            {
+                str(row.get("group") or "")
+                for row in admitted
+                if bool(row.get("authoritative")) and str(row.get("group") or "")
+            }
+        )
+        normalized_primary = {
+            str(item).strip().lower()
+            for item in (primary_groups or set())
+            if str(item).strip()
+        }
+        primary_ok = not normalized_primary or any(
+            str(row.get("group") or "").strip().lower() in normalized_primary
+            for row in admitted
+        )
+        research_eligible = bool(admitted) and primary_ok
+        forward_test_eligible = research_eligible and not missing
+        allocation_source_qualified = forward_test_eligible and len(groups) >= 2
+        blockers: list[str] = []
+        if not admitted:
+            blockers.append("no fresh admitted authoritative source")
+        if not primary_ok:
+            blockers.append("candidate primary venue/protocol source is not freshly admitted")
+        blockers.extend(f"missing evidence class:{item}" for item in missing)
+        if forward_test_eligible and len(groups) < 2:
+            blockers.append("independent-source redundancy remains required for allocation")
+        return CandidateSourceSufficiency(
+            lane_id=lane.lane_id,
+            required_evidence_classes=required,
+            covered_evidence_classes=covered,
+            missing_evidence_classes=missing,
+            admitted_source_groups=groups,
+            primary_source_groups=sorted(normalized_primary),
+            primary_group_satisfied=primary_ok,
+            research_eligible=research_eligible,
+            forward_test_eligible=forward_test_eligible,
+            allocation_source_qualified=allocation_source_qualified,
+            blockers=blockers,
+        )
+
+    def _source_gate(
+        self,
+        *,
+        mechanism_id: str,
+        venues: list[str],
+        coverage: SourceCoverageSnapshot | None = None,
+    ) -> CandidateSourceSufficiency:
+        required = [str(item) for item in list(LANES[mechanism_id]["required"])]
+        primary = self._primary_groups(venues, mechanism_id)
+        if coverage is None:
+            return self.source_plane.candidate_sufficiency(
+                mechanism_id,
+                required_evidence_classes=required,
+                primary_groups=primary,
+            )
+        lane = next((row for row in coverage.lanes if row.lane_id == mechanism_id), None)
+        if lane is None:
+            raise KeyError(mechanism_id)
+        return self._gate_from_lane(lane, required=required, primary_groups=primary)
 
     def discover_specs(self, snapshot, *, total_capital_usd: float):
         rows = super().discover_specs(snapshot, total_capital_usd=total_capital_usd)
+        coverage = self.source_plane.snapshot(now=snapshot.completed_at)
         eligible = []
         for row in rows:
             try:
                 gate = self._source_gate(
                     mechanism_id=row.mechanism_id,
                     venues=list(row.venues),
+                    coverage=coverage,
                 )
             except Exception:
                 continue
@@ -64,8 +137,14 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
         return eligible
 
     def _candidate_from_spec(self, spec):
-        # This is the allocation boundary. Forward trials can learn with a single
-        # authoritative source; portfolio candidates cannot bypass redundancy.
+        # discover_specs stamps the current source decision onto the forward spec,
+        # avoiding another full source-plane query inside the same evidence cycle.
+        gate_payload = spec.settlement_payload.get("source_evidence_gate")
+        if isinstance(gate_payload, dict):
+            if not bool(gate_payload.get("allocation_source_qualified")):
+                return None
+            return super()._candidate_from_spec(spec)
+
         try:
             gate = self._source_gate(
                 mechanism_id=spec.mechanism_id,
@@ -79,12 +158,14 @@ class GovernedMechanismExecutionService(ExecutableMechanismExecutionService):
 
     def promoted_candidates(self, *, max_age_hours: float = 24.0):
         rows = super().promoted_candidates(max_age_hours=max_age_hours)
+        coverage = self.source_plane.snapshot()
         qualified = []
         for row in rows:
             try:
                 gate = self._source_gate(
                     mechanism_id=row.mechanism_id,
                     venues=list(row.venues),
+                    coverage=coverage,
                 )
             except Exception:
                 continue
