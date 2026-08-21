@@ -53,16 +53,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # v3.5.10 keeps Render to one Python process but reserves the main thread for
-    # supervision only. Research and canonical portfolio accounting each rebuild
-    # their own service/store inside daemon threads with independent asyncio loops.
-    # A synchronously wedged portfolio thread can therefore be detected by the
-    # provider-free main thread, which fails closed and exits for a clean service
-    # restart rather than allowing canonical accounting to remain silently stale.
+    # Keep the mature watchdog/memory-bounded runtime and its exact provider-free
+    # main-thread bootstrap. The all-lane installer swaps only worker child concrete
+    # classes before threaded_worker imports/binds them.
     if args.command == "worker":
         settings, store = _settings_and_store()
         if store is None:
             raise RuntimeError("worker requires CIE_DATABASE_URL/DATABASE_URL or CIE_EVIDENCE_DB_PATH")
+        from inefficiency_engine.worker_children_all_lanes import _install_all_lane_runtime
+
+        _install_all_lane_runtime()
         from inefficiency_engine.threaded_worker import run_threaded_worker
 
         asyncio.run(run_threaded_worker(store, settings=settings))
@@ -101,14 +101,14 @@ def main() -> None:
     elif args.command == "research-worker":
         if store is None:
             raise RuntimeError("research worker requires evidence persistence")
-        from inefficiency_engine.worker_children import run_research_child
+        from inefficiency_engine.worker_children_all_lanes import run_research_child
 
         stats = asyncio.run(run_research_child(service, store))
         payload = stats.__dict__
     elif args.command == "portfolio-worker":
         if store is None:
             raise RuntimeError("portfolio worker requires evidence persistence")
-        from inefficiency_engine.worker_children import run_portfolio_child
+        from inefficiency_engine.worker_children_all_lanes import run_portfolio_child
 
         payload = {"cycles_attempted": asyncio.run(run_portfolio_child(service, store))}
     else:
