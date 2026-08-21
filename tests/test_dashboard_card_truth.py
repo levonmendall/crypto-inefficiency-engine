@@ -23,7 +23,7 @@ def test_evidence_cards_use_paper_capability_not_promoted_count_as_execution_tru
     assert "stat('Executable now'" not in html
     assert "evidenceStep('Paper-capable'" in html
     assert "paperCapableIds.has(r.mechanism_id)" in html
-    assert "stale projection · fail closed" in html
+    assert "stale or unavailable projection · fail closed" in html
 
 
 def test_card_truth_surfaces_stale_or_cached_projection_fail_closed():
@@ -43,3 +43,11 @@ def test_card_truth_keeps_single_snapshot_request_contract():
     assert "/v3/dashboard/snapshot" in html
     assert "getJSON('/v3/portfolio/canonical')" not in html
     assert "safeJSON('/v3/portfolio/positions'" not in html
+
+
+def test_mobile_resize_does_not_issue_another_dashboard_request():
+    html = RESILIENT_DASHBOARD_HTML
+
+    assert "window.__dashboardHistory=history.snapshots||[]" in html
+    assert "window.addEventListener('resize',()=>renderChart(window.__dashboardHistory||[]))" in html
+    assert "window.addEventListener('resize',()=>refresh())" not in html
