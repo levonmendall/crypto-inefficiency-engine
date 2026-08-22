@@ -77,8 +77,8 @@ def test_statistical_failure_exposes_exact_threshold_gap_without_relaxing_it():
     assert any("mean-return CI lower" in gate for gate in row["failed_gates"])
 
 
-def test_v382_dashboard_exposes_strategy_evidence_and_preserves_authority_boundary():
-    assert __version__ == "3.8.2"
+def test_v383_dashboard_exposes_strategy_evidence_and_preserves_authority_boundary():
+    assert __version__ == "3.8.3"
     assert "Strategy evidence" in RESILIENT_DASHBOARD_HTML
     assert "Capital authority remains qualified independently by strategy + asset + direction" in RESILIENT_DASHBOARD_HTML
     assert "historical failed cohorts are not reset" in RESILIENT_DASHBOARD_HTML
