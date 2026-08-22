@@ -28,6 +28,12 @@ services:
         value: "2"
       - key: CIE_PAPER_ONLY
         value: "true"
+      # Bybit blocks public API traffic from US IP space. The Oregon production
+      # service therefore treats Bybit as policy-disabled rather than repeatedly
+      # recording 403s as data failures. Existing Coinbase/Kraken/OKX/Hyperliquid/
+      # Deribit/protocol-native surfaces remain the production evidence routes.
+      - key: CIE_BYBIT_PUBLIC_ENABLED
+        value: "false"
       - key: CIE_SHADOW_HORIZONS_SECONDS
         value: "1,5,15,30,60"
       - key: CIE_SHADOW_MAX_OPPORTUNITIES
