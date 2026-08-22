@@ -7,7 +7,10 @@ from typing import Any
 SOURCE_REFRESH_WORKER_ID = "priority-source-refresh-plane"
 ALPHA_L2_WORKER_ID = "alpha-l2-research-sampling"
 MECHANISM_FORWARD_WORKER_ID = "mechanism-forward-evidence"
-DEFAULT_CRITICAL_EVIDENCE_RECOVERY_STALE_SECONDS = 1800.0
+# Keep recovery aligned with the production worker/dashboard freshness contract.
+# The previous 1,800-second guard allowed evidence to remain stale for 27 minutes
+# after the runtime had already declared it stale (180 seconds).
+DEFAULT_CRITICAL_EVIDENCE_RECOVERY_STALE_SECONDS = 180.0
 
 
 def _utc(value: datetime) -> datetime:
@@ -48,7 +51,8 @@ def _worker_status(
 
     observed_at = _utc(heartbeat.observed_at)
     age_seconds = max(0.0, (now - observed_at).total_seconds())
-    stale = age_seconds > max(60.0, float(stale_after_seconds))
+    recovery_after_seconds = max(60.0, float(stale_after_seconds))
+    stale = age_seconds > recovery_after_seconds
     return {
         "worker_id": worker_id,
         "available": True,
@@ -58,6 +62,7 @@ def _worker_status(
         "observed_at": observed_at.isoformat(),
         "state": heartbeat.state,
         "error_type": heartbeat.error_type,
+        "recovery_after_seconds": recovery_after_seconds,
     }
 
 
@@ -69,12 +74,15 @@ def critical_evidence_recovery_status(
 ) -> dict[str, Any]:
     """Return bounded recovery needs for dashboard-critical research workers.
 
-    Normal evidence cadence remains authoritative. This helper only asks for an
-    unscheduled recovery pass when a critical worker has never published a durable
-    heartbeat or its last heartbeat is grossly older than the normal research
-    cadence. A fresh degraded/error heartbeat suppresses forced retries until the
-    recovery window elapses, preventing provider hammering while preserving normal
-    scheduled attempts.
+    Recovery uses the same 180-second default freshness budget as the production
+    worker/card contract. This closes the old gap where the dashboard could mark
+    evidence stale at 180 seconds while recovery waited 1,800 seconds.
+
+    A recent degraded/error heartbeat still suppresses immediate retries until the
+    freshness budget elapses, preventing provider hammering. Once that budget is
+    exceeded, the next disposable research cycle may force one early source/alpha
+    recovery pass. Qualification, sizing, settlement, and execution authority are
+    unchanged.
     """
 
     current = _utc(now or datetime.now(timezone.utc))
@@ -103,11 +111,13 @@ def critical_evidence_recovery_status(
         workers["alpha_l2_sampling"].get("recovery_required")
         or workers["mechanism_forward"].get("recovery_required")
     )
+    recovery_after_seconds = max(60.0, float(stale_after_seconds))
     return {
         "source_refresh_required": source_required,
         "alpha_forward_required": alpha_required,
         "any_required": source_required or alpha_required,
-        "stale_after_seconds": max(60.0, float(stale_after_seconds)),
+        "stale_after_seconds": recovery_after_seconds,
+        "dashboard_freshness_aligned": True,
         "workers": workers,
         "normal_cadence_unchanged": True,
         "qualification_thresholds_unchanged": True,
