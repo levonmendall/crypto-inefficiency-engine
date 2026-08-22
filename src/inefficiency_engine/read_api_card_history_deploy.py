@@ -67,14 +67,11 @@ def _runtime_contract(payload: dict[str, object]) -> dict[str, object]:
     return result
 
 
-def _build_v5(legacy: dict[str, object]) -> dict[str, object]:
-    return preserve_meaningful_card_conclusions(build_dashboard_v5_snapshot(legacy))
-
-
 def _v5_from_legacy() -> dict[str, object]:
     try:
         legacy = dict(_base.dashboard_snapshot())
-        return _build_v5(legacy)
+        v5 = build_dashboard_v5_snapshot(legacy)
+        return preserve_meaningful_card_conclusions(v5)
     except HTTPException:
         raise
     except Exception as exc:
@@ -123,7 +120,8 @@ def dashboard_v5_snapshot():
 def dashboard_snapshot():
     try:
         legacy = dict(_base.dashboard_snapshot())
-        v5 = _build_v5(legacy)
+        v5 = build_dashboard_v5_snapshot(legacy)
+        v5 = preserve_meaningful_card_conclusions(v5)
     except HTTPException:
         raise
     except Exception as exc:
