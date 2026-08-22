@@ -7,10 +7,12 @@ from typing import Awaitable, Callable
 
 from inefficiency_engine.adapters.dynamic_registry import DynamicVolumePublicAdapterRegistry
 from inefficiency_engine.alpha_coverage_strategies import EventLedger, EventObservation
-from inefficiency_engine.disposable_alpha_factory import ALPHA_L2_WORKER_ID
 from inefficiency_engine.evidence import EvidenceStore, ScanSnapshot
 from inefficiency_engine.models import MarketKind, OpportunityLeg, Side
-from inefficiency_engine.priority_source_collection import PrioritySourceCollectionService
+from inefficiency_engine.priority_source_collection import (
+    ALPHA_L2_WORKER_ID,
+    PrioritySourceCollectionService,
+)
 from inefficiency_engine.provider_gap_collection import ProviderAdmissionLedger
 from inefficiency_engine.research_mechanisms import VolatilityResearchService, YieldResearchService
 from inefficiency_engine.source_coverage import SourceCoveragePlane
@@ -77,7 +79,13 @@ def permanent_source_plane_current(
     current = now or _now()
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
-    age = max(0.0, (current.astimezone(timezone.utc) - observed_at.astimezone(timezone.utc)).total_seconds())
+    age = max(
+        0.0,
+        (
+            current.astimezone(timezone.utc)
+            - observed_at.astimezone(timezone.utc)
+        ).total_seconds(),
+    )
     return bool(
         age <= max(30.0, float(max_age_seconds))
         and str(heartbeat.state or "") in {"running", "success", "degraded"}
@@ -154,7 +162,9 @@ class PermanentSourcePlane:
     def _selected_assets(self, market_quotes: list[object]) -> tuple[str, ...]:
         ordered: list[str] = []
         seen: set[str] = set()
-        managed = tuple(getattr(getattr(self.registry, "coinbase", None), "assets", ()) or ())
+        managed = tuple(
+            getattr(getattr(self.registry, "coinbase", None), "assets", ()) or ()
+        )
         for raw in managed:
             asset = str(raw).upper().strip()
             if asset and asset not in seen:
@@ -170,22 +180,34 @@ class PermanentSourcePlane:
             return ()
         count = min(len(ordered), self._l2_batch_size())
         start = (self._market_cycle * count) % len(ordered)
-        return tuple(ordered[(start + offset) % len(ordered)] for offset in range(count))
+        return tuple(
+            ordered[(start + offset) % len(ordered)] for offset in range(count)
+        )
 
     @staticmethod
-    def _book_requests(market_quotes: list[object], selected_assets: tuple[str, ...]) -> list[object]:
+    def _book_requests(
+        market_quotes: list[object], selected_assets: tuple[str, ...]
+    ) -> list[object]:
         selected = set(selected_assets)
         opportunities: list[object] = []
         seen: set[tuple[str, str, str, str]] = set()
         for quote in market_quotes:
             asset = str(getattr(quote, "asset", "")).upper()
             market_kind = getattr(quote, "market_kind", None)
-            if asset not in selected or market_kind not in {MarketKind.SPOT, MarketKind.PERPETUAL}:
+            if asset not in selected or market_kind not in {
+                MarketKind.SPOT,
+                MarketKind.PERPETUAL,
+            }:
                 continue
             venue = str(getattr(quote, "venue", ""))
             symbol = str(getattr(quote, "symbol", ""))
             contract_key = str(getattr(quote, "contract_key", "") or symbol)
-            key = (venue, asset, str(getattr(market_kind, "value", market_kind)), contract_key)
+            key = (
+                venue,
+                asset,
+                str(getattr(market_kind, "value", market_kind)),
+                contract_key,
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -198,7 +220,9 @@ class PermanentSourcePlane:
                             market_kind=market_kind,
                             side=Side.LONG,
                             symbol=symbol,
-                            quote_currency=str(getattr(quote, "quote_currency", "USD")),
+                            quote_currency=str(
+                                getattr(quote, "quote_currency", "USD")
+                            ),
                             contract_key=getattr(quote, "contract_key", None),
                             expires_at=getattr(quote, "expires_at", None),
                             reference_price=float(getattr(quote, "mid")),
@@ -264,7 +288,10 @@ class PermanentSourcePlane:
     def _priority_due(self, now: datetime) -> bool:
         if self._last_priority_started_at is None:
             return True
-        age = max(0.0, (now - self._last_priority_started_at).total_seconds())
+        age = max(
+            0.0,
+            (now - self._last_priority_started_at).total_seconds(),
+        )
         return age >= source_priority_interval_seconds()
 
     async def run_cycle(self) -> dict[str, object]:
@@ -319,14 +346,20 @@ class PermanentSourcePlane:
             self._last_priority_started_at = cycle_started
             try:
                 priority = await self.priority.run_cycle()
-                source_refresh = priority.get("source_refresh", {}) if isinstance(priority, dict) else {}
+                source_refresh = (
+                    priority.get("source_refresh", {})
+                    if isinstance(priority, dict)
+                    else {}
+                )
                 detail.update(
                     {
                         "priority_refresh_complete": True,
                         "priority_refresh_state": source_refresh.get("state")
                         if isinstance(source_refresh, dict)
                         else None,
-                        "priority_failed_sources": list(source_refresh.get("failed_sources") or [])
+                        "priority_failed_sources": list(
+                            source_refresh.get("failed_sources") or []
+                        )
                         if isinstance(source_refresh, dict)
                         else [],
                         "priority_memory_deferred_sources": list(
@@ -336,7 +369,10 @@ class PermanentSourcePlane:
                         else [],
                     }
                 )
-                if isinstance(source_refresh, dict) and source_refresh.get("state") == "degraded":
+                if (
+                    isinstance(source_refresh, dict)
+                    and source_refresh.get("state") == "degraded"
+                ):
                     error_types.append("PrioritySourceDegraded")
             except Exception as exc:
                 error_types.append(type(exc).__name__)
@@ -350,7 +386,10 @@ class PermanentSourcePlane:
             detail["priority_refresh_complete"] = None
             detail["priority_refresh_state"] = "not_due"
 
-        detail["cycle_runtime_seconds"] = max(0.0, (_now() - cycle_started).total_seconds())
+        detail["cycle_runtime_seconds"] = max(
+            0.0,
+            (_now() - cycle_started).total_seconds(),
+        )
         detail["subsystem_error_types"] = sorted(set(error_types))
         state = "degraded" if error_types else "success"
         self.store.record_worker_heartbeat(
