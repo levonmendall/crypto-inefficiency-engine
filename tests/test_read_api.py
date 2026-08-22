@@ -93,10 +93,23 @@ def test_render_combined_service_preserves_deployment_safe_research_read_plane()
     assert runtime["name"] == "cie-shadow-worker"
     assert runtime["type"] == "web"
     assert runtime["plan"] == "standard"
-    assert runtime["startCommand"] == "python -m inefficiency_engine.render_combined_card_history"
-    wrapper = Path("src/inefficiency_engine/render_combined_card_history.py").read_text()
-    assert "return _base.main()" in wrapper
-    assert 'inefficiency_engine.read_api_card_history_deploy:app' in wrapper
+    assert runtime["startCommand"] == "python -m inefficiency_engine.render_combined"
+
+    canonical = Path("src/inefficiency_engine/render_combined.py").read_text()
+    assert 'CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"' in canonical
+    assert "render_combined_runtime" in canonical
+
+    compatibility = Path("src/inefficiency_engine/render_combined_card_history.py").read_text()
+    assert "from inefficiency_engine.render_combined import API_APP, main" in compatibility
+    assert "_base.API_APP" not in compatibility
+
+    deploy = Path("src/inefficiency_engine/read_api_card_history_deploy.py").read_text()
+    assert '"/health"' in deploy
+    assert '"/ready"' in deploy
+    assert '"dashboard_contract_active": True' in deploy
+    assert '"dashboard_ui_contract_version": DASHBOARD_UI_CONTRACT_VERSION' in deploy
+    assert '"canonical_api_app": CANONICAL_API_APP' in deploy
+
     assert runtime["healthCheckPath"] == "/health"
     assert runtime["autoDeployTrigger"] == "checksPass"
     assert runtime["buildCommand"] == "python -m pip install --retries 5 --timeout 30 ."

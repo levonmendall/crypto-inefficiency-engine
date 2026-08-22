@@ -50,8 +50,9 @@ def test_combined_runtime_makes_research_and_history_disposable_and_mutually_sch
     ]
 
 
-def test_combined_runtime_uses_active_volume_deployment_read_plane():
-    assert API_APP == "inefficiency_engine.read_api_active_volume_deploy:app"
+def test_combined_runtime_uses_canonical_card_history_read_plane():
+    assert API_APP == "inefficiency_engine.read_api_card_history_deploy:app"
+    assert child_commands("10000")["api"][3] == API_APP
 
 
 def _health_row(*, observed_at: datetime, age_seconds: float, state: str = "success"):
