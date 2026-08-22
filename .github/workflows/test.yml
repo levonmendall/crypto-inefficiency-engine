@@ -56,15 +56,29 @@ jobs:
         run: |
           PYTHONPATH=src python - <<'PY'
           from fastapi.testclient import TestClient
-          from inefficiency_engine.read_api_card_history_deploy import app
+          import inefficiency_engine.dashboard_cards_v5 as v5
+          import inefficiency_engine.read_api_card_history_deploy as deploy
+          app = deploy.app
+          print('deploy_file=', deploy.__file__)
+          print('v5_file=', v5.__file__)
+          print('v5_constant_bytes=', len(deploy.DASHBOARD_V5_HTML))
+          for marker in ['Evidence accumulation', 'Mechanism truth', 'v5_mechanism_truth']:
+              print('constant', repr(marker), marker in deploy.DASHBOARD_V5_HTML)
+          direct = deploy.dashboard_root()
+          direct_text = bytes(direct.body).decode(errors='replace')
+          print('direct_x_contract=', direct.headers.get('x-dashboard-contract'))
+          for marker in ['Evidence accumulation', 'Mechanism truth', 'v5_mechanism_truth']:
+              print('direct', repr(marker), marker in direct_text)
+          print('user_middleware=', app.user_middleware)
           print('=== ROOT ROUTES IN ORDER ===')
           for i, route in enumerate(app.router.routes):
               if getattr(route, 'path', None) in {'/', '/dashboard', '/health', '/v3/dashboard/snapshot', '/v3/dashboard/v5-snapshot'}:
                   endpoint = getattr(route, 'endpoint', None)
-                  print(i, getattr(route, 'path', None), getattr(route, 'methods', None), getattr(endpoint, '__module__', None), getattr(endpoint, '__name__', None))
+                  print(i, getattr(route, 'path', None), getattr(route, 'methods', None), getattr(endpoint, '__module__', None), getattr(endpoint, '__name__', None), endpoint is deploy.dashboard_root)
           client = TestClient(app)
           response = client.get('/')
           print('local_root_status=', response.status_code)
+          print('local_root_history=', [(r.status_code, r.headers.get('location')) for r in response.history])
           print('local_root_x_contract=', response.headers.get('x-dashboard-contract'))
           for marker in ['Evidence accumulation', 'Mechanism truth', 'v5_mechanism_truth']:
               print('local', repr(marker), marker in response.text)
