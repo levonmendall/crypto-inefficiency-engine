@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from inefficiency_engine.dashboard_research_closure import build_research_closure_dashboard_router
+from inefficiency_engine.dashboard_v5_router import build_v5_dashboard_router
 from inefficiency_engine.read_api import _latest_payload, _payload_history, _require_store
 from inefficiency_engine.read_api_fast import app
 from inefficiency_engine.research_reset_runtime import RESEARCH_RESET_POLICY_VERSION
@@ -10,19 +10,19 @@ RESEARCH_CLOSURE_WORKER_ID = "research-closure-diagnostic-loop"
 RESEARCH_RESET_WORKER_ID = "research-qualification-reset"
 
 
-# Replace only the HTML presentation routes. The API remains the v3.5.25 fast,
-# database-backed read plane and does not construct providers, scanners, allocators,
-# or execution services.
+# Replace the inherited HTML presentation routes at the shared research read-plane
+# layer. Every higher production deploy app composes from this same FastAPI object,
+# so V5 no longer depends on which historical module Render launches.
 app.router.routes[:] = [
     route
     for route in app.router.routes
     if not (
-        getattr(route, "path", None) in {"/", "/dashboard"}
+        getattr(route, "path", None) in {"/", "/dashboard", "/v3/dashboard/v5-snapshot"}
         and "GET" in (getattr(route, "methods", set()) or set())
     )
 ]
 app.openapi_schema = None
-app.include_router(build_research_closure_dashboard_router())
+app.include_router(build_v5_dashboard_router())
 
 
 @app.get("/v3/operations/research-closure")
