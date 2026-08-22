@@ -20,6 +20,19 @@ from inefficiency_engine.dashboard_command_center_v6 import (
 
 CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"
 
+_SOURCE_CONNECTIVITY_SECTION = r'''<section class="section"><div class="section-head"><div><div class="section-title">Source connectivity</div><div class="section-note">Independent persisted source diagnostics · updates even if the main dashboard snapshot fails</div></div><div id="sourceSummary" class="section-note">Loading source status…</div></div><div id="sourceProblems"></div></section>
+'''
+_SOURCE_SECTION_MARKER = '<section class="section"><div class="section-head"><div><div class="section-title">Evidence accumulation</div>'
+_SOURCE_CONNECTIVITY_JS = r'''
+function renderSourceConnectivity(p){const s=p?.summary||{},rows=p?.sources||[];if(!p?.available){$('sourceSummary').textContent=`Source diagnostic unavailable${p?.read_error_type?` · ${p.read_error_type}`:''}`;$('sourceProblems').innerHTML=empty('Could not read persisted source status.');return}const bad=rows.filter(x=>x.state!=='healthy'),parts=[`${num(s.healthy)} healthy`,`${num(s.stale)} stale`,`${num(s.failed)} failed`,`${num(s.unobserved)} unobserved`,`${num(s.credential_required)} credential-gated`];$('sourceSummary').textContent=`${num(s.healthy)} / ${num(s.configured)} healthy · ${parts.slice(1).join(' · ')}`;const rank={failed:0,stale:1,unobserved:2,credential_required:3};bad.sort((a,b)=>(rank[a.state]??9)-(rank[b.state]??9)||String(a.name).localeCompare(String(b.name)));$('sourceProblems').innerHTML=bad.length?bad.map(x=>`<div class="item"><div class="item-top"><div><div class="item-title">${esc(x.name||x.source_id)}</div><div class="item-sub">${esc((x.lane_ids||[]).join(' · '))} · ${esc((x.classes||[]).join(', '))}</div></div><span class="badge ${clsStatus(x.state)}">${esc(String(x.state||'unknown').replaceAll('_',' '))}</span></div><div class="item-sub">${x.observed_at?`Last observation ${when(x.observed_at)} · ${age(x.age_seconds)} · TTL ${age(x.freshness_ttl_seconds)}`:'No persisted observation'}${x.error_type?` · error ${esc(x.error_type)}`:''}${x.credential_env&&!x.credential_configured?` · configure ${esc(x.credential_env)}`:''}</div></div>`).join(''):empty('All configured source surfaces currently report healthy.')}
+async function refreshSourceConnectivity(){try{const r=await fetch('/v3/dashboard/source-connectivity',{cache:'no-store'});const p=await r.json();renderSourceConnectivity(p)}catch(e){$('sourceSummary').textContent='Source diagnostic unavailable';$('sourceProblems').innerHTML=empty(`Source diagnostic failed: ${e.message}`)}}
+'''
+_SOURCE_JS_MARKER = "function renderSummary(s){"
+_OLD_REFRESH_JS = "async function refresh(){const b=$('refreshBtn');b.disabled=true;$('error').classList.remove('show');try{const r=await fetch('/v3/dashboard/v5-snapshot',{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);const p=await r.json();if(p.dashboard_ui_contract_version!=='v5_mechanism_truth')throw new Error(`Unexpected card contract ${p.dashboard_ui_contract_version||'missing'}`);render(p)}catch(e){$('error').textContent=`Dashboard refresh failed: ${e.message}`;$('error').classList.add('show')}finally{b.disabled=false}}"
+_NEW_REFRESH_JS = r'''async function refresh(){const b=$('refreshBtn');b.disabled=true;$('error').classList.remove('show');try{const r=await fetch('/v3/dashboard/v5-snapshot',{cache:'no-store'});if(!r.ok){let d=null;try{d=(await r.json())?.detail}catch(_e){}let m=`HTTP ${r.status}`;if(d&&typeof d==='object'){if(d.stage)m+=` · ${d.stage}`;if(d.error_type)m+=` · ${d.error_type}`;if(d.cause_type)m+=` / ${d.cause_type}`}else if(d)m+=` · ${d}`;throw new Error(m)}const p=await r.json();if(p.dashboard_ui_contract_version!=='v5_mechanism_truth')throw new Error(`Unexpected card contract ${p.dashboard_ui_contract_version||'missing'}`);render(p)}catch(e){$('error').textContent=`Dashboard refresh failed: ${e.message}`;$('error').classList.add('show')}finally{b.disabled=false}}'''
+_OLD_BOOT_JS = "$('refreshBtn').addEventListener('click',refresh);window.addEventListener('resize',()=>renderChart(window.__history||[]));refresh();setInterval(refresh,30000);"
+_NEW_BOOT_JS = "$('refreshBtn').addEventListener('click',()=>{refresh();refreshSourceConnectivity()});window.addEventListener('resize',()=>refresh());refresh();refreshSourceConnectivity();setInterval(()=>{refresh();refreshSourceConnectivity()},30000);"
+
 # Do not mutate the inherited FastAPI router in place. The inherited application
 # has already been composed through several deploy layers and Starlette may have
 # materialized its ASGI middleware/router stack by the time this module imports it.
@@ -55,14 +68,21 @@ def _html_headers() -> dict[str, str]:
 
 
 def _dashboard_html() -> str:
-    """Serve the restored command center through the actual production entrypoint."""
+    """Serve the command center with an independent source-diagnostic read path."""
 
-    # Re-read the same persisted snapshot after a viewport change rather than
-    # retaining a second client-side authority just for chart redraws.
-    return DASHBOARD_COMMAND_CENTER_HTML.replace(
-        "window.addEventListener('resize',()=>renderChart(window.__history||[]));",
-        "window.addEventListener('resize',()=>refresh());",
+    html = DASHBOARD_COMMAND_CENTER_HTML.replace(
+        _SOURCE_SECTION_MARKER,
+        _SOURCE_CONNECTIVITY_SECTION + _SOURCE_SECTION_MARKER,
+        1,
     )
+    html = html.replace(
+        _SOURCE_JS_MARKER,
+        _SOURCE_CONNECTIVITY_JS + _SOURCE_JS_MARKER,
+        1,
+    )
+    html = html.replace(_OLD_REFRESH_JS, _NEW_REFRESH_JS, 1)
+    html = html.replace(_OLD_BOOT_JS, _NEW_BOOT_JS, 1)
+    return html
 
 
 def _dict(value: object) -> dict[str, Any]:
@@ -124,10 +144,21 @@ def _legacy_snapshot() -> dict[str, object]:
     except Exception as exc:
         raise HTTPException(
             status_code=503,
-            detail="canonical persisted dashboard snapshot is temporarily unavailable",
+            detail={
+                "message": "canonical persisted dashboard snapshot is temporarily unavailable",
+                "stage": "canonical_snapshot_adapter",
+                "error_type": type(exc).__name__,
+            },
         ) from exc
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=503, detail="canonical dashboard snapshot is invalid")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "canonical dashboard snapshot is invalid",
+                "stage": "canonical_snapshot_adapter",
+                "error_type": "InvalidSnapshotPayload",
+            },
+        )
     return dict(payload)
 
 
@@ -148,7 +179,11 @@ def _v5_from_legacy(legacy: dict[str, object] | None = None) -> dict[str, object
     except Exception as exc:
         raise HTTPException(
             status_code=503,
-            detail="v5 mechanism truth snapshot is temporarily unavailable",
+            detail={
+                "message": "v5 mechanism truth snapshot is temporarily unavailable",
+                "stage": "v5_card_build",
+                "error_type": type(exc).__name__,
+            },
         ) from exc
 
 
@@ -197,7 +232,11 @@ def dashboard_snapshot():
     except Exception as exc:
         raise HTTPException(
             status_code=503,
-            detail="v5 mechanism truth snapshot is temporarily unavailable",
+            detail={
+                "message": "v5 mechanism truth snapshot is temporarily unavailable",
+                "stage": "final_snapshot_adapter",
+                "error_type": type(exc).__name__,
+            },
         ) from exc
 
     # Keep the compact legacy fields for diagnostic consumers while making the V5
