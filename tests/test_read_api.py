@@ -106,7 +106,7 @@ def test_render_combined_service_uses_standalone_v5_mechanism_truth_dashboard():
     assert runtime["name"] == "cie-shadow-worker"
     assert runtime["type"] == "web"
     assert runtime["plan"] == "standard"
-    assert runtime["startCommand"] == "python -m inefficiency_engine.render_combined"
+    assert runtime["startCommand"] == "PYTHONPATH=src python -m inefficiency_engine.render_combined"
 
     canonical = Path("src/inefficiency_engine/render_combined.py").read_text()
     assert 'CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"' in canonical
@@ -130,4 +130,4 @@ def test_render_combined_service_uses_standalone_v5_mechanism_truth_dashboard():
 
     assert runtime["healthCheckPath"] == "/health"
     assert runtime["autoDeployTrigger"] == "checksPass"
-    assert runtime["buildCommand"] == "python -m pip install --retries 5 --timeout 30 ."
+    assert runtime["buildCommand"] == "python -m pip install --retries 5 --timeout 30 --no-cache-dir ."

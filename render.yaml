@@ -11,8 +11,12 @@ services:
     plan: standard
     branch: main
     autoDeployTrigger: checksPass
-    buildCommand: python -m pip install --retries 5 --timeout 30 .
-    startCommand: python -m inefficiency_engine.render_combined
+    # Install dependencies from the current checkout without reusing a stale local
+    # project wheel. Runtime imports are then pinned directly to ./src so a Render
+    # deploy cannot report the latest Git SHA while executing an older installed
+    # copy of the application package.
+    buildCommand: python -m pip install --retries 5 --timeout 30 --no-cache-dir .
+    startCommand: PYTHONPATH=src python -m inefficiency_engine.render_combined
     healthCheckPath: /health
     maxShutdownDelaySeconds: 90
     envVars:

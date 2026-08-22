@@ -13,7 +13,7 @@ def test_render_blueprint_defines_single_paid_combined_runtime():
     runtime = services["cie-shadow-worker"]
     assert runtime["type"] == "web"
     assert runtime["plan"] == "standard"
-    assert runtime["startCommand"] == "python -m inefficiency_engine.render_combined"
+    assert runtime["startCommand"] == "PYTHONPATH=src python -m inefficiency_engine.render_combined"
 
     canonical = Path("src/inefficiency_engine/render_combined.py").read_text()
     assert 'CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"' in canonical
@@ -28,7 +28,7 @@ def test_render_blueprint_defines_single_paid_combined_runtime():
 
     assert runtime["healthCheckPath"] == "/health"
     assert runtime["autoDeployTrigger"] == "checksPass"
-    assert runtime["buildCommand"] == "python -m pip install --retries 5 --timeout 30 ."
+    assert runtime["buildCommand"] == "python -m pip install --retries 5 --timeout 30 --no-cache-dir ."
     assert runtime["maxShutdownDelaySeconds"] == 90
 
     runtime_env = {item["key"]: item for item in runtime["envVars"]}
