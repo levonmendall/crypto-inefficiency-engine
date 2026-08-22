@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-inefficiency-engine"
-version = "3.8.2"
+version = "3.8.3"
 description = "Paper-first crypto opportunity engine with memory-bounded research, cycle-aware multi-horizon directional alpha, freshness-separated qualified-opportunity control and candidate evidence, universal settlement-supported canonical portfolio accounting, worker-published dashboard projections, and fail-closed profitability certification."
 readme = "README.md"
 requires-python = ">=3.11"
