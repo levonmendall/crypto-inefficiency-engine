@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 
 from inefficiency_engine.dashboard_cards_v5 import (
     DASHBOARD_UI_CONTRACT_VERSION,
-    DASHBOARD_V5_HTML,
     build_dashboard_v5_snapshot,
+)
+from inefficiency_engine.dashboard_command_center_v6 import (
+    COMMAND_CENTER_LAYOUT_VERSION,
+    DASHBOARD_COMMAND_CENTER_HTML,
 )
 
 
@@ -19,23 +24,20 @@ def _headers() -> dict[str, str]:
         "Pragma": "no-cache",
         "Expires": "0",
         "X-Dashboard-Contract": DASHBOARD_UI_CONTRACT_VERSION,
+        "X-Dashboard-Layout": COMMAND_CENTER_LAYOUT_VERSION,
         "X-Dashboard-Route": "canonical-v5-router",
     }
 
 
 def _html() -> str:
-    """Serve V5 from a dedicated snapshot route that survives deploy composition.
+    """Serve one standalone full command center with V5 mechanism cards.
 
-    The production app has several historical composition layers.  The dashboard
-    page therefore no longer depends on which module owns /v3/dashboard/snapshot.
-    A dedicated V5 endpoint always builds the server-side card model from the
-    current persisted compact snapshot.
+    Portfolio/account history, runtime diagnostics, and research evidence share one
+    persisted snapshot request with the server-built V5 mechanism read model. The
+    historical dashboard card renderer is intentionally not composed back in.
     """
 
-    return DASHBOARD_V5_HTML.replace(
-        "fetch('/v3/dashboard/snapshot'",
-        f"fetch('{V5_SNAPSHOT_PATH}'",
-    )
+    return DASHBOARD_COMMAND_CENTER_HTML
 
 
 def _legacy_snapshot() -> dict[str, object]:
@@ -58,6 +60,42 @@ def _legacy_snapshot() -> dict[str, object]:
     return dict(payload)
 
 
+def _dict(value: object) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _command_center_payload(legacy: dict[str, object]) -> dict[str, object]:
+    """Preserve non-mechanism command-center truth beside the V5 card model.
+
+    This intentionally excludes the historical mechanism renderer. Mechanism state
+    has one presentation authority: ``cards`` from ``build_dashboard_v5_snapshot``.
+    """
+
+    runtime_heartbeats = _dict(legacy.get("runtime_heartbeats"))
+    return {
+        "portfolio": _dict(legacy.get("portfolio")),
+        "performance": _dict(legacy.get("performance")),
+        "runtime": _dict(legacy.get("runtime")),
+        "positions": _dict(legacy.get("positions")) or {"positions": []},
+        "trades": _dict(legacy.get("trades")) or {"trades": []},
+        "history": _dict(legacy.get("history")) or {"count": 0, "snapshots": []},
+        "skips": _dict(legacy.get("skips")) or {"skips": []},
+        "attribution": _dict(legacy.get("attribution")) or {
+            "pnl_by_mechanism_usd": {},
+            "pnl_by_strategy_usd": {},
+        },
+        "queue": _dict(legacy.get("queue")) or {"actions": []},
+        "cycle_history": _dict(legacy.get("cycle_history")) or {
+            "available": False,
+            "assets": [],
+        },
+        "runtime_heartbeats": runtime_heartbeats,
+        "projection_mode": legacy.get("projection_mode"),
+        "presentation_fallback": bool(legacy.get("presentation_fallback")),
+        "presentation_fallback_reason": legacy.get("presentation_fallback_reason"),
+    }
+
+
 def build_v5_dashboard_router() -> APIRouter:
     router = APIRouter()
 
@@ -77,8 +115,10 @@ def build_v5_dashboard_router() -> APIRouter:
             {
                 "dashboard_contract_active": True,
                 "dashboard_ui_contract_version": DASHBOARD_UI_CONTRACT_VERSION,
+                "command_center_layout_version": COMMAND_CENTER_LAYOUT_VERSION,
                 "dashboard_route_authority": "canonical-v5-router",
                 "legacy_snapshot_fields_available": True,
+                "command_center": _command_center_payload(legacy),
             }
         )
         return result
