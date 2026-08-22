@@ -51,6 +51,27 @@ jobs:
           cache: pip
       - name: Install
         run: python -m pip install -e '.[dev]'
+      - name: Trace production app route ownership locally
+        shell: bash
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          from fastapi.testclient import TestClient
+          from inefficiency_engine.read_api_card_history_deploy import app
+          print('=== ROOT ROUTES IN ORDER ===')
+          for i, route in enumerate(app.router.routes):
+              if getattr(route, 'path', None) in {'/', '/dashboard', '/health', '/v3/dashboard/snapshot', '/v3/dashboard/v5-snapshot'}:
+                  endpoint = getattr(route, 'endpoint', None)
+                  print(i, getattr(route, 'path', None), getattr(route, 'methods', None), getattr(endpoint, '__module__', None), getattr(endpoint, '__name__', None))
+          client = TestClient(app)
+          response = client.get('/')
+          print('local_root_status=', response.status_code)
+          print('local_root_x_contract=', response.headers.get('x-dashboard-contract'))
+          for marker in ['Evidence accumulation', 'Mechanism truth', 'v5_mechanism_truth']:
+              print('local', repr(marker), marker in response.text)
+          health = client.get('/health').json()
+          print('local_health_version=', health.get('version'))
+          print('local_health_contract=', health.get('dashboard_ui_contract_version'))
+          PY
       - name: Test
         run: python -m pytest -q
       - name: Compile
