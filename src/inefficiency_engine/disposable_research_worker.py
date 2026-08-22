@@ -12,6 +12,7 @@ from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidence
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.cex_dex_shadow import CexDexCompositeEdgeShadowService
 from inefficiency_engine.certification_worker import run_certification_loop
+from inefficiency_engine.critical_evidence_recovery import critical_evidence_recovery_status
 from inefficiency_engine.dashboard_projection import (
     DASHBOARD_RESEARCH_PROJECTION_WORKER_ID,
     ResearchDashboardProjectionLedger,
@@ -106,6 +107,10 @@ async def run_disposable_research_cycle(
     certification_every = alpha_every
     frontier_every = max(1, int(service.settings.dex_route_frontier_every_cycles))
 
+    critical_recovery = critical_evidence_recovery_status(store)
+    source_recovery_required = bool(critical_recovery.get("source_refresh_required"))
+    alpha_recovery_required = bool(critical_recovery.get("alpha_forward_required"))
+
     detail: dict[str, object] = {
         "sequence": sequence,
         "disposable_process": True,
@@ -115,6 +120,9 @@ async def run_disposable_research_cycle(
         "release_d_lane_success_runtime": True,
         "progress_heartbeat_contract": True,
         "critical_evidence_before_heavy_tail": True,
+        "critical_evidence_recovery_guard": True,
+        "critical_evidence_recovery_required": bool(critical_recovery.get("any_required")),
+        "critical_evidence_recovery": critical_recovery,
         "paper_only": True,
     }
     progress_index = 0
@@ -211,10 +219,14 @@ async def run_disposable_research_cycle(
     _publish_research_projection("cycle_start")
     _record_progress("dashboard_projection_start_complete")
 
-    # Bootstrap source truth periodically. This now happens before the heavy shadow
-    # tail and is published immediately, so a later optional stall cannot leave the
-    # dashboard showing source truth from an older successful process.
-    if sequence == 1 or sequence % alpha_every == 1:
+    # Bootstrap source truth periodically, and recover it out-of-band only when the
+    # durable source-refresh heartbeat has never existed or is grossly stale. A fresh
+    # degraded/error heartbeat suppresses forced retries for the recovery window, so
+    # provider failures do not turn into a tight retry loop.
+    source_bootstrap_scheduled = sequence == 1 or sequence % alpha_every == 1
+    if source_bootstrap_scheduled or source_recovery_required:
+        detail["source_bootstrap_scheduled"] = source_bootstrap_scheduled
+        detail["source_recovery_forced"] = source_recovery_required and not source_bootstrap_scheduled
         _record_progress("provider_gap_bootstrap")
         try:
             bootstrap = await operating_certification.provider_gap_collection.run_cycle()
@@ -237,12 +249,16 @@ async def run_disposable_research_cycle(
         _record_progress("provider_gap_bootstrap_complete")
         _reconcile_and_publish("source_bootstrap")
 
-    # Dashboard-critical evidence must run before the long optional research tail.
-    # Cadence and all qualification/allocation thresholds are unchanged. Source TTLs
-    # continue to bound network work. The immediate projection publication ensures
-    # source, candidate, forward, and mechanism-worker progress survives a later
-    # disposable-process timeout or memory termination.
-    if _due(sequence, alpha_every, 0.75):
+    # Dashboard-critical evidence normally keeps its existing sequence cadence. If
+    # either the L2 sampler or mechanism-forward worker is unobserved/grossly stale,
+    # one early recovery attempt is allowed irrespective of sequence. Once it emits
+    # any fresh heartbeat, the 30-minute recovery guard turns off and normal cadence
+    # resumes. Qualification, sizing, settlement, and execution thresholds are not
+    # altered by this scheduling recovery.
+    alpha_scheduled = _due(sequence, alpha_every, 0.75)
+    if alpha_scheduled or alpha_recovery_required:
+        detail["alpha_evidence_scheduled"] = alpha_scheduled
+        detail["alpha_recovery_forced"] = alpha_recovery_required and not alpha_scheduled
         _record_progress("pre_alpha_source_refresh")
         try:
             source_refresh = await operating_certification.provider_gap_collection.run_cycle()
