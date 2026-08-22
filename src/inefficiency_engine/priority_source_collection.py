@@ -4,11 +4,19 @@ import gc
 import os
 from datetime import datetime, timezone
 
+from inefficiency_engine.coinbase_trade_flow import (
+    COINBASE_EXCHANGE_URL,
+    collect_coinbase_trade_flow,
+)
 from inefficiency_engine.evidence_velocity import prioritize_source_probes, stagnation_diagnostics
 from inefficiency_engine.memory_budget import (
     DEFAULT_RESEARCH_MEMORY_SOFT_LIMIT_MB,
     memory_budget_exceeded,
     memory_snapshot,
+)
+from inefficiency_engine.option_capacity import (
+    DERIBIT_BASE_URL as DERIBIT_CAPACITY_BASE_URL,
+    collect_deribit_option_capacity,
 )
 from inefficiency_engine.priority_source_event_yield import (
     DEFILLAMA_PROTOCOLS_URL,
@@ -48,6 +56,8 @@ SOURCE_REFRESH_TTL_SECONDS: dict[str, float] = {
     "bybit-options": 120.0,
     "okx-options": 120.0,
     "defillama-protocols": 900.0,
+    "deribit-option-capacity": 300.0,
+    "public-trade-flow": 60.0,
 }
 
 
@@ -276,6 +286,18 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                 ["volatility"],
                 f"{OKX_BASE_URL}/api/v5/public/opt-summary",
                 lambda: collect_okx_options(self.volatility_service),
+            ),
+            (
+                "deribit-option-capacity",
+                ["volatility"],
+                f"{DERIBIT_CAPACITY_BASE_URL}/public/get_order_book",
+                lambda: collect_deribit_option_capacity(self.store),
+            ),
+            (
+                "public-trade-flow",
+                ["liquidity_provision", "microstructure"],
+                f"{COINBASE_EXCHANGE_URL}/products/{{product_id}}/trades",
+                lambda: collect_coinbase_trade_flow(self.source_coverage),
             ),
             (
                 "defillama-protocols",

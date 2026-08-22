@@ -27,6 +27,7 @@ from inefficiency_engine.volume_universe import (
 
 
 VOLUME_UNIVERSE_WORKER_ID = "volume-universe-lightweight-refresh"
+PERMANENT_SOURCE_WORKER_ID = "canonical-source-operating-loop"
 # The permanent worker gets several attempts to refresh membership before the
 # database-only read plane reaches its stale boundary. This is intentionally tiny
 # work (two CoinGecko reads plus one compact DB snapshot), not historical research.
@@ -42,7 +43,8 @@ RESEARCH_PROJECTION_MAINTENANCE_SECONDS = 60.0
 
 # Preserve the permanent worker's durable-bridge and canonical-portfolio lineage
 # explicitly while installing the integrated evidence-velocity + Release D subclasses.
-# The process remains provider-free for allocation and consumes only persisted qualified state.
+# The accounting/allocation path consumes only persisted qualified state; the source
+# maintenance coroutine below may collect public evidence but has zero portfolio authority.
 CanonicalPortfolioAllocatorService = EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService
 CanonicalPaperPortfolioService = EvidenceVelocityLaneSuccessOperationallyResilientPaperPortfolioService
 assert issubclass(
@@ -110,6 +112,61 @@ async def _volume_universe_refresh_loop(
             await asyncio.wait_for(
                 stop_event.wait(),
                 timeout=VOLUME_UNIVERSE_MAINTENANCE_SECONDS,
+            )
+        except TimeoutError:
+            continue
+
+
+async def _permanent_source_refresh_loop(
+    store: EvidenceStore,
+    *,
+    stop_event: asyncio.Event,
+) -> None:
+    """Continuously acquire public evidence without relying on disposable research.
+
+    The source plane is intentionally hosted inside this already-resident process so
+    Render does not pay for a third Python interpreter. Each source cycle has its own
+    heartbeat and catches all provider/collector failures; a bad provider can degrade
+    evidence but cannot crash canonical portfolio accounting. If construction itself
+    fails, the loop retries rather than silently dying.
+    """
+
+    source_plane = None
+    while not stop_event.is_set():
+        try:
+            if source_plane is None:
+                from inefficiency_engine.permanent_source_plane import PermanentSourcePlane
+
+                source_plane = PermanentSourcePlane(store)
+            await source_plane.run_cycle()
+        except Exception as exc:
+            try:
+                store.record_worker_heartbeat(
+                    worker_id=PERMANENT_SOURCE_WORKER_ID,
+                    state="degraded",
+                    error_type=type(exc).__name__,
+                    detail={
+                        "retrying": True,
+                        "resident_with_portfolio_process": True,
+                        "disposable_research_required": False,
+                        "portfolio_authority": False,
+                        "allocation_authority": False,
+                        "live_execution_authority": False,
+                        "paper_only": True,
+                    },
+                )
+            except Exception:
+                pass
+            # Rebuild after an unexpected construction/runtime failure so a poisoned
+            # client/session object cannot leave source collection permanently dead.
+            source_plane = None
+
+        try:
+            from inefficiency_engine.permanent_source_plane import source_market_interval_seconds
+
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=source_market_interval_seconds(),
             )
         except TimeoutError:
             continue
@@ -195,7 +252,7 @@ async def run_lightweight_portfolio_worker(
     settings: Settings | None = None,
     stop_event: asyncio.Event | None = None,
 ) -> int:
-    """Run persisted-state canonical accounting with all-lane paper settlement enabled."""
+    """Run canonical accounting plus isolated lightweight maintenance surfaces."""
 
     settings = settings or Settings.from_env()
     service = OpportunityService(settings=settings, evidence_store=store)
@@ -215,11 +272,16 @@ async def run_lightweight_portfolio_worker(
         except (NotImplementedError, RuntimeError):
             pass
 
-    # Keep small maintenance surfaces in this already-resident process rather than
-    # adding permanent Python processes to the Render memory footprint.
+    # Keep maintenance surfaces in this already-resident process rather than adding
+    # permanent Python processes to the Render memory footprint. Source acquisition
+    # is a separate coroutine/failure domain and carries no portfolio authority.
     volume_task = asyncio.create_task(
         _volume_universe_refresh_loop(store, stop_event=stop),
         name="volume-universe-refresh",
+    )
+    source_task = asyncio.create_task(
+        _permanent_source_refresh_loop(store, stop_event=stop),
+        name="permanent-source-refresh",
     )
     projection_task = asyncio.create_task(
         _research_projection_refresh_loop(store, settings=settings, stop_event=stop),
@@ -234,7 +296,7 @@ async def run_lightweight_portfolio_worker(
         )
     finally:
         stop.set()
-        for task in (volume_task, projection_task):
+        for task in (volume_task, source_task, projection_task):
             try:
                 await task
             except asyncio.CancelledError:
