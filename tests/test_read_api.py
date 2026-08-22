@@ -93,7 +93,10 @@ def test_render_combined_service_preserves_deployment_safe_research_read_plane()
     assert runtime["name"] == "cie-shadow-worker"
     assert runtime["type"] == "web"
     assert runtime["plan"] == "standard"
-    assert runtime["startCommand"] == "python -m inefficiency_engine.render_combined"
+    assert runtime["startCommand"] == "python -m inefficiency_engine.render_combined_card_history"
+    wrapper = Path("src/inefficiency_engine/render_combined_card_history.py").read_text()
+    assert "return _base.main()" in wrapper
+    assert 'inefficiency_engine.read_api_card_history_deploy:app' in wrapper
     assert runtime["healthCheckPath"] == "/health"
     assert runtime["autoDeployTrigger"] == "checksPass"
     assert runtime["buildCommand"] == "python -m pip install --retries 5 --timeout 30 ."
