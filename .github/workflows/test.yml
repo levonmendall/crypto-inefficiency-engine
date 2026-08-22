@@ -13,6 +13,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Probe production dashboard contract
+        shell: bash
+        run: |
+          set -u
+          BASE="https://cie-shadow-worker-m0sc.onrender.com"
+          echo "=== ROOT ==="
+          curl -sS --max-time 20 -D /tmp/root.headers -o /tmp/root.html "$BASE/" || true
+          cat /tmp/root.headers 2>/dev/null || true
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('/tmp/root.html')
+          text = p.read_text(errors='replace') if p.exists() else ''
+          print('root_bytes=', len(text))
+          for marker in ['Evidence accumulation', 'EXECUTABLE NOW', 'Portfolio Command Center', 'Mechanism truth', 'v5_mechanism_truth']:
+              print(f'{marker!r}:', marker in text)
+          print(text[:700].replace('\n', ' '))
+          PY
+          echo "=== HEALTH ==="
+          curl -sS --max-time 20 -D /tmp/health.headers -o /tmp/health.json "$BASE/health" || true
+          cat /tmp/health.headers 2>/dev/null || true
+          cat /tmp/health.json 2>/dev/null || true
+          echo
+          echo "=== V5 SNAPSHOT ==="
+          curl -sS --max-time 20 -D /tmp/v5.headers -o /tmp/v5.json "$BASE/v3/dashboard/v5-snapshot" || true
+          cat /tmp/v5.headers 2>/dev/null || true
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('/tmp/v5.json')
+          text = p.read_text(errors='replace') if p.exists() else ''
+          print('v5_bytes=', len(text))
+          print(text[:1200])
+          PY
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
