@@ -22,6 +22,8 @@ def _row(mechanism_id: str, *, state: str = "provider_gap", stage: str = "waitin
         "current_promoted_count": 0,
         "settled_allocator_outcome_count": 0,
         "profitability_certified": False,
+        "research_projection_stale": True,
+        "operating_projection_stale": True,
         "paper_only": True,
         "live_execution_authority": False,
     }
