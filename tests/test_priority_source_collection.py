@@ -66,6 +66,19 @@ def test_morpho_parser_requires_rate_capacity_and_liquidity():
     assert rows == [{"market_id":"m1","asset":"USDC","supply_apy":0.05,"supply_usd":1000000.0,"liquidity_usd":250000.0}]
 
 
+def test_morpho_parser_accepts_current_market_id_schema():
+    rows = parse_morpho_markets({"data":{"markets":{"items":[
+        {"marketId":"0xmarket2","loanAsset":{"symbol":"WETH"},"state":{"supplyApy":0.031,"supplyAssetsUsd":2000000,"liquidityAssetsUsd":600000}},
+    ]}}})
+    assert rows == [{
+        "market_id":"0xmarket2",
+        "asset":"WETH",
+        "supply_apy":0.031,
+        "supply_usd":2000000.0,
+        "liquidity_usd":600000.0,
+    }]
+
+
 def test_option_symbol_parsers_cover_bybit_and_okx():
     bybit = parse_bybit_option_symbol("BTC-30AUG26-65000-C")
     okx = parse_okx_option_symbol("ETH-USD-260830-4000-P")
