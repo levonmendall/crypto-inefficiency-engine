@@ -10,6 +10,7 @@ from inefficiency_engine.active_volume_runtime import (
     read_active_cycle_history_status,
     read_active_volume_universe_status,
 )
+from inefficiency_engine.dashboard_source_connectivity import read_source_connectivity
 from inefficiency_engine.dashboard_source_truth import overlay_dashboard_source_truth
 from inefficiency_engine.lane_readiness import build_lane_executable_readiness
 from inefficiency_engine.production_dashboard_fastpath import build_production_dashboard_snapshot
@@ -25,6 +26,7 @@ _REPLACED_PATHS = {
     "/health",
     "/ready",
     "/v3/dashboard/snapshot",
+    "/v3/dashboard/source-connectivity",
     "/v3/research/cycle-history",
 }
 app.router.routes[:] = [
@@ -313,6 +315,28 @@ def lane_executability_detail(lane_id: str):
     raise HTTPException(status_code=404, detail="unknown profit-mechanism lane")
 
 
+@app.get("/v3/dashboard/source-connectivity")
+def source_connectivity():
+    """Return source-by-source persisted connectivity independent of the main snapshot."""
+
+    store = _store()
+    if store is None:
+        return {
+            "available": False,
+            "read_error_type": "EvidencePersistenceNotConfigured",
+            "summary": {},
+            "sources": [],
+            "release_commit": _release_commit(),
+            "paper_only": True,
+            "allocation_authority": False,
+            "live_execution_authority": False,
+        }
+    payload = read_source_connectivity(store)
+    payload["release_commit"] = _release_commit()
+    payload["diagnostic_only"] = True
+    return payload
+
+
 @app.get("/v3/dashboard/snapshot")
 def dashboard_snapshot():
     """Return a bounded persisted-only command-center snapshot.
@@ -326,7 +350,14 @@ def dashboard_snapshot():
 
     store = _store()
     if store is None:
-        raise HTTPException(status_code=503, detail="evidence persistence is not configured")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "persisted dashboard snapshot is unavailable",
+                "stage": "evidence_store",
+                "error_type": "EvidencePersistenceNotConfigured",
+            },
+        )
 
     try:
         payload = build_production_dashboard_snapshot(
@@ -346,12 +377,26 @@ def dashboard_snapshot():
                 ),
             ),
         )
-        payload = overlay_dashboard_source_truth(store, payload)
     except Exception as exc:
+        cause = exc.__cause__
         raise HTTPException(
             status_code=503,
-            detail="persisted dashboard snapshot is temporarily unavailable",
+            detail={
+                "message": "persisted dashboard snapshot is temporarily unavailable",
+                "stage": "production_dashboard_fastpath",
+                "error_type": type(exc).__name__,
+                "cause_type": type(cause).__name__ if cause is not None else None,
+            },
         ) from exc
+
+    # Source truth is a presentation/diagnostic overlay. If its bounded persisted read
+    # fails, preserve the canonical portfolio snapshot and make the degradation
+    # explicit instead of taking the entire command center down.
+    try:
+        payload = overlay_dashboard_source_truth(store, payload)
+    except Exception as exc:
+        payload["source_truth_overlay_degraded"] = True
+        payload["source_truth_overlay_error_type"] = type(exc).__name__
 
     try:
         volume = read_active_volume_universe_status(store)

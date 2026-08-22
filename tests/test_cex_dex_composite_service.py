@@ -107,7 +107,10 @@ class FakeCore:
             kraken_spot_taker_fee_bps=80.0,
             okx_spot_taker_fee_bps=10.0,
             max_quote_age_seconds=120.0,
-            max_order_book_age_seconds=15.0,
+            # These tests exercise conversion-depth availability and ordering, not
+            # wall-clock expiry. Keep fake books comfortably fresh for the full
+            # suite so adding unrelated tests cannot make this module time-sensitive.
+            max_order_book_age_seconds=120.0,
             max_order_book_skew_seconds=5.0,
         )
 

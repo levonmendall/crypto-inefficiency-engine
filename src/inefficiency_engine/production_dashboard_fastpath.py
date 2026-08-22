@@ -13,6 +13,8 @@ from inefficiency_engine.evidence import EvidenceStore
 
 DEFAULT_RESEARCH_PROJECTION_STALE_SECONDS = 900.0
 DEFAULT_OPERATING_PROJECTION_STALE_SECONDS = 1800.0
+DEFAULT_COMPACT_READ_TIMEOUT_MS = 1500
+RETRY_COMPACT_READ_TIMEOUT_MS = 4500
 
 
 def _decode(raw: object | None) -> dict[str, Any] | None:
@@ -42,6 +44,9 @@ def _table_exists(db, backend: str, table_name: str) -> bool:
 
 def _read_compact_projections(
     store: EvidenceStore,
+    *,
+    statement_timeout_ms: int = DEFAULT_COMPACT_READ_TIMEOUT_MS,
+    lock_timeout_ms: int = 500,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
     """Read both compact projections in one short transaction.
 
@@ -50,11 +55,15 @@ def _read_compact_projections(
     read even as the top-volume universe and research architecture grow.
     """
 
+    statement_timeout_ms = max(100, int(statement_timeout_ms))
+    lock_timeout_ms = max(50, int(lock_timeout_ms))
     try:
         with store.engine.begin() as db:
             if store.backend == "postgresql":
-                db.execute(text("SET LOCAL statement_timeout = '1500ms'"))
-                db.execute(text("SET LOCAL lock_timeout = '500ms'"))
+                db.execute(
+                    text(f"SET LOCAL statement_timeout = '{statement_timeout_ms}ms'")
+                )
+                db.execute(text(f"SET LOCAL lock_timeout = '{lock_timeout_ms}ms'"))
             base_raw = None
             research_raw = None
             if _table_exists(db, store.backend, "dashboard_projection_snapshots"):
@@ -309,21 +318,37 @@ def build_production_dashboard_snapshot(
 ) -> dict[str, Any]:
     """Return the production dashboard without request-time research computation.
 
-    Normal operation reads the two worker-published compact projections. If the
-    portfolio projection is absent or invalid, reconstruct it once from durable
-    canonical tables using ``build_dashboard_projection``; that helper performs a
-    single bounded read transaction. The read plane never fans out through the
-    diagnostic endpoints and never constructs an OpportunityService here.
+    Normal operation reads the two worker-published compact projections. A transient
+    compact-read failure gets one bounded retry before any durable reconstruction is
+    attempted. If the portfolio projection is genuinely absent or invalid, reconstruct
+    it once from durable canonical tables using ``build_dashboard_projection``. The
+    read plane never fans out through diagnostic endpoints or constructs an
+    OpportunityService here.
 
     Persisted research and each lane's own expected collection deadline are evaluated
     against the actual request-time UTC clock. Old evidence remains visible, but it
     cannot continue claiming current collector health.
     """
 
-    base, research, compact_error = _read_compact_projections(store)
+    base, research, first_compact_error = _read_compact_projections(store)
+    retry_used = False
+    retry_error: str | None = None
+    if base is None and first_compact_error is not None:
+        retry_used = True
+        retry_base, retry_research, retry_error = _read_compact_projections(
+            store,
+            statement_timeout_ms=RETRY_COMPACT_READ_TIMEOUT_MS,
+            lock_timeout_ms=1000,
+        )
+        if retry_base is not None:
+            base = retry_base
+            research = retry_research
+        elif research is None and retry_research is not None:
+            research = retry_research
+
     fallback_reason: str | None = None
     if base is None:
-        fallback_reason = compact_error or "compact_projection_unavailable"
+        fallback_reason = retry_error or first_compact_error or "compact_projection_unavailable"
         try:
             base = build_dashboard_projection(
                 store,
@@ -331,8 +356,10 @@ def build_production_dashboard_snapshot(
                 settled_target=max(1, int(settled_target)),
             )
         except Exception as exc:
+            compact_context = fallback_reason or "none"
             raise RuntimeError(
-                f"durable dashboard reconstruction failed: {type(exc).__name__}"
+                "durable dashboard reconstruction failed after compact read "
+                f"({compact_context}): {type(exc).__name__}"
             ) from exc
         base = dict(base)
         base["projection_mode"] = "durable_single_read_fallback"
@@ -340,6 +367,9 @@ def build_production_dashboard_snapshot(
         base["presentation_fallback_reason"] = fallback_reason
 
     combined = dict(base)
+    combined["compact_projection_read_retry_used"] = retry_used
+    combined["compact_projection_read_initial_error_type"] = first_compact_error
+    combined["compact_projection_read_retry_error_type"] = retry_error
     current = datetime.now(timezone.utc)
     research_freshness = research_projection_freshness(research, now=current)
     operating_freshness = operating_projection_freshness(research, now=current)

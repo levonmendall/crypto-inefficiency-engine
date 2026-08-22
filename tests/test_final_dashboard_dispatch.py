@@ -21,6 +21,7 @@ def test_final_production_app_serves_restored_command_center_through_actual_asgi
         "Recent completed trades",
         "Skipped / rejected allocations",
         "Cycle history backfill",
+        "Source connectivity",
         "Evidence accumulation",
         "Profit mechanism certification",
         "What needs attention next",
@@ -29,6 +30,9 @@ def test_final_production_app_serves_restored_command_center_through_actual_asgi
         assert label in response.text
     assert "v5_mechanism_truth" in response.text
     assert "fetch('/v3/dashboard/v5-snapshot'" in response.text
+    assert "fetch('/v3/dashboard/source-connectivity'" in response.text
+    assert "Source diagnostic unavailable" in response.text
+    assert "cause_type" in response.text
     assert "EXECUTABLE NOW" not in response.text
 
 
@@ -41,6 +45,7 @@ def test_dashboard_alias_serves_same_restored_command_center_contract():
     assert response.headers["x-dashboard-contract"] == "v5_mechanism_truth"
     assert response.headers["x-dashboard-layout"] == "v6_full_command_center"
     assert "Current portfolio NAV" in response.text
+    assert "Source connectivity" in response.text
     assert "Profit mechanism certification" in response.text
     assert "Evidence accumulation" in response.text
 
@@ -96,5 +101,6 @@ def test_legacy_read_routes_are_preserved_without_legacy_dashboard_conflicts():
     assert paths.count("/ready") == 1
     assert paths.count("/v3/dashboard/snapshot") == 1
     assert paths.count("/v3/dashboard/v5-snapshot") == 1
+    assert paths.count("/v3/dashboard/source-connectivity") == 1
     assert "/v3/portfolio/canonical" in paths
     assert "/v3/operations/mechanisms" in paths
