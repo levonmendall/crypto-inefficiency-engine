@@ -3,29 +3,46 @@ from fastapi.testclient import TestClient
 from inefficiency_engine import read_api_card_history_deploy as deploy
 
 
-def test_final_production_app_serves_v5_root_through_actual_asgi_dispatch():
+def test_final_production_app_serves_restored_command_center_through_actual_asgi_dispatch():
     client = TestClient(deploy.app)
 
     response = client.get("/")
 
     assert response.status_code == 200
     assert response.headers["x-dashboard-contract"] == "v5_mechanism_truth"
+    assert response.headers["x-dashboard-layout"] == "v6_full_command_center"
     assert response.headers["x-canonical-api-app"] == deploy.CANONICAL_API_APP
-    assert "Mechanism truth" in response.text
-    assert "Profit mechanism cards" in response.text
-    assert "Evidence accumulation" not in response.text
+    for label in (
+        "Current portfolio NAV",
+        "Runtime health",
+        "Equity curve",
+        "P&L attribution",
+        "Open paper positions",
+        "Recent completed trades",
+        "Skipped / rejected allocations",
+        "Cycle history backfill",
+        "Evidence accumulation",
+        "Profit mechanism certification",
+        "What needs attention next",
+        "Active volume universe",
+    ):
+        assert label in response.text
+    assert "v5_mechanism_truth" in response.text
+    assert "fetch('/v3/dashboard/v5-snapshot'" in response.text
     assert "EXECUTABLE NOW" not in response.text
 
 
-def test_dashboard_alias_serves_same_v5_contract_through_asgi_dispatch():
+def test_dashboard_alias_serves_same_restored_command_center_contract():
     client = TestClient(deploy.app)
 
     response = client.get("/dashboard")
 
     assert response.status_code == 200
     assert response.headers["x-dashboard-contract"] == "v5_mechanism_truth"
-    assert "Mechanism truth" in response.text
-    assert "Evidence accumulation" not in response.text
+    assert response.headers["x-dashboard-layout"] == "v6_full_command_center"
+    assert "Current portfolio NAV" in response.text
+    assert "Profit mechanism certification" in response.text
+    assert "Evidence accumulation" in response.text
 
 
 def test_v5_snapshot_route_is_owned_by_fresh_final_router(monkeypatch):
@@ -34,6 +51,8 @@ def test_v5_snapshot_route_is_owned_by_fresh_final_router(monkeypatch):
         "dashboard_snapshot",
         lambda: {
             "release_commit": "test-release",
+            "portfolio": {"portfolio_id": "canonical"},
+            "performance": {"current_nav_usd": 250000.0},
             "mechanisms": {
                 "observed_at": "2026-08-22T14:00:00+00:00",
                 "requirements": {
@@ -56,7 +75,10 @@ def test_v5_snapshot_route_is_owned_by_fresh_final_router(monkeypatch):
     payload = response.json()
     assert payload["dashboard_ui_contract_version"] == "v5_mechanism_truth"
     assert payload["card_view_version"] == "v5"
+    assert payload["command_center_layout_version"] == "v6_full_command_center"
     assert payload["dashboard_route_authority"] == "final-fresh-router"
+    assert payload["command_center"]["portfolio"]["portfolio_id"] == "canonical"
+    assert payload["command_center"]["performance"]["current_nav_usd"] == 250000.0
     assert payload["cards"] == []
 
 

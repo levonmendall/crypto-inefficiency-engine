@@ -4,9 +4,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import inefficiency_engine.critical_evidence_recovery as recovery_module
 from inefficiency_engine.critical_evidence_recovery import (
     ALPHA_L2_WORKER_ID,
     DEFAULT_CRITICAL_EVIDENCE_RECOVERY_STALE_SECONDS,
+    DEFAULT_SOURCE_TRUTH_RETRY_COOLDOWN_SECONDS,
     MECHANISM_FORWARD_WORKER_ID,
     SOURCE_REFRESH_WORKER_ID,
     critical_evidence_recovery_status,
@@ -32,8 +34,31 @@ def _heartbeat(*, age_seconds: float, state: str = "success", error_type=None):
     )
 
 
-def test_default_recovery_window_matches_production_freshness_budget():
+def _current_truth():
+    return {
+        "carry": {
+            "source_state": "sufficient",
+            "stale_source_ids": [],
+        }
+    }
+
+
+def _stale_truth():
+    return {
+        "carry": {
+            "source_state": "stale",
+            "stale_source_ids": ["funding-primary"],
+        },
+        "options": {
+            "source_state": "evidence_class_gap",
+            "stale_source_ids": ["options-primary"],
+        },
+    }
+
+
+def test_default_recovery_windows_match_production_freshness_contract():
     assert DEFAULT_CRITICAL_EVIDENCE_RECOVERY_STALE_SECONDS == 180.0
+    assert DEFAULT_SOURCE_TRUTH_RETRY_COOLDOWN_SECONDS == 60.0
 
 
 def test_unobserved_critical_workers_force_bounded_recovery():
@@ -46,6 +71,7 @@ def test_unobserved_critical_workers_force_bounded_recovery():
     assert status["workers"]["alpha_l2_sampling"]["reason"] == "unobserved"
     assert status["workers"]["mechanism_forward"]["reason"] == "unobserved"
     assert status["dashboard_freshness_aligned"] is True
+    assert status["source_truth_recovery_active"] is True
     assert status["qualification_thresholds_unchanged"] is True
     assert status["allocation_authority"] is False
 
@@ -71,7 +97,7 @@ def test_fresh_degraded_heartbeat_suppresses_immediate_retry():
     store = FakeStore(
         {
             SOURCE_REFRESH_WORKER_ID: _heartbeat(
-                age_seconds=60,
+                age_seconds=30,
                 state="degraded",
                 error_type="ProviderUnavailable",
             ),
@@ -113,6 +139,60 @@ def test_degraded_heartbeat_recovers_once_it_is_stale_for_dashboard():
 
     assert status["source_refresh_required"] is True
     assert status["workers"]["source_refresh"]["reason"] == "grossly_stale"
+
+
+def test_stale_source_truth_forces_recovery_even_with_current_worker_heartbeat(monkeypatch):
+    monkeypatch.setattr(recovery_module, "_read_source_truth", lambda store, now: _stale_truth())
+    store = FakeStore(
+        {
+            SOURCE_REFRESH_WORKER_ID: _heartbeat(age_seconds=61, state="degraded"),
+            ALPHA_L2_WORKER_ID: _heartbeat(age_seconds=30),
+            MECHANISM_FORWARD_WORKER_ID: _heartbeat(age_seconds=30),
+        }
+    )
+
+    status = critical_evidence_recovery_status(store, now=NOW)
+
+    assert status["workers"]["source_refresh"]["recovery_required"] is False
+    assert status["source_refresh_required"] is True
+    assert status["source_truth"]["recovery_required"] is True
+    assert status["source_truth"]["reason"] == "stale_truth_retry_due"
+    assert status["source_truth"]["stale_lane_ids"] == ["carry", "options"]
+    assert status["source_truth"]["stale_source_ids"] == ["funding-primary", "options-primary"]
+
+
+def test_stale_source_truth_respects_short_retry_cooldown(monkeypatch):
+    monkeypatch.setattr(recovery_module, "_read_source_truth", lambda store, now: _stale_truth())
+    store = FakeStore(
+        {
+            SOURCE_REFRESH_WORKER_ID: _heartbeat(age_seconds=30, state="degraded"),
+            ALPHA_L2_WORKER_ID: _heartbeat(age_seconds=30),
+            MECHANISM_FORWARD_WORKER_ID: _heartbeat(age_seconds=30),
+        }
+    )
+
+    status = critical_evidence_recovery_status(store, now=NOW)
+
+    assert status["source_refresh_required"] is False
+    assert status["source_truth"]["stale"] is True
+    assert status["source_truth"]["recovery_required"] is False
+    assert status["source_truth"]["reason"] == "stale_truth_retry_cooldown"
+
+
+def test_current_source_truth_does_not_create_extra_recovery(monkeypatch):
+    monkeypatch.setattr(recovery_module, "_read_source_truth", lambda store, now: _current_truth())
+    store = FakeStore(
+        {
+            SOURCE_REFRESH_WORKER_ID: _heartbeat(age_seconds=120),
+            ALPHA_L2_WORKER_ID: _heartbeat(age_seconds=120),
+            MECHANISM_FORWARD_WORKER_ID: _heartbeat(age_seconds=120),
+        }
+    )
+
+    status = critical_evidence_recovery_status(store, now=NOW)
+
+    assert status["source_refresh_required"] is False
+    assert status["source_truth"]["reason"] == "source_truth_current"
 
 
 def test_custom_recovery_window_remains_supported():

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 
@@ -8,18 +10,21 @@ from inefficiency_engine import read_api_active_volume_deploy as _base
 from inefficiency_engine.dashboard_card_currentness import preserve_meaningful_card_conclusions
 from inefficiency_engine.dashboard_cards_v5 import (
     DASHBOARD_UI_CONTRACT_VERSION,
-    DASHBOARD_V5_HTML,
     build_dashboard_v5_snapshot,
+)
+from inefficiency_engine.dashboard_command_center_v6 import (
+    COMMAND_CENTER_LAYOUT_VERSION,
+    DASHBOARD_COMMAND_CENTER_HTML,
 )
 
 
 CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"
 
-# Do not mutate the inherited FastAPI router in place.  The inherited application
+# Do not mutate the inherited FastAPI router in place. The inherited application
 # has already been composed through several deploy layers and Starlette may have
 # materialized its ASGI middleware/router stack by the time this module imports it.
-# In that state app.router.routes can *look* correct while requests still dispatch
-# through the previously-built legacy root.  A fresh final application makes the
+# In that state app.router.routes can look correct while requests still dispatch
+# through a previously-built legacy root. A fresh final application makes the
 # canonical routes authoritative at ASGI request time and then appends only the
 # non-conflicting legacy diagnostic/API routes.
 _legacy_app = _base.app
@@ -44,7 +49,50 @@ def _html_headers() -> dict[str, str]:
         "Pragma": "no-cache",
         "Expires": "0",
         "X-Dashboard-Contract": DASHBOARD_UI_CONTRACT_VERSION,
+        "X-Dashboard-Layout": COMMAND_CENTER_LAYOUT_VERSION,
         "X-Canonical-API-App": CANONICAL_API_APP,
+    }
+
+
+def _dashboard_html() -> str:
+    """Serve the restored command center through the actual production entrypoint."""
+
+    # Re-read the same persisted snapshot after a viewport change rather than
+    # retaining a second client-side authority just for chart redraws.
+    return DASHBOARD_COMMAND_CENTER_HTML.replace(
+        "window.addEventListener('resize',()=>renderChart(window.__history||[]));",
+        "window.addEventListener('resize',()=>refresh());",
+    )
+
+
+def _dict(value: object) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _command_center_payload(legacy: dict[str, object]) -> dict[str, object]:
+    """Expose the non-mechanism command-center sections beside V5 card truth."""
+
+    return {
+        "portfolio": _dict(legacy.get("portfolio")),
+        "performance": _dict(legacy.get("performance")),
+        "runtime": _dict(legacy.get("runtime")),
+        "positions": _dict(legacy.get("positions")) or {"positions": []},
+        "trades": _dict(legacy.get("trades")) or {"trades": []},
+        "history": _dict(legacy.get("history")) or {"count": 0, "snapshots": []},
+        "skips": _dict(legacy.get("skips")) or {"skips": []},
+        "attribution": _dict(legacy.get("attribution")) or {
+            "pnl_by_mechanism_usd": {},
+            "pnl_by_strategy_usd": {},
+        },
+        "queue": _dict(legacy.get("queue")) or {"actions": []},
+        "cycle_history": _dict(legacy.get("cycle_history")) or {
+            "available": False,
+            "assets": [],
+        },
+        "runtime_heartbeats": _dict(legacy.get("runtime_heartbeats")),
+        "projection_mode": legacy.get("projection_mode"),
+        "presentation_fallback": bool(legacy.get("presentation_fallback")),
+        "presentation_fallback_reason": legacy.get("presentation_fallback_reason"),
     }
 
 
@@ -54,6 +102,7 @@ def _runtime_contract(payload: dict[str, object]) -> dict[str, object]:
         {
             "dashboard_contract_active": True,
             "dashboard_ui_contract_version": DASHBOARD_UI_CONTRACT_VERSION,
+            "command_center_layout_version": COMMAND_CENTER_LAYOUT_VERSION,
             "canonical_api_app": CANONICAL_API_APP,
             "dashboard_card_truth_resolver_active": True,
             "dashboard_card_read_model": "standalone_server_built_v5",
@@ -67,11 +116,33 @@ def _runtime_contract(payload: dict[str, object]) -> dict[str, object]:
     return result
 
 
-def _v5_from_legacy() -> dict[str, object]:
+def _legacy_snapshot() -> dict[str, object]:
     try:
-        legacy = dict(_base.dashboard_snapshot())
-        v5 = build_dashboard_v5_snapshot(legacy)
-        return preserve_meaningful_card_conclusions(v5)
+        payload = _base.dashboard_snapshot()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="canonical persisted dashboard snapshot is temporarily unavailable",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=503, detail="canonical dashboard snapshot is invalid")
+    return dict(payload)
+
+
+def _v5_from_legacy(legacy: dict[str, object] | None = None) -> dict[str, object]:
+    try:
+        source = dict(legacy) if isinstance(legacy, dict) else _legacy_snapshot()
+        v5 = build_dashboard_v5_snapshot(source)
+        v5 = preserve_meaningful_card_conclusions(v5)
+        v5.update(
+            {
+                "command_center_layout_version": COMMAND_CENTER_LAYOUT_VERSION,
+                "command_center": _command_center_payload(source),
+            }
+        )
+        return v5
     except HTTPException:
         raise
     except Exception as exc:
@@ -83,12 +154,12 @@ def _v5_from_legacy() -> dict[str, object]:
 
 @app.get("/", include_in_schema=False, response_class=HTMLResponse)
 def dashboard_root() -> HTMLResponse:
-    return HTMLResponse(DASHBOARD_V5_HTML, headers=_html_headers())
+    return HTMLResponse(_dashboard_html(), headers=_html_headers())
 
 
 @app.get("/dashboard", include_in_schema=False, response_class=HTMLResponse)
 def portfolio_dashboard() -> HTMLResponse:
-    return HTMLResponse(DASHBOARD_V5_HTML, headers=_html_headers())
+    return HTMLResponse(_dashboard_html(), headers=_html_headers())
 
 
 @app.get("/health")
@@ -119,9 +190,8 @@ def dashboard_v5_snapshot():
 @app.get("/v3/dashboard/snapshot")
 def dashboard_snapshot():
     try:
-        legacy = dict(_base.dashboard_snapshot())
-        v5 = build_dashboard_v5_snapshot(legacy)
-        v5 = preserve_meaningful_card_conclusions(v5)
+        legacy = _legacy_snapshot()
+        v5 = _v5_from_legacy(legacy)
     except HTTPException:
         raise
     except Exception as exc:
@@ -130,14 +200,15 @@ def dashboard_snapshot():
             detail="v5 mechanism truth snapshot is temporarily unavailable",
         ) from exc
 
-    # Keep the compact legacy sections for diagnostic consumers while making the
-    # V5 cards/summary/system fields available from the same request.
+    # Keep the compact legacy fields for diagnostic consumers while making the V5
+    # card model and command-center context available from the same persisted read.
     result = dict(legacy)
     result.update(v5)
     result.update(
         {
             "dashboard_contract_active": True,
             "dashboard_ui_contract_version": DASHBOARD_UI_CONTRACT_VERSION,
+            "command_center_layout_version": COMMAND_CENTER_LAYOUT_VERSION,
             "canonical_api_app": CANONICAL_API_APP,
             "dashboard_route_authority": "final-fresh-router",
             "dashboard_snapshot_backward_compatible": True,
@@ -148,8 +219,8 @@ def dashboard_snapshot():
 
 
 # Append inherited routes only after every canonical production path above has
-# been registered.  Conflicting historical dashboard routes are intentionally not
-# copied.  This preserves the detailed read API without allowing an older root or
+# been registered. Conflicting historical dashboard routes are intentionally not
+# copied. This preserves the detailed read API without allowing an older root or
 # snapshot endpoint to shadow the final dashboard contract.
 for _route in _legacy_app.router.routes:
     _path = getattr(_route, "path", None)

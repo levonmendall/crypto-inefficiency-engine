@@ -98,7 +98,7 @@ def test_lightweight_portfolio_worker_refreshes_projection_without_research_auth
     assert '"live_execution_authority": False' in source
 
 
-def test_render_combined_service_uses_standalone_v5_mechanism_truth_dashboard():
+def test_render_combined_service_uses_restored_command_center_with_v5_mechanism_truth():
     payload = yaml.safe_load(Path("render.yaml").read_text())
     assert len(payload["services"]) == 1
     runtime = payload["services"][0]
@@ -114,8 +114,10 @@ def test_render_combined_service_uses_standalone_v5_mechanism_truth_dashboard():
 
     deploy = Path("src/inefficiency_engine/read_api_card_history_deploy.py").read_text()
     assert "dashboard_cards_v5" in deploy
-    assert "DASHBOARD_V5_HTML" in deploy
+    assert "dashboard_command_center_v6" in deploy
+    assert "DASHBOARD_COMMAND_CENTER_HTML" in deploy
     assert "build_dashboard_v5_snapshot" in deploy
+    assert '"command_center": _command_center_payload(source)' in deploy
     assert "dashboard_card_history" not in deploy
     assert '"dashboard_inherited_card_overlay_chain_active": False' in deploy
     assert '"dashboard_contract_active": True' in deploy
@@ -127,6 +129,12 @@ def test_render_combined_service_uses_standalone_v5_mechanism_truth_dashboard():
     assert "Raw / emitted" in v5
     assert "Research overdue since" in v5
     assert "_replace_once" not in v5
+
+    command = Path("src/inefficiency_engine/dashboard_command_center_v6.py").read_text()
+    assert 'COMMAND_CENTER_LAYOUT_VERSION = "v6_full_command_center"' in command
+    assert "Current portfolio NAV" in command
+    assert "Profit mechanism certification" in command
+    assert "fetch('/v3/dashboard/v5-snapshot'" in command
 
     assert runtime["healthCheckPath"] == "/health"
     assert runtime["autoDeployTrigger"] == "checksPass"
