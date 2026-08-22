@@ -7,6 +7,7 @@ from typing import Awaitable, Callable
 
 from inefficiency_engine.adapters.dynamic_registry import DynamicVolumePublicAdapterRegistry
 from inefficiency_engine.alpha_coverage_strategies import EventLedger, EventObservation
+from inefficiency_engine.alpha_extensions import FundamentalFactorLedger, FundamentalFactorObservation
 from inefficiency_engine.evidence import EvidenceStore, ScanSnapshot
 from inefficiency_engine.models import MarketKind, OpportunityLeg, Side
 from inefficiency_engine.priority_source_collection import (
@@ -93,20 +94,27 @@ def permanent_source_plane_current(
 
 
 class _PersistedEventSink:
-    """Minimal event writer required by the provider/source collectors.
+    """Minimal ledgers required by provider/source collectors.
 
     This deliberately does not instantiate the all-lane alpha factory in the permanent
-    portfolio process. It only appends source events to the same event ledger that
+    portfolio process. It appends only the source-derived event/fundamental records that
     research already consumes and exposes the bounded L2 refresh callback expected by
     PrioritySourceCollectionService.
     """
 
     def __init__(self, store: EvidenceStore):
         self.ledger = EventLedger(store)
+        self.fundamentals = FundamentalFactorLedger(store)
         self._l2_refresh: Callable[[], Awaitable[ScanSnapshot]] | None = None
 
     def record_event_observation(self, observation: EventObservation) -> str:
         return self.ledger.record(observation)
+
+    def record_fundamental_observation(
+        self,
+        observation: FundamentalFactorObservation,
+    ) -> str:
+        return self.fundamentals.record(observation)
 
     def bind_l2_refresh(self, refresh: Callable[[], Awaitable[ScanSnapshot]]) -> None:
         self._l2_refresh = refresh
