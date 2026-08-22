@@ -5,6 +5,7 @@ from fastapi.responses import HTMLResponse
 
 from inefficiency_engine import __version__
 from inefficiency_engine import read_api_active_volume_deploy as _base
+from inefficiency_engine.dashboard_card_currentness import preserve_meaningful_card_conclusions
 from inefficiency_engine.dashboard_cards_v5 import (
     DASHBOARD_UI_CONTRACT_VERSION,
     DASHBOARD_V5_HTML,
@@ -58,6 +59,7 @@ def _runtime_contract(payload: dict[str, object]) -> dict[str, object]:
             "dashboard_card_read_model": "standalone_server_built_v5",
             "dashboard_inherited_card_overlay_chain_active": False,
             "dashboard_final_router_rebuilt": True,
+            "dashboard_conclusion_currentness_active": True,
             "dashboard_snapshot_backward_compatible": True,
             "legacy_snapshot_fields_preserved": True,
         }
@@ -65,10 +67,14 @@ def _runtime_contract(payload: dict[str, object]) -> dict[str, object]:
     return result
 
 
+def _build_v5(legacy: dict[str, object]) -> dict[str, object]:
+    return preserve_meaningful_card_conclusions(build_dashboard_v5_snapshot(legacy))
+
+
 def _v5_from_legacy() -> dict[str, object]:
     try:
         legacy = dict(_base.dashboard_snapshot())
-        return build_dashboard_v5_snapshot(legacy)
+        return _build_v5(legacy)
     except HTTPException:
         raise
     except Exception as exc:
@@ -117,7 +123,7 @@ def dashboard_v5_snapshot():
 def dashboard_snapshot():
     try:
         legacy = dict(_base.dashboard_snapshot())
-        v5 = build_dashboard_v5_snapshot(legacy)
+        v5 = _build_v5(legacy)
     except HTTPException:
         raise
     except Exception as exc:
