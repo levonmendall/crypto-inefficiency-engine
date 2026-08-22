@@ -13,6 +13,7 @@ from inefficiency_engine.memory_budget import (
     memory_snapshot,
 )
 from inefficiency_engine.models import FundingQuote, MarketQuote, Opportunity, OrderBookSnapshot
+from inefficiency_engine.runtime_provider_policy import bybit_public_enabled
 from inefficiency_engine.volume_universe import resolve_top_volume_assets
 
 
@@ -60,6 +61,7 @@ class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
         memory_soft_limit_mb: float = DEFAULT_RESEARCH_MEMORY_SOFT_LIMIT_MB,
     ):
         self.evidence_store = evidence_store
+        self.bybit_public_enabled = bybit_public_enabled()
         self._managed_coinbase = coinbase is None
         self._managed_bybit = bybit is None
         self._managed_kraken = kraken is None
@@ -113,6 +115,7 @@ class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
                     "order_book_batch_size": self.order_book_batch_size,
                     "max_order_book_levels": self.max_order_book_levels,
                     "memory_budget_exceeded": over_budget,
+                    "bybit_public_enabled": self.bybit_public_enabled,
                     "paper_only": True,
                     "live_execution_authority": False,
                     **detail,
@@ -128,7 +131,7 @@ class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
         assets = await resolve_top_volume_assets(self.evidence_store)
         if self._managed_coinbase:
             self.coinbase.assets = assets
-        if self._managed_bybit:
+        if self._managed_bybit and self.bybit_public_enabled:
             self.bybit.assets = assets
         if self._managed_kraken:
             self.kraken.assets = assets
@@ -216,7 +219,7 @@ class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
         self,
     ) -> tuple[list[FundingQuote], list[MarketQuote], list[ProviderStatus]]:
         refreshed = await self._refresh_managed_assets()
-        universe = refreshed or tuple(getattr(self.bybit, "assets", ()))
+        universe = refreshed or tuple(getattr(self.coinbase, "assets", ()))
         gate = asyncio.Semaphore(self.provider_group_concurrency)
 
         async def gated(factory):
@@ -246,6 +249,12 @@ class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
                 )
             return await self._capture_list("coinbase-exchange:ticker", self.coinbase.market_quotes())
 
+        async def bybit_group():
+            if not self.bybit_public_enabled:
+                return [], [], None
+            market, funding, status = await self._capture_bybit()
+            return market, funding, status
+
         async def kraken_group():
             assets = tuple(getattr(self.kraken, "assets", ()))
             if self._managed_kraken and assets:
@@ -273,7 +282,7 @@ class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
         hyper, coinbase, bybit, kraken, okx = await asyncio.gather(
             gated(hyper_group),
             gated(coinbase_group),
-            gated(self._capture_bybit),
+            gated(bybit_group),
             gated(kraken_group),
             gated(okx_group),
         )
@@ -288,7 +297,7 @@ class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
             hyper_funding_status,
             hyper_market_status,
             coinbase_status,
-            bybit_status,
+            *([bybit_status] if bybit_status is not None else []),
             kraken_status,
             okx_market_status,
             okx_funding_status,
@@ -300,6 +309,11 @@ class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
             funding_quote_count=len(funding_quotes),
         )
         return funding_quotes, market_quotes, statuses
+
+    def book_request(self, leg):
+        if leg.venue == "Bybit" and not self.bybit_public_enabled:
+            return None
+        return super().book_request(leg)
 
     def _trim_book(self, book: OrderBookSnapshot) -> OrderBookSnapshot:
         book.bids.sort(key=lambda level: level.price, reverse=True)
