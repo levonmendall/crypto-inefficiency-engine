@@ -39,6 +39,7 @@ def _record(
 
 def test_connectivity_reports_every_configured_source_without_provider_calls(monkeypatch, tmp_path):
     monkeypatch.delenv("CIE_TOKENOMIST_API_KEY", raising=False)
+    monkeypatch.delenv("CIE_BYBIT_PUBLIC_ENABLED", raising=False)
     store = EvidenceStore(tmp_path / "source-connectivity.sqlite")
     ledger = SourceCoverageLedger(store)
     _record(
@@ -81,6 +82,40 @@ def test_connectivity_reports_every_configured_source_without_provider_calls(mon
     assert rows["tokenomist-unlocks"]["credential_configured"] is False
     assert payload["live_execution_authority"] is False
     assert payload["allocation_authority"] is False
+
+
+def test_connectivity_distinguishes_policy_disabled_and_endogenous_waiting(monkeypatch, tmp_path):
+    monkeypatch.setenv("CIE_BYBIT_PUBLIC_ENABLED", "false")
+    monkeypatch.delenv("CIE_TOKENOMIST_API_KEY", raising=False)
+    store = EvidenceStore(tmp_path / "source-connectivity-policy.sqlite")
+    SourceCoverageLedger(store)
+
+    payload = read_source_connectivity(store, now=NOW)
+    rows = {row["source_id"]: row for row in payload["sources"]}
+
+    for source_id in (
+        "bybit-market",
+        "bybit-l2",
+        "bybit-funding",
+        "bybit-catalog",
+        "bybit-options",
+        "bybit-liquidations",
+        "bybit-distress",
+    ):
+        assert rows[source_id]["state"] == "not_applicable"
+        assert rows[source_id]["status_reason"] == "disabled_by_runtime_provider_policy"
+
+    for source_id in (
+        "internal-maker-shadow",
+        "internal-opportunity-history",
+        "internal-transfer-telemetry",
+    ):
+        assert rows[source_id]["state"] == "awaiting_endogenous"
+        assert rows[source_id]["status_reason"] == "generated_only_after_governed_activity"
+
+    assert payload["summary"]["not_applicable"] == 7
+    assert payload["summary"]["awaiting_endogenous"] == 3
+    assert payload["summary"]["connectivity_configured"] == len(SOURCES) - 7 - 3
 
 
 def test_connectivity_never_exposes_credential_value(monkeypatch, tmp_path):

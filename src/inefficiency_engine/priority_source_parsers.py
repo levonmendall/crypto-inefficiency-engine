@@ -96,7 +96,8 @@ def parse_morpho_markets(payload: object) -> list[dict[str, object]]:
         asset = item.get("loanAsset") if isinstance(item.get("loanAsset"), dict) else {}
         state = item.get("state") if isinstance(item.get("state"), dict) else {}
         apy, supply, liquidity = number(state.get("supplyApy")), number(state.get("supplyAssetsUsd")), number(state.get("liquidityAssetsUsd"))
-        symbol, key = str(asset.get("symbol") or "").upper(), str(item.get("uniqueKey") or item.get("id") or "")
+        symbol = str(asset.get("symbol") or "").upper()
+        key = str(item.get("marketId") or item.get("uniqueKey") or item.get("id") or "")
         if key and symbol and apy is not None and supply and supply > 0 and liquidity and liquidity > 0:
             result.append({"market_id":key,"asset":symbol,"supply_apy":apy,"supply_usd":supply,"liquidity_usd":liquidity})
     return result

@@ -31,10 +31,13 @@ from inefficiency_engine.provider_gap_resilience import (
     ResilientProviderGapAwareOperatingCertificationService,
     ResilientProviderGapCollectionService,
 )
+from inefficiency_engine.runtime_provider_policy import bybit_public_enabled
 from inefficiency_engine.source_coverage import SourceCoverageObservation, SourceCoveragePlane
 
 
 SOURCE_REFRESH_WORKER_ID = "priority-source-refresh-plane"
+ALPHA_L2_WORKER_ID = "alpha-l2-research-sampling"
+L2_SOURCE_RECOVERY_STALE_SECONDS = 180.0
 # Collection TTLs remain deliberately faster than the source-coverage validity
 # windows. They control refresh effort, not qualification authority.
 SOURCE_REFRESH_TTL_SECONDS: dict[str, float] = {
@@ -174,12 +177,70 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
         except Exception:
             pass
 
+    def _l2_source_refresh_due(self) -> bool:
+        """Return true only when the independent bounded L2 sampler needs recovery."""
+
+        try:
+            heartbeat = self.store.latest_worker_heartbeat(ALPHA_L2_WORKER_ID)
+        except Exception:
+            # A failed heartbeat read cannot safely prove another sampler is absent.
+            return False
+        if heartbeat is None:
+            return True
+        observed_at = heartbeat.observed_at
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        age = max(0.0, (_now() - observed_at.astimezone(timezone.utc)).total_seconds())
+        return age > L2_SOURCE_RECOVERY_STALE_SECONDS
+
+    async def _refresh_l2_source_if_due(self) -> dict[str, object]:
+        """Persist bounded visible L2 as critical source work before heavy research."""
+
+        refresher = getattr(self.alpha_factory, "refresh_l2_source_snapshot", None)
+        if not callable(refresher):
+            return {"state": "unsupported", "attempted": False}
+        if not self._l2_source_refresh_due():
+            return {"state": "fresh_cached", "attempted": False}
+        if memory_budget_exceeded(self.memory_soft_limit_mb):
+            return {
+                "state": "memory_deferred",
+                "attempted": False,
+                "preserved_previous_source_observation": True,
+            }
+        try:
+            snapshot = await refresher()
+            books = list(getattr(snapshot, "order_books", ()) or ())
+            return {
+                "state": "refreshed" if books else "degraded",
+                "attempted": True,
+                "retained_book_count": len(books),
+            }
+        except Exception as exc:
+            return {
+                "state": "failed",
+                "attempted": True,
+                "error_type": type(exc).__name__,
+            }
+        finally:
+            gc.collect()
+
     async def run_cycle(self) -> dict[str, object]:
         self._record_refresh_heartbeat(state="running", stage="provider_admission")
         base = await super().run_cycle()
         self._record_memory("base_provider_gap_complete")
+
+        # Visible L2 is source evidence, not an optional consequence of an already
+        # discovered arbitrage/carry candidate. Recover the existing bounded sampler
+        # here when its durable heartbeat is absent/stale so L2 persistence can
+        # advance before the full alpha/mechanism research tail.
+        l2_source_refresh = await self._refresh_l2_source_if_due()
+        self._record_memory(
+            "critical_l2_source_refresh_complete",
+            l2_source_refresh_state=l2_source_refresh.get("state"),
+        )
+
         eth_source = _safe_reference(os.getenv("CIE_ETHEREUM_RPC_URL", DEFAULT_ETHEREUM_RPC_URL))
-        probes = (
+        probes: list[tuple[str, list[str], str, object]] = [
             (
                 "bybit-liquidations",
                 ["liquidation_distress", "microstructure"],
@@ -222,13 +283,19 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                 DEFILLAMA_PROTOCOLS_URL,
                 collect_defillama_protocols,
             ),
-        )
+        ]
+
+        policy_disabled_sources: list[str] = []
+        if not bybit_public_enabled():
+            disabled = {"bybit-liquidations", "bybit-options"}
+            policy_disabled_sources = sorted(disabled)
+            probes = [probe for probe in probes if probe[0] not in disabled]
 
         coverage_before = self.source_coverage.snapshot()
         ordered_probes = prioritize_source_probes(
             self.store,
             coverage_before.lanes,
-            probes,
+            tuple(probes),
         )
         priority: dict[str, object] = {}
         memory_by_source: dict[str, dict[str, float | None]] = {}
@@ -317,6 +384,9 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
             fresh_cached_sources=cached_sources,
             memory_deferred_sources=deferred_sources,
             failed_sources=failed_sources,
+            policy_disabled_sources=policy_disabled_sources,
+            bybit_public_enabled=bybit_public_enabled(),
+            l2_source_refresh=l2_source_refresh,
             stagnant_lane_count=sum(item.stagnant for item in stagnation.values()),
         )
         return {
@@ -339,6 +409,9 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                 "fresh_cached_sources": cached_sources,
                 "memory_deferred_sources": deferred_sources,
                 "failed_sources": failed_sources,
+                "policy_disabled_sources": policy_disabled_sources,
+                "bybit_public_enabled": bybit_public_enabled(),
+                "l2_source_refresh": l2_source_refresh,
                 "source_specific_ttls": dict(SOURCE_REFRESH_TTL_SECONDS),
                 "dynamic_distance_to_gate_scheduler": True,
                 "dynamic_lane_priority_order": coverage.priority_order,

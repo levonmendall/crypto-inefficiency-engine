@@ -11,6 +11,7 @@ from inefficiency_engine.dashboard_source_truth import (
     _read_source_inputs,
 )
 from inefficiency_engine.evidence_velocity import evidence_freshness_seconds
+from inefficiency_engine.runtime_provider_policy import env_flag
 from inefficiency_engine.source_coverage_catalog import SOURCES
 
 
@@ -35,21 +36,44 @@ def _source_row(
     lane_ids = [str(value) for value in list(spec.get("lanes") or [])]
     configured_classes = [str(value) for value in list(spec.get("classes") or [])]
     credential = spec.get("credential")
+    enabled_env = spec.get("enabled_env")
+    enabled = env_flag(str(enabled_env), default=True) if enabled_env else True
+    tier = str(spec.get("tier") or "unknown")
     base: dict[str, object] = {
         "source_id": source_id,
         "name": str(spec.get("name") or source_id),
         "lane_ids": lane_ids,
         "classes": configured_classes,
         "group": str(spec.get("group") or source_id),
-        "tier": str(spec.get("tier") or "unknown"),
+        "tier": tier,
         "authoritative": bool(spec.get("authoritative", True)),
         "active": bool(spec.get("active", True)),
+        "enabled_env": str(enabled_env) if enabled_env else None,
+        "enabled": enabled,
         "credential_env": str(credential) if credential else None,
         "credential_configured": bool(not credential or os.getenv(str(credential))),
         "paper_only": True,
         "allocation_authority": False,
         "live_execution_authority": False,
     }
+    if not enabled:
+        return {
+            **base,
+            "state": "not_applicable",
+            "healthy": False,
+            "fresh": False,
+            "admitted": False,
+            "observed_at": None,
+            "age_seconds": None,
+            "freshness_ttl_seconds": evidence_freshness_seconds(
+                configured_classes,
+                fallback_seconds=fallback_seconds,
+            ),
+            "item_count": 0,
+            "error_type": None,
+            "source_reference": None,
+            "status_reason": "disabled_by_runtime_provider_policy",
+        }
     if credential and not os.getenv(str(credential)):
         return {
             **base,
@@ -138,9 +162,10 @@ def _source_row(
 
     latest = _latest_candidate(candidates)
     if latest is None:
+        state = "awaiting_endogenous" if tier == "internal" else "unobserved"
         return {
             **base,
-            "state": "unobserved",
+            "state": state,
             "healthy": False,
             "fresh": False,
             "admitted": False,
@@ -153,6 +178,11 @@ def _source_row(
             "item_count": 0,
             "error_type": None,
             "source_reference": None,
+            "status_reason": (
+                "generated_only_after_governed_activity"
+                if tier == "internal"
+                else None
+            ),
         }
 
     observed_at = latest.get("observed_at")
@@ -208,11 +238,14 @@ def read_source_connectivity(
             "read_error_type": type(exc).__name__,
             "summary": {
                 "configured": len(SOURCES),
+                "connectivity_configured": 0,
                 "healthy": 0,
                 "stale": 0,
                 "failed": 0,
                 "unobserved": 0,
+                "awaiting_endogenous": 0,
                 "credential_required": 0,
+                "not_applicable": 0,
                 "admitted": 0,
             },
             "sources": [],
@@ -234,14 +267,24 @@ def read_source_connectivity(
         )
         for spec in SOURCES
     ]
+    connectivity_rows = [
+        row
+        for row in rows
+        if row.get("tier") != "internal" and row.get("state") != "not_applicable"
+    ]
     counts = {
         "configured": len(rows),
-        "healthy": sum(row.get("state") == "healthy" for row in rows),
-        "stale": sum(row.get("state") == "stale" for row in rows),
-        "failed": sum(row.get("state") == "failed" for row in rows),
-        "unobserved": sum(row.get("state") == "unobserved" for row in rows),
-        "credential_required": sum(row.get("state") == "credential_required" for row in rows),
-        "admitted": sum(bool(row.get("admitted")) for row in rows),
+        "connectivity_configured": len(connectivity_rows),
+        "healthy": sum(row.get("state") == "healthy" for row in connectivity_rows),
+        "stale": sum(row.get("state") == "stale" for row in connectivity_rows),
+        "failed": sum(row.get("state") == "failed" for row in connectivity_rows),
+        "unobserved": sum(row.get("state") == "unobserved" for row in connectivity_rows),
+        "awaiting_endogenous": sum(row.get("state") == "awaiting_endogenous" for row in rows),
+        "credential_required": sum(
+            row.get("state") == "credential_required" for row in connectivity_rows
+        ),
+        "not_applicable": sum(row.get("state") == "not_applicable" for row in rows),
+        "admitted": sum(bool(row.get("admitted")) for row in connectivity_rows),
     }
     return {
         "available": True,
