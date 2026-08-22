@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Probe production dashboard contract
+      - name: Probe production dashboard and bottlenecks
         shell: bash
         run: |
           set -u
@@ -30,8 +30,32 @@ jobs:
           PY
           echo "=== HEALTH ==="
           curl -sS --max-time 20 -o /tmp/health.json "$BASE/health" || true
-          cat /tmp/health.json 2>/dev/null || true
-          echo
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('/tmp/health.json')
+          data=json.loads(p.read_text()) if p.exists() and p.read_text().strip() else {}
+          print('release_commit=',data.get('release_commit'),'version=',data.get('version'),'final_router=',data.get('dashboard_final_router_rebuilt'))
+          workers=((data.get('runtime_heartbeats') or {}).get('workers') or {})
+          for name,row in workers.items():
+              print('worker',name,'state=',row.get('state'),'available=',row.get('available'),'stale=',row.get('stale'),'age=',row.get('age_seconds'),'error=',row.get('error_type'),'at=',row.get('observed_at'))
+          PY
+          echo "=== V5 MECHANISM TRUTH ==="
+          curl -sS --max-time 30 -o /tmp/v5.json "$BASE/v3/dashboard/v5-snapshot" || true
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('/tmp/v5.json')
+          data=json.loads(p.read_text()) if p.exists() and p.read_text().strip() else {}
+          print('generated_at=',data.get('generated_at'),'release=',data.get('release_commit'))
+          print('summary=',json.dumps(data.get('summary') or {},sort_keys=True))
+          print('system=',json.dumps(data.get('system') or {},sort_keys=True))
+          keys=['mechanism_id','status','provider_status','evidence_status','source_state','source_item_count','source_age_seconds','independent_source_count','missing_evidence_classes','research_status','research_worker_state','research_worker_error','research_last_at','research_due_at','research_due_state','persisted_state','stage','raw_candidate_count','emitted_candidate_count','signal_count','forward_outcome_count','forward_target','qualified_count','paper_capable','settled_count','certified','mean_forward_net_return','forward_hit_rate','best_net_economics','required_net_economics','gap_to_hurdle','dominant_rejection_gate','primary_blocker','next_action']
+          for card in data.get('cards') or []:
+              print('CARD',json.dumps({k:card.get(k) for k in keys},sort_keys=True))
+          PY
+          echo "=== WORKER IMPLEMENTATION REFERENCES ==="
+          grep -R -n -E 'priority-source-refresh-plane|mechanism-forward-evidence|alpha-l2-research-sampling' src tests || true
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
