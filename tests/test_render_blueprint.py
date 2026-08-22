@@ -13,10 +13,19 @@ def test_render_blueprint_defines_single_paid_combined_runtime():
     runtime = services["cie-shadow-worker"]
     assert runtime["type"] == "web"
     assert runtime["plan"] == "standard"
-    assert runtime["startCommand"] == "python -m inefficiency_engine.render_combined_card_history"
-    wrapper = Path("src/inefficiency_engine/render_combined_card_history.py").read_text()
-    assert "return _base.main()" in wrapper
-    assert 'inefficiency_engine.read_api_card_history_deploy:app' in wrapper
+    assert runtime["startCommand"] == "python -m inefficiency_engine.render_combined"
+
+    canonical = Path("src/inefficiency_engine/render_combined.py").read_text()
+    assert 'CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"' in canonical
+    assert "render_combined_runtime" in canonical
+
+    # Keep the former Blueprint command as a compatibility alias so an existing
+    # Render service cannot fall back to the old dashboard application while its
+    # service-level command catches up with the repository Blueprint.
+    compatibility = Path("src/inefficiency_engine/render_combined_card_history.py").read_text()
+    assert "from inefficiency_engine.render_combined import API_APP, main" in compatibility
+    assert "_base.API_APP" not in compatibility
+
     assert runtime["healthCheckPath"] == "/health"
     assert runtime["autoDeployTrigger"] == "checksPass"
     assert runtime["buildCommand"] == "python -m pip install --retries 5 --timeout 30 ."

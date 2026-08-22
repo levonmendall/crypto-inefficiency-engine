@@ -11,9 +11,12 @@ from inefficiency_engine.dashboard_card_history import (
 )
 
 
+CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"
 app = _base.app
 
-_REPLACED_PATHS = {"/", "/dashboard", "/v3/dashboard/snapshot"}
+# Own every route needed to prove the dashboard contract is actually active.  The
+# base read plane still supplies the underlying persisted data and runtime health.
+_REPLACED_PATHS = {"/", "/dashboard", "/health", "/ready", "/v3/dashboard/snapshot"}
 app.router.routes[:] = [
     route
     for route in app.router.routes
@@ -31,7 +34,22 @@ def _html_headers() -> dict[str, str]:
         "Pragma": "no-cache",
         "Expires": "0",
         "X-Dashboard-Contract": DASHBOARD_UI_CONTRACT_VERSION,
+        "X-Canonical-API-App": CANONICAL_API_APP,
     }
+
+
+def _runtime_contract(payload: dict[str, object]) -> dict[str, object]:
+    result = dict(payload)
+    result.update(
+        {
+            "dashboard_contract_active": True,
+            "dashboard_ui_contract_version": DASHBOARD_UI_CONTRACT_VERSION,
+            "canonical_api_app": CANONICAL_API_APP,
+            "dashboard_card_truth_resolver_active": True,
+            "dashboard_history_preserving": True,
+        }
+    )
+    return result
 
 
 @app.get("/", include_in_schema=False, response_class=HTMLResponse)
@@ -42,6 +60,16 @@ def dashboard_root() -> HTMLResponse:
 @app.get("/dashboard", include_in_schema=False, response_class=HTMLResponse)
 def portfolio_dashboard() -> HTMLResponse:
     return HTMLResponse(CARD_HISTORY_DASHBOARD_HTML, headers=_html_headers())
+
+
+@app.get("/health")
+def deployment_health():
+    return _runtime_contract(dict(_base.deployment_health()))
+
+
+@app.get("/ready")
+def deployment_readiness():
+    return _runtime_contract(dict(_base.deployment_readiness()))
 
 
 @app.get("/v3/dashboard/snapshot")
@@ -56,5 +84,11 @@ def dashboard_snapshot():
             detail="history-preserving dashboard snapshot is temporarily unavailable",
         ) from exc
     result = restore_card_history_truth(dict(payload))
-    result["dashboard_ui_contract_version"] = DASHBOARD_UI_CONTRACT_VERSION
+    result.update(
+        {
+            "dashboard_contract_active": True,
+            "dashboard_ui_contract_version": DASHBOARD_UI_CONTRACT_VERSION,
+            "canonical_api_app": CANONICAL_API_APP,
+        }
+    )
     return result
