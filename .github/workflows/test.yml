@@ -13,12 +13,46 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Probe production dashboard contract
+        shell: bash
+        run: |
+          set -u
+          BASE="https://cie-shadow-worker-m0sc.onrender.com"
+          echo "=== ROOT ==="
+          curl -sS --max-time 20 -D /tmp/root.headers -o /tmp/root.html "$BASE/" || true
+          cat /tmp/root.headers 2>/dev/null || true
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('/tmp/root.html').read_text(errors='replace') if Path('/tmp/root.html').exists() else ''
+          print('root_bytes=', len(text))
+          for marker in ['Evidence accumulation', 'Mechanism truth', 'v5_mechanism_truth']:
+              print(f'{marker!r}:', marker in text)
+          PY
+          echo "=== HEALTH ==="
+          curl -sS --max-time 20 -o /tmp/health.json "$BASE/health" || true
+          cat /tmp/health.json 2>/dev/null || true
+          echo
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
       - name: Install
         run: python -m pip install -e '.[dev]'
+      - name: Verify ASGI dashboard dispatch
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          from fastapi.testclient import TestClient
+          from inefficiency_engine.read_api_card_history_deploy import app
+          response = TestClient(app).get('/')
+          print('status=', response.status_code)
+          print('contract=', response.headers.get('x-dashboard-contract'))
+          print('v5=', 'Mechanism truth' in response.text)
+          print('legacy=', 'Evidence accumulation' in response.text)
+          assert response.status_code == 200
+          assert response.headers.get('x-dashboard-contract') == 'v5_mechanism_truth'
+          assert 'Mechanism truth' in response.text
+          assert 'Evidence accumulation' not in response.text
+          PY
       - name: Test
         run: python -m pytest -q
       - name: Compile
