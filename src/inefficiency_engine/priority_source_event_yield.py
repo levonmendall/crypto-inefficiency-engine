@@ -127,7 +127,7 @@ async def collect_snapshot_governance(coverage: SourceCoveragePlane, alpha_facto
 async def collect_morpho_markets(coverage: SourceCoveragePlane, yield_service) -> SourceProbeResult:
     query = '''query SourceCoverageMarkets {
       markets(first: 50) {
-        items { uniqueKey loanAsset { symbol } state { supplyApy supplyAssetsUsd liquidityAssetsUsd } }
+        items { marketId loanAsset { symbol } state { supplyApy supplyAssetsUsd liquidityAssetsUsd } }
       }
     }'''
     async with httpx.AsyncClient(timeout=8.0, headers={"Cache-Control":"no-cache","User-Agent":"crypto-inefficiency-engine/source-coverage"}) as client:
