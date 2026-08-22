@@ -42,6 +42,9 @@ app.openapi_schema = None
 _PRODUCTION_EVIDENCE_DISCONNECTED = {"capital_location_settlement"}
 _RUNTIME_HEARTBEATS = {
     "portfolio": "canonical-portfolio-operating-loop",
+    "permanent_source": "canonical-source-operating-loop",
+    "volume_universe": "volume-universe-lightweight-refresh",
+    "market_universe_routing": "market-universe-routing",
     "research": "shadow-research-auxiliary",
     "heavy_worker": "disposable-heavy-work",
     "source_refresh": "priority-source-refresh-plane",
@@ -389,9 +392,6 @@ def dashboard_snapshot():
             },
         ) from exc
 
-    # Source truth is a presentation/diagnostic overlay. If its bounded persisted read
-    # fails, preserve the canonical portfolio snapshot and make the degradation
-    # explicit instead of taking the entire command center down.
     try:
         payload = overlay_dashboard_source_truth(store, payload)
     except Exception as exc:
