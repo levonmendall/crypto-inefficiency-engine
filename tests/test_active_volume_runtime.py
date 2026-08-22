@@ -229,7 +229,7 @@ def test_active_history_maintenance_uses_resolved_top25(monkeypatch, tmp_path):
 def test_render_combined_keeps_active_history_disposable():
     permanent = child_commands("10000")
     disposable = heavy_commands()
-    assert API_APP == "inefficiency_engine.read_api_active_volume_deploy:app"
+    assert API_APP == "inefficiency_engine.read_api_card_history_deploy:app"
     assert "history" not in permanent
     assert disposable["history"][-2] == "inefficiency_engine.disposable_heavy_job"
     assert disposable["history"][-1] == "history"
