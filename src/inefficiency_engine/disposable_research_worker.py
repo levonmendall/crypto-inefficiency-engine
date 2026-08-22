@@ -114,6 +114,7 @@ async def run_disposable_research_cycle(
         "all_lane_evidence_velocity_runtime": True,
         "release_d_lane_success_runtime": True,
         "progress_heartbeat_contract": True,
+        "critical_evidence_before_heavy_tail": True,
         "paper_only": True,
     }
     progress_index = 0
@@ -184,6 +185,24 @@ async def run_disposable_research_cycle(
             detail[f"research_projection_{stage}_error_type"] = type(exc).__name__
             return False
 
+    def _reconcile_and_publish(stage: str) -> None:
+        """Make newly persisted critical evidence visible before optional heavy work."""
+
+        _record_progress(f"{stage}_runtime_reconciliation")
+        try:
+            reconciled = operating_certification.reconcile_latest_runtime_truth()
+            detail[f"{stage}_lane_reconciliation_complete"] = reconciled is not None
+            if reconciled is not None:
+                detail[f"{stage}_operating_snapshot_id"] = reconciled.snapshot_id
+                detail[f"{stage}_operating_observed_at"] = reconciled.observed_at.isoformat()
+        except Exception as exc:
+            detail[f"{stage}_lane_reconciliation_complete"] = False
+            detail[f"{stage}_lane_reconciliation_error_type"] = type(exc).__name__
+        gc.collect()
+        _record_progress(f"{stage}_runtime_reconciliation_complete")
+        _publish_research_projection(stage)
+        _record_progress(f"{stage}_projection_published")
+
     _record_progress("cycle_start")
     # Publish the latest durable research truth before optional/network-heavy work.
     # This refreshes presentation liveness only: evidence timestamps, readiness,
@@ -192,11 +211,10 @@ async def run_disposable_research_cycle(
     _publish_research_projection("cycle_start")
     _record_progress("dashboard_projection_start_complete")
 
-    # Bootstrap source truth periodically. The alpha/mechanism cycle performs an
-    # additional source refresh immediately before evidence generation, so short-
-    # lived trade-flow/liquidation evidence cannot expire merely because of the
-    # sequential disposable scheduler.
-    if sequence == 1 or sequence % 10 == 1:
+    # Bootstrap source truth periodically. This now happens before the heavy shadow
+    # tail and is published immediately, so a later optional stall cannot leave the
+    # dashboard showing source truth from an older successful process.
+    if sequence == 1 or sequence % alpha_every == 1:
         _record_progress("provider_gap_bootstrap")
         try:
             bootstrap = await operating_certification.provider_gap_collection.run_cycle()
@@ -217,6 +235,50 @@ async def run_disposable_research_cycle(
             detail["provider_gap_bootstrap_error_type"] = type(exc).__name__
         gc.collect()
         _record_progress("provider_gap_bootstrap_complete")
+        _reconcile_and_publish("source_bootstrap")
+
+    # Dashboard-critical evidence must run before the long optional research tail.
+    # Cadence and all qualification/allocation thresholds are unchanged. Source TTLs
+    # continue to bound network work. The immediate projection publication ensures
+    # source, candidate, forward, and mechanism-worker progress survives a later
+    # disposable-process timeout or memory termination.
+    if _due(sequence, alpha_every, 0.75):
+        _record_progress("pre_alpha_source_refresh")
+        try:
+            source_refresh = await operating_certification.provider_gap_collection.run_cycle()
+            refresh_state = source_refresh.get("source_refresh", {}) if isinstance(source_refresh, dict) else {}
+            detail["pre_alpha_source_refresh_complete"] = True
+            if isinstance(refresh_state, dict):
+                detail["pre_alpha_source_refresh_state"] = refresh_state.get("state")
+                detail["pre_alpha_source_refresh_failed_sources"] = list(
+                    refresh_state.get("failed_sources") or []
+                )
+                detail["pre_alpha_source_refresh_deferred_sources"] = list(
+                    refresh_state.get("memory_deferred_sources") or []
+                )
+        except Exception as exc:
+            detail["pre_alpha_source_refresh_complete"] = False
+            detail["pre_alpha_source_refresh_error_type"] = type(exc).__name__
+        gc.collect()
+        _record_progress("pre_alpha_source_refresh_complete")
+
+        _record_progress("alpha_forward_evidence")
+        try:
+            value = await alpha_factory.run_evidence_cycle()
+            detail["alpha_candidate_count"] = value.candidate_count
+            detail["alpha_signals_recorded"] = value.signals_recorded
+            detail["alpha_outcomes_matured"] = value.outcomes_matured
+            mechanism = alpha_factory.mechanism_execution.readiness_summary()
+            detail["mechanism_forward_outcomes"] = {
+                lane: int(row.get("forward_outcome_count") or 0)
+                for lane, row in mechanism.items()
+            }
+            del value
+        except Exception as exc:
+            detail["alpha_forward_evidence_error_type"] = type(exc).__name__
+        gc.collect()
+        _record_progress("alpha_forward_evidence_complete")
+        _reconcile_and_publish("critical_evidence")
 
     _record_progress("core_shadow")
     try:
@@ -327,46 +389,6 @@ async def run_disposable_research_cycle(
             detail["allocation_certification_error_type"] = type(exc).__name__
         gc.collect()
         _record_progress("allocation_certification_complete")
-
-    if _due(sequence, alpha_every, 0.75):
-        # Refresh short-lived provider evidence at the exact decision point where
-        # alpha and native mechanism forward trials consume it. Source-specific
-        # collector TTLs still prevent unnecessary network requests.
-        _record_progress("pre_alpha_source_refresh")
-        try:
-            source_refresh = await operating_certification.provider_gap_collection.run_cycle()
-            refresh_state = source_refresh.get("source_refresh", {}) if isinstance(source_refresh, dict) else {}
-            detail["pre_alpha_source_refresh_complete"] = True
-            if isinstance(refresh_state, dict):
-                detail["pre_alpha_source_refresh_state"] = refresh_state.get("state")
-                detail["pre_alpha_source_refresh_failed_sources"] = list(
-                    refresh_state.get("failed_sources") or []
-                )
-                detail["pre_alpha_source_refresh_deferred_sources"] = list(
-                    refresh_state.get("memory_deferred_sources") or []
-                )
-        except Exception as exc:
-            detail["pre_alpha_source_refresh_complete"] = False
-            detail["pre_alpha_source_refresh_error_type"] = type(exc).__name__
-        gc.collect()
-        _record_progress("pre_alpha_source_refresh_complete")
-
-        _record_progress("alpha_forward_evidence")
-        try:
-            value = await alpha_factory.run_evidence_cycle()
-            detail["alpha_candidate_count"] = value.candidate_count
-            detail["alpha_signals_recorded"] = value.signals_recorded
-            detail["alpha_outcomes_matured"] = value.outcomes_matured
-            mechanism = alpha_factory.mechanism_execution.readiness_summary()
-            detail["mechanism_forward_outcomes"] = {
-                lane: int(row.get("forward_outcome_count") or 0)
-                for lane, row in mechanism.items()
-            }
-            del value
-        except Exception as exc:
-            detail["alpha_forward_evidence_error_type"] = type(exc).__name__
-        gc.collect()
-        _record_progress("alpha_forward_evidence_complete")
 
     if sequence % frontier_every == 0:
         _record_progress("dex_route_frontier")
