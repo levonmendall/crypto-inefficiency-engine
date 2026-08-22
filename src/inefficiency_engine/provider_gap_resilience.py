@@ -17,6 +17,7 @@ from inefficiency_engine.provider_gap_collection import (
     ProviderProbeResult,
     _safe_reference,
 )
+from inefficiency_engine.runtime_provider_policy import bybit_public_enabled
 
 
 COINBASE_PRODUCTS_URL = "https://api.exchange.coinbase.com/products"
@@ -112,16 +113,24 @@ class ResilientProviderGapCollectionService(ProviderGapCollectionService):
 
     def _failure_sources(self, mechanism_id: str) -> list[tuple[str, str]]:
         if mechanism_id == "event_driven":
-            return [
-                (self.BYBIT_CATALOG_PROVIDER, f"{BYBIT_BASE_URLS[0]}/v5/market/instruments-info"),
-                (self.COINBASE_CATALOG_PROVIDER, COINBASE_PRODUCTS_URL),
-            ]
+            rows = [(self.COINBASE_CATALOG_PROVIDER, COINBASE_PRODUCTS_URL)]
+            if bybit_public_enabled():
+                rows.insert(
+                    0,
+                    (
+                        self.BYBIT_CATALOG_PROVIDER,
+                        f"{BYBIT_BASE_URLS[0]}/v5/market/instruments-info",
+                    ),
+                )
+            return rows
         if mechanism_id == "liquidation_distress":
-            return [
-                (self.BYBIT_ADL_PROVIDER, f"{BYBIT_BASE_URLS[0]}/v5/market/adlAlert"),
-                (self.BYBIT_DISTRESS_PROVIDER, f"{BYBIT_BASE_URLS[0]}/v5/market/insurance"),
-                (self.HYPERLIQUID_DISTRESS_PROVIDER, HYPERLIQUID_INFO_URL),
-            ]
+            rows = [(self.HYPERLIQUID_DISTRESS_PROVIDER, HYPERLIQUID_INFO_URL)]
+            if bybit_public_enabled():
+                rows[:0] = [
+                    (self.BYBIT_ADL_PROVIDER, f"{BYBIT_BASE_URLS[0]}/v5/market/adlAlert"),
+                    (self.BYBIT_DISTRESS_PROVIDER, f"{BYBIT_BASE_URLS[0]}/v5/market/insurance"),
+                ]
+            return rows
         return []
 
     async def run_cycle(self) -> dict[str, object]:
@@ -222,6 +231,12 @@ class ResilientProviderGapCollectionService(ProviderGapCollectionService):
         }
 
     async def _collect_bybit_catalog(self) -> ProviderProbeResult:
+        if not bybit_public_enabled():
+            probe = await self._collect_coinbase_catalog()
+            probe.detail["fallback_reason"] = "Bybit public surfaces disabled by runtime provider policy"
+            probe.detail["policy_disabled_provider"] = "bybit"
+            return probe
+
         failures: list[dict[str, object]] = []
         try:
             return await super()._collect_bybit_catalog()
@@ -431,6 +446,12 @@ class ResilientProviderGapCollectionService(ProviderGapCollectionService):
         )
 
     async def _collect_bybit_distress_surface(self) -> ProviderProbeResult:
+        if not bybit_public_enabled():
+            probe = await self._collect_hyperliquid_distress_surface()
+            probe.detail["fallback_reason"] = "Bybit public surfaces disabled by runtime provider policy"
+            probe.detail["policy_disabled_provider"] = "bybit"
+            return probe
+
         failures: list[dict[str, object]] = []
         for base_url in BYBIT_BASE_URLS:
             try:
