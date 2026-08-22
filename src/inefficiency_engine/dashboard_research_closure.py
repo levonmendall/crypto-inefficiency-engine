@@ -49,6 +49,7 @@ def _build_research_closure_dashboard_html() -> str:
   if((+r?.forward_signal_count||0)>0&&(+r?.independent_forward_outcome_count||0)===0)return 'Awaiting forward outcomes';
   if(r?.state==='certified')return 'Certified';if(r?.state==='certifying')return 'Certifying';return 'Collecting evidence';
 }
+function providerCardValue(r){const status=String(r?.card_truth?.provider_status||'');if(status==='connected')return 'Connected';if(status==='stale')return 'Stale';if(status==='missing')return 'Missing';return r?.provider_ready?'Connected':'Missing'}
 function forwardMeanLabel(r){const outcomes=+r?.independent_forward_outcome_count||0;if(outcomes<=0)return 'Awaiting outcomes';return Number.isFinite(+r?.mean_forward_net_return)?pct(r.mean_forward_net_return):'Outcome metric pending'}
 function renderEvidenceProgress(rows,requirements,observedAt,laneTruth){""",
     )
@@ -70,7 +71,7 @@ function renderEvidenceProgress(rows,requirements,observedAt,laneTruth){""",
     html = _replace_once(
         html,
         "${evidenceStep('Provider',r.provider_ready?'Ready':'Gap',`${obs} authoritative`,providerCls)}",
-        "${evidenceStep('Provider',r.provider_ready?'Connected':'Missing',`${phase} · ${obs} authoritative`,providerCls)}",
+        "${evidenceStep('Provider',providerCardValue(r),`${phase} · ${obs} current authoritative`,providerCls)}",
     )
     html = _replace_once(
         html,
