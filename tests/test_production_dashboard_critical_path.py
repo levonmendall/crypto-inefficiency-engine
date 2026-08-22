@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import pytest
+from fastapi import HTTPException
+
 from inefficiency_engine import read_api_active_volume_deploy as deploy
+from inefficiency_engine import production_dashboard_fastpath as fastpath
 from inefficiency_engine.canonical_paper_portfolio import CanonicalPaperPortfolioLedger
 from inefficiency_engine.dashboard_projection import DashboardProjectionLedger
 from inefficiency_engine.evidence import EvidenceStore
@@ -92,3 +96,71 @@ def test_exact_render_dashboard_prefers_compact_projection_without_durable_rebui
     assert payload["critical_path_persisted_only"] is True
     assert payload["request_time_research_computation"] is False
     assert payload.get("presentation_fallback") is not True
+
+
+def test_compact_projection_read_gets_one_bounded_retry_before_reconstruction(monkeypatch):
+    calls: list[tuple[int, int]] = []
+
+    def compact(_store, *, statement_timeout_ms=fastpath.DEFAULT_COMPACT_READ_TIMEOUT_MS, lock_timeout_ms=500):
+        calls.append((statement_timeout_ms, lock_timeout_ms))
+        if len(calls) == 1:
+            return None, None, "OperationalError"
+        return {"portfolio": {"available": True}}, None, None
+
+    monkeypatch.setattr(fastpath, "_read_compact_projections", compact)
+    monkeypatch.setattr(
+        fastpath,
+        "build_dashboard_projection",
+        _forbidden("successful compact retry must avoid durable reconstruction"),
+    )
+
+    payload = fastpath.build_production_dashboard_snapshot(object())
+
+    assert calls == [
+        (fastpath.DEFAULT_COMPACT_READ_TIMEOUT_MS, 500),
+        (fastpath.RETRY_COMPACT_READ_TIMEOUT_MS, 1000),
+    ]
+    assert payload["compact_projection_read_retry_used"] is True
+    assert payload["compact_projection_read_initial_error_type"] == "OperationalError"
+    assert payload["compact_projection_read_retry_error_type"] is None
+    assert payload["presentation_fallback"] if "presentation_fallback" in payload else True
+
+
+def test_snapshot_503_identifies_fastpath_stage_and_error_type(monkeypatch):
+    monkeypatch.setattr(deploy, "_store", lambda: object())
+
+    def fail(*_args, **_kwargs):
+        try:
+            raise TimeoutError("db timeout")
+        except TimeoutError as cause:
+            raise RuntimeError("bounded dashboard read failed") from cause
+
+    monkeypatch.setattr(deploy, "build_production_dashboard_snapshot", fail)
+
+    with pytest.raises(HTTPException) as caught:
+        deploy.dashboard_snapshot()
+
+    assert caught.value.status_code == 503
+    assert caught.value.detail["stage"] == "production_dashboard_fastpath"
+    assert caught.value.detail["error_type"] == "RuntimeError"
+    assert caught.value.detail["cause_type"] == "TimeoutError"
+
+
+def test_source_connectivity_endpoint_is_independent_of_main_snapshot(monkeypatch):
+    monkeypatch.setattr(deploy, "_store", lambda: object())
+    monkeypatch.setattr(
+        deploy,
+        "read_source_connectivity",
+        lambda _store: {
+            "available": True,
+            "summary": {"configured": 2, "healthy": 1, "stale": 1},
+            "sources": [{"source_id": "a", "state": "healthy"}],
+        },
+    )
+
+    payload = deploy.source_connectivity()
+
+    assert payload["available"] is True
+    assert payload["summary"]["stale"] == 1
+    assert payload["diagnostic_only"] is True
+    assert payload["live_execution_authority"] is False or "live_execution_authority" not in payload
