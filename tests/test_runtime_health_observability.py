@@ -31,12 +31,28 @@ def test_lane_fast_summary_reports_production_connectivity_separately():
     ]
 
 
+def test_runtime_contract_includes_permanent_source_and_universe_routing():
+    assert deploy._RUNTIME_HEARTBEATS["permanent_source"] == "canonical-source-operating-loop"
+    assert deploy._RUNTIME_HEARTBEATS["volume_universe"] == "volume-universe-lightweight-refresh"
+    assert deploy._RUNTIME_HEARTBEATS["market_universe_routing"] == "market-universe-routing"
+
+
 def test_runtime_heartbeat_payload_exposes_degraded_and_stale_without_raising(monkeypatch):
     rows = {
         "canonical-portfolio-operating-loop": SimpleNamespace(
             state="success",
             error_type=None,
             observed_at=NOW,
+        ),
+        "canonical-source-operating-loop": SimpleNamespace(
+            state="degraded",
+            error_type="ProviderSubsystemDegraded",
+            observed_at=NOW - timedelta(seconds=20),
+        ),
+        "market-universe-routing": SimpleNamespace(
+            state="degraded",
+            error_type="VolumeUniverseUnavailableError",
+            observed_at=NOW - timedelta(seconds=10),
         ),
         "shadow-research-auxiliary": SimpleNamespace(
             state="degraded",
@@ -55,6 +71,9 @@ def test_runtime_heartbeat_payload_exposes_degraded_and_stale_without_raising(mo
     assert payload["diagnostic_only"] is True
     assert payload["liveness_authority"] is False
     assert payload["workers"]["portfolio"]["state"] == "success"
+    assert payload["workers"]["permanent_source"]["state"] == "degraded"
+    assert payload["workers"]["permanent_source"]["stale"] is False
+    assert payload["workers"]["market_universe_routing"]["error_type"] == "VolumeUniverseUnavailableError"
     assert payload["workers"]["research"]["state"] == "degraded"
     assert payload["workers"]["research"]["stale"] is True
     assert payload["workers"]["research"]["error_type"] == "ResearchSubsystemDegraded"
@@ -63,5 +82,8 @@ def test_runtime_heartbeat_payload_exposes_degraded_and_stale_without_raising(mo
 def test_unobserved_worker_is_visible_not_assumed_healthy(monkeypatch):
     monkeypatch.setattr(deploy, "_store", lambda: _Store({}))
     payload = deploy._runtime_heartbeats()
+    assert payload["workers"]["permanent_source"]["available"] is False
+    assert payload["workers"]["permanent_source"]["state"] == "unobserved"
+    assert payload["workers"]["market_universe_routing"]["available"] is False
     assert payload["workers"]["alpha_l2_sampling"]["available"] is False
     assert payload["workers"]["alpha_l2_sampling"]["state"] == "unobserved"

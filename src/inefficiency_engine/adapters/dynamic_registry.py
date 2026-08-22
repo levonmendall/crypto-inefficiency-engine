@@ -21,6 +21,7 @@ DEFAULT_ASSET_CHUNK_SIZE = 4
 DEFAULT_PROVIDER_GROUP_CONCURRENCY = 2
 DEFAULT_ORDER_BOOK_BATCH_SIZE = 4
 DEFAULT_MAX_ORDER_BOOK_LEVELS = 100
+MARKET_UNIVERSE_ROUTING_WORKER_ID = "market-universe-routing"
 
 
 def _chunks(values: tuple[str, ...], size: int) -> tuple[tuple[str, ...], ...]:
@@ -28,19 +29,17 @@ def _chunks(values: tuple[str, ...], size: int) -> tuple[tuple[str, ...], ...]:
 
 
 class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
-    """Top-volume public-data registry with universe-size-independent peak work.
+    """Bounded public-data registry with universe routing separated from acquisition.
 
-    The liquid universe is expected to grow to at least 40 assets. The registry
-    therefore bounds provider fanout by asset chunks and bounds L2 acquisition by
-    batches instead of allowing concurrency to scale with universe size. Full-depth
-    provider responses are reduced to a conservative top-of-book depth window before
-    they are retained for qualification. If process RSS reaches the soft budget,
-    remaining L2 work fails closed instead of risking a Render OOM restart.
+    The validated top-volume universe controls research eligibility and managed CEX
+    routing when available. It is not allowed to become a kill switch for raw public
+    data acquisition: if universe resolution is unavailable, providers continue on
+    their last-known managed assets (or the constructor seed on first boot). Those
+    fallback observations carry no research-universe authority by themselves.
 
-    Hyperliquid remains full-universe. Only default-managed Coinbase, Bybit,
-    Kraken and OKX adapters are updated; explicitly supplied/custom adapters are
-    never mutated. Universe selection is research routing only and creates no
-    allocation or execution authority.
+    Provider fanout and L2 acquisition remain bounded so universe size does not make
+    peak memory scale without limit. Bybit runtime policy and all downstream source,
+    qualification, allocation and execution gates remain unchanged.
     """
 
     def __init__(
@@ -66,6 +65,8 @@ class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
         self._managed_bybit = bybit is None
         self._managed_kraken = kraken is None
         self._managed_okx = okx is None
+        self._universe_routing_state = "unobserved"
+        self._universe_routing_error_type: str | None = None
         self.asset_chunk_size = max(
             1,
             int(os.getenv("CIE_MARKET_ASSET_CHUNK_SIZE", str(asset_chunk_size))),
@@ -122,13 +123,65 @@ class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
                 },
             )
         except Exception:
-            # Memory telemetry must never become market-data authority.
             pass
+
+    def _record_universe_routing(
+        self,
+        *,
+        state: str,
+        assets: tuple[str, ...],
+        error_type: str | None = None,
+    ) -> None:
+        self._universe_routing_state = state
+        self._universe_routing_error_type = error_type
+        if self.evidence_store is None:
+            return
+        try:
+            self.evidence_store.record_worker_heartbeat(
+                worker_id=MARKET_UNIVERSE_ROUTING_WORKER_ID,
+                state="success" if state == "authoritative" else "degraded",
+                error_type=error_type,
+                detail={
+                    "routing_state": state,
+                    "asset_count": len(assets),
+                    "assets": list(assets),
+                    "raw_acquisition_continues": True,
+                    "fallback_has_research_universe_authority": False,
+                    "qualification_thresholds_unchanged": True,
+                    "paper_only": True,
+                    "allocation_authority": False,
+                    "live_execution_authority": False,
+                },
+            )
+        except Exception:
+            pass
+
+    def _fallback_managed_assets(self) -> tuple[str, ...]:
+        candidates = (
+            tuple(getattr(self.coinbase, "assets", ()) or ()),
+            tuple(getattr(self.kraken, "assets", ()) or ()),
+            tuple(getattr(self.okx, "assets", ()) or ()),
+        )
+        for values in candidates:
+            cleaned = tuple(str(value).upper().strip() for value in values if str(value).strip())
+            if cleaned:
+                return cleaned
+        return ("BTC",)
 
     async def _refresh_managed_assets(self) -> tuple[str, ...] | None:
         if self.evidence_store is None:
             return None
-        assets = await resolve_top_volume_assets(self.evidence_store)
+        try:
+            assets = await resolve_top_volume_assets(self.evidence_store)
+        except Exception as exc:
+            fallback = self._fallback_managed_assets()
+            self._record_universe_routing(
+                state="fallback_acquisition_only",
+                assets=fallback,
+                error_type=type(exc).__name__,
+            )
+            return None
+
         if self._managed_coinbase:
             self.coinbase.assets = assets
         if self._managed_bybit and self.bybit_public_enabled:
@@ -137,6 +190,7 @@ class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
             self.kraken.assets = assets
         if self._managed_okx:
             self.okx.assets = assets
+        self._record_universe_routing(state="authoritative", assets=assets)
         return assets
 
     async def _chunked_market_surface(
@@ -219,7 +273,7 @@ class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
         self,
     ) -> tuple[list[FundingQuote], list[MarketQuote], list[ProviderStatus]]:
         refreshed = await self._refresh_managed_assets()
-        universe = refreshed or tuple(getattr(self.coinbase, "assets", ()))
+        universe = refreshed or self._fallback_managed_assets()
         gate = asyncio.Semaphore(self.provider_group_concurrency)
 
         async def gated(factory):
@@ -305,6 +359,10 @@ class DynamicVolumePublicAdapterRegistry(PublicAdapterRegistry):
         self._record_memory(
             "market_inputs_complete",
             universe_asset_count=len(universe),
+            universe_routing_state=self._universe_routing_state,
+            universe_routing_error_type=self._universe_routing_error_type,
+            raw_acquisition_continues=True,
+            fallback_has_research_universe_authority=False,
             market_quote_count=len(market_quotes),
             funding_quote_count=len(funding_quotes),
         )

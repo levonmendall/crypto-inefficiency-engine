@@ -104,6 +104,14 @@ class ScalableFakeAdapter:
             self.active_books -= 1
 
 
+class HeartbeatStore:
+    def __init__(self):
+        self.rows: list[dict[str, object]] = []
+
+    def record_worker_heartbeat(self, **payload):
+        self.rows.append(dict(payload))
+
+
 def registry(assets: tuple[str, ...], **kwargs) -> tuple[DynamicVolumePublicAdapterRegistry, dict[str, ScalableFakeAdapter]]:
     adapters = {
         "hyperliquid": ScalableFakeAdapter("HlPerp", assets),
@@ -158,7 +166,6 @@ def opportunity(asset: str) -> Opportunity:
 async def test_top40_managed_cex_collection_is_chunked():
     assets = tuple(f"A{index:02d}" for index in range(40))
     value, adapters = registry(assets, asset_chunk_size=4, provider_group_concurrency=2)
-    # Simulate default-managed adapters without making public network calls.
     value._managed_coinbase = True
     value._managed_kraken = True
     value._managed_okx = True
@@ -174,6 +181,59 @@ async def test_top40_managed_cex_collection_is_chunked():
     assert tuple(adapters["coinbase"].assets) == assets
     assert tuple(adapters["kraken"].assets) == assets
     assert tuple(adapters["okx"].assets) == assets
+
+
+@pytest.mark.asyncio
+async def test_raw_collection_survives_cold_volume_universe_failure(monkeypatch):
+    assets = ("BTC", "ETH", "SOL")
+    store = HeartbeatStore()
+    adapters = {
+        "hyperliquid": ScalableFakeAdapter("HlPerp", assets),
+        "coinbase": ScalableFakeAdapter("Coinbase", assets),
+        "bybit": ScalableFakeAdapter("Bybit", assets),
+        "kraken": ScalableFakeAdapter("Kraken", assets),
+        "okx": ScalableFakeAdapter("OKX", assets),
+    }
+
+    async def unavailable(_store):
+        raise RuntimeError("cold CoinGecko bootstrap unavailable")
+
+    monkeypatch.setenv("CIE_BYBIT_PUBLIC_ENABLED", "false")
+    monkeypatch.setattr(
+        "inefficiency_engine.adapters.dynamic_registry.resolve_top_volume_assets",
+        unavailable,
+    )
+    value = DynamicVolumePublicAdapterRegistry(
+        evidence_store=store,
+        hyperliquid=adapters["hyperliquid"],
+        coinbase=adapters["coinbase"],
+        bybit=adapters["bybit"],
+        kraken=adapters["kraken"],
+        okx=adapters["okx"],
+        memory_soft_limit_mb=999999.0,
+    )
+    # Exercise the production managed-CEX routing path while keeping all provider
+    # calls local to deterministic fakes.
+    value._managed_coinbase = True
+    value._managed_kraken = True
+    value._managed_okx = True
+
+    funding, markets, statuses = await value.collect_inputs()
+
+    assert markets
+    assert funding
+    assert statuses
+    assert {quote.venue for quote in markets} >= {"HlPerp", "Coinbase", "Kraken", "OKX"}
+    routing = [row for row in store.rows if row.get("worker_id") == "market-universe-routing"]
+    assert routing
+    assert routing[-1]["state"] == "degraded"
+    assert routing[-1]["error_type"] == "RuntimeError"
+    detail = routing[-1]["detail"]
+    assert detail["routing_state"] == "fallback_acquisition_only"
+    assert detail["raw_acquisition_continues"] is True
+    assert detail["fallback_has_research_universe_authority"] is False
+    assert detail["allocation_authority"] is False
+    assert detail["live_execution_authority"] is False
 
 
 @pytest.mark.asyncio
