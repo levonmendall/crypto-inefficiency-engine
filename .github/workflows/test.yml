@@ -13,6 +13,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Probe post-repair production evidence progress
+        shell: bash
+        run: |
+          set -u
+          BASE="https://cie-shadow-worker-m0sc.onrender.com"
+          curl -sS --max-time 20 -o /tmp/health.json "$BASE/health" || true
+          curl -sS --max-time 30 -o /tmp/v5.json "$BASE/v3/dashboard/v5-snapshot" || true
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          health=json.loads(Path('/tmp/health.json').read_text()) if Path('/tmp/health.json').exists() else {}
+          snap=json.loads(Path('/tmp/v5.json').read_text()) if Path('/tmp/v5.json').exists() else {}
+          print('RELEASE',health.get('release_commit'),'VERSION',health.get('version'),'CURRENTNESS',health.get('dashboard_conclusion_currentness_active'))
+          workers=((health.get('runtime_heartbeats') or {}).get('workers') or {})
+          for name in ['research','heavy_worker','source_refresh','mechanism_forward','alpha_l2_sampling','portfolio']:
+              row=workers.get(name) or {}
+              print('WORKER',name,'available=',row.get('available'),'state=',row.get('state'),'stale=',row.get('stale'),'age=',row.get('age_seconds'),'at=',row.get('observed_at'),'error=',row.get('error_type'))
+          print('SUMMARY',json.dumps(snap.get('summary') or {},sort_keys=True))
+          print('SYSTEM',json.dumps(snap.get('system') or {},sort_keys=True))
+          for card in snap.get('cards') or []:
+              print('CARD',card.get('mechanism_id'),'status=',card.get('status'),'research=',card.get('research_status'),'state=',card.get('persisted_state'),'current=',card.get('research_conclusion_current'),'source=',card.get('provider_status'),'evidence=',card.get('evidence_status'),'items=',card.get('source_item_count'),'raw=',card.get('raw_candidate_count'),'signals=',card.get('signal_count'),'forward=',card.get('forward_outcome_count'),'qualified=',card.get('qualified_count'),'paper=',card.get('paper_capable'))
+          PY
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
