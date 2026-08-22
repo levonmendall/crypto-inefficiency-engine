@@ -12,7 +12,7 @@ services:
     branch: main
     autoDeployTrigger: checksPass
     buildCommand: python -m pip install --retries 5 --timeout 30 .
-    startCommand: python -m inefficiency_engine.render_combined
+    startCommand: python -m inefficiency_engine.render_combined_card_history
     healthCheckPath: /health
     maxShutdownDelaySeconds: 90
     envVars:
