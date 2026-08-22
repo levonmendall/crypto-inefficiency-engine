@@ -43,8 +43,6 @@ def test_read_plane_exposes_dashboard_and_durable_status_routes_only():
     }
     assert expected.issubset(paths)
 
-    # Provider-heavy and authority-adjacent manual compute surfaces stay out of the
-    # production web process. They remain available in the full development API.
     assert "/v1/opportunities/live" not in paths
     assert "/v1/executability/live" not in paths
     assert "/v1/shadow/cycle" not in paths
@@ -100,7 +98,7 @@ def test_lightweight_portfolio_worker_refreshes_projection_without_research_auth
     assert '"live_execution_authority": False' in source
 
 
-def test_render_combined_service_preserves_deployment_safe_research_read_plane():
+def test_render_combined_service_uses_standalone_v5_mechanism_truth_dashboard():
     payload = yaml.safe_load(Path("render.yaml").read_text())
     assert len(payload["services"]) == 1
     runtime = payload["services"][0]
@@ -114,22 +112,21 @@ def test_render_combined_service_preserves_deployment_safe_research_read_plane()
     assert 'CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"' in canonical
     assert "render_combined_runtime" in canonical
 
-    compatibility = Path("src/inefficiency_engine/render_combined_card_history.py").read_text()
-    assert "from inefficiency_engine.render_combined import API_APP, main" in compatibility
-    assert "_base.API_APP" not in compatibility
-
     deploy = Path("src/inefficiency_engine/read_api_card_history_deploy.py").read_text()
-    assert '"/health"' in deploy
-    assert '"/ready"' in deploy
+    assert "dashboard_cards_v5" in deploy
+    assert "DASHBOARD_V5_HTML" in deploy
+    assert "build_dashboard_v5_snapshot" in deploy
+    assert "dashboard_card_history" not in deploy
+    assert '"dashboard_inherited_card_overlay_chain_active": False' in deploy
     assert '"dashboard_contract_active": True' in deploy
-    assert '"dashboard_ui_contract_version": DASHBOARD_UI_CONTRACT_VERSION' in deploy
-    assert '"canonical_api_app": CANONICAL_API_APP' in deploy
 
-    card_truth = Path("src/inefficiency_engine/dashboard_card_history.py").read_text()
-    assert 'DASHBOARD_UI_CONTRACT_VERSION = "v4_truthful_source_runtime"' in card_truth
-    assert '"legacy_table_high_water_mark_display_authority"] = False' in card_truth
-    assert "Current source data" in card_truth
-    assert "Research overdue since" in card_truth
+    v5 = Path("src/inefficiency_engine/dashboard_cards_v5.py").read_text()
+    assert 'DASHBOARD_UI_CONTRACT_VERSION = "v5_mechanism_truth"' in v5
+    assert "function renderCard(c)" in v5
+    assert "Current source" in v5
+    assert "Raw / emitted" in v5
+    assert "Research overdue since" in v5
+    assert "_replace_once" not in v5
 
     assert runtime["healthCheckPath"] == "/health"
     assert runtime["autoDeployTrigger"] == "checksPass"
