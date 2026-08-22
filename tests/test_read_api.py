@@ -85,6 +85,17 @@ def test_reconciled_capability_truth_removes_obsolete_settlement_blockers():
     ).read_text()
 
 
+def test_lightweight_portfolio_worker_refreshes_projection_without_research_authority():
+    source = Path("src/inefficiency_engine/lightweight_portfolio_worker.py").read_text()
+    assert "ResearchDashboardProjectionLedger" in source
+    assert "_research_projection_refresh_loop" in source
+    assert "research-dashboard-projection-refresh" in source
+    assert '"research_computation": False' in source
+    assert '"provider_calls": False' in source
+    assert '"allocation_authority": False' in source
+    assert '"live_execution_authority": False' in source
+
+
 def test_render_combined_service_preserves_deployment_safe_research_read_plane():
     payload = yaml.safe_load(Path("render.yaml").read_text())
     assert len(payload["services"]) == 1
@@ -109,6 +120,12 @@ def test_render_combined_service_preserves_deployment_safe_research_read_plane()
     assert '"dashboard_contract_active": True' in deploy
     assert '"dashboard_ui_contract_version": DASHBOARD_UI_CONTRACT_VERSION' in deploy
     assert '"canonical_api_app": CANONICAL_API_APP' in deploy
+
+    card_truth = Path("src/inefficiency_engine/dashboard_card_history.py").read_text()
+    assert 'DASHBOARD_UI_CONTRACT_VERSION = "v4_truthful_source_runtime"' in card_truth
+    assert '"legacy_table_high_water_mark_display_authority"] = False' in card_truth
+    assert "Current source data" in card_truth
+    assert "Research overdue since" in card_truth
 
     assert runtime["healthCheckPath"] == "/health"
     assert runtime["autoDeployTrigger"] == "checksPass"
