@@ -34,6 +34,15 @@ services:
       # Deribit/protocol-native surfaces remain the production evidence routes.
       - key: CIE_BYBIT_PUBLIC_ENABLED
         value: "false"
+      # Public source acquisition is permanent inside the already-resident portfolio
+      # process. Heavy research/history may be memory-deferred without stopping these
+      # market, funding, L2, protocol, event, options and trade-flow refreshes.
+      - key: CIE_SOURCE_MARKET_INTERVAL_SECONDS
+        value: "30"
+      - key: CIE_SOURCE_PRIORITY_INTERVAL_SECONDS
+        value: "60"
+      - key: CIE_SOURCE_L2_ASSET_BATCH_SIZE
+        value: "4"
       - key: CIE_SHADOW_HORIZONS_SECONDS
         value: "1,5,15,30,60"
       - key: CIE_SHADOW_MAX_OPPORTUNITIES
