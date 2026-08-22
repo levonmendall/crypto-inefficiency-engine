@@ -123,7 +123,7 @@ def test_compact_projection_read_gets_one_bounded_retry_before_reconstruction(mo
     assert payload["compact_projection_read_retry_used"] is True
     assert payload["compact_projection_read_initial_error_type"] == "OperationalError"
     assert payload["compact_projection_read_retry_error_type"] is None
-    assert payload["presentation_fallback"] if "presentation_fallback" in payload else True
+    assert payload.get("presentation_fallback") is not True
 
 
 def test_snapshot_503_identifies_fastpath_stage_and_error_type(monkeypatch):
@@ -155,6 +155,7 @@ def test_source_connectivity_endpoint_is_independent_of_main_snapshot(monkeypatc
             "available": True,
             "summary": {"configured": 2, "healthy": 1, "stale": 1},
             "sources": [{"source_id": "a", "state": "healthy"}],
+            "live_execution_authority": False,
         },
     )
 
@@ -163,4 +164,4 @@ def test_source_connectivity_endpoint_is_independent_of_main_snapshot(monkeypatc
     assert payload["available"] is True
     assert payload["summary"]["stale"] == 1
     assert payload["diagnostic_only"] is True
-    assert payload["live_execution_authority"] is False or "live_execution_authority" not in payload
+    assert payload["live_execution_authority"] is False
