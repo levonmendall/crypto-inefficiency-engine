@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from inefficiency_engine.critical_evidence_recovery import (
     ALPHA_L2_WORKER_ID,
+    DEFAULT_CRITICAL_EVIDENCE_RECOVERY_STALE_SECONDS,
     MECHANISM_FORWARD_WORKER_ID,
     SOURCE_REFRESH_WORKER_ID,
     critical_evidence_recovery_status,
@@ -31,6 +32,10 @@ def _heartbeat(*, age_seconds: float, state: str = "success", error_type=None):
     )
 
 
+def test_default_recovery_window_matches_production_freshness_budget():
+    assert DEFAULT_CRITICAL_EVIDENCE_RECOVERY_STALE_SECONDS == 180.0
+
+
 def test_unobserved_critical_workers_force_bounded_recovery():
     status = critical_evidence_recovery_status(FakeStore(), now=NOW)
 
@@ -40,27 +45,29 @@ def test_unobserved_critical_workers_force_bounded_recovery():
     assert status["workers"]["source_refresh"]["reason"] == "unobserved"
     assert status["workers"]["alpha_l2_sampling"]["reason"] == "unobserved"
     assert status["workers"]["mechanism_forward"]["reason"] == "unobserved"
+    assert status["dashboard_freshness_aligned"] is True
     assert status["qualification_thresholds_unchanged"] is True
     assert status["allocation_authority"] is False
 
 
-def test_grossly_stale_source_worker_forces_source_recovery_only():
+def test_stale_source_worker_forces_source_recovery_at_dashboard_sla():
     store = FakeStore(
         {
-            SOURCE_REFRESH_WORKER_ID: _heartbeat(age_seconds=7200),
+            SOURCE_REFRESH_WORKER_ID: _heartbeat(age_seconds=181),
             ALPHA_L2_WORKER_ID: _heartbeat(age_seconds=120),
             MECHANISM_FORWARD_WORKER_ID: _heartbeat(age_seconds=120),
         }
     )
 
-    status = critical_evidence_recovery_status(store, now=NOW, stale_after_seconds=1800)
+    status = critical_evidence_recovery_status(store, now=NOW)
 
     assert status["source_refresh_required"] is True
     assert status["alpha_forward_required"] is False
     assert status["workers"]["source_refresh"]["reason"] == "grossly_stale"
+    assert status["workers"]["source_refresh"]["recovery_after_seconds"] == 180.0
 
 
-def test_fresh_degraded_heartbeat_suppresses_forced_retry_window():
+def test_fresh_degraded_heartbeat_suppresses_immediate_retry():
     store = FakeStore(
         {
             SOURCE_REFRESH_WORKER_ID: _heartbeat(
@@ -81,15 +88,46 @@ def test_fresh_degraded_heartbeat_suppresses_forced_retry_window():
         }
     )
 
-    status = critical_evidence_recovery_status(store, now=NOW, stale_after_seconds=1800)
+    status = critical_evidence_recovery_status(store, now=NOW)
 
     assert status["source_refresh_required"] is False
     assert status["alpha_forward_required"] is False
     assert status["any_required"] is False
-    assert all(
-        row["reason"] == "current_enough"
-        for row in status["workers"].values()
+    assert all(row["reason"] == "current_enough" for row in status["workers"].values())
+
+
+def test_degraded_heartbeat_recovers_once_it_is_stale_for_dashboard():
+    store = FakeStore(
+        {
+            SOURCE_REFRESH_WORKER_ID: _heartbeat(
+                age_seconds=181,
+                state="degraded",
+                error_type="ProviderUnavailable",
+            ),
+            ALPHA_L2_WORKER_ID: _heartbeat(age_seconds=60),
+            MECHANISM_FORWARD_WORKER_ID: _heartbeat(age_seconds=60),
+        }
     )
+
+    status = critical_evidence_recovery_status(store, now=NOW)
+
+    assert status["source_refresh_required"] is True
+    assert status["workers"]["source_refresh"]["reason"] == "grossly_stale"
+
+
+def test_custom_recovery_window_remains_supported():
+    store = FakeStore(
+        {
+            SOURCE_REFRESH_WORKER_ID: _heartbeat(age_seconds=240),
+            ALPHA_L2_WORKER_ID: _heartbeat(age_seconds=240),
+            MECHANISM_FORWARD_WORKER_ID: _heartbeat(age_seconds=240),
+        }
+    )
+
+    status = critical_evidence_recovery_status(store, now=NOW, stale_after_seconds=300)
+
+    assert status["any_required"] is False
+    assert status["stale_after_seconds"] == 300.0
 
 
 def test_recovery_is_wired_ahead_of_core_shadow_without_changing_normal_cadence():
