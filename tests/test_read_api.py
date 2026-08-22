@@ -67,13 +67,17 @@ def test_read_plane_exposes_dashboard_and_durable_status_routes_only():
     assert len(action_routes) == 1
 
 
-def test_mechanism_overlay_never_full_scans_growing_evidence_tables():
+def test_mechanism_overlay_uses_primary_keys_only_as_non_count_high_water_diagnostics():
     source = Path("src/inefficiency_engine/read_api_fast.py").read_text()
     assert "select(func.count" not in source
     assert "func.max" not in source
     assert "order_by(table.c.id.desc()).limit(1)" in source
     assert "dex_route_quotes.c.observed_at.desc()" in source
-    assert '"query_mode": "append_only_primary_key_tail_plus_compact_closure_summary"' in source
+    assert "live_count = max(" not in source
+    assert 'row["authoritative_observation_count"] = live_count' not in source
+    assert 'row["source_table_high_water_marks_display_authority"] = False' in source
+    assert '"high_water_marks_are_counts": False' in source
+    assert '"query_mode": "append_only_high_water_plus_compact_closure_summary"' in source
 
 
 def test_reconciled_capability_truth_removes_obsolete_settlement_blockers():

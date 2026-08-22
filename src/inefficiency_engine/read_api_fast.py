@@ -20,9 +20,10 @@ from inefficiency_engine.read_api import (
 from inefficiency_engine.research_closure import classify_research_worker_state
 
 
-# The production read plane deliberately avoids table-wide aggregates. Mechanism
-# telemetry reads append-only primary-key tails, one indexed DEX timestamp, the
-# latest worker heartbeat, and the latest compact research-closure summary.
+# The production read plane deliberately avoids table-wide aggregates. Primary-key
+# tails are cheap high-water diagnostics only; they are never observation counts.
+# Current/historical mechanism counts remain owned by worker-published certification
+# state, while source freshness is tracked independently from indexed timestamps.
 
 
 def _integer_tail(table) -> tuple[int, datetime | None]:
@@ -76,9 +77,9 @@ def _fast_live_mechanism_overlay(
     except Exception:
         pass
 
-    market_count, market_at = _integer_tail(store.market_quotes)
-    funding_count, funding_at = _integer_tail(store.funding_quotes)
-    order_book_count, order_book_at = _integer_tail(store.order_books)
+    market_high_water, market_at = _integer_tail(store.market_quotes)
+    funding_high_water, funding_at = _integer_tail(store.funding_quotes)
+    order_book_high_water, order_book_at = _integer_tail(store.order_books)
     dex_at = _dex_tail()
 
     heartbeat = None
@@ -132,28 +133,37 @@ def _fast_live_mechanism_overlay(
         mechanism_id = str(row.get("mechanism_id") or "")
         row["forward_evidence_worker_healthy"] = worker_healthy
         row["forward_evidence_persistence_healthy"] = persistence_healthy
+        row.setdefault(
+            "authoritative_observation_count_semantics",
+            "worker_published_mechanism_evidence_count",
+        )
 
-        existing_count = int(row.get("authoritative_observation_count") or 0)
-        live_count: int | None = None
+        # Indexed table tails prove recent durable activity and provide cheap
+        # high-water diagnostics. They must never overwrite a mechanism's persisted
+        # evidence count: a primary-key value is neither a row count nor lane-specific.
+        high_water: dict[str, int] = {}
         authoritative_at: datetime | None = None
         if mechanism_id == "price_discrepancy":
-            live_count = max(existing_count, market_count)
+            high_water["market_quotes"] = market_high_water
             authoritative_at = _max_timestamp(market_at, dex_at)
         elif mechanism_id == "carry":
-            live_count = max(existing_count, market_count + funding_count)
+            high_water["market_quotes"] = market_high_water
+            high_water["funding_quotes"] = funding_high_water
             authoritative_at = _max_timestamp(market_at, funding_at)
         elif mechanism_id in {"trend_momentum", "mean_reversion", "cross_sectional_relative_value"}:
-            live_count = max(existing_count, market_count)
+            high_water["market_quotes"] = market_high_water
             authoritative_at = market_at
         elif mechanism_id == "microstructure":
-            live_count = max(existing_count, market_count + order_book_count)
+            high_water["market_quotes"] = market_high_water
+            high_water["order_books"] = order_book_high_water
             authoritative_at = _max_timestamp(market_at, order_book_at)
         elif mechanism_id == "liquidity_provision":
-            live_count = max(existing_count, order_book_count)
+            high_water["order_books"] = order_book_high_water
             authoritative_at = order_book_at
 
-        if live_count is not None:
-            row["authoritative_observation_count"] = live_count
+        if high_water:
+            row["source_table_high_water_marks"] = high_water
+            row["source_table_high_water_marks_display_authority"] = False
         if authoritative_at is not None:
             row["authoritative_observation_last_at"] = authoritative_at.isoformat()
 
@@ -242,13 +252,14 @@ def _fast_live_mechanism_overlay(
         "latest_authoritative_observation_at": newest_authoritative.isoformat() if newest_authoritative is not None else None,
         "research_closure_observed_at": closure.get("observed_at"),
         "canonical_capabilities": capabilities,
-        "durable_counts": {
-            "market": market_count,
-            "funding": funding_count,
-            "order_book": order_book_count,
+        "durable_high_water_marks": {
+            "market_quotes": market_high_water,
+            "funding_quotes": funding_high_water,
+            "order_books": order_book_high_water,
             "dex_route": None,
         },
-        "query_mode": "append_only_primary_key_tail_plus_compact_closure_summary",
+        "high_water_marks_are_counts": False,
+        "query_mode": "append_only_high_water_plus_compact_closure_summary",
     }
     return live_rows, telemetry
 
@@ -286,7 +297,8 @@ def _mechanism_payload() -> dict[str, Any]:
                 "worker_id": RESEARCH_WORKER_ID,
                 "worker_healthy": None,
                 "persistence_healthy": bool(store.ping()),
-                "query_mode": "append_only_primary_key_tail_plus_compact_closure_summary",
+                "high_water_marks_are_counts": False,
+                "query_mode": "append_only_high_water_plus_compact_closure_summary",
             },
             "mechanisms": [],
         }
