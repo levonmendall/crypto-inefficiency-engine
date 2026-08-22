@@ -37,7 +37,13 @@ def _html() -> str:
     historical dashboard card renderer is intentionally not composed back in.
     """
 
-    return DASHBOARD_COMMAND_CENTER_HTML
+    # The page is otherwise a standalone literal. On mobile, viewport changes can
+    # resize the canvas; re-read the same persisted snapshot rather than retaining a
+    # second client-side data authority just for chart redraws.
+    return DASHBOARD_COMMAND_CENTER_HTML.replace(
+        "window.addEventListener('resize',()=>renderChart(window.__history||[]));",
+        "window.addEventListener('resize',()=>refresh());",
+    )
 
 
 def _legacy_snapshot() -> dict[str, object]:
