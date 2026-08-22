@@ -197,6 +197,18 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
             }
         )
 
+    async def refresh_l2_source_snapshot(self, quote_collector=None):
+        """Run the bounded independent L2 sampler as source-recovery work.
+
+        The source refresh plane can call this before the full alpha/mechanism cycle,
+        so visible L2 persistence no longer waits for the heavy research tail. The
+        same bounded asset selection, provider timeouts, memory guardrails, and
+        paper-only semantics remain in force.
+        """
+
+        collector = quote_collector or self.core.collect_live_evidence
+        return await self._collect_alpha_l2_snapshot(collector)
+
     async def run_evidence_cycle(self, *, total_capital_usd: float | None = None):
         """Run alpha + native mechanisms against one independent bounded L2 snapshot.
 
@@ -220,7 +232,7 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
         async def collect_with_l2():
             nonlocal cached_snapshot
             if cached_snapshot is None:
-                cached_snapshot = await self._collect_alpha_l2_snapshot(original_evidence)
+                cached_snapshot = await self.refresh_l2_source_snapshot(original_evidence)
             return cached_snapshot
 
         self.core.collect_live_evidence = collect_with_l2
