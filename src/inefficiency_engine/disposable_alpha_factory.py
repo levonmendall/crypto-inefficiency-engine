@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -29,10 +31,11 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
     Release D subtractive lane-success calibration plane.
 
     L2-dependent strategies must not depend on an unrelated structural arbitrage or
-    carry signal existing first. The disposable alpha cycle therefore samples a
-    rotating, bounded slice of the active top-volume universe and asks the existing
-    adapter registry for books. The registry's normal batching, timeouts, depth trim
-    and memory fail-closed behavior remain the only L2 acquisition implementation.
+    carry signal existing first. When the permanent source owner is current, research
+    now reuses that exact durable quote/funding/L2 snapshot instead of launching a
+    duplicate market/L2 request and then persisting an L2-only row that can race the
+    canonical bridge. If the permanent owner is unavailable, the existing bounded
+    network sampler remains the fail-safe fallback.
     """
 
     def __init__(self, *args, **kwargs):
@@ -98,6 +101,30 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
         batch_size = min(len(assets), self._l2_batch_size())
         start = (self._l2_rotation_index() * batch_size) % len(assets)
         return tuple(assets[(start + offset) % len(assets)] for offset in range(batch_size))
+
+    def _latest_permanent_source_snapshot(self):
+        """Load the newest durable full snapshot owned by the source process."""
+
+        with self.store.engine.connect() as db:
+            rows = list(
+                db.execute(
+                    select(
+                        self.store.scans.c.scan_id,
+                        self.store.scans.c.analysis_config_json,
+                    )
+                    .order_by(self.store.scans.c.completed_at.desc())
+                    .limit(200)
+                ).mappings()
+            )
+        for row in rows:
+            raw = row["analysis_config_json"] or "{}"
+            try:
+                config = json.loads(raw) if isinstance(raw, str) else {}
+            except (TypeError, ValueError):
+                config = {}
+            if isinstance(config, dict) and bool(config.get("permanent_source_plane")):
+                return self.store.load_scan(str(row["scan_id"]))
+        return None
 
     async def _collect_alpha_l2_snapshot(self, quote_collector):
         snapshot = await quote_collector()
@@ -199,13 +226,56 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
         )
 
     async def refresh_l2_source_snapshot(self, quote_collector=None):
-        """Run the bounded independent L2 sampler as source-recovery work.
+        """Return one current bounded L2 snapshot without duplicating source work.
 
-        The source refresh plane can call this before the full alpha/mechanism cycle,
-        so visible L2 persistence no longer waits for the heavy research tail. The
-        same bounded asset selection, provider timeouts, memory guardrails, and
-        paper-only semantics remain in force.
+        The permanent source process is the canonical owner of market/funding/L2
+        acquisition. While its durable heartbeat is current, research and the
+        permanent mechanism worker reuse its newest full snapshot. This prevents a
+        duplicate provider cycle from delaying mechanism evidence and prevents an
+        L2-only maintenance scan from becoming the bridge's accidental latest input.
+        If the source owner is unavailable, the original bounded sampler is retained
+        as a fail-safe source-recovery path.
         """
+
+        try:
+            from inefficiency_engine.permanent_source_plane import (
+                permanent_source_plane_current,
+            )
+
+            stale_seconds = max(
+                120.0,
+                float(
+                    getattr(
+                        self.core.settings,
+                        "worker_heartbeat_stale_seconds",
+                        180.0,
+                    )
+                ),
+            )
+            if permanent_source_plane_current(
+                self.store,
+                max_age_seconds=stale_seconds,
+            ):
+                snapshot = await asyncio.to_thread(
+                    self._latest_permanent_source_snapshot
+                )
+                if snapshot is not None:
+                    return snapshot.model_copy(
+                        update={
+                            "analysis_config": {
+                                **snapshot.analysis_config,
+                                "reused_by_alpha_factory": True,
+                                "duplicate_provider_requests": 0,
+                                "allocation_authority": False,
+                                "live_execution_authority": False,
+                                "paper_only": True,
+                            }
+                        }
+                    )
+        except Exception:
+            # Fail-safe fallback below intentionally retains the pre-existing source
+            # recovery path if durable source ownership cannot be established.
+            pass
 
         collector = quote_collector or self.core.collect_live_evidence
         return await self._collect_alpha_l2_snapshot(collector)
