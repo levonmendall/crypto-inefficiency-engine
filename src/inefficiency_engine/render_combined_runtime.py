@@ -15,6 +15,7 @@ from inefficiency_engine.instance_memory import instance_memory_snapshot
 
 API_APP = "inefficiency_engine.read_api_active_volume_deploy:app"
 PORTFOLIO_WORKER_ID = "canonical-portfolio-operating-loop"
+SOURCE_WORKER_ID = "canonical-source-operating-loop"
 RESEARCH_WORKER_ID = "shadow-research-auxiliary"
 TEMPORARY_ADMISSION_EXIT_CODE = 75
 
@@ -24,6 +25,9 @@ DEFAULT_HEAVY_STARTUP_GRACE_SECONDS = 90.0
 DEFAULT_PORTFOLIO_WATCHDOG_STARTUP_GRACE_SECONDS = 180.0
 DEFAULT_PORTFOLIO_RUNNING_STALE_SECONDS = 210.0
 DEFAULT_PORTFOLIO_HEARTBEAT_STALE_SECONDS = 600.0
+DEFAULT_SOURCE_WATCHDOG_STARTUP_GRACE_SECONDS = 120.0
+DEFAULT_SOURCE_RUNNING_STALE_SECONDS = 180.0
+DEFAULT_SOURCE_HEARTBEAT_STALE_SECONDS = 180.0
 DEFAULT_RESEARCH_WATCHDOG_STARTUP_GRACE_SECONDS = 180.0
 DEFAULT_RESEARCH_HEARTBEAT_STALE_SECONDS = 600.0
 DEFAULT_RESEARCH_JOB_TIMEOUT_SECONDS = 300.0
@@ -47,6 +51,7 @@ def child_commands(port: str | int) -> dict[str, list[str]]:
     port_text = str(port)
     return {
         "portfolio": [sys.executable, "-m", "inefficiency_engine.lightweight_portfolio_worker"],
+        "source": [sys.executable, "-m", "inefficiency_engine.permanent_source_worker"],
         "api": [
             sys.executable,
             "-m",
@@ -201,6 +206,47 @@ def portfolio_watchdog_reason(
     return None
 
 
+def source_watchdog_reason(
+    payload: dict[str, object],
+    *,
+    process_started_at: datetime,
+    process_age_seconds: float,
+    startup_grace_seconds: float = DEFAULT_SOURCE_WATCHDOG_STARTUP_GRACE_SECONDS,
+    running_stale_seconds: float = DEFAULT_SOURCE_RUNNING_STALE_SECONDS,
+    heartbeat_stale_seconds: float = DEFAULT_SOURCE_HEARTBEAT_STALE_SECONDS,
+) -> str | None:
+    """Return a restart reason when the isolated source process stops advancing."""
+
+    if process_age_seconds < max(0.0, startup_grace_seconds):
+        return None
+    runtime = payload.get("runtime_heartbeats")
+    workers = runtime.get("workers") if isinstance(runtime, dict) else None
+    row = workers.get("permanent_source") if isinstance(workers, dict) else None
+    if not isinstance(row, dict) or not row.get("available"):
+        return "current source child has not published a durable heartbeat"
+    try:
+        observed_at = datetime.fromisoformat(str(row.get("observed_at")).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return "source heartbeat has no valid observed_at timestamp"
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    started = process_started_at if process_started_at.tzinfo is not None else process_started_at.replace(tzinfo=timezone.utc)
+    if observed_at < started:
+        return "current source child has not replaced the previous process heartbeat"
+    try:
+        age_seconds = max(0.0, float(row.get("age_seconds") or 0.0))
+    except (TypeError, ValueError):
+        return "source heartbeat age is invalid"
+    state = str(row.get("state") or "unknown")
+    if state == "running" and age_seconds > max(1.0, running_stale_seconds):
+        return f"source cycle remained running for {age_seconds:.1f}s (limit {running_stale_seconds:.1f}s)"
+    if age_seconds > max(1.0, heartbeat_stale_seconds):
+        return f"source heartbeat is {age_seconds:.1f}s old (limit {heartbeat_stale_seconds:.1f}s; state={state})"
+    if state in {"error", "stopped", "completed"}:
+        return f"source subprocess is alive but heartbeat state={state}"
+    return None
+
+
 def research_watchdog_reason(
     health: dict[str, object],
     dashboard: dict[str, object] | None,
@@ -289,6 +335,17 @@ def main() -> int:
     portfolio_heartbeat_stale = _env_seconds(
         "CIE_PORTFOLIO_HEARTBEAT_STALE_SECONDS", DEFAULT_PORTFOLIO_HEARTBEAT_STALE_SECONDS, minimum=480.0
     )
+    source_watchdog_startup_grace = _env_seconds(
+        "CIE_SOURCE_WATCHDOG_STARTUP_GRACE_SECONDS",
+        DEFAULT_SOURCE_WATCHDOG_STARTUP_GRACE_SECONDS,
+        minimum=30.0,
+    )
+    source_running_stale = _env_seconds(
+        "CIE_SOURCE_RUNNING_STALE_SECONDS", DEFAULT_SOURCE_RUNNING_STALE_SECONDS, minimum=120.0
+    )
+    source_heartbeat_stale = _env_seconds(
+        "CIE_SOURCE_HEARTBEAT_STALE_SECONDS", DEFAULT_SOURCE_HEARTBEAT_STALE_SECONDS, minimum=120.0
+    )
     research_watchdog_startup_grace = _env_seconds(
         "CIE_RESEARCH_WATCHDOG_STARTUP_GRACE_SECONDS",
         DEFAULT_RESEARCH_WATCHDOG_STARTUP_GRACE_SECONDS,
@@ -316,12 +373,12 @@ def main() -> int:
         permanent_started_at[name] = datetime.now(timezone.utc)
         permanent_started_monotonic[name] = time.monotonic()
 
-    def _restart_portfolio(reason: str) -> None:
-        current = permanent.get("portfolio")
+    def _restart_permanent(name: str, reason: str) -> None:
+        current = permanent.get(name)
         if current is not None:
-            print(f"portfolio watchdog restarting child pid={current.pid}: {reason}", flush=True)
+            print(f"{name} watchdog restarting child pid={current.pid}: {reason}", flush=True)
             _terminate_children([current], timeout_seconds=PERMANENT_RESTART_GRACE_SECONDS)
-        _start_permanent("portfolio")
+        _start_permanent(name)
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, _request_stop)
@@ -338,21 +395,34 @@ def main() -> int:
     research_recovery_failed_since: float | None = None
 
     try:
-        for name in ("portfolio", "api"):
+        for name in ("portfolio", "source", "api"):
             _start_permanent(name)
 
         while not stopping:
-            for name, child in permanent.items():
+            for name, child in list(permanent.items()):
                 return_code = child.poll()
-                if return_code is not None:
-                    print(f"critical permanent child {name} exited code={return_code}; restarting Render service", flush=True)
-                    return return_code if return_code != 0 else 1
+                if return_code is None:
+                    continue
+                if name == "source":
+                    print(
+                        f"isolated source child exited code={return_code}; restarting source only",
+                        flush=True,
+                    )
+                    _start_permanent("source")
+                    continue
+                print(
+                    f"critical permanent child {name} exited code={return_code}; restarting Render service",
+                    flush=True,
+                )
+                return return_code if return_code != 0 else 1
 
             now = time.monotonic()
             memory = instance_memory_snapshot()
 
             if now >= next_runtime_watchdog:
                 next_runtime_watchdog = now + PORTFOLIO_WATCHDOG_CHECK_SECONDS
+                portfolio_reason: str | None = None
+                source_reason: str | None = None
                 try:
                     health = _local_json(port, "/health")
                     marker = research_heartbeat_marker(health)
@@ -373,6 +443,14 @@ def main() -> int:
                         running_stale_seconds=portfolio_running_stale,
                         heartbeat_stale_seconds=portfolio_heartbeat_stale,
                     )
+                    source_reason = source_watchdog_reason(
+                        health,
+                        process_started_at=permanent_started_at["source"],
+                        process_age_seconds=max(0.0, now - permanent_started_monotonic["source"]),
+                        startup_grace_seconds=source_watchdog_startup_grace,
+                        running_stale_seconds=source_running_stale,
+                        heartbeat_stale_seconds=source_heartbeat_stale,
+                    )
                     try:
                         dashboard = _local_json(port, "/v3/dashboard/snapshot")
                     except Exception:
@@ -388,9 +466,12 @@ def main() -> int:
                     research_overdue_reason = research_reason
                 except Exception as exc:
                     print(f"runtime watchdog read unavailable: {type(exc).__name__}", flush=True)
-                    portfolio_reason = None
                 if portfolio_reason is not None:
-                    _restart_portfolio(portfolio_reason)
+                    _restart_permanent("portfolio", portfolio_reason)
+                    now = time.monotonic()
+                    next_runtime_watchdog = now + PORTFOLIO_WATCHDOG_CHECK_SECONDS
+                if source_reason is not None:
+                    _restart_permanent("source", source_reason)
                     now = time.monotonic()
                     next_runtime_watchdog = now + PORTFOLIO_WATCHDOG_CHECK_SECONDS
                 if research_overdue:
@@ -478,9 +559,6 @@ def main() -> int:
                         f"memory={memory.as_dict()}",
                         flush=True,
                     )
-                    # Rate-limit this durability warning while allowing another
-                    # disposable research attempt. A stale isolated research plane is
-                    # not a reason to take down a healthy API or portfolio child.
                     research_recovery_failed_since = now
 
                 due_history = now >= next_due["history"]
