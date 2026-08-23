@@ -55,6 +55,13 @@ services:
         value: "30"
       - key: CIE_MECHANISM_FORWARD_DEADLINE_SECONDS
         value: "90"
+      # Canonical control is database-only and has no provider authority. It must
+      # either reconcile/publish promptly or expose an explicit timeout heartbeat;
+      # it may never wait on live L2/provider I/O.
+      - key: CIE_CONTROL_INTERVAL_SECONDS
+        value: "30"
+      - key: CIE_CONTROL_CYCLE_DEADLINE_SECONDS
+        value: "25"
       - key: CIE_SHADOW_HORIZONS_SECONDS
         value: "1,5,15,30,60"
       - key: CIE_SHADOW_MAX_OPPORTUNITIES
