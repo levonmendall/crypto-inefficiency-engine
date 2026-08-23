@@ -25,16 +25,10 @@ from inefficiency_engine.volume_universe import (
 
 
 VOLUME_UNIVERSE_WORKER_ID = "volume-universe-lightweight-refresh"
-# Keep the small membership refresh independent from disposable research while also
-# keeping every external-network dependency outside canonical portfolio accounting.
 VOLUME_UNIVERSE_MAINTENANCE_SECONDS = max(
     60.0,
     min(300.0, VOLUME_UNIVERSE_REFRESH_SECONDS / 3.0),
 )
-# Retained for compatibility and as a bounded liveness helper for any future long
-# market refresh. The normal production path now separates market/L2 from the slow
-# priority-source tail, so a slow Aave/options/governance probe cannot hold the L2
-# cadence hostage.
 SOURCE_PROGRESS_PULSE_SECONDS = 30.0
 
 
@@ -101,7 +95,7 @@ async def _source_cycle_progress_pulse(
     cycle_done: asyncio.Event,
     interval_seconds: float = SOURCE_PROGRESS_PULSE_SECONDS,
 ) -> None:
-    """Publish liveness while one async market/provider cycle is still running."""
+    """Publish market/L2 liveness while one bounded refresh is still running."""
 
     interval = max(0.01, float(interval_seconds))
     while not cycle_done.is_set():
@@ -125,6 +119,42 @@ async def _source_cycle_progress_pulse(
                     "priority_source_tail_decoupled": True,
                     "disposable_research_required": False,
                     "portfolio_authority": False,
+                    "allocation_authority": False,
+                    "live_execution_authority": False,
+                    "paper_only": True,
+                },
+            )
+        except Exception:
+            pass
+
+
+async def _priority_source_progress_pulse(
+    store: EvidenceStore,
+    *,
+    cycle_done: asyncio.Event,
+    interval_seconds: float = SOURCE_PROGRESS_PULSE_SECONDS,
+) -> None:
+    """Keep slow priority-source ownership current without delaying market/L2."""
+
+    interval = max(0.01, float(interval_seconds))
+    while not cycle_done.is_set():
+        try:
+            await asyncio.wait_for(cycle_done.wait(), timeout=interval)
+            return
+        except TimeoutError:
+            pass
+        if cycle_done.is_set():
+            return
+        try:
+            store.record_worker_heartbeat(
+                worker_id=SOURCE_REFRESH_WORKER_ID,
+                state="running",
+                detail={
+                    "stage": "priority_source_cycle_in_progress",
+                    "progress_pulse": True,
+                    "market_l2_cadence_independent": True,
+                    "isolated_source_process": True,
+                    "qualification_thresholds_unchanged": True,
                     "allocation_authority": False,
                     "live_execution_authority": False,
                     "paper_only": True,
@@ -237,15 +267,20 @@ async def _priority_source_refresh_loop(
     *,
     stop_event: asyncio.Event,
 ) -> None:
-    """Refresh slower protocol/event/options/trade-flow evidence independently."""
+    """Refresh protocol/event/options/trade-flow evidence on an independent cadence."""
 
     source_plane: PermanentSourcePlane | None = None
     while not stop_event.is_set():
+        cycle_done: asyncio.Event | None = None
+        pulse_task: asyncio.Task[None] | None = None
         try:
             if source_plane is None:
                 source_plane = PermanentSourcePlane(store)
-            # PrioritySourceCollectionService owns its own durable source-refresh
-            # heartbeat and provider-level fail-closed diagnostics.
+            cycle_done = asyncio.Event()
+            pulse_task = asyncio.create_task(
+                _priority_source_progress_pulse(store, cycle_done=cycle_done),
+                name="priority-source-progress-pulse",
+            )
             await source_plane.priority.run_cycle()
         except Exception as exc:
             try:
@@ -267,6 +302,12 @@ async def _priority_source_refresh_loop(
             except Exception:
                 pass
             source_plane = None
+        finally:
+            if cycle_done is not None:
+                cycle_done.set()
+            if pulse_task is not None:
+                pulse_task.cancel()
+                await asyncio.gather(pulse_task, return_exceptions=True)
 
         try:
             await asyncio.wait_for(
@@ -284,10 +325,10 @@ async def run_permanent_source_worker(
 ) -> int:
     """Own network-facing source/universe work outside portfolio accounting.
 
-    Market/L2 and slower priority sources now have separate schedules inside this
-    isolated process. A slow protocol or event provider can therefore no longer make
-    executable order-book evidence stale. The supervisor can still restart the source
-    process when the market/L2 durable heartbeat itself stops advancing.
+    Market/L2 and slower priority sources have separate schedules inside this isolated
+    process. A slow protocol or event provider can therefore no longer make executable
+    order-book evidence stale. Both ownership heartbeats remain durable so research
+    falls back only when the corresponding source cadence truly stops advancing.
     """
 
     install_bulk_provider_catalog_runtime()
