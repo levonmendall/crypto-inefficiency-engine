@@ -28,12 +28,13 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
     row in ``scans`` as a complete decision snapshot therefore allowed an L2-only
     maintenance write to erase the canonical bridge input every cycle.
 
-    The bridge now selects the newest scan that actually contains market quotes,
-    explicitly skips L2-only maintenance rows, and reconstructs only the bounded
-    executability projection needed by the canonical portfolio when the source scan
-    has not already persisted it. No provider request is made here: all inputs come
-    from the durable source ledger. Economic, cost, statistical, freshness, risk,
-    settlement, and paper-only gates remain unchanged.
+    The bridge now prefers the newest permanent-source scan, explicitly skips L2-only
+    maintenance rows, and reconstructs only the bounded executability projection
+    needed by the canonical portfolio when the source scan has not already persisted
+    it. If the permanent owner is absent, a complete generic executable scan remains
+    a fail-safe fallback. No provider request is made here: all inputs come from the
+    durable source ledger. Economic, cost, statistical, freshness, risk, settlement,
+    and paper-only gates remain unchanged.
     """
 
     _SCAN_LOOKBACK = 200
@@ -48,6 +49,29 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
             return {}
         return payload if isinstance(payload, dict) else {}
 
+    @staticmethod
+    def _row_has_market_quote(db, store, scan_id: str) -> bool:
+        return db.execute(
+            select(store.market_quotes.c.id)
+            .where(store.market_quotes.c.scan_id == scan_id)
+            .limit(1)
+        ).scalar_one_or_none() is not None
+
+    @staticmethod
+    def _row_has_depth_or_executability(db, store, scan_id: str) -> bool:
+        has_book = db.execute(
+            select(store.order_books.c.id)
+            .where(store.order_books.c.scan_id == scan_id)
+            .limit(1)
+        ).scalar_one_or_none()
+        if has_book is not None:
+            return True
+        return db.execute(
+            select(store.executability.c.id)
+            .where(store.executability.c.scan_id == scan_id)
+            .limit(1)
+        ).scalar_one_or_none() is not None
+
     def _select_full_scan(self, db):
         rows = list(
             db.execute(
@@ -61,17 +85,33 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
                 .limit(self._SCAN_LOOKBACK)
             ).mappings()
         )
-        for row in rows:
-            config = self._analysis_config(row["analysis_config_json"])
+
+        parsed = [
+            (row, self._analysis_config(row["analysis_config_json"]))
+            for row in rows
+        ]
+
+        # The permanent source process is the canonical owner of current market/L2
+        # truth. Prefer its newest full quote snapshot even when the L2 set is empty:
+        # an empty current depth set is a real fail-closed condition and must not be
+        # replaced by older depth merely to manufacture an opportunity.
+        for row, config in parsed:
+            if not bool(config.get("permanent_source_plane")):
+                continue
+            scan_id = str(row["scan_id"])
+            if self._row_has_market_quote(db, self.store, scan_id):
+                return row, config
+
+        # Source ownership may be unavailable during fail-safe recovery. In that
+        # case accept the newest generic scan only when it contains both quote truth
+        # and enough persisted depth/executability to support a real bridge decision.
+        for row, config in parsed:
             if bool(config.get("alpha_l2_sampling")):
                 continue
             scan_id = str(row["scan_id"])
-            has_market_quote = db.execute(
-                select(self.store.market_quotes.c.id)
-                .where(self.store.market_quotes.c.scan_id == scan_id)
-                .limit(1)
-            ).scalar_one_or_none()
-            if has_market_quote is not None:
+            if not self._row_has_market_quote(db, self.store, scan_id):
+                continue
+            if self._row_has_depth_or_executability(db, self.store, scan_id):
                 return row, config
         return None, {}
 
