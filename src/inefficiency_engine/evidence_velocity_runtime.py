@@ -412,12 +412,25 @@ class EvidenceVelocityAllLaneOperatingCertificationService(
         if latest is None:
             return None
         strategy_evidence = _load_strategy_evidence(self.store, self.core.settings)
+        source_snapshot = self.source_coverage.snapshot()
+        source_by_id = {row.lane_id: row for row in source_snapshot.lanes}
+        mechanism_readiness = (
+            self.mechanism_execution.readiness_summary()
+            if any(row.mechanism_id in MECHANISM_IDS for row in latest.mechanisms)
+            else {}
+        )
         statuses = []
         for existing in latest.mechanisms:
-            if existing.mechanism_id in MECHANISM_IDS:
-                status = self._mechanism_status(existing)
-            else:
+            lane = source_by_id.get(existing.mechanism_id)
+            if lane is None:
                 lane = self.source_coverage.lane(existing.mechanism_id)
+            if existing.mechanism_id in MECHANISM_IDS:
+                status = self._mechanism_status(
+                    existing,
+                    lane=lane,
+                    readiness=mechanism_readiness.get(existing.mechanism_id),
+                )
+            else:
                 strategy_rows = list(strategy_evidence.get(existing.mechanism_id, []))
                 if existing.mechanism_id in _ALPHA_LANES:
                     status = self._alpha_runtime_status(existing, lane, strategy_rows)
@@ -441,9 +454,14 @@ class EvidenceVelocityAllLaneOperatingCertificationService(
         self.ledger.record(corrected)
         return corrected
 
-    def _mechanism_status(self, existing):
-        status = super()._mechanism_status(existing)
-        lane = self.source_coverage.lane(existing.mechanism_id)
+    def _mechanism_status(self, existing, *, lane=None, readiness=None):
+        status = super()._mechanism_status(
+            existing,
+            lane=lane,
+            readiness=readiness,
+        )
+        if lane is None:
+            lane = self.source_coverage.lane(existing.mechanism_id)
         source = classify_lane_source_dimensions(lane)
         if not source.forward_test_eligible or source.allocation_source_qualified:
             return status
