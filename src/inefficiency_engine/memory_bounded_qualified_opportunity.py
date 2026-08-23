@@ -31,10 +31,11 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
     The bridge now prefers the newest permanent-source scan, explicitly skips L2-only
     maintenance rows, and reconstructs only the bounded executability projection
     needed by the canonical portfolio when the source scan has not already persisted
-    it. If the permanent owner is absent, a complete generic executable scan remains
-    a fail-safe fallback. No provider request is made here: all inputs come from the
-    durable source ledger. Economic, cost, statistical, freshness, risk, settlement,
-    and paper-only gates remain unchanged.
+    it. If the permanent owner is absent, the newest generic quote-bearing scan
+    remains a fail-safe fallback so an empty-but-fresh control envelope can still be
+    published. No provider request is made here: all inputs come from the durable
+    source ledger. Economic, cost, statistical, freshness, risk, settlement, and
+    paper-only gates remain unchanged.
     """
 
     _SCAN_LOOKBACK = 200
@@ -54,21 +55,6 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
         return db.execute(
             select(store.market_quotes.c.id)
             .where(store.market_quotes.c.scan_id == scan_id)
-            .limit(1)
-        ).scalar_one_or_none() is not None
-
-    @staticmethod
-    def _row_has_depth_or_executability(db, store, scan_id: str) -> bool:
-        has_book = db.execute(
-            select(store.order_books.c.id)
-            .where(store.order_books.c.scan_id == scan_id)
-            .limit(1)
-        ).scalar_one_or_none()
-        if has_book is not None:
-            return True
-        return db.execute(
-            select(store.executability.c.id)
-            .where(store.executability.c.scan_id == scan_id)
             .limit(1)
         ).scalar_one_or_none() is not None
 
@@ -102,16 +88,16 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
             if self._row_has_market_quote(db, self.store, scan_id):
                 return row, config
 
-        # Source ownership may be unavailable during fail-safe recovery. In that
-        # case accept the newest generic scan only when it contains both quote truth
-        # and enough persisted depth/executability to support a real bridge decision.
+        # During startup/tests/fail-safe recovery there may be no permanent-source
+        # marker yet. Preserve the historical contract by accepting the newest
+        # non-maintenance quote-bearing scan. If it has no depth, candidate
+        # executability remains empty/fail-closed; the control envelope itself can
+        # still advance rather than being mislabeled stale.
         for row, config in parsed:
             if bool(config.get("alpha_l2_sampling")):
                 continue
             scan_id = str(row["scan_id"])
-            if not self._row_has_market_quote(db, self.store, scan_id):
-                continue
-            if self._row_has_depth_or_executability(db, self.store, scan_id):
+            if self._row_has_market_quote(db, self.store, scan_id):
                 return row, config
         return None, {}
 
@@ -173,7 +159,11 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
                     order_books.append(book)
 
         synthesized = False
-        if not executability:
+        can_project = bool(
+            callable(getattr(self.core, "analyze", None))
+            and callable(getattr(self.core, "empirical_latency_resolver", None))
+        )
+        if not executability and can_project:
             # The permanent source plane is intentionally an acquisition plane, so
             # it persists fresh quotes/funding/L2 without granting portfolio
             # authority. Reconstruct the same deterministic structural opportunity
