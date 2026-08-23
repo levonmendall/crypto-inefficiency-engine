@@ -11,7 +11,7 @@ from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidence
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.config import Settings
 from inefficiency_engine.dashboard_projection import ResearchDashboardProjectionLedger
-from inefficiency_engine.disposable_alpha_factory import DisposableExpandedAlphaFactoryService
+from inefficiency_engine.durable_control_alpha import DurableControlAlphaFactoryService
 from inefficiency_engine.durable_control_bridge import (
     DurableControlQualifiedOpportunityBridgePublisher,
 )
@@ -27,6 +27,7 @@ from inefficiency_engine.universal_service import UniversalOpportunityService
 
 CONTROL_WORKER_ID = "canonical-control-operating-loop"
 DEFAULT_CONTROL_INTERVAL_SECONDS = 30.0
+DEFAULT_CONTROL_CYCLE_DEADLINE_SECONDS = 25.0
 
 
 def _interval_seconds() -> float:
@@ -42,11 +43,29 @@ def _interval_seconds() -> float:
     return max(5.0, value)
 
 
+def _deadline_seconds() -> float:
+    """Bound one database-only control cycle below its normal publication cadence."""
+
+    try:
+        value = float(
+            os.getenv(
+                "CIE_CONTROL_CYCLE_DEADLINE_SECONDS",
+                str(DEFAULT_CONTROL_CYCLE_DEADLINE_SECONDS),
+            )
+        )
+    except ValueError:
+        value = DEFAULT_CONTROL_CYCLE_DEADLINE_SECONDS
+    return max(5.0, value)
+
+
 def _build_control_services(settings, store):
     """Build the durable control graph without granting acquisition authority."""
 
     service = OpportunityService(settings=settings, evidence_store=store)
-    factory = DisposableExpandedAlphaFactoryService(service, store)
+    # This control-specific alpha factory rejects any promotion path that would need
+    # a provider request. Current executable cost must come from the persisted source
+    # snapshot or the candidate remains fail-closed.
+    factory = DurableControlAlphaFactoryService(service, store)
     universal = UniversalOpportunityService(service)
     composite_service = CexDexCompositeEvidenceService(service, universal=universal)
     promotion = CexDexPaperPromotionService(service, composite_service, store)
@@ -79,6 +98,7 @@ async def _run() -> None:
         store,
     )
     interval = _interval_seconds()
+    deadline = _deadline_seconds()
     sequence = 0
 
     while True:
@@ -94,6 +114,9 @@ async def _run() -> None:
                     "runtime_plane": "canonical-control",
                     "permanent_process": True,
                     "provider_requests_allowed": False,
+                    "current_execution_cost_source": "persisted_order_books_only",
+                    "missing_current_executable_depth_policy": "fail_closed",
+                    "cycle_deadline_seconds": deadline,
                     "mechanism_forward_dependency": False,
                     "disposable_research_dependency": False,
                     "allocation_authority": False,
@@ -102,18 +125,28 @@ async def _run() -> None:
                 },
             )
 
-            control = await refresh_canonical_control_plane(
-                store=store,
-                operating_certification=operating_certification,
-                qualified_bridge=qualified_bridge,
-                research_projection=research_projection,
-                settings=settings,
-                bridge_snapshot=None,
+            control = await asyncio.wait_for(
+                refresh_canonical_control_plane(
+                    store=store,
+                    operating_certification=operating_certification,
+                    qualified_bridge=qualified_bridge,
+                    research_projection=research_projection,
+                    settings=settings,
+                    bridge_snapshot=None,
+                ),
+                timeout=deadline,
             )
             errors = control.get("control_plane_errors")
             error_map = errors if isinstance(errors, dict) else {}
             state = "degraded" if error_map else "success"
             error_type = next(iter(error_map.values()), None)
+            alpha_factory = getattr(qualified_bridge.allocator, "alpha_factory", None)
+            alpha_diagnostics = (
+                alpha_factory.durable_promotion_diagnostics()
+                if alpha_factory is not None
+                and callable(getattr(alpha_factory, "durable_promotion_diagnostics", None))
+                else {}
+            )
             store.record_worker_heartbeat(
                 worker_id=CONTROL_WORKER_ID,
                 state=state,
@@ -125,6 +158,11 @@ async def _run() -> None:
                     "runtime_plane": "canonical-control",
                     "permanent_process": True,
                     "provider_requests_allowed": False,
+                    "current_execution_cost_source": "persisted_order_books_only",
+                    "missing_current_executable_depth_policy": "fail_closed",
+                    "cycle_deadline_seconds": deadline,
+                    "cycle_runtime_seconds": max(0.0, time.monotonic() - started),
+                    "alpha_durable_promotion": alpha_diagnostics,
                     "mechanism_forward_dependency": False,
                     "disposable_research_dependency": False,
                     "qualification_thresholds_unchanged": True,
@@ -147,6 +185,10 @@ async def _run() -> None:
                         "runtime_plane": "canonical-control",
                         "permanent_process": True,
                         "provider_requests_allowed": False,
+                        "current_execution_cost_source": "persisted_order_books_only",
+                        "missing_current_executable_depth_policy": "fail_closed",
+                        "cycle_deadline_seconds": deadline,
+                        "cycle_runtime_seconds": max(0.0, time.monotonic() - started),
                         "mechanism_forward_dependency": False,
                         "disposable_research_dependency": False,
                         "qualification_thresholds_unchanged": True,
