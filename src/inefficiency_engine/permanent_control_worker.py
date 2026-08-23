@@ -22,6 +22,9 @@ from inefficiency_engine.evidence_velocity_runtime import (
     EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService as UnifiedPaperAllocatorService,
 )
 from inefficiency_engine.service import OpportunityService
+from inefficiency_engine.source_runtime_safety import (
+    install_source_coverage_reconciliation_runtime,
+)
 from inefficiency_engine.universal_service import UniversalOpportunityService
 
 
@@ -88,6 +91,7 @@ def _build_control_services(settings, store):
 
 
 async def _run() -> None:
+    install_source_coverage_reconciliation_runtime()
     settings = Settings.from_env()
     store = build_evidence_store(settings.evidence_db_path)
     if store is None:

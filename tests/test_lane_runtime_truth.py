@@ -215,8 +215,8 @@ def test_post_evidence_reconciliation_is_durable_only(monkeypatch):
 
     class SourcePlane:
         @staticmethod
-        def lane(lane_id):
-            return _lane(lane_id)
+        def snapshot():
+            return SimpleNamespace(lanes=[_lane("mean_reversion")])
 
     service.ledger = Ledger()
     service.source_coverage = SourcePlane()
@@ -248,6 +248,71 @@ def test_post_evidence_reconciliation_is_durable_only(monkeypatch):
     assert corrected.observed_at > latest.observed_at
     assert corrected.mechanisms[0].state == "collecting"
     assert len(service.ledger.recorded) == 1
+
+
+def test_operating_reconciliation_reads_one_source_snapshot_for_all_lanes(monkeypatch):
+    """One control cycle must not re-scan multimillion-row source tables per lane."""
+
+    service = object.__new__(EvidenceVelocityAllLaneOperatingCertificationService)
+    latest = OperatingCertificationSnapshot(
+        observed_at=datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc),
+        version="test",
+        public_market_provider_healthy=True,
+        public_market_surface_count=1,
+        public_market_surface_ok_count=1,
+        public_order_book_probe_count=1,
+        public_order_book_probe_ok_count=1,
+        market_quote_count=1,
+        funding_quote_count=0,
+        mechanism_count=2,
+        provider_gap_count=0,
+        collecting_count=2,
+        poor_economics_count=0,
+        blocked_count=0,
+        certifying_count=0,
+        certified_count=0,
+        mechanisms=[
+            _status("mean_reversion", state="collecting"),
+            _status("trend_momentum", state="collecting"),
+        ],
+    )
+
+    class Ledger:
+        def latest(self):
+            return latest
+
+        @staticmethod
+        def record(snapshot):
+            return snapshot.snapshot_id
+
+    class SourcePlane:
+        def __init__(self):
+            self.snapshot_calls = 0
+
+        def snapshot(self):
+            self.snapshot_calls += 1
+            return SimpleNamespace(
+                lanes=[
+                    _lane("mean_reversion"),
+                    _lane("trend_momentum"),
+                ]
+            )
+
+        def lane(self, lane_id):
+            snapshot = self.snapshot()
+            return next(row for row in snapshot.lanes if row.lane_id == lane_id)
+
+    source_plane = SourcePlane()
+    service.ledger = Ledger()
+    service.source_coverage = source_plane
+    service.store = object()
+    service.core = SimpleNamespace(settings=SimpleNamespace())
+    monkeypatch.setattr(runtime_module, "_load_strategy_evidence", lambda store, settings: {})
+
+    corrected = service.reconcile_latest_runtime_truth()
+
+    assert corrected is not None
+    assert source_plane.snapshot_calls == 1
 
 
 def test_disposable_worker_reconciles_before_research_projection():

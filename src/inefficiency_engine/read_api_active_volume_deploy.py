@@ -16,8 +16,12 @@ from inefficiency_engine.lane_readiness import build_lane_executable_readiness
 from inefficiency_engine.production_dashboard_fastpath import build_production_dashboard_snapshot
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.source_coverage_catalog import LANES
+from inefficiency_engine.source_runtime_safety import (
+    install_source_coverage_reconciliation_runtime,
+)
 
 
+install_source_coverage_reconciliation_runtime()
 app = _base_deploy.app
 
 # Replace only the deploy/read-model routes whose payloads need the active volume
@@ -41,6 +45,7 @@ app.openapi_schema = None
 
 _PRODUCTION_EVIDENCE_DISCONNECTED = {"capital_location_settlement"}
 _RUNTIME_HEARTBEATS = {
+    "canonical_control": "canonical-control-operating-loop",
     "portfolio": "canonical-portfolio-operating-loop",
     "permanent_source": "canonical-source-operating-loop",
     "volume_universe": "volume-universe-lightweight-refresh",
@@ -56,6 +61,7 @@ _RUNTIME_HEARTBEATS = {
 # their subordinate diagnostics can legitimately go several minutes between terminal
 # heartbeats. Source/evidence cards retain their own strict TTL/readiness contracts.
 _RUNTIME_STALE_AFTER_SECONDS = {
+    "canonical_control": 180.0,
     "portfolio": 600.0,
     "permanent_source": 180.0,
     "volume_universe": 600.0,
@@ -140,7 +146,8 @@ def _runtime_heartbeats() -> dict[str, object]:
         if observed_at.tzinfo is None:
             observed_at = observed_at.replace(tzinfo=timezone.utc)
         age_seconds = max(0.0, (now - observed_at).total_seconds())
-        workers[label] = {
+        detail = heartbeat.detail if isinstance(getattr(heartbeat, "detail", None), dict) else {}
+        worker = {
             "worker_id": worker_id,
             "available": True,
             "state": heartbeat.state,
@@ -149,7 +156,42 @@ def _runtime_heartbeats() -> dict[str, object]:
             "age_seconds": age_seconds,
             "stale_after_seconds": worker_stale_seconds,
             "stale": age_seconds > worker_stale_seconds,
+            "sequence": detail.get("sequence"),
+            "stage": detail.get("stage"),
         }
+        if label == "canonical_control":
+            alpha = (
+                detail.get("alpha_durable_promotion")
+                if isinstance(detail.get("alpha_durable_promotion"), dict)
+                else {}
+            )
+            worker.update(
+                {
+                    "provider_requests_allowed": detail.get("provider_requests_allowed"),
+                    "provider_requests_used": alpha.get("provider_requests_used"),
+                    "operating_reconciliation_complete": detail.get(
+                        "operating_reconciliation_complete"
+                    ),
+                    "operating_observed_at": detail.get("operating_observed_at"),
+                    "qualified_bridge_publication_complete": detail.get(
+                        "qualified_bridge_publication_complete"
+                    ),
+                    "qualified_bridge_observed_at": detail.get(
+                        "qualified_bridge_observed_at"
+                    ),
+                    "qualified_bridge_candidate_count": detail.get(
+                        "qualified_bridge_candidate_count"
+                    ),
+                    "research_projection_publication_complete": detail.get(
+                        "research_projection_publication_complete"
+                    ),
+                    "control_plane_errors": detail.get("control_plane_errors"),
+                    "control_stage_timings_seconds": detail.get(
+                        "control_stage_timings_seconds"
+                    ),
+                }
+            )
+        workers[label] = worker
     return {
         "available": True,
         "stale_after_seconds": stale_seconds,
