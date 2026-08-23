@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import gc
 import os
 from datetime import datetime, timezone
@@ -132,14 +133,22 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
         source_id: str,
         lane_ids: list[str],
         ttl_seconds: float,
+        *,
+        latest: dict[tuple[str, str], object] | None = None,
     ) -> bool:
-        latest = self.source_coverage.ledger.latest()
+        # The caller may provide one point-in-time latest-state map for the entire
+        # source cycle. This avoids one remote PostgreSQL query per source while
+        # preserving the same freshness semantics.
+        rows = latest if latest is not None else self.source_coverage.ledger.latest()
         now = _now()
         for lane_id in lane_ids:
-            row = latest.get((source_id, lane_id))
-            if row is None or not row.healthy:
+            row = rows.get((source_id, lane_id))
+            if row is None or not bool(getattr(row, "healthy", False)):
                 return False
-            age = max(0.0, (now - row.observed_at).total_seconds())
+            observed_at = getattr(row, "observed_at", None)
+            if not isinstance(observed_at, datetime):
+                return False
+            age = max(0.0, (now - observed_at).total_seconds())
             if age > max(1.0, ttl_seconds):
                 return False
         return True
@@ -209,7 +218,8 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
         refresher = getattr(self.alpha_factory, "refresh_l2_source_snapshot", None)
         if not callable(refresher):
             return {"state": "unsupported", "attempted": False}
-        if not self._l2_source_refresh_due():
+        l2_due = await asyncio.to_thread(self._l2_source_refresh_due)
+        if not l2_due:
             return {"state": "fresh_cached", "attempted": False}
         if memory_budget_exceeded(self.memory_soft_limit_mb):
             return {
@@ -235,16 +245,24 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
             gc.collect()
 
     async def run_cycle(self) -> dict[str, object]:
-        self._record_refresh_heartbeat(state="running", stage="provider_admission")
+        # Durable PostgreSQL reconciliation/writes are synchronous SQLAlchemy calls.
+        # Never run them on the source asyncio thread: a slow remote query must not
+        # suppress the source worker's independent 30-second progress heartbeat.
+        await asyncio.to_thread(
+            self._record_refresh_heartbeat,
+            state="running",
+            stage="provider_admission",
+        )
         base = await super().run_cycle()
-        self._record_memory("base_provider_gap_complete")
+        await asyncio.to_thread(self._record_memory, "base_provider_gap_complete")
 
         # Visible L2 is source evidence, not an optional consequence of an already
         # discovered arbitrage/carry candidate. Recover the existing bounded sampler
         # here when its durable heartbeat is absent/stale so L2 persistence can
         # advance before the full alpha/mechanism research tail.
         l2_source_refresh = await self._refresh_l2_source_if_due()
-        self._record_memory(
+        await asyncio.to_thread(
+            self._record_memory,
             "critical_l2_source_refresh_complete",
             l2_source_refresh_state=l2_source_refresh.get("state"),
         )
@@ -313,12 +331,15 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
             policy_disabled_sources = sorted(disabled)
             probes = [probe for probe in probes if probe[0] not in disabled]
 
-        coverage_before = self.source_coverage.snapshot()
-        ordered_probes = prioritize_source_probes(
+        coverage_before = await asyncio.to_thread(self.source_coverage.snapshot)
+        ordered_probes = await asyncio.to_thread(
+            prioritize_source_probes,
             self.store,
             coverage_before.lanes,
             tuple(probes),
         )
+        # One point-in-time source-state read serves every TTL check in this cycle.
+        latest_source_rows = await asyncio.to_thread(self.source_coverage.ledger.latest)
         priority: dict[str, object] = {}
         memory_by_source: dict[str, dict[str, float | None]] = {}
         deferred_sources: list[str] = []
@@ -328,7 +349,12 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
 
         for source_id, lane_ids, reference, collector in ordered_probes:
             ttl_seconds = SOURCE_REFRESH_TTL_SECONDS[source_id]
-            if self._source_is_fresh(source_id, lane_ids, ttl_seconds):
+            if self._source_is_fresh(
+                source_id,
+                lane_ids,
+                ttl_seconds,
+                latest=latest_source_rows,
+            ):
                 cached_sources.append(source_id)
                 priority[source_id] = {
                     "healthy": True,
@@ -349,7 +375,8 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                     "refresh_ttl_seconds": ttl_seconds,
                 }
                 gc.collect()
-                memory_by_source[source_id] = self._record_memory(
+                memory_by_source[source_id] = await asyncio.to_thread(
+                    self._record_memory,
                     "priority_source_deferred",
                     source_id=source_id,
                 )
@@ -357,7 +384,7 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
 
             try:
                 probe = await collector()
-                self._record_probe(probe)
+                await asyncio.to_thread(self._record_probe, probe)
                 refreshed_sources.append(source_id)
                 priority[source_id] = {
                     "healthy": True,
@@ -369,7 +396,13 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                 }
                 del probe
             except Exception as exc:
-                self._record_failure(source_id, lane_ids, reference, exc)
+                await asyncio.to_thread(
+                    self._record_failure,
+                    source_id,
+                    lane_ids,
+                    reference,
+                    exc,
+                )
                 failed_sources.append(source_id)
                 priority[source_id] = {
                     "healthy": False,
@@ -380,23 +413,27 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                 }
             finally:
                 gc.collect()
-                memory_by_source[source_id] = self._record_memory(
+                memory_by_source[source_id] = await asyncio.to_thread(
+                    self._record_memory,
                     "priority_source_complete",
                     source_id=source_id,
                 )
 
-        coverage = self.source_coverage.snapshot()
-        stagnation = stagnation_diagnostics(
+        coverage = await asyncio.to_thread(self.source_coverage.snapshot)
+        stagnation = await asyncio.to_thread(
+            stagnation_diagnostics,
             self.store,
             lane_ids=[row.lane_id for row in coverage.lanes],
         )
-        final_memory = self._record_memory(
+        final_memory = await asyncio.to_thread(
+            self._record_memory,
             "source_coverage_snapshot_complete",
             sufficient_lane_count=coverage.sufficient_lane_count,
             forward_test_eligible_lane_count=coverage.forward_test_eligible_lane_count,
         )
         refresh_state = "degraded" if (deferred_sources or failed_sources) else "success"
-        self._record_refresh_heartbeat(
+        await asyncio.to_thread(
+            self._record_refresh_heartbeat,
             state=refresh_state,
             stage="complete",
             sufficient_lane_count=coverage.sufficient_lane_count,
