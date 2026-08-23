@@ -15,6 +15,10 @@ from inefficiency_engine.heavy_work_lease import HeavyWorkLeaseLedger, HeavyWork
 from inefficiency_engine.history_batch_job import maintain_history_batch_once
 from inefficiency_engine.instance_memory import instance_memory_snapshot
 from inefficiency_engine.service import OpportunityService
+from inefficiency_engine.source_runtime_safety import (
+    install_bulk_provider_catalog_runtime,
+    install_research_source_delegation,
+)
 
 
 HEAVY_WORKER_ID = "disposable-heavy-work"
@@ -135,6 +139,13 @@ async def _run(job: str) -> int:
         completion_error_type: str | None = None
         propagated_detail: dict[str, object] = {}
         if job == "research":
+            # Research consumes source evidence; it should not compete with the
+            # permanent source process for the same providers or PostgreSQL catalog
+            # tables. Preserve fail-safe fallback only when the durable source owner
+            # is missing/stale, and use bounded catalog persistence if fallback is
+            # actually required.
+            install_bulk_provider_catalog_runtime()
+            install_research_source_delegation()
             service = OpportunityService(settings=settings, evidence_store=store)
             result = await run_disposable_research_cycle(
                 service,

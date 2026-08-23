@@ -10,6 +10,7 @@ from inefficiency_engine.permanent_source_plane import (
     PermanentSourcePlane,
     source_market_interval_seconds,
 )
+from inefficiency_engine.source_runtime_safety import install_bulk_provider_catalog_runtime
 from inefficiency_engine.volume_universe import (
     TOP_VOLUME_ASSET_COUNT,
     VOLUME_UNIVERSE_REFRESH_SECONDS,
@@ -200,6 +201,12 @@ async def run_permanent_source_worker(
     distinct Python process. The supervisor can terminate/restart this process when the
     durable source heartbeat stops advancing.
     """
+
+    # Exchange product catalogs can contain hundreds of rows. Install the bounded
+    # persistence implementation before constructing any provider collector so remote
+    # PostgreSQL cannot turn a catalog refresh into hundreds of serial event-loop
+    # blocking round trips.
+    install_bulk_provider_catalog_runtime()
 
     stop = stop_event or asyncio.Event()
     loop = asyncio.get_running_loop()
