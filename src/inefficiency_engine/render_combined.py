@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 # and the former compatibility command execute exactly the same runtime.
 from inefficiency_engine import render_combined_runtime as _runtime
 from inefficiency_engine.config import Settings
+from inefficiency_engine.critical_evidence_recovery import MECHANISM_FORWARD_WORKER_ID
 from inefficiency_engine.evidence import build_evidence_store
 
 
@@ -30,12 +31,34 @@ CONTROL_COMMAND = [
     "-m",
     "inefficiency_engine.permanent_control_worker",
 ]
+MECHANISM_COMMAND = [
+    sys.executable,
+    "-m",
+    "inefficiency_engine.permanent_mechanism_worker",
+]
 
 _CONTROL_GUARD_CHECK_SECONDS = 15.0
 _CONTROL_GUARD_STARTUP_GRACE_SECONDS = 180.0
 _CONTROL_GUARD_STALE_SECONDS = 180.0
 _CONTROL_GUARD_DEGRADED_SECONDS = 180.0
 _CONTROL_RESTART_GRACE_SECONDS = 15.0
+_MECHANISM_GUARD_CHECK_SECONDS = 15.0
+_MECHANISM_GUARD_STARTUP_GRACE_SECONDS = 120.0
+_MECHANISM_GUARD_RUNNING_STALE_SECONDS = 120.0
+_MECHANISM_GUARD_HEARTBEAT_STALE_SECONDS = 180.0
+_MECHANISM_RESTART_GRACE_SECONDS = 15.0
+
+# The mechanism-forward process needs heartbeat-aware supervision rather than the
+# parent runtime's former "restart only after process exit" behavior. Capture the
+# original command builder so production can temporarily remove mechanism ownership
+# from the inner runtime while the dedicated outer guard owns exactly one child.
+_BASE_RUNTIME_CHILD_COMMANDS = _runtime.child_commands
+
+
+def supervised_runtime_child_commands(port: str | int) -> dict[str, list[str]]:
+    commands = dict(_BASE_RUNTIME_CHILD_COMMANDS(port))
+    commands.pop("mechanism", None)
+    return commands
 
 
 def control_child_command() -> list[str]:
@@ -44,17 +67,31 @@ def control_child_command() -> list[str]:
     return list(CONTROL_COMMAND)
 
 
-def _terminate_control_child(child: subprocess.Popen[bytes]) -> None:
+def mechanism_child_command() -> list[str]:
+    """Return the dedicated mechanism-forward process command."""
+
+    return list(MECHANISM_COMMAND)
+
+
+def _terminate_child(
+    child: subprocess.Popen[bytes],
+    *,
+    grace_seconds: float,
+) -> None:
     if child.poll() is not None:
         return
     child.terminate()
-    deadline = time.monotonic() + _CONTROL_RESTART_GRACE_SECONDS
+    deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
         if child.poll() is not None:
             return
         time.sleep(0.2)
     if child.poll() is None:
         child.kill()
+
+
+def _terminate_control_child(child: subprocess.Popen[bytes]) -> None:
+    _terminate_child(child, grace_seconds=_CONTROL_RESTART_GRACE_SECONDS)
 
 
 def _start_control_child() -> subprocess.Popen[bytes]:
@@ -152,23 +189,143 @@ def _control_plane_guard(stop_event: threading.Event) -> None:
         _terminate_control_child(child)
 
 
+def mechanism_watchdog_reason(
+    heartbeat,
+    *,
+    process_started_at: datetime,
+    process_age_seconds: float,
+    now: datetime | None = None,
+    startup_grace_seconds: float = _MECHANISM_GUARD_STARTUP_GRACE_SECONDS,
+    running_stale_seconds: float = _MECHANISM_GUARD_RUNNING_STALE_SECONDS,
+    heartbeat_stale_seconds: float = _MECHANISM_GUARD_HEARTBEAT_STALE_SECONDS,
+) -> str | None:
+    """Return why the dedicated mechanism-forward child must be restarted."""
+
+    if process_age_seconds < max(0.0, startup_grace_seconds):
+        return None
+    if heartbeat is None:
+        return "mechanism-forward child has not published a durable heartbeat"
+
+    observed_at = heartbeat.observed_at
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    started = process_started_at
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    if observed_at < started:
+        return "mechanism-forward child has not replaced the previous process heartbeat"
+
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    age_seconds = max(
+        0.0,
+        (current.astimezone(timezone.utc) - observed_at.astimezone(timezone.utc)).total_seconds(),
+    )
+    state = str(heartbeat.state or "unknown")
+    if state == "running" and age_seconds > max(1.0, running_stale_seconds):
+        return (
+            f"mechanism-forward cycle remained running for {age_seconds:.1f}s "
+            f"(limit {running_stale_seconds:.1f}s)"
+        )
+    if age_seconds > max(1.0, heartbeat_stale_seconds):
+        return (
+            f"mechanism-forward heartbeat is {age_seconds:.1f}s old "
+            f"(limit {heartbeat_stale_seconds:.1f}s; state={state})"
+        )
+    if state in {"stopped", "completed"}:
+        return f"mechanism-forward subprocess is alive but heartbeat state={state}"
+    return None
+
+
+def _start_mechanism_child() -> subprocess.Popen[bytes]:
+    command = mechanism_child_command()
+    print(f"starting isolated mechanism-forward child: {' '.join(command)}", flush=True)
+    return subprocess.Popen(command)
+
+
+def _mechanism_plane_guard(stop_event: threading.Event) -> None:
+    """Supervise forward-evidence progress, not merely process liveness."""
+
+    child = _start_mechanism_child()
+    child_started_at = datetime.now(timezone.utc)
+    child_started_mono = time.monotonic()
+
+    try:
+        settings = Settings.from_env()
+        store = build_evidence_store(settings.evidence_db_path)
+    except Exception as exc:
+        print(f"mechanism-forward heartbeat guard unavailable: {type(exc).__name__}", flush=True)
+        store = None
+
+    try:
+        while not stop_event.wait(_MECHANISM_GUARD_CHECK_SECONDS):
+            now_mono = time.monotonic()
+            return_code = child.poll()
+            if return_code is not None:
+                print(
+                    f"isolated mechanism-forward child exited code={return_code}; restarting mechanism only",
+                    flush=True,
+                )
+                child = _start_mechanism_child()
+                child_started_at = datetime.now(timezone.utc)
+                child_started_mono = now_mono
+                continue
+
+            if store is None:
+                continue
+
+            try:
+                heartbeat = store.latest_worker_heartbeat(MECHANISM_FORWARD_WORKER_ID)
+            except Exception:
+                continue
+
+            reason = mechanism_watchdog_reason(
+                heartbeat,
+                process_started_at=child_started_at,
+                process_age_seconds=max(0.0, now_mono - child_started_mono),
+            )
+            if reason is None:
+                continue
+
+            print(f"mechanism-forward guard restarting child: {reason}", flush=True)
+            _terminate_child(child, grace_seconds=_MECHANISM_RESTART_GRACE_SECONDS)
+            child = _start_mechanism_child()
+            child_started_at = datetime.now(timezone.utc)
+            child_started_mono = time.monotonic()
+    finally:
+        _terminate_child(child, grace_seconds=_MECHANISM_RESTART_GRACE_SECONDS)
+
+
 _ORIGINAL_MAIN = _runtime.main
 
 
 def main() -> int:
     stop_event = threading.Event()
-    guard = threading.Thread(
+    control_guard = threading.Thread(
         target=_control_plane_guard,
         args=(stop_event,),
         name="canonical-control-plane-guard",
         daemon=True,
     )
-    guard.start()
+    mechanism_guard = threading.Thread(
+        target=_mechanism_plane_guard,
+        args=(stop_event,),
+        name="mechanism-forward-plane-guard",
+        daemon=True,
+    )
+    # Production ownership is changed only for the duration of the combined runtime;
+    # importing this module for tests or tooling does not mutate the private runtime.
+    _runtime.child_commands = supervised_runtime_child_commands
+    control_guard.start()
+    mechanism_guard.start()
     try:
         return _ORIGINAL_MAIN()
     finally:
         stop_event.set()
-        guard.join(timeout=_CONTROL_RESTART_GRACE_SECONDS + 2.0)
+        control_guard.join(timeout=_CONTROL_RESTART_GRACE_SECONDS + 2.0)
+        mechanism_guard.join(timeout=_MECHANISM_RESTART_GRACE_SECONDS + 2.0)
+        _runtime.child_commands = _BASE_RUNTIME_CHILD_COMMANDS
 
 
 if __name__ == "__main__":

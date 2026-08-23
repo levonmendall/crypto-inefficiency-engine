@@ -21,7 +21,12 @@ from inefficiency_engine.source_runtime_safety import (
 
 
 DEFAULT_MECHANISM_FORWARD_INTERVAL_SECONDS = 30.0
+DEFAULT_MECHANISM_FORWARD_DEADLINE_SECONDS = 90.0
 DEFAULT_MECHANISM_SOURCE_MAX_AGE_SECONDS = 120.0
+
+
+class MechanismForwardDeadlineExceeded(TimeoutError):
+    """One forward-evidence cycle exceeded its bounded production budget."""
 
 
 def _interval_seconds() -> float:
@@ -35,6 +40,19 @@ def _interval_seconds() -> float:
     except ValueError:
         value = DEFAULT_MECHANISM_FORWARD_INTERVAL_SECONDS
     return max(5.0, value)
+
+
+def _forward_deadline_seconds() -> float:
+    try:
+        value = float(
+            os.getenv(
+                "CIE_MECHANISM_FORWARD_DEADLINE_SECONDS",
+                str(DEFAULT_MECHANISM_FORWARD_DEADLINE_SECONDS),
+            )
+        )
+    except ValueError:
+        value = DEFAULT_MECHANISM_FORWARD_DEADLINE_SECONDS
+    return max(30.0, value)
 
 
 def _source_max_age_seconds() -> float:
@@ -121,11 +139,56 @@ def _current_durable_source_snapshot(factory: DisposableExpandedAlphaFactoryServ
     return snapshot
 
 
+async def _run_forward_cycle(
+    factory: DisposableExpandedAlphaFactoryService,
+    service: OpportunityService,
+    execution,
+):
+    """Run one durable-only forward cycle while always restoring service bindings."""
+
+    snapshot = await asyncio.to_thread(_current_durable_source_snapshot, factory)
+    original_evidence = service.collect_live_evidence
+    original_executability = getattr(service, "collect_live_executability", None)
+
+    async def cached_snapshot():
+        return snapshot
+
+    service.collect_live_evidence = cached_snapshot
+    if original_executability is not None:
+        service.collect_live_executability = cached_snapshot
+    try:
+        return await execution.run_evidence_cycle()
+    finally:
+        service.collect_live_evidence = original_evidence
+        if original_executability is not None:
+            service.collect_live_executability = original_executability
+
+
 async def _run() -> None:
     settings = Settings.from_env()
     store = build_evidence_store(settings.evidence_db_path)
     if store is None:
         raise RuntimeError("permanent mechanism-forward worker requires durable evidence persistence")
+
+    # Publish process ownership before constructing the heavier mechanism services.
+    # If initialization itself wedges, the outer dedicated guard can now distinguish
+    # a stuck current process from an old or absent heartbeat and restart only this
+    # failure domain.
+    store.record_worker_heartbeat(
+        worker_id=MECHANISM_FORWARD_WORKER_ID,
+        state="running",
+        detail={
+            "sequence": 0,
+            "stage": "initializing",
+            "permanent_process": True,
+            "runtime_plane": "mechanism-forward",
+            "supervised_by_dedicated_guard": True,
+            "provider_acquisition_owned_elsewhere": True,
+            "allocation_authority": False,
+            "live_execution_authority": False,
+            "paper_only": True,
+        },
+    )
 
     install_bulk_provider_catalog_runtime()
     install_source_coverage_reconciliation_runtime()
@@ -135,6 +198,7 @@ async def _run() -> None:
     execution = factory.mechanism_execution
 
     interval = _interval_seconds()
+    deadline = _forward_deadline_seconds()
     sequence = 0
 
     while True:
@@ -149,6 +213,8 @@ async def _run() -> None:
                     "stage": "forward_evidence",
                     "permanent_process": True,
                     "runtime_plane": "mechanism-forward",
+                    "whole_cycle_deadline_seconds": deadline,
+                    "supervised_by_dedicated_guard": True,
                     "canonical_control_owned_elsewhere": True,
                     "provider_acquisition_owned_elsewhere": True,
                     "allocation_authority": False,
@@ -157,22 +223,15 @@ async def _run() -> None:
                 },
             )
 
-            snapshot = await asyncio.to_thread(_current_durable_source_snapshot, factory)
-            original_evidence = service.collect_live_evidence
-            original_executability = getattr(service, "collect_live_executability", None)
-
-            async def cached_snapshot():
-                return snapshot
-
-            service.collect_live_evidence = cached_snapshot
-            if original_executability is not None:
-                service.collect_live_executability = cached_snapshot
             try:
-                cycle = await execution.run_evidence_cycle()
-            finally:
-                service.collect_live_evidence = original_evidence
-                if original_executability is not None:
-                    service.collect_live_executability = original_executability
+                cycle = await asyncio.wait_for(
+                    _run_forward_cycle(factory, service, execution),
+                    timeout=deadline,
+                )
+            except TimeoutError as exc:
+                raise MechanismForwardDeadlineExceeded(
+                    f"MechanismForwardDeadlineExceeded:{deadline:.1f}s"
+                ) from exc
 
             funnel = mechanism_forward_funnel(execution, cycle)
             store.record_worker_heartbeat(
@@ -185,6 +244,8 @@ async def _run() -> None:
                     "funnel_telemetry": True,
                     "permanent_process": True,
                     "runtime_plane": "mechanism-forward",
+                    "whole_cycle_deadline_seconds": deadline,
+                    "supervised_by_dedicated_guard": True,
                     "canonical_control_owned_elsewhere": True,
                     "provider_acquisition_owned_elsewhere": True,
                     "disposable_research_dependency": False,
@@ -207,6 +268,8 @@ async def _run() -> None:
                         "message": str(exc)[:500],
                         "permanent_process": True,
                         "runtime_plane": "mechanism-forward",
+                        "whole_cycle_deadline_seconds": deadline,
+                        "supervised_by_dedicated_guard": True,
                         "canonical_control_owned_elsewhere": True,
                         "provider_acquisition_owned_elsewhere": True,
                         "disposable_research_dependency": False,
