@@ -24,6 +24,11 @@ VOLUME_UNIVERSE_MAINTENANCE_SECONDS = max(
     60.0,
     min(300.0, VOLUME_UNIVERSE_REFRESH_SECONDS / 3.0),
 )
+# A complete bounded source cycle can legitimately exceed the 180-second supervisor
+# freshness boundary while many async provider attempts time out independently. Pulse
+# durable liveness during the cycle so the supervisor restarts only a genuinely stuck
+# event loop, not a healthy long-running acquisition cycle.
+SOURCE_PROGRESS_PULSE_SECONDS = 30.0
 
 
 async def _volume_universe_refresh_loop(
@@ -78,6 +83,52 @@ async def _volume_universe_refresh_loop(
             continue
 
 
+async def _source_cycle_progress_pulse(
+    store: EvidenceStore,
+    *,
+    cycle_done: asyncio.Event,
+    interval_seconds: float = SOURCE_PROGRESS_PULSE_SECONDS,
+) -> None:
+    """Publish liveness while one async provider cycle is legitimately still running.
+
+    The pulse cannot create evidence, qualification or allocation authority. If a
+    synchronous/provider bug actually blocks this event loop, this coroutine also stops
+    advancing and the external supervisor's 180-second watchdog still restarts the
+    isolated source process.
+    """
+
+    interval = max(0.01, float(interval_seconds))
+    while not cycle_done.is_set():
+        try:
+            await asyncio.wait_for(cycle_done.wait(), timeout=interval)
+            return
+        except TimeoutError:
+            pass
+        if cycle_done.is_set():
+            return
+        try:
+            store.record_worker_heartbeat(
+                worker_id=PERMANENT_SOURCE_WORKER_ID,
+                state="running",
+                detail={
+                    "stage": "provider_cycle_in_progress",
+                    "progress_pulse": True,
+                    "isolated_source_process": True,
+                    "resident_with_portfolio_process": False,
+                    "separate_python_process": True,
+                    "disposable_research_required": False,
+                    "portfolio_authority": False,
+                    "allocation_authority": False,
+                    "live_execution_authority": False,
+                    "paper_only": True,
+                },
+            )
+        except Exception:
+            # Heartbeat persistence failure must not cancel source acquisition; the
+            # supervisor will fail closed and restart if durable liveness remains old.
+            pass
+
+
 async def _permanent_source_refresh_loop(
     store: EvidenceStore,
     *,
@@ -90,7 +141,20 @@ async def _permanent_source_refresh_loop(
         try:
             if source_plane is None:
                 source_plane = PermanentSourcePlane(store)
-            await source_plane.run_cycle()
+
+            cycle_done = asyncio.Event()
+            pulse_task = asyncio.create_task(
+                _source_cycle_progress_pulse(store, cycle_done=cycle_done),
+                name="source-cycle-progress-pulse",
+            )
+            try:
+                await source_plane.run_cycle()
+            finally:
+                # Stop the pulse before writing any outer degraded heartbeat so a
+                # late pulse can never overwrite the cycle's terminal durable state.
+                cycle_done.set()
+                pulse_task.cancel()
+                await asyncio.gather(pulse_task, return_exceptions=True)
         except Exception as exc:
             try:
                 store.record_worker_heartbeat(
