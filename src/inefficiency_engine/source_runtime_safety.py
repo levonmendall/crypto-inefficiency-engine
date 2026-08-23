@@ -1,20 +1,32 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, inspect, select, text
 
 from inefficiency_engine.provider_gap_collection import (
     ProviderCatalogLedger,
     _deterministic_id,
 )
 from inefficiency_engine.priority_source_collection import PrioritySourceCollectionService
+from inefficiency_engine.source_coverage import (
+    SourceCoverageLedger,
+    SourceCoverageObservation,
+    SourceCoveragePlane,
+)
 
 
 _BULK_PATCH_MARKER = "_cie_bulk_catalog_runtime"
 _RESEARCH_DELEGATION_MARKER = "_cie_research_source_delegation"
+_COVERAGE_PATCH_MARKER = "_cie_source_coverage_runtime"
+_TABLE_CACHE_ATTR = "_cie_snapshot_table_candidate_cache"
+
+_ORIGINAL_TABLE_CANDIDATE = SourceCoveragePlane._table_candidate
+_ORIGINAL_SNAPSHOT = SourceCoveragePlane.snapshot
 
 
 def _bulk_catalog_observe(
@@ -62,11 +74,7 @@ def _bulk_catalog_observe(
             ).scalars()
         )
         is_baseline = not existing_keys
-        pending = [
-            pair
-            for key, pair in normalized.items()
-            if key not in existing_keys
-        ]
+        pending = [pair for key, pair in normalized.items() if key not in existing_keys]
         if pending:
             db.execute(insert(self.rows), [row for row, _ in pending])
 
@@ -80,6 +88,165 @@ def install_bulk_provider_catalog_runtime() -> None:
         return
     ProviderCatalogLedger.observe = _bulk_catalog_observe  # type: ignore[method-assign]
     setattr(ProviderCatalogLedger, _BULK_PATCH_MARKER, True)
+
+
+def _latest_source_coverage_rows(
+    self: SourceCoverageLedger,
+) -> dict[tuple[str, str], SourceCoverageObservation]:
+    """Read one durable row per source/lane instead of thousands of history rows."""
+
+    latest_ids = (
+        select(func.max(self.rows.c.id).label("id"))
+        .group_by(self.rows.c.source_id, self.rows.c.lane_id)
+        .subquery()
+    )
+    with self.store.engine.connect() as db:
+        payloads = list(
+            db.execute(
+                select(self.rows.c.payload_json).join(
+                    latest_ids,
+                    self.rows.c.id == latest_ids.c.id,
+                )
+            ).scalars()
+        )
+    result: dict[tuple[str, str], SourceCoverageObservation] = {}
+    for payload in payloads:
+        row = SourceCoverageObservation.model_validate_json(payload)
+        result[(row.source_id, row.lane_id)] = row
+    return result
+
+
+def _latest_provider_rows(
+    self: SourceCoveragePlane,
+    available: set[str],
+) -> list[dict[str, object]]:
+    """Read exactly the latest durable status for each public provider."""
+
+    if "provider_statuses" not in available:
+        return []
+    query = text(
+        "SELECT p.provider,p.ok,p.item_count,p.error_type,p.observed_at "
+        "FROM provider_statuses p "
+        "JOIN (SELECT provider,MAX(id) AS id FROM provider_statuses GROUP BY provider) latest "
+        "ON p.id=latest.id"
+    )
+    with self.store.engine.connect() as db:
+        return [dict(row) for row in db.execute(query).mappings()]
+
+
+def _latest_admissions(
+    self: SourceCoveragePlane,
+    available: set[str],
+) -> list[dict[str, object]]:
+    """Read exactly the latest durable admission for each mechanism/provider pair."""
+
+    if "provider_gap_admissions" not in available:
+        return []
+    query = text(
+        "SELECT a.payload_json FROM provider_gap_admissions a "
+        "JOIN ("
+        "SELECT mechanism_id,provider,MAX(id) AS id "
+        "FROM provider_gap_admissions GROUP BY mechanism_id,provider"
+        ") latest ON a.id=latest.id"
+    )
+    result: list[dict[str, object]] = []
+    with self.store.engine.connect() as db:
+        raws = list(db.execute(query).scalars())
+    for raw in raws:
+        try:
+            payload = json.loads(str(raw))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            result.append(payload)
+    return result
+
+
+def _cached_table_candidate(
+    self: SourceCoveragePlane,
+    spec: dict[str, object],
+    available: set[str],
+) -> dict[str, object] | None:
+    """Reuse identical latest-table probes within one coverage snapshot."""
+
+    cache = getattr(self, _TABLE_CACHE_ATTR, None)
+    probe = spec.get("table")
+    if not isinstance(cache, dict) or not isinstance(probe, tuple):
+        return _ORIGINAL_TABLE_CANDIDATE(self, spec, available)
+    key = tuple(probe)
+    if key not in cache:
+        cache[key] = _ORIGINAL_TABLE_CANDIDATE(self, spec, available)
+    value = cache[key]
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _snapshot_with_table_cache(
+    self: SourceCoveragePlane,
+    *args: object,
+    **kwargs: object,
+):
+    previous = getattr(self, _TABLE_CACHE_ATTR, None)
+    setattr(self, _TABLE_CACHE_ATTR, {})
+    try:
+        return _ORIGINAL_SNAPSHOT(self, *args, **kwargs)
+    finally:
+        if previous is None:
+            try:
+                delattr(self, _TABLE_CACHE_ATTR)
+            except AttributeError:
+                pass
+        else:
+            setattr(self, _TABLE_CACHE_ATTR, previous)
+
+
+def install_source_coverage_reconciliation_runtime() -> None:
+    """Install bounded latest-state reads for source coverage once per process.
+
+    This changes only how the same durable truth is retrieved. Evidence freshness,
+    admission, qualification, settlement, sizing, allocation, and execution rules are
+    unchanged.
+    """
+
+    if bool(getattr(SourceCoveragePlane, _COVERAGE_PATCH_MARKER, False)):
+        return
+    SourceCoverageLedger.latest = _latest_source_coverage_rows  # type: ignore[method-assign]
+    SourceCoveragePlane._provider_rows = _latest_provider_rows  # type: ignore[method-assign]
+    SourceCoveragePlane._admissions = _latest_admissions  # type: ignore[method-assign]
+    SourceCoveragePlane._table_candidate = _cached_table_candidate  # type: ignore[method-assign]
+    SourceCoveragePlane.snapshot = _snapshot_with_table_cache  # type: ignore[method-assign]
+    setattr(SourceCoveragePlane, _COVERAGE_PATCH_MARKER, True)
+
+
+def ensure_source_coverage_runtime_indexes(store: Any) -> None:
+    """Create indexes used by latest-evidence reconciliation when their tables exist."""
+
+    available = set(inspect(store.engine).get_table_names())
+    index_specs: dict[str, tuple[str, ...]] = {
+        "market_quotes": ("venue", "observed_at"),
+        "funding_quotes": ("venue", "observed_at"),
+        "order_books": ("venue", "observed_at"),
+        "opportunities": ("observed_at",),
+        "provider_statuses": ("provider", "id"),
+        "source_coverage_observations": ("source_id", "lane_id", "id"),
+        "provider_gap_admissions": ("mechanism_id", "provider", "id"),
+        "maker_shadow_outcomes": ("observed_at",),
+        "capital_transfer_outcomes": ("observed_at",),
+    }
+    statements: list[str] = []
+    for table_name, columns in index_specs.items():
+        if table_name not in available:
+            continue
+        safe_suffix = "_".join(columns)
+        index_name = f"ix_runtime_{table_name}_{safe_suffix}"
+        statements.append(
+            f"CREATE INDEX IF NOT EXISTS {index_name} "
+            f"ON {table_name} ({','.join(columns)})"
+        )
+    if not statements:
+        return
+    with store.engine.begin() as db:
+        for statement in statements:
+            db.execute(text(statement))
 
 
 def _research_source_owner_current(store: Any) -> bool:
@@ -103,8 +270,13 @@ def _research_source_owner_current(store: Any) -> bool:
     )
 
 
-def _delegated_source_payload(service: PrioritySourceCollectionService) -> dict[str, object]:
-    coverage = service.source_coverage.snapshot()
+async def _delegated_source_payload(
+    service: PrioritySourceCollectionService,
+) -> dict[str, object]:
+    # Coverage reconciliation contains synchronous SQLAlchemy reads. Keep them off
+    # the research event loop so a slow database read cannot suppress research
+    # liveness or delay unrelated async work.
+    coverage = await asyncio.to_thread(service.source_coverage.snapshot)
     return {
         "mechanisms": {},
         "priority_sources": {},
@@ -153,7 +325,7 @@ def install_research_source_delegation() -> None:
 
     async def delegated_run_cycle(self: PrioritySourceCollectionService) -> dict[str, object]:
         if _research_source_owner_current(self.store):
-            return _delegated_source_payload(self)
+            return await _delegated_source_payload(self)
         return await original_run_cycle(self)
 
     PrioritySourceCollectionService.run_cycle = delegated_run_cycle  # type: ignore[method-assign]
