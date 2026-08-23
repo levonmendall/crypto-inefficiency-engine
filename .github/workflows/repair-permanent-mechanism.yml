@@ -3,6 +3,8 @@ name: Permanent mechanism-forward repair
 on:
   push:
     branches: [repair/permanent-mechanism-forward-worker]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
