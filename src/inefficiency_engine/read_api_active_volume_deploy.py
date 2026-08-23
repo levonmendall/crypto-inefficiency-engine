@@ -51,6 +51,21 @@ _RUNTIME_HEARTBEATS = {
     "mechanism_forward": "mechanism-forward-evidence",
     "alpha_l2_sampling": "alpha-l2-research-sampling",
 }
+# Runtime liveness cadence is not evidence freshness. The source owner pulses every
+# 30s and is supervised at the baseline 180s boundary, while portfolio/research and
+# their subordinate diagnostics can legitimately go several minutes between terminal
+# heartbeats. Source/evidence cards retain their own strict TTL/readiness contracts.
+_RUNTIME_STALE_AFTER_SECONDS = {
+    "portfolio": 600.0,
+    "permanent_source": 180.0,
+    "volume_universe": 600.0,
+    "market_universe_routing": 600.0,
+    "research": 600.0,
+    "heavy_worker": 600.0,
+    "source_refresh": 600.0,
+    "mechanism_forward": 600.0,
+    "alpha_l2_sampling": 600.0,
+}
 
 
 def _store():
@@ -62,14 +77,23 @@ def _release_commit() -> str | None:
     return value.strip() if value and value.strip() else None
 
 
+def _worker_stale_after_seconds(label: str, baseline_seconds: float) -> float:
+    """Return the worker liveness window without changing evidence freshness."""
+
+    return max(
+        max(1.0, float(baseline_seconds)),
+        float(_RUNTIME_STALE_AFTER_SECONDS.get(label, baseline_seconds)),
+    )
+
+
 def _runtime_heartbeats() -> dict[str, object]:
     """Best-effort durable runtime truth without changing liveness semantics.
 
     Render uses /health as a process liveness probe. A transient provider or research
     degradation must therefore remain visible in the payload without converting the
     endpoint into a restart trigger. Each worker's durable heartbeat is reported with
-    age/staleness so a healthy web process can no longer be mistaken for a healthy
-    research engine.
+    age/staleness using that worker's actual operating cadence. Evidence/source TTLs
+    remain separate and are not relaxed here.
     """
 
     store = _store()
@@ -92,6 +116,7 @@ def _runtime_heartbeats() -> dict[str, object]:
     )
     workers: dict[str, object] = {}
     for label, worker_id in _RUNTIME_HEARTBEATS.items():
+        worker_stale_seconds = _worker_stale_after_seconds(label, stale_seconds)
         try:
             heartbeat = store.latest_worker_heartbeat(worker_id)
         except Exception as exc:
@@ -100,6 +125,7 @@ def _runtime_heartbeats() -> dict[str, object]:
                 "available": False,
                 "state": "unavailable",
                 "error_type": type(exc).__name__,
+                "stale_after_seconds": worker_stale_seconds,
             }
             continue
         if heartbeat is None:
@@ -107,6 +133,7 @@ def _runtime_heartbeats() -> dict[str, object]:
                 "worker_id": worker_id,
                 "available": False,
                 "state": "unobserved",
+                "stale_after_seconds": worker_stale_seconds,
             }
             continue
         observed_at = heartbeat.observed_at
@@ -120,11 +147,13 @@ def _runtime_heartbeats() -> dict[str, object]:
             "error_type": heartbeat.error_type,
             "observed_at": observed_at.isoformat(),
             "age_seconds": age_seconds,
-            "stale": age_seconds > stale_seconds,
+            "stale_after_seconds": worker_stale_seconds,
+            "stale": age_seconds > worker_stale_seconds,
         }
     return {
         "available": True,
         "stale_after_seconds": stale_seconds,
+        "worker_specific_staleness": True,
         "workers": workers,
         "liveness_authority": False,
         "diagnostic_only": True,

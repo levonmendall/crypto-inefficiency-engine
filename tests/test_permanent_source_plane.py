@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -131,6 +132,41 @@ async def test_permanent_market_l2_cycle_persists_source_truth_without_research(
     assert heartbeat.detail["permanent_source_plane"] is True
 
 
+@pytest.mark.asyncio
+async def test_source_progress_pulse_keeps_long_async_cycle_durably_current(tmp_path):
+    store = EvidenceStore(tmp_path / "source-progress.sqlite")
+    cycle_done = asyncio.Event()
+    pulse = asyncio.create_task(
+        permanent_source_worker._source_cycle_progress_pulse(
+            store,
+            cycle_done=cycle_done,
+            interval_seconds=0.01,
+        )
+    )
+
+    await asyncio.sleep(0.035)
+    heartbeat = store.latest_worker_heartbeat(PERMANENT_SOURCE_WORKER_ID)
+    assert heartbeat is not None
+    assert heartbeat.state == "running"
+    assert heartbeat.detail["progress_pulse"] is True
+    assert heartbeat.detail["stage"] == "provider_cycle_in_progress"
+    assert heartbeat.detail["separate_python_process"] is True
+    assert heartbeat.detail["allocation_authority"] is False
+
+    cycle_done.set()
+    await pulse
+    store.record_worker_heartbeat(
+        worker_id=PERMANENT_SOURCE_WORKER_ID,
+        state="success",
+        detail={"terminal": True},
+    )
+    await asyncio.sleep(0.02)
+    terminal = store.latest_worker_heartbeat(PERMANENT_SOURCE_WORKER_ID)
+    assert terminal is not None
+    assert terminal.state == "success"
+    assert terminal.detail["terminal"] is True
+
+
 def test_source_provider_work_is_not_hosted_on_portfolio_event_loop():
     portfolio_source = inspect.getsource(lightweight_portfolio_worker)
     source_worker = inspect.getsource(permanent_source_worker)
@@ -145,4 +181,5 @@ def test_source_provider_work_is_not_hosted_on_portfolio_event_loop():
     assert "resolve_top_volume_assets" in source_worker
     assert 'name="permanent-source-refresh"' in source_worker
     assert 'name="volume-universe-refresh"' in source_worker
+    assert "_source_cycle_progress_pulse" in source_worker
     assert "allocation_authority" in source_worker
