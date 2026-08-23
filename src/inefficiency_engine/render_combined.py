@@ -50,8 +50,8 @@ _MECHANISM_RESTART_GRACE_SECONDS = 15.0
 
 # The mechanism-forward process needs heartbeat-aware supervision rather than the
 # parent runtime's former "restart only after process exit" behavior. Capture the
-# original command builder, then remove mechanism ownership from the inner runtime
-# so exactly one dedicated guard owns that child.
+# original command builder so production can temporarily remove mechanism ownership
+# from the inner runtime while the dedicated outer guard owns exactly one child.
 _BASE_RUNTIME_CHILD_COMMANDS = _runtime.child_commands
 
 
@@ -59,9 +59,6 @@ def supervised_runtime_child_commands(port: str | int) -> dict[str, list[str]]:
     commands = dict(_BASE_RUNTIME_CHILD_COMMANDS(port))
     commands.pop("mechanism", None)
     return commands
-
-
-_runtime.child_commands = supervised_runtime_child_commands
 
 
 def control_child_command() -> list[str]:
@@ -317,6 +314,9 @@ def main() -> int:
         name="mechanism-forward-plane-guard",
         daemon=True,
     )
+    # Production ownership is changed only for the duration of the combined runtime;
+    # importing this module for tests or tooling does not mutate the private runtime.
+    _runtime.child_commands = supervised_runtime_child_commands
     control_guard.start()
     mechanism_guard.start()
     try:
@@ -325,6 +325,7 @@ def main() -> int:
         stop_event.set()
         control_guard.join(timeout=_CONTROL_RESTART_GRACE_SECONDS + 2.0)
         mechanism_guard.join(timeout=_MECHANISM_RESTART_GRACE_SECONDS + 2.0)
+        _runtime.child_commands = _BASE_RUNTIME_CHILD_COMMANDS
 
 
 if __name__ == "__main__":
