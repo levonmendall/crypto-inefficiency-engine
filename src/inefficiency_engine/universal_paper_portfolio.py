@@ -40,6 +40,12 @@ class UniversalOperationallyResilientPaperPortfolioService(
         for position in state.positions:
             event = open_events.get(position.position_id)
             trial = self._event_trial(event)
+            if trial is not None:
+                # The portfolio event embeds the immutable trial for recovery; the
+                # allocation ledger is the operating-certification source of truth.
+                # Re-recording is idempotent and repairs a crash between the event
+                # append and the original trial append.
+                self.settlement.ledger.record_trial(trial)
             is_universal = bool(
                 trial is not None
                 and trial.settlement_method
@@ -58,6 +64,7 @@ class UniversalOperationallyResilientPaperPortfolioService(
                         stale_positions += 1
                         settlement_blocked += 1
                         continue
+                    self.settlement.ledger.record_outcome(outcome)
                     self.ledger.record_event(
                         self._close_from_outcome(position, outcome)
                     )
@@ -253,6 +260,7 @@ class UniversalOperationallyResilientPaperPortfolioService(
                         observed_at=plan.observed_at,
                     )
                     self.ledger.record_event(event)
+                    self.settlement.ledger.record_trial(trial)
                     fresh_position_evidence[event.position_id or ""] = (
                         allocation.source_observed_at or plan.observed_at
                     )

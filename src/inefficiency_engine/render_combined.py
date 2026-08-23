@@ -15,6 +15,7 @@ from inefficiency_engine import render_combined_runtime as _runtime
 from inefficiency_engine.config import Settings
 from inefficiency_engine.critical_evidence_recovery import MECHANISM_FORWARD_WORKER_ID
 from inefficiency_engine.evidence import build_evidence_store
+from inefficiency_engine.permanent_control_worker import _build_control_services
 
 
 CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"
@@ -306,7 +307,30 @@ def _mechanism_plane_guard(stop_event: threading.Event) -> None:
 _ORIGINAL_MAIN = _runtime.main
 
 
+def bootstrap_permanent_runtime_schema() -> None:
+    """Create shared permanent-worker tables once before concurrent child startup.
+
+    SQLAlchemy's ``create_all(checkfirst=True)`` performs a check followed by DDL;
+    it is not a cross-process schema migration lock. Starting control, mechanism,
+    portfolio, and source against a newly introduced table at the same instant can
+    therefore make two children both attempt the same CREATE TABLE. The durable
+    control graph owns the union of tables shared by those workers, so constructing
+    it once in the parent removes that race without changing any runtime authority.
+    """
+
+    settings = Settings.from_env()
+    store = build_evidence_store(settings.evidence_db_path)
+    if store is None:
+        raise RuntimeError("combined runtime requires durable evidence persistence")
+    _build_control_services(settings, store)
+    print(
+        f"permanent runtime schema bootstrap complete: {store.safe_database_url}",
+        flush=True,
+    )
+
+
 def main() -> int:
+    bootstrap_permanent_runtime_schema()
     stop_event = threading.Event()
     control_guard = threading.Thread(
         target=_control_plane_guard,

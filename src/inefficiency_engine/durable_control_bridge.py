@@ -15,6 +15,49 @@ from inefficiency_engine.qualified_opportunity_freshness import (
 from inefficiency_engine.unified_allocation import UnifiedPaperCandidate, _core_candidates
 
 
+def _core_rejection_failures(snapshot, candidates) -> list[dict[str, object]]:
+    """Explain observed core evidence that failed qualification, without relaxing it."""
+
+    promoted_ids = {
+        item.opportunity_id for item in candidates if item.opportunity_id is not None
+    }
+    opportunities = {item.id: item for item in snapshot.opportunities}
+    failures: list[dict[str, object]] = []
+    for execution in snapshot.executability:
+        opportunity = opportunities.get(execution.opportunity_id)
+        if opportunity is None or opportunity.id in promoted_ids:
+            continue
+        executable = [
+            tier
+            for tier in execution.tiers
+            if tier.executable and tier.capital_required_usd > 0
+        ]
+        passing = [tier for tier in executable if tier.passes_return_hurdle]
+        if executable and not passing:
+            failures.append(
+                {
+                    "family": "core_cex",
+                    "error_type": "EconomicQualificationRejected",
+                    "reason": "executable core CEX evidence failed the unchanged return hurdle",
+                    "opportunity_id": opportunity.id,
+                    "executable_tier_count": len(executable),
+                    "return_hurdle_pass_count": 0,
+                }
+            )
+        elif not executable:
+            failures.append(
+                {
+                    "family": "core_cex",
+                    "error_type": "ExecutionQualificationRejected",
+                    "reason": "observed core CEX evidence failed executable depth or capital qualification",
+                    "opportunity_id": opportunity.id,
+                    "executable_tier_count": 0,
+                    "return_hurdle_pass_count": 0,
+                }
+            )
+    return failures
+
+
 class DurableControlQualifiedOpportunityBridgePublisher(
     CexDexFreshnessSeparatedQualifiedOpportunityBridgePublisher
 ):
@@ -78,7 +121,9 @@ class DurableControlQualifiedOpportunityBridgePublisher(
         failures: list[dict[str, object]] = []
 
         try:
-            rows.extend(_core_candidates(snapshot.opportunities, snapshot.executability))
+            core_rows = _core_candidates(snapshot.opportunities, snapshot.executability)
+            rows.extend(core_rows)
+            failures.extend(_core_rejection_failures(snapshot, core_rows))
         except Exception as exc:
             failures.append(
                 {

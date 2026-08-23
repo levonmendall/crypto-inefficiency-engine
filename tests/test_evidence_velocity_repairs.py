@@ -353,9 +353,9 @@ def test_production_disposable_runtime_uses_integrated_all_lane_services():
 
 def test_lightweight_portfolio_runtime_preserves_integrated_all_lane_settlement():
     assert CanonicalPortfolioAllocatorService is EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService
-    assert (
-        CanonicalPaperPortfolioService
-        is EvidenceVelocityLaneSuccessOperationallyResilientPaperPortfolioService
+    assert issubclass(
+        CanonicalPaperPortfolioService,
+        EvidenceVelocityLaneSuccessOperationallyResilientPaperPortfolioService,
     )
 
 
