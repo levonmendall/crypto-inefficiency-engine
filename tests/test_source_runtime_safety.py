@@ -53,8 +53,6 @@ def test_catalog_refresh_uses_bounded_database_round_trips(tmp_path):
         )
         assert baseline is True
         assert len(new_items) == 250
-        # One existing-key read plus one executemany insert; allow one dialect-level
-        # extra statement without permitting the old one-query-per-product behavior.
         assert len(statements) <= 3
 
         statements.clear()
@@ -114,10 +112,12 @@ def test_source_coverage_latest_reads_one_row_per_source_lane(tmp_path):
     assert len(statements) == 1
 
 
-def test_source_coverage_snapshot_caches_repeated_table_probes_and_adds_indexes(tmp_path):
+def test_source_coverage_snapshot_caches_repeated_table_probes_and_manual_indexes(tmp_path):
     store = EvidenceStore(tmp_path / "coverage-cache.sqlite")
     plane = SourceCoveragePlane(store)
     install_source_coverage_reconciliation_runtime()
+    # The index helper remains available for controlled/offline maintenance, but
+    # production source/research workers must never invoke DDL in their hot paths.
     ensure_source_coverage_runtime_indexes(store)
 
     indexes = {
@@ -140,9 +140,6 @@ def test_source_coverage_snapshot_caches_repeated_table_probes_and_adds_indexes(
         event.remove(store.engine, "before_cursor_execute", before_cursor_execute)
 
     assert snapshot.lane_count == 13
-    # There are five unique market-quote table probes in the source catalog. Each
-    # source appears in several lanes, but reconciliation must query each unique
-    # table/filter only once per snapshot.
     assert len(statements) <= 5
 
 
@@ -173,20 +170,19 @@ async def test_research_delegates_source_refresh_to_current_permanent_owner(tmp_
     assert payload["source_refresh"]["state"] == "delegated_to_permanent_source"
     assert payload["source_refresh"]["permanent_source_owner_current"] is True
     assert payload["source_coverage"]["lane_count"] == 13
-    # Research delegation must not impersonate or overwrite the permanent source
-    # worker's own source-refresh heartbeat.
     assert store.latest_worker_heartbeat("priority-source-refresh-plane") is None
 
 
-def test_runtime_entrypoints_install_source_safety_contracts():
+def test_runtime_entrypoints_install_source_safety_without_runtime_ddl():
     source_worker = inspect.getsource(permanent_source_worker.run_permanent_source_worker)
     source_loop = inspect.getsource(permanent_source_worker._permanent_source_refresh_loop)
     heavy_worker = inspect.getsource(disposable_heavy_job._run)
 
     assert "install_bulk_provider_catalog_runtime()" in source_worker
     assert "install_source_coverage_reconciliation_runtime()" in source_worker
-    assert "ensure_source_coverage_runtime_indexes(store)" in source_loop
+    assert "ensure_source_coverage_runtime_indexes" not in source_worker
+    assert "ensure_source_coverage_runtime_indexes" not in source_loop
     assert "install_bulk_provider_catalog_runtime()" in heavy_worker
     assert "install_source_coverage_reconciliation_runtime()" in heavy_worker
     assert "install_research_source_delegation()" in heavy_worker
-    assert "ensure_source_coverage_runtime_indexes(store)" in heavy_worker
+    assert "ensure_source_coverage_runtime_indexes" not in heavy_worker
