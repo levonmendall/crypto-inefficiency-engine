@@ -70,6 +70,7 @@ def test_runtime_heartbeat_payload_exposes_degraded_and_stale_without_raising(mo
     payload = deploy._runtime_heartbeats()
     assert payload["diagnostic_only"] is True
     assert payload["liveness_authority"] is False
+    assert payload["worker_specific_staleness"] is True
     assert payload["workers"]["portfolio"]["state"] == "success"
     assert payload["workers"]["permanent_source"]["state"] == "degraded"
     assert payload["workers"]["permanent_source"]["stale"] is False
@@ -79,11 +80,60 @@ def test_runtime_heartbeat_payload_exposes_degraded_and_stale_without_raising(mo
     assert payload["workers"]["research"]["error_type"] == "ResearchSubsystemDegraded"
 
 
+def test_runtime_liveness_windows_match_worker_cadence_without_relaxing_source_owner(monkeypatch):
+    rows = {
+        "canonical-portfolio-operating-loop": SimpleNamespace(
+            state="success",
+            error_type=None,
+            observed_at=NOW - timedelta(seconds=240),
+        ),
+        "canonical-source-operating-loop": SimpleNamespace(
+            state="running",
+            error_type=None,
+            observed_at=NOW - timedelta(seconds=181),
+        ),
+        "shadow-research-auxiliary": SimpleNamespace(
+            state="success",
+            error_type=None,
+            observed_at=NOW - timedelta(seconds=300),
+        ),
+        "alpha-l2-research-sampling": SimpleNamespace(
+            state="success",
+            error_type=None,
+            observed_at=NOW - timedelta(seconds=300),
+        ),
+    }
+    monkeypatch.setattr(deploy, "_store", lambda: _Store(rows))
+    monkeypatch.setattr(
+        deploy._base_deploy._base,
+        "settings",
+        SimpleNamespace(worker_heartbeat_stale_seconds=180.0),
+    )
+
+    payload = deploy._runtime_heartbeats()
+
+    portfolio = payload["workers"]["portfolio"]
+    source = payload["workers"]["permanent_source"]
+    research = payload["workers"]["research"]
+    l2 = payload["workers"]["alpha_l2_sampling"]
+
+    assert portfolio["stale_after_seconds"] == 600.0
+    assert portfolio["stale"] is False
+    assert source["stale_after_seconds"] == 180.0
+    assert source["stale"] is True
+    assert research["stale_after_seconds"] == 600.0
+    assert research["stale"] is False
+    assert l2["stale_after_seconds"] == 600.0
+    assert l2["stale"] is False
+
+
 def test_unobserved_worker_is_visible_not_assumed_healthy(monkeypatch):
     monkeypatch.setattr(deploy, "_store", lambda: _Store({}))
     payload = deploy._runtime_heartbeats()
     assert payload["workers"]["permanent_source"]["available"] is False
     assert payload["workers"]["permanent_source"]["state"] == "unobserved"
+    assert payload["workers"]["permanent_source"]["stale_after_seconds"] == 180.0
     assert payload["workers"]["market_universe_routing"]["available"] is False
     assert payload["workers"]["alpha_l2_sampling"]["available"] is False
     assert payload["workers"]["alpha_l2_sampling"]["state"] == "unobserved"
+    assert payload["workers"]["alpha_l2_sampling"]["stale_after_seconds"] == 600.0
