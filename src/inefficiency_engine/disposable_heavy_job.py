@@ -16,8 +16,10 @@ from inefficiency_engine.history_batch_job import maintain_history_batch_once
 from inefficiency_engine.instance_memory import instance_memory_snapshot
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.source_runtime_safety import (
+    ensure_source_coverage_runtime_indexes,
     install_bulk_provider_catalog_runtime,
     install_research_source_delegation,
+    install_source_coverage_reconciliation_runtime,
 )
 
 
@@ -142,11 +144,16 @@ async def _run(job: str) -> int:
             # Research consumes source evidence; it should not compete with the
             # permanent source process for the same providers or PostgreSQL catalog
             # tables. Preserve fail-safe fallback only when the durable source owner
-            # is missing/stale, and use bounded catalog persistence if fallback is
-            # actually required.
+            # is missing/stale, and use bounded persistence/reconciliation if fallback
+            # is actually required.
             install_bulk_provider_catalog_runtime()
+            install_source_coverage_reconciliation_runtime()
             install_research_source_delegation()
             service = OpportunityService(settings=settings, evidence_store=store)
+            # OpportunityService constructs source/admission ledgers. Add their
+            # latest-state indexes after construction before the research cycle reads
+            # coverage, so mechanism-forward cannot be delayed by table scans.
+            ensure_source_coverage_runtime_indexes(store)
             result = await run_disposable_research_cycle(
                 service,
                 store,
