@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
+from datetime import datetime, timezone
+
+from sqlalchemy import select
 
 from inefficiency_engine.canonical_worker import run_canonical_portfolio_loop
 from inefficiency_engine.cex_dex_canonical_runtime import (
@@ -26,11 +30,148 @@ from inefficiency_engine.service import OpportunityService
 RESEARCH_PROJECTION_MAINTENANCE_SECONDS = 60.0
 
 
+class PermanentSourceExecutableSnapshotUnavailable(RuntimeError):
+    pass
+
+
+class PermanentSourceExecutableSnapshotStale(RuntimeError):
+    pass
+
+
+class PermanentSourceMarketQuotesStale(RuntimeError):
+    pass
+
+
 # Preserve the permanent worker's durable-bridge and canonical-portfolio lineage.
 # Canonical accounting consumes persisted qualified state only. All network-facing
 # source/universe acquisition is owned by the separately supervised source process.
 CanonicalPortfolioAllocatorService = EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService
-CanonicalPaperPortfolioService = EvidenceVelocityLaneSuccessOperationallyResilientPaperPortfolioService
+
+
+class PersistedSourceCanonicalPaperPortfolioService(
+    EvidenceVelocityLaneSuccessOperationallyResilientPaperPortfolioService
+):
+    """Canonical accounting over the permanent source process's durable snapshot.
+
+    The permanent source worker is the sole owner of provider acquisition. The
+    portfolio process must not inherit the generic portfolio service's direct quote
+    collection or settlement-L2 fallback, because either call can block accounting
+    independently of an already healthy persisted source plane.
+    """
+
+    _SOURCE_SCAN_LOOKBACK = 200
+
+    @staticmethod
+    def _analysis_config(raw: object) -> dict[str, object]:
+        if not isinstance(raw, str) or not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _latest_permanent_source_snapshot(self):
+        with self.store.engine.connect() as db:
+            rows = list(
+                db.execute(
+                    select(
+                        self.store.scans.c.scan_id,
+                        self.store.scans.c.completed_at,
+                        self.store.scans.c.analysis_config_json,
+                    )
+                    .order_by(self.store.scans.c.completed_at.desc())
+                    .limit(self._SOURCE_SCAN_LOOKBACK)
+                ).mappings()
+            )
+            scan_id = None
+            for row in rows:
+                config = self._analysis_config(row["analysis_config_json"])
+                if not bool(config.get("permanent_source_plane")):
+                    continue
+                candidate_scan_id = str(row["scan_id"])
+                has_market_quote = db.execute(
+                    select(self.store.market_quotes.c.id)
+                    .where(self.store.market_quotes.c.scan_id == candidate_scan_id)
+                    .limit(1)
+                ).scalar_one_or_none()
+                if has_market_quote is not None:
+                    scan_id = candidate_scan_id
+                    break
+
+        if scan_id is None:
+            raise PermanentSourceExecutableSnapshotUnavailable
+        snapshot = self.store.load_scan(scan_id)
+        completed_at = snapshot.completed_at
+        if completed_at.tzinfo is None:
+            completed_at = completed_at.replace(tzinfo=timezone.utc)
+        age_seconds = (
+            datetime.now(timezone.utc) - completed_at.astimezone(timezone.utc)
+        ).total_seconds()
+        freshness_seconds = max(
+            30.0,
+            float(getattr(self.core.settings, "max_quote_age_seconds", 120.0)),
+        )
+        if age_seconds < 0.0 or age_seconds > freshness_seconds:
+            raise PermanentSourceExecutableSnapshotStale
+        current = datetime.now(timezone.utc)
+        fresh_quotes = []
+        for quote in snapshot.market_quotes:
+            observed_at = quote.observed_at
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=timezone.utc)
+            quote_age = (
+                current - observed_at.astimezone(timezone.utc)
+            ).total_seconds()
+            if 0.0 <= quote_age <= freshness_seconds:
+                fresh_quotes.append(quote)
+        if not fresh_quotes:
+            raise PermanentSourceMarketQuotesStale
+        return snapshot.model_copy(update={"market_quotes": fresh_quotes})
+
+    async def _collect_canonical_market_snapshot(self):
+        snapshot = await asyncio.to_thread(self._latest_permanent_source_snapshot)
+        self._current_persisted_source_snapshot = snapshot
+        return snapshot
+
+    async def _settlement_books(self, trial):
+        if trial.settlement_method != self.settlement.MULTI_LEG_SETTLEMENT_METHOD:
+            return []
+        snapshot = getattr(self, "_current_persisted_source_snapshot", None)
+        if snapshot is None:
+            return []
+        books = {
+            (
+                item.venue,
+                item.asset.upper(),
+                item.market_kind.value,
+                item.symbol,
+            ): item
+            for item in snapshot.order_books
+        }
+        max_book_age_seconds = max(
+            0.0,
+            float(getattr(self.core.settings, "max_order_book_age_seconds", 30.0)),
+        )
+        current = datetime.now(timezone.utc)
+        result = []
+        for leg in trial.settlement_legs:
+            book = books.get((leg.venue, leg.asset.upper(), leg.market_kind, leg.symbol))
+            if book is None:
+                return []
+            observed_at = book.observed_at
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=timezone.utc)
+            age_seconds = (
+                current - observed_at.astimezone(timezone.utc)
+            ).total_seconds()
+            if age_seconds < 0.0 or age_seconds > max_book_age_seconds:
+                return []
+            result.append(book)
+        return result
+
+
+CanonicalPaperPortfolioService = PersistedSourceCanonicalPaperPortfolioService
 assert issubclass(
     CanonicalPortfolioAllocatorService,
     CexDexFreshnessSeparatedQualifiedOpportunityAllocatorService,
