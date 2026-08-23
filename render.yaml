@@ -16,7 +16,10 @@ services:
     # deploy cannot report the latest Git SHA while executing an older installed
     # copy of the application package.
     buildCommand: python -m pip install --retries 5 --timeout 30 --no-cache-dir .
-    startCommand: PYTHONPATH=src python -m inefficiency_engine.render_combined
+    # Large production read indexes are intentionally maintained only after the API
+    # has bound its Render port. This keeps multimillion-row DDL out of the deploy
+    # startup deadline while preserving serial table bootstrap before child startup.
+    startCommand: PYTHONPATH=src python -m inefficiency_engine.render_combined_postbind
     healthCheckPath: /health
     maxShutdownDelaySeconds: 90
     envVars:
