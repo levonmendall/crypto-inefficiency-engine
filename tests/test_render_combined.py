@@ -58,11 +58,16 @@ def test_combined_runtime_keeps_operating_planes_isolated():
     ]
 
 
-def test_inner_runtime_does_not_double_start_dedicated_mechanism_child():
+def test_inner_runtime_keeps_hardcoded_mechanism_slot_without_double_starting_real_worker():
     commands = supervised_runtime_child_commands("12345")
 
-    assert set(commands) == {"portfolio", "source", "api"}
-    assert "mechanism" not in commands
+    assert set(commands) == {"portfolio", "source", "mechanism", "api"}
+    assert commands["mechanism"] == [
+        sys.executable,
+        "-m",
+        "inefficiency_engine.mechanism_supervision_slot",
+    ]
+    assert commands["mechanism"] != mechanism_child_command()
 
 
 def test_combined_runtime_makes_research_and_history_disposable_and_mutually_scheduled():
