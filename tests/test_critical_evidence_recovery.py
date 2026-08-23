@@ -66,6 +66,7 @@ def test_unobserved_critical_workers_force_bounded_recovery():
 
     assert status["source_refresh_required"] is True
     assert status["alpha_forward_required"] is True
+    assert status["mechanism_forward_required"] is True
     assert status["any_required"] is True
     assert status["workers"]["source_refresh"]["reason"] == "unobserved"
     assert status["workers"]["alpha_l2_sampling"]["reason"] == "unobserved"
@@ -91,6 +92,23 @@ def test_stale_source_worker_forces_source_recovery_at_dashboard_sla():
     assert status["alpha_forward_required"] is False
     assert status["workers"]["source_refresh"]["reason"] == "grossly_stale"
     assert status["workers"]["source_refresh"]["recovery_after_seconds"] == 180.0
+
+
+def test_stale_mechanism_worker_does_not_force_disposable_alpha_recovery():
+    store = FakeStore(
+        {
+            SOURCE_REFRESH_WORKER_ID: _heartbeat(age_seconds=60),
+            ALPHA_L2_WORKER_ID: _heartbeat(age_seconds=60),
+            MECHANISM_FORWARD_WORKER_ID: _heartbeat(age_seconds=181),
+        }
+    )
+
+    status = critical_evidence_recovery_status(store, now=NOW)
+
+    assert status["source_refresh_required"] is False
+    assert status["alpha_forward_required"] is False
+    assert status["mechanism_forward_required"] is True
+    assert status["any_required"] is True
 
 
 def test_fresh_degraded_heartbeat_suppresses_immediate_retry():

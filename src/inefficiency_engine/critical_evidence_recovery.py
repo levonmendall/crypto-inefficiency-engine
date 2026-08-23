@@ -207,15 +207,14 @@ def critical_evidence_recovery_status(
         workers["source_refresh"].get("recovery_required")
         or source_truth.get("recovery_required")
     )
-    alpha_required = bool(
-        workers["alpha_l2_sampling"].get("recovery_required")
-        or workers["mechanism_forward"].get("recovery_required")
-    )
+    alpha_required = bool(workers["alpha_l2_sampling"].get("recovery_required"))
+    mechanism_required = bool(workers["mechanism_forward"].get("recovery_required"))
     recovery_after_seconds = max(60.0, float(stale_after_seconds))
     return {
         "source_refresh_required": source_required,
         "alpha_forward_required": alpha_required,
-        "any_required": source_required or alpha_required,
+        "mechanism_forward_required": mechanism_required,
+        "any_required": source_required or alpha_required or mechanism_required,
         "stale_after_seconds": recovery_after_seconds,
         "source_truth_retry_cooldown_seconds": max(30.0, float(source_truth_retry_cooldown_seconds)),
         "dashboard_freshness_aligned": True,

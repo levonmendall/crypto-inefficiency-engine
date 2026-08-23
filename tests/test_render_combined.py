@@ -12,10 +12,10 @@ from inefficiency_engine.render_combined import (
 )
 
 
-def test_combined_runtime_keeps_portfolio_source_and_api_permanent():
+def test_combined_runtime_keeps_portfolio_source_mechanism_and_api_permanent():
     commands = child_commands("12345")
 
-    assert set(commands) == {"portfolio", "source", "api"}
+    assert set(commands) == {"portfolio", "source", "mechanism", "api"}
     assert commands["portfolio"] == [
         sys.executable,
         "-m",
@@ -25,6 +25,11 @@ def test_combined_runtime_keeps_portfolio_source_and_api_permanent():
         sys.executable,
         "-m",
         "inefficiency_engine.permanent_source_worker",
+    ]
+    assert commands["mechanism"] == [
+        sys.executable,
+        "-m",
+        "inefficiency_engine.permanent_mechanism_worker",
     ]
     assert commands["api"] == [
         sys.executable,
