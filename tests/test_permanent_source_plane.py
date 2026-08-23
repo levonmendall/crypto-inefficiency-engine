@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from inefficiency_engine import lightweight_portfolio_worker
+from inefficiency_engine import lightweight_portfolio_worker, permanent_source_worker
 from inefficiency_engine.evidence import EvidenceStore, ProviderStatus
 from inefficiency_engine.models import (
     MarketKind,
@@ -131,11 +131,18 @@ async def test_permanent_market_l2_cycle_persists_source_truth_without_research(
     assert heartbeat.detail["permanent_source_plane"] is True
 
 
-def test_lightweight_portfolio_process_hosts_source_loop_without_extra_process():
-    source = inspect.getsource(lightweight_portfolio_worker)
+def test_source_provider_work_is_not_hosted_on_portfolio_event_loop():
+    portfolio_source = inspect.getsource(lightweight_portfolio_worker)
+    source_worker = inspect.getsource(permanent_source_worker)
 
-    assert "_permanent_source_refresh_loop" in source
-    assert 'name="permanent-source-refresh"' in source
-    assert "PermanentSourcePlane(store)" in source
-    assert "subprocess" not in source
-    assert "allocation_authority" in source
+    assert "PermanentSourcePlane" not in portfolio_source
+    assert "resolve_top_volume_assets" not in portfolio_source
+    assert "_permanent_source_refresh_loop" not in portfolio_source
+    assert "_volume_universe_refresh_loop" not in portfolio_source
+    assert 'name="research-dashboard-projection-refresh"' in portfolio_source
+
+    assert "PermanentSourcePlane" in source_worker
+    assert "resolve_top_volume_assets" in source_worker
+    assert 'name="permanent-source-refresh"' in source_worker
+    assert 'name="volume-universe-refresh"' in source_worker
+    assert "allocation_authority" in source_worker
