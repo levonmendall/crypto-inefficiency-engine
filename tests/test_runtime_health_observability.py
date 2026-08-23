@@ -32,9 +32,55 @@ def test_lane_fast_summary_reports_production_connectivity_separately():
 
 
 def test_runtime_contract_includes_permanent_source_and_universe_routing():
+    assert deploy._RUNTIME_HEARTBEATS["canonical_control"] == "canonical-control-operating-loop"
     assert deploy._RUNTIME_HEARTBEATS["permanent_source"] == "canonical-source-operating-loop"
     assert deploy._RUNTIME_HEARTBEATS["volume_universe"] == "volume-universe-lightweight-refresh"
     assert deploy._RUNTIME_HEARTBEATS["market_universe_routing"] == "market-universe-routing"
+
+
+def test_runtime_health_exposes_control_progress_and_zero_provider_requests(monkeypatch):
+    rows = {
+        "canonical-control-operating-loop": SimpleNamespace(
+            state="success",
+            error_type=None,
+            observed_at=NOW,
+            detail={
+                "sequence": 17,
+                "stage": "durable_control_complete",
+                "provider_requests_allowed": False,
+                "operating_reconciliation_complete": True,
+                "operating_observed_at": NOW.isoformat(),
+                "qualified_bridge_publication_complete": True,
+                "qualified_bridge_observed_at": NOW.isoformat(),
+                "qualified_bridge_candidate_count": 0,
+                "research_projection_publication_complete": True,
+                "control_plane_errors": {},
+                "control_stage_timings_seconds": {"total": 1.25},
+                "alpha_durable_promotion": {
+                    "provider_requests_allowed": False,
+                    "provider_requests_used": 0,
+                },
+            },
+        )
+    }
+    monkeypatch.setattr(deploy, "_store", lambda: _Store(rows))
+    monkeypatch.setattr(
+        deploy._base_deploy._base,
+        "settings",
+        SimpleNamespace(worker_heartbeat_stale_seconds=180.0),
+    )
+
+    control = deploy._runtime_heartbeats()["workers"]["canonical_control"]
+
+    assert control["sequence"] == 17
+    assert control["stage"] == "durable_control_complete"
+    assert control["provider_requests_allowed"] is False
+    assert control["provider_requests_used"] == 0
+    assert control["operating_reconciliation_complete"] is True
+    assert control["qualified_bridge_publication_complete"] is True
+    assert control["qualified_bridge_candidate_count"] == 0
+    assert control["research_projection_publication_complete"] is True
+    assert control["control_plane_errors"] == {}
 
 
 def test_runtime_heartbeat_payload_exposes_degraded_and_stale_without_raising(monkeypatch):
