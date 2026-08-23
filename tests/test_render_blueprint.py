@@ -13,11 +13,17 @@ def test_render_blueprint_defines_single_paid_combined_runtime():
     runtime = services["cie-shadow-worker"]
     assert runtime["type"] == "web"
     assert runtime["plan"] == "standard"
-    assert runtime["startCommand"] == "PYTHONPATH=src python -m inefficiency_engine.render_combined"
+    assert runtime["startCommand"] == (
+        "PYTHONPATH=src python -m inefficiency_engine.render_combined_postbind"
+    )
 
     canonical = Path("src/inefficiency_engine/render_combined.py").read_text()
     assert 'CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"' in canonical
     assert "render_combined_runtime" in canonical
+
+    postbind = Path("src/inefficiency_engine/render_combined_postbind.py").read_text()
+    assert "API bound; starting deferred source-coverage runtime index maintenance" in postbind
+    assert "canonical control waiting for deferred runtime indexes" in postbind
 
     # Keep the former Blueprint command as a compatibility alias so an existing
     # Render service cannot fall back to the old dashboard application while its
