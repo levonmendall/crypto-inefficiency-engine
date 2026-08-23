@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from inefficiency_engine.render_combined import (
     API_APP,
     child_commands,
     control_child_command,
     heavy_commands,
+    mechanism_child_command,
+    mechanism_watchdog_reason,
     portfolio_watchdog_reason,
     source_watchdog_reason,
+    supervised_runtime_child_commands,
 )
 
 
@@ -37,6 +41,11 @@ def test_combined_runtime_keeps_operating_planes_isolated():
         "-m",
         "inefficiency_engine.permanent_control_worker",
     ]
+    assert mechanism_child_command() == [
+        sys.executable,
+        "-m",
+        "inefficiency_engine.permanent_mechanism_worker",
+    ]
     assert commands["api"] == [
         sys.executable,
         "-m",
@@ -47,6 +56,13 @@ def test_combined_runtime_keeps_operating_planes_isolated():
         "--port",
         "12345",
     ]
+
+
+def test_inner_runtime_does_not_double_start_dedicated_mechanism_child():
+    commands = supervised_runtime_child_commands("12345")
+
+    assert set(commands) == {"portfolio", "source", "api"}
+    assert "mechanism" not in commands
 
 
 def test_combined_runtime_makes_research_and_history_disposable_and_mutually_scheduled():
@@ -207,5 +223,64 @@ def test_source_watchdog_requires_heartbeat_from_current_source_process():
         process_age_seconds=121.0,
     )
 
+    assert reason is not None
+    assert "previous process heartbeat" in reason
+
+
+def test_mechanism_watchdog_restarts_unobserved_child_after_startup_grace():
+    started = datetime(2026, 8, 23, 18, 0, tzinfo=timezone.utc)
+
+    assert mechanism_watchdog_reason(
+        None,
+        process_started_at=started,
+        process_age_seconds=90.0,
+        now=started + timedelta(seconds=90),
+    ) is None
+
+    reason = mechanism_watchdog_reason(
+        None,
+        process_started_at=started,
+        process_age_seconds=121.0,
+        now=started + timedelta(seconds=121),
+    )
+    assert reason is not None
+    assert "has not published" in reason
+
+
+def test_mechanism_watchdog_restarts_stuck_running_cycle():
+    started = datetime(2026, 8, 23, 18, 0, tzinfo=timezone.utc)
+    observed = started + timedelta(seconds=1)
+    heartbeat = SimpleNamespace(
+        observed_at=observed,
+        state="running",
+        error_type=None,
+        detail={"stage": "forward_evidence"},
+    )
+
+    reason = mechanism_watchdog_reason(
+        heartbeat,
+        process_started_at=started,
+        process_age_seconds=150.0,
+        now=observed + timedelta(seconds=121),
+    )
+    assert reason is not None
+    assert "remained running" in reason
+
+
+def test_mechanism_watchdog_rejects_previous_process_heartbeat():
+    started = datetime(2026, 8, 23, 18, 10, tzinfo=timezone.utc)
+    heartbeat = SimpleNamespace(
+        observed_at=started - timedelta(minutes=1),
+        state="success",
+        error_type=None,
+        detail={},
+    )
+
+    reason = mechanism_watchdog_reason(
+        heartbeat,
+        process_started_at=started,
+        process_age_seconds=121.0,
+        now=started + timedelta(seconds=121),
+    )
     assert reason is not None
     assert "previous process heartbeat" in reason
