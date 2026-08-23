@@ -48,6 +48,13 @@ services:
         value: "60"
       - key: CIE_SOURCE_L2_ASSET_BATCH_SIZE
         value: "4"
+      # Mechanism-forward evidence is independently supervised. One cycle is bounded
+      # below the unchanged 120-second source-freshness contract so a wedged forward
+      # evaluation cannot leave the process alive but the evidence funnel unobserved.
+      - key: CIE_MECHANISM_FORWARD_INTERVAL_SECONDS
+        value: "30"
+      - key: CIE_MECHANISM_FORWARD_DEADLINE_SECONDS
+        value: "90"
       - key: CIE_SHADOW_HORIZONS_SECONDS
         value: "1,5,15,30,60"
       - key: CIE_SHADOW_MAX_OPPORTUNITIES
