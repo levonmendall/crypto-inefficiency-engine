@@ -36,6 +36,11 @@ MECHANISM_COMMAND = [
     "-m",
     "inefficiency_engine.permanent_mechanism_worker",
 ]
+MECHANISM_SUPERVISION_SLOT_COMMAND = [
+    sys.executable,
+    "-m",
+    "inefficiency_engine.mechanism_supervision_slot",
+]
 
 _CONTROL_GUARD_CHECK_SECONDS = 15.0
 _CONTROL_GUARD_STARTUP_GRACE_SECONDS = 180.0
@@ -48,16 +53,17 @@ _MECHANISM_GUARD_RUNNING_STALE_SECONDS = 120.0
 _MECHANISM_GUARD_HEARTBEAT_STALE_SECONDS = 180.0
 _MECHANISM_RESTART_GRACE_SECONDS = 15.0
 
-# The mechanism-forward process needs heartbeat-aware supervision rather than the
-# parent runtime's former "restart only after process exit" behavior. Capture the
-# original command builder so production can temporarily remove mechanism ownership
-# from the inner runtime while the dedicated outer guard owns exactly one child.
+# The inner combined supervisor still has a hard-coded mechanism startup slot. The
+# dedicated outer guard owns the real mechanism-forward process, so production keeps
+# that legacy slot alive with an inert child rather than deleting the key and causing
+# the inner supervisor to raise KeyError during boot. The slot has no data, research,
+# qualification, allocation, or execution authority.
 _BASE_RUNTIME_CHILD_COMMANDS = _runtime.child_commands
 
 
 def supervised_runtime_child_commands(port: str | int) -> dict[str, list[str]]:
     commands = dict(_BASE_RUNTIME_CHILD_COMMANDS(port))
-    commands.pop("mechanism", None)
+    commands["mechanism"] = list(MECHANISM_SUPERVISION_SLOT_COMMAND)
     return commands
 
 
