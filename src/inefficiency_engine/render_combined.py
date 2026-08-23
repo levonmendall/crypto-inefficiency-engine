@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 from inefficiency_engine import render_combined_runtime as _runtime
 from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import build_evidence_store
-from inefficiency_engine.permanent_control_worker import CONTROL_WORKER_ID
 
 
 CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"
@@ -25,6 +24,7 @@ _runtime.API_APP = CANONICAL_API_APP
 from inefficiency_engine.render_combined_runtime import *  # noqa: E402,F401,F403
 
 API_APP = CANONICAL_API_APP
+CONTROL_WORKER_ID = "canonical-control-operating-loop"
 CONTROL_COMMAND = [
     sys.executable,
     "-m",
