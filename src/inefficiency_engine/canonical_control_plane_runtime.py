@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from inefficiency_engine.canonical_paper_portfolio import CANONICAL_INITIAL_CAPITAL_USD
 from inefficiency_engine.dashboard_projection import DASHBOARD_RESEARCH_PROJECTION_WORKER_ID
@@ -47,9 +48,13 @@ async def refresh_canonical_control_plane(
         "qualified_bridge_publication_complete": False,
         "research_projection_publication_complete": False,
         "control_plane_errors": {},
+        "control_stage_timings_seconds": {},
     }
     errors: dict[str, str] = {}
+    timings: dict[str, float] = {}
+    cycle_started = time.monotonic()
 
+    stage_started = time.monotonic()
     try:
         reconciled = await asyncio.to_thread(
             operating_certification.reconcile_latest_runtime_truth
@@ -62,9 +67,12 @@ async def refresh_canonical_control_plane(
             result["operating_observed_at"] = reconciled.observed_at.isoformat()
     except Exception as exc:
         errors["operating_reconciliation"] = type(exc).__name__
+    finally:
+        timings["operating_reconciliation"] = max(0.0, time.monotonic() - stage_started)
 
     if result["operating_reconciliation_complete"]:
         original_latest_scan = getattr(qualified_bridge, "_latest_scan", None)
+        stage_started = time.monotonic()
         try:
             if bridge_snapshot is not None and callable(original_latest_scan):
                 qualified_bridge._latest_scan = lambda: bridge_snapshot
@@ -83,9 +91,14 @@ async def refresh_canonical_control_plane(
         except Exception as exc:
             errors["qualified_bridge_publication"] = type(exc).__name__
         finally:
+            timings["qualified_bridge_publication"] = max(
+                0.0,
+                time.monotonic() - stage_started,
+            )
             if bridge_snapshot is not None and callable(original_latest_scan):
                 qualified_bridge._latest_scan = original_latest_scan
 
+        stage_started = time.monotonic()
         try:
             payload = await asyncio.to_thread(
                 research_projection.publish,
@@ -143,7 +156,14 @@ async def refresh_canonical_control_plane(
                 )
             except Exception:
                 pass
+        finally:
+            timings["research_projection_publication"] = max(
+                0.0,
+                time.monotonic() - stage_started,
+            )
 
+    timings["total"] = max(0.0, time.monotonic() - cycle_started)
+    result["control_stage_timings_seconds"] = timings
     result["control_plane_errors"] = errors
     result["control_plane_healthy"] = not errors
     return result
