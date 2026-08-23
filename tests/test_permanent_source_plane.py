@@ -21,6 +21,7 @@ from inefficiency_engine.permanent_source_plane import (
     PermanentSourcePlane,
     permanent_source_plane_current,
 )
+from inefficiency_engine.priority_source_collection import SOURCE_REFRESH_WORKER_ID
 
 
 NOW = datetime(2026, 8, 22, 21, 0, tzinfo=timezone.utc)
@@ -133,7 +134,7 @@ async def test_permanent_market_l2_cycle_persists_source_truth_without_research(
 
 
 @pytest.mark.asyncio
-async def test_source_progress_pulse_keeps_long_async_cycle_durably_current(tmp_path):
+async def test_source_progress_pulse_keeps_long_market_cycle_durably_current(tmp_path):
     store = EvidenceStore(tmp_path / "source-progress.sqlite")
     cycle_done = asyncio.Event()
     pulse = asyncio.create_task(
@@ -149,7 +150,8 @@ async def test_source_progress_pulse_keeps_long_async_cycle_durably_current(tmp_
     assert heartbeat is not None
     assert heartbeat.state == "running"
     assert heartbeat.detail["progress_pulse"] is True
-    assert heartbeat.detail["stage"] == "provider_cycle_in_progress"
+    assert heartbeat.detail["stage"] == "market_l2_cycle_in_progress"
+    assert heartbeat.detail["priority_source_tail_decoupled"] is True
     assert heartbeat.detail["separate_python_process"] is True
     assert heartbeat.detail["allocation_authority"] is False
 
@@ -167,6 +169,31 @@ async def test_source_progress_pulse_keeps_long_async_cycle_durably_current(tmp_
     assert terminal.detail["terminal"] is True
 
 
+@pytest.mark.asyncio
+async def test_priority_source_progress_pulse_is_independent_from_market_l2(tmp_path):
+    store = EvidenceStore(tmp_path / "priority-progress.sqlite")
+    cycle_done = asyncio.Event()
+    pulse = asyncio.create_task(
+        permanent_source_worker._priority_source_progress_pulse(
+            store,
+            cycle_done=cycle_done,
+            interval_seconds=0.01,
+        )
+    )
+
+    await asyncio.sleep(0.035)
+    heartbeat = store.latest_worker_heartbeat(SOURCE_REFRESH_WORKER_ID)
+    assert heartbeat is not None
+    assert heartbeat.state == "running"
+    assert heartbeat.detail["progress_pulse"] is True
+    assert heartbeat.detail["stage"] == "priority_source_cycle_in_progress"
+    assert heartbeat.detail["market_l2_cadence_independent"] is True
+    assert heartbeat.detail["allocation_authority"] is False
+
+    cycle_done.set()
+    await pulse
+
+
 def test_source_provider_work_is_not_hosted_on_portfolio_event_loop():
     portfolio_source = inspect.getsource(lightweight_portfolio_worker)
     source_worker = inspect.getsource(permanent_source_worker)
@@ -180,6 +207,18 @@ def test_source_provider_work_is_not_hosted_on_portfolio_event_loop():
     assert "PermanentSourcePlane" in source_worker
     assert "resolve_top_volume_assets" in source_worker
     assert 'name="permanent-source-refresh"' in source_worker
+    assert 'name="priority-source-refresh"' in source_worker
     assert 'name="volume-universe-refresh"' in source_worker
     assert "_source_cycle_progress_pulse" in source_worker
+    assert "_priority_source_progress_pulse" in source_worker
     assert "allocation_authority" in source_worker
+
+
+def test_market_l2_loop_does_not_wait_for_priority_source_tail():
+    market_loop = inspect.getsource(permanent_source_worker._permanent_source_refresh_loop)
+    priority_loop = inspect.getsource(permanent_source_worker._priority_source_refresh_loop)
+
+    assert "refresh_market_l2_snapshot" in market_loop
+    assert ".priority.run_cycle" not in market_loop
+    assert ".priority.run_cycle" in priority_loop
+    assert "refresh_market_l2_snapshot" not in priority_loop

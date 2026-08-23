@@ -149,7 +149,12 @@ async def test_research_delegates_source_refresh_to_current_permanent_owner(tmp_
     store.record_worker_heartbeat(
         worker_id="canonical-source-operating-loop",
         state="running",
-        detail={"stage": "provider_cycle_in_progress"},
+        detail={"stage": "market_l2_cycle_in_progress"},
+    )
+    store.record_worker_heartbeat(
+        worker_id="priority-source-refresh-plane",
+        state="running",
+        detail={"stage": "priority_source_cycle_in_progress"},
     )
     coverage = SimpleNamespace(
         lane_count=13,
@@ -169,8 +174,11 @@ async def test_research_delegates_source_refresh_to_current_permanent_owner(tmp_
 
     assert payload["source_refresh"]["state"] == "delegated_to_permanent_source"
     assert payload["source_refresh"]["permanent_source_owner_current"] is True
+    assert payload["source_refresh"]["priority_source_owner_current"] is True
     assert payload["source_coverage"]["lane_count"] == 13
-    assert store.latest_worker_heartbeat("priority-source-refresh-plane") is None
+    priority = store.latest_worker_heartbeat("priority-source-refresh-plane")
+    assert priority is not None
+    assert priority.state == "running"
 
 
 def test_runtime_entrypoints_install_source_safety_without_runtime_ddl():
