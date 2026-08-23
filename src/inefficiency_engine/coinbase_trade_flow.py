@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
 from datetime import datetime, timezone
 
 import httpx
+from sqlalchemy import insert, select
 
 from inefficiency_engine.priority_source_models import SourceProbeResult
 from inefficiency_engine.source_coverage import SourceCoveragePlane, SourceEventObservation
@@ -13,6 +15,7 @@ from inefficiency_engine.source_coverage import SourceCoveragePlane, SourceEvent
 COINBASE_EXCHANGE_URL = "https://api.exchange.coinbase.com"
 COINBASE_TRADE_FLOW_SOURCE_ID = "public-trade-flow"
 DEFAULT_TRADE_PRODUCTS = ("BTC-USD", "ETH-USD", "SOL-USD")
+_BULK_EVENT_CHUNK_SIZE = 500
 
 
 def _now() -> datetime:
@@ -84,6 +87,50 @@ def parse_coinbase_product_trades(
     return rows
 
 
+def _event_rows(observations: list[SourceEventObservation]) -> list[dict[str, object]]:
+    return [
+        {
+            "event_id": row.event_id,
+            "lane_id": row.lane_id,
+            "source_id": row.source_id,
+            "event_type": row.event_type,
+            "observed_at": row.observed_at.isoformat(),
+            "event_at": row.event_at.isoformat(),
+            "payload_json": row.model_dump_json(),
+        }
+        for row in observations
+    ]
+
+
+def _persist_trade_events_bulk(
+    coverage: SourceCoveragePlane,
+    observations: list[SourceEventObservation],
+) -> int:
+    """Persist a bounded event batch without one transaction per trade/lane row."""
+
+    if not observations:
+        return 0
+    table = coverage.events.rows
+    rows = _event_rows(observations)
+    event_ids = [str(row["event_id"]) for row in rows]
+    existing: set[str] = set()
+    with coverage.store.engine.begin() as db:
+        for offset in range(0, len(event_ids), _BULK_EVENT_CHUNK_SIZE):
+            chunk = event_ids[offset : offset + _BULK_EVENT_CHUNK_SIZE]
+            existing.update(
+                str(value)
+                for value in db.execute(
+                    select(table.c.event_id).where(table.c.event_id.in_(chunk))
+                ).scalars()
+            )
+        pending = [row for row in rows if str(row["event_id"]) not in existing]
+        for offset in range(0, len(pending), _BULK_EVENT_CHUNK_SIZE):
+            batch = pending[offset : offset + _BULK_EVENT_CHUNK_SIZE]
+            if batch:
+                db.execute(insert(table), batch)
+    return len(pending)
+
+
 async def collect_coinbase_trade_flow(
     coverage: SourceCoveragePlane,
     *,
@@ -119,6 +166,7 @@ async def collect_coinbase_trade_flow(
     if not trades:
         raise ValueError("Coinbase public trades returned no usable trade flow")
 
+    observations: list[SourceEventObservation] = []
     for trade in trades:
         event_at = trade["event_at"]
         assert isinstance(event_at, datetime)
@@ -132,7 +180,7 @@ async def collect_coinbase_trade_flow(
             "notional_usd": float(trade["notional_usd"]),
         }
         for lane_id in ("microstructure", "liquidity_provision"):
-            coverage.record_event(
+            observations.append(
                 SourceEventObservation(
                     event_id=_stable_id(
                         "coinbase-trade",
@@ -149,6 +197,12 @@ async def collect_coinbase_trade_flow(
                     payload=payload,
                 )
             )
+
+    inserted_event_rows = await asyncio.to_thread(
+        _persist_trade_events_bulk,
+        coverage,
+        observations,
+    )
 
     return SourceProbeResult(
         source_id=COINBASE_TRADE_FLOW_SOURCE_ID,
@@ -167,6 +221,9 @@ async def collect_coinbase_trade_flow(
             "venue": "Coinbase",
             "products": list(products),
             "trade_count": len(trades),
+            "event_row_count": len(observations),
+            "inserted_event_row_count": inserted_event_rows,
+            "bulk_event_persistence": True,
             "side_semantics": "coinbase_maker_side_inverted_to_aggressor",
             "maker_fill_assumed": False,
             "credential_required": False,
