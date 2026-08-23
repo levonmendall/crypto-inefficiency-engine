@@ -26,6 +26,7 @@ class FakeExecution:
 
 
 def test_mechanism_forward_funnel_reports_durable_qualification_progress():
+    # The permanent plane must expose progress at each mechanism-qualification stage.
     cycle = SimpleNamespace(
         current_specs=5,
         trials_recorded=3,
