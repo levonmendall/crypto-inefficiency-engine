@@ -52,6 +52,7 @@ def child_commands(port: str | int) -> dict[str, list[str]]:
     return {
         "portfolio": [sys.executable, "-m", "inefficiency_engine.lightweight_portfolio_worker"],
         "source": [sys.executable, "-m", "inefficiency_engine.permanent_source_worker"],
+        "mechanism": [sys.executable, "-m", "inefficiency_engine.permanent_mechanism_worker"],
         "api": [
             sys.executable,
             "-m",
@@ -395,7 +396,7 @@ def main() -> int:
     research_recovery_failed_since: float | None = None
 
     try:
-        for name in ("portfolio", "source", "api"):
+        for name in ("portfolio", "source", "mechanism", "api"):
             _start_permanent(name)
 
         while not stopping:
@@ -403,12 +404,12 @@ def main() -> int:
                 return_code = child.poll()
                 if return_code is None:
                     continue
-                if name == "source":
+                if name in {"source", "mechanism"}:
                     print(
-                        f"isolated source child exited code={return_code}; restarting source only",
+                        f"isolated {name} child exited code={return_code}; restarting {name} only",
                         flush=True,
                     )
-                    _start_permanent("source")
+                    _start_permanent(name)
                     continue
                 print(
                     f"critical permanent child {name} exited code={return_code}; restarting Render service",

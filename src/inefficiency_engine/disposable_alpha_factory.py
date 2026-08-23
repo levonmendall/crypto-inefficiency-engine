@@ -23,9 +23,10 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
     """Production disposable all-lane research factory.
 
     Research consumes persisted history but never performs network backfill in the
-    disposable research process. It does, however, run the executable alpha
-    refinements and all five native mechanism forward loops. Mechanism outcomes are
-    also fed into the Release D subtractive lane-success calibration plane.
+    disposable research process. It runs executable alpha refinements and the
+    bounded L2 sampler, while native mechanism-forward mutation is owned by the
+    permanent mechanism worker. Durable mechanism outcomes remain available to the
+    Release D subtractive lane-success calibration plane.
 
     L2-dependent strategies must not depend on an unrelated structural arbitrage or
     carry signal existing first. The disposable alpha cycle therefore samples a
@@ -210,7 +211,7 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
         return await self._collect_alpha_l2_snapshot(collector)
 
     async def run_evidence_cycle(self, *, total_capital_usd: float | None = None):
-        """Run alpha + native mechanisms against one independent bounded L2 snapshot.
+        """Run disposable alpha research against one independent bounded L2 snapshot.
 
         The earlier production repair routed only ``collect_live_evidence`` through
         the independent L2 sampler. Native maker/liquidity-provision research calls
@@ -238,11 +239,14 @@ class DisposableExpandedAlphaFactoryService(AllLaneEvidenceFactoryService):
         self.core.collect_live_evidence = collect_with_l2
         if original_executability is not None:
             self.core.collect_live_executability = collect_with_l2
+        mechanism_evidence_enabled = getattr(self, "_mechanism_evidence_enabled", True)
+        self._mechanism_evidence_enabled = False
         try:
             return await super().run_evidence_cycle(
                 total_capital_usd=total_capital_usd
             )
         finally:
+            self._mechanism_evidence_enabled = mechanism_evidence_enabled
             self.core.collect_live_evidence = original_evidence
             if original_executability is not None:
                 self.core.collect_live_executability = original_executability
