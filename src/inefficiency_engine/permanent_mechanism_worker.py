@@ -4,27 +4,13 @@ import asyncio
 import gc
 import os
 import time
+from datetime import datetime, timezone
 
-from inefficiency_engine import __version__
-from inefficiency_engine.canonical_paper_portfolio import CANONICAL_INITIAL_CAPITAL_USD
-from inefficiency_engine.cex_dex_canonical_runtime import (
-    CexDexFreshnessSeparatedQualifiedOpportunityBridgePublisher as QualifiedOpportunityBridgePublisher,
-)
-from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
-from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
+from inefficiency_engine.canonical_control_plane_runtime import refresh_canonical_control_plane
 from inefficiency_engine.config import Settings
 from inefficiency_engine.critical_evidence_recovery import MECHANISM_FORWARD_WORKER_ID
-from inefficiency_engine.dashboard_projection import (
-    DASHBOARD_RESEARCH_PROJECTION_WORKER_ID,
-    ResearchDashboardProjectionLedger,
-)
 from inefficiency_engine.disposable_alpha_factory import DisposableExpandedAlphaFactoryService
 from inefficiency_engine.evidence import build_evidence_store
-from inefficiency_engine.evidence_velocity_runtime import (
-    EvidenceVelocityAllLaneOperatingCertificationService as OperatingCertificationService,
-    EvidenceVelocityLaneSuccessAllocationForwardCertificationService as AllocationForwardCertificationService,
-    EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService as UnifiedPaperAllocatorService,
-)
 from inefficiency_engine.execution import qualify_opportunity
 from inefficiency_engine.service import OpportunityService, _books_for_opportunity
 from inefficiency_engine.source_runtime_safety import (
@@ -32,11 +18,10 @@ from inefficiency_engine.source_runtime_safety import (
     install_research_source_delegation,
     install_source_coverage_reconciliation_runtime,
 )
-from inefficiency_engine.universal_service import UniversalOpportunityService
 
 
 DEFAULT_MECHANISM_FORWARD_INTERVAL_SECONDS = 30.0
-PORTFOLIO_WORKER_ID = "canonical-portfolio-operating-loop"
+DEFAULT_MECHANISM_SOURCE_MAX_AGE_SECONDS = 120.0
 
 
 def _interval_seconds() -> float:
@@ -50,6 +35,19 @@ def _interval_seconds() -> float:
     except ValueError:
         value = DEFAULT_MECHANISM_FORWARD_INTERVAL_SECONDS
     return max(5.0, value)
+
+
+def _source_max_age_seconds() -> float:
+    try:
+        value = float(
+            os.getenv(
+                "CIE_MECHANISM_SOURCE_MAX_AGE_SECONDS",
+                str(DEFAULT_MECHANISM_SOURCE_MAX_AGE_SECONDS),
+            )
+        )
+    except ValueError:
+        value = DEFAULT_MECHANISM_SOURCE_MAX_AGE_SECONDS
+    return max(30.0, value)
 
 
 def mechanism_forward_funnel(execution, cycle) -> dict[str, object]:
@@ -78,26 +76,13 @@ def mechanism_forward_funnel(execution, cycle) -> dict[str, object]:
     }
 
 
-def _portfolio_nav(store) -> float:
-    """Read the latest canonical NAV without giving this worker portfolio authority."""
-
-    try:
-        heartbeat = store.latest_worker_heartbeat(PORTFOLIO_WORKER_ID)
-    except Exception:
-        heartbeat = None
-    detail = getattr(heartbeat, "detail", {}) or {}
-    value = detail.get("portfolio_nav_usd") if isinstance(detail, dict) else None
-    if isinstance(value, (int, float)) and float(value) > 0:
-        return float(value)
-    return float(CANONICAL_INITIAL_CAPITAL_USD)
-
-
 def bridge_snapshot_from_source(service: OpportunityService, snapshot):
-    """Attach fail-closed executability to the already-collected bounded L2 snapshot.
+    """Compatibility helper for deterministic executability reconstruction.
 
-    The mechanism worker already has fresh quotes plus a bounded L2 working set. Reuse
-    those exact observations to qualify any core opportunities that have matching
-    books rather than performing another network scan. Missing books remain blocked.
+    The permanent mechanism loop no longer publishes the canonical bridge. This
+    helper remains available for tests and disposable callers that need to attach
+    fail-closed executability to an already-collected snapshot without another
+    provider request.
     """
 
     latency_resolver = service.empirical_latency_resolver()
@@ -115,130 +100,25 @@ def bridge_snapshot_from_source(service: OpportunityService, snapshot):
     return snapshot.model_copy(update={"executability": executability})
 
 
-async def refresh_canonical_control_plane(
-    *,
-    store,
-    operating_certification,
-    qualified_bridge,
-    research_projection,
-    settings,
-    bridge_snapshot=None,
-) -> dict[str, object]:
-    """Advance the durable operating -> bridge -> projection handoff.
+def _current_durable_source_snapshot(factory: DisposableExpandedAlphaFactoryService):
+    """Return current permanent-source evidence or fail closed without network fallback."""
 
-    This is independent from disposable research. It creates no new market evidence
-    and grants no execution authority: operating reconciliation reads already-
-    persisted source/forward/settlement truth, the bridge republishes only currently
-    qualified canonical-settleable candidates, and the projection exposes that same
-    durable state to the dashboard.
-    """
-
-    result: dict[str, object] = {
-        "canonical_control_plane_refresh": True,
-        "operating_reconciliation_complete": False,
-        "qualified_bridge_publication_complete": False,
-        "research_projection_publication_complete": False,
-        "control_plane_errors": {},
-    }
-    errors: dict[str, str] = {}
-
-    try:
-        reconciled = await asyncio.to_thread(
-            operating_certification.reconcile_latest_runtime_truth
+    snapshot = factory._latest_permanent_source_snapshot()  # noqa: SLF001 - same runtime package
+    if snapshot is None:
+        raise RuntimeError("PermanentSourceSnapshotUnavailable")
+    observed_at = snapshot.completed_at
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    age_seconds = max(
+        0.0,
+        (datetime.now(timezone.utc) - observed_at.astimezone(timezone.utc)).total_seconds(),
+    )
+    max_age = _source_max_age_seconds()
+    if age_seconds > max_age:
+        raise RuntimeError(
+            f"PermanentSourceSnapshotStale:{age_seconds:.1f}s>{max_age:.1f}s"
         )
-        if reconciled is None:
-            errors["operating_reconciliation"] = "OperatingSnapshotUnavailable"
-        else:
-            result["operating_reconciliation_complete"] = True
-            result["operating_snapshot_id"] = reconciled.snapshot_id
-            result["operating_observed_at"] = reconciled.observed_at.isoformat()
-    except Exception as exc:
-        errors["operating_reconciliation"] = type(exc).__name__
-
-    if result["operating_reconciliation_complete"]:
-        original_latest_scan = getattr(qualified_bridge, "_latest_scan", None)
-        try:
-            if bridge_snapshot is not None and callable(original_latest_scan):
-                qualified_bridge._latest_scan = lambda: bridge_snapshot
-            bridge = await qualified_bridge.publish_latest(
-                total_capital_usd=_portfolio_nav(store)
-            )
-            result["qualified_bridge_publication_complete"] = True
-            result["qualified_bridge_published"] = bridge is not None
-            result["qualified_bridge_candidate_count"] = (
-                len(bridge.candidates) if bridge is not None else 0
-            )
-            result["qualified_bridge_observed_at"] = (
-                bridge.observed_at.isoformat() if bridge is not None else None
-            )
-            result["qualified_bridge_used_current_bounded_snapshot"] = bridge_snapshot is not None
-        except Exception as exc:
-            errors["qualified_bridge_publication"] = type(exc).__name__
-        finally:
-            if bridge_snapshot is not None and callable(original_latest_scan):
-                qualified_bridge._latest_scan = original_latest_scan
-
-        try:
-            payload = await asyncio.to_thread(
-                research_projection.publish,
-                forward_target=max(1, int(settings.alpha_min_forward_samples)),
-                settled_target=max(
-                    5,
-                    int(
-                        getattr(
-                            settings,
-                            "operating_certification_min_settled_trials",
-                            20,
-                        )
-                    ),
-                ),
-                shadow_horizons_seconds=tuple(
-                    getattr(settings, "shadow_horizons_seconds", (60.0,)) or (60.0,)
-                ),
-                shadow_cycle_interval_seconds=float(settings.shadow_cycle_interval_seconds),
-                alpha_evidence_every_cycles=max(1, int(settings.alpha_evidence_every_cycles)),
-                heartbeat_stale_seconds=float(settings.worker_heartbeat_stale_seconds),
-            )
-            result["research_projection_publication_complete"] = True
-            result["research_projection_observed_at"] = payload.get("observed_at")
-            store.record_worker_heartbeat(
-                worker_id=DASHBOARD_RESEARCH_PROJECTION_WORKER_ID,
-                state="success",
-                detail={
-                    "projection_observed_at": payload.get("observed_at"),
-                    "publication_stage": "permanent_control_plane_refresh",
-                    "operating_reconciled_first": True,
-                    "disposable_research_dependency": False,
-                    "presentation_only": True,
-                    "allocation_authority": False,
-                    "live_execution_authority": False,
-                    "paper_only": True,
-                },
-            )
-        except Exception as exc:
-            errors["research_projection_publication"] = type(exc).__name__
-            try:
-                store.record_worker_heartbeat(
-                    worker_id=DASHBOARD_RESEARCH_PROJECTION_WORKER_ID,
-                    state="degraded",
-                    error_type=type(exc).__name__,
-                    detail={
-                        "publication_stage": "permanent_control_plane_refresh",
-                        "operating_reconciled_first": True,
-                        "retrying": True,
-                        "disposable_research_dependency": False,
-                        "presentation_only": True,
-                        "allocation_authority": False,
-                        "live_execution_authority": False,
-                        "paper_only": True,
-                    },
-                )
-            except Exception:
-                pass
-
-    result["control_plane_errors"] = errors
-    result["control_plane_healthy"] = not errors
-    return result
+    return snapshot
 
 
 async def _run() -> None:
@@ -254,21 +134,6 @@ async def _run() -> None:
     factory = DisposableExpandedAlphaFactoryService(service, store)
     execution = factory.mechanism_execution
 
-    universal = UniversalOpportunityService(service)
-    composite_service = CexDexCompositeEvidenceService(service, universal=universal)
-    promotion = CexDexPaperPromotionService(service, composite_service, store)
-    unified = UnifiedPaperAllocatorService(service, promotion, factory)
-    qualified_bridge = QualifiedOpportunityBridgePublisher(service, store, unified)
-    allocation_certification = AllocationForwardCertificationService(service, unified, store)
-    operating_certification = OperatingCertificationService(
-        service,
-        store,
-        factory,
-        allocation_certification,
-        version=__version__,
-    )
-    research_projection = ResearchDashboardProjectionLedger(store)
-
     interval = _interval_seconds()
     sequence = 0
 
@@ -283,15 +148,18 @@ async def _run() -> None:
                     "sequence": sequence,
                     "stage": "forward_evidence",
                     "permanent_process": True,
-                    "runtime_plane": "mechanism-forward-and-control",
+                    "runtime_plane": "mechanism-forward",
+                    "canonical_control_owned_elsewhere": True,
+                    "provider_acquisition_owned_elsewhere": True,
                     "allocation_authority": False,
+                    "live_execution_authority": False,
                     "paper_only": True,
                 },
             )
 
+            snapshot = await asyncio.to_thread(_current_durable_source_snapshot, factory)
             original_evidence = service.collect_live_evidence
             original_executability = getattr(service, "collect_live_executability", None)
-            snapshot = await factory.refresh_l2_source_snapshot(original_evidence)
 
             async def cached_snapshot():
                 return snapshot
@@ -306,54 +174,24 @@ async def _run() -> None:
                 if original_executability is not None:
                     service.collect_live_executability = original_executability
 
-            bridge_snapshot = await asyncio.to_thread(
-                bridge_snapshot_from_source,
-                service,
-                snapshot,
-            )
             funnel = mechanism_forward_funnel(execution, cycle)
             store.record_worker_heartbeat(
                 worker_id=MECHANISM_FORWARD_WORKER_ID,
-                state="running",
-                detail={
-                    "sequence": sequence,
-                    "stage": "canonical_control_plane_refresh",
-                    **funnel,
-                    "permanent_process": True,
-                    "runtime_plane": "mechanism-forward-and-control",
-                    "disposable_research_dependency": False,
-                    "allocation_authority": False,
-                    "paper_only": True,
-                },
-            )
-            control = await refresh_canonical_control_plane(
-                store=store,
-                operating_certification=operating_certification,
-                qualified_bridge=qualified_bridge,
-                research_projection=research_projection,
-                settings=settings,
-                bridge_snapshot=bridge_snapshot,
-            )
-            errors = control.get("control_plane_errors")
-            error_map = errors if isinstance(errors, dict) else {}
-            state = "degraded" if error_map else "success"
-            error_type = next(iter(error_map.values()), None)
-            store.record_worker_heartbeat(
-                worker_id=MECHANISM_FORWARD_WORKER_ID,
-                state=state,
-                error_type=str(error_type) if error_type else None,
+                state="success",
                 detail={
                     "sequence": sequence,
                     **funnel,
-                    **control,
+                    "stage": "forward_evidence_complete",
                     "funnel_telemetry": True,
                     "permanent_process": True,
-                    "runtime_plane": "mechanism-forward-and-control",
+                    "runtime_plane": "mechanism-forward",
+                    "canonical_control_owned_elsewhere": True,
+                    "provider_acquisition_owned_elsewhere": True,
                     "disposable_research_dependency": False,
                     "qualification_thresholds_unchanged": True,
                     "allocation_authority": False,
-                    "paper_only": True,
                     "live_execution_authority": False,
+                    "paper_only": True,
                 },
             )
             sleep_seconds = max(0.25, interval - (time.monotonic() - started))
@@ -365,14 +203,17 @@ async def _run() -> None:
                     error_type=type(exc).__name__,
                     detail={
                         "sequence": sequence,
+                        "stage": "forward_evidence_failed",
                         "message": str(exc)[:500],
                         "permanent_process": True,
-                        "runtime_plane": "mechanism-forward-and-control",
+                        "runtime_plane": "mechanism-forward",
+                        "canonical_control_owned_elsewhere": True,
+                        "provider_acquisition_owned_elsewhere": True,
                         "disposable_research_dependency": False,
                         "qualification_thresholds_unchanged": True,
                         "allocation_authority": False,
-                        "paper_only": True,
                         "live_execution_authority": False,
+                        "paper_only": True,
                     },
                 )
             except Exception:
