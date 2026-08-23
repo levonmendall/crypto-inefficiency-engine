@@ -16,6 +16,9 @@ from inefficiency_engine.config import Settings
 from inefficiency_engine.critical_evidence_recovery import MECHANISM_FORWARD_WORKER_ID
 from inefficiency_engine.evidence import build_evidence_store
 from inefficiency_engine.permanent_control_worker import _build_control_services
+from inefficiency_engine.source_runtime_safety import (
+    ensure_source_coverage_runtime_indexes,
+)
 
 
 CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"
@@ -323,6 +326,7 @@ def bootstrap_permanent_runtime_schema() -> None:
     if store is None:
         raise RuntimeError("combined runtime requires durable evidence persistence")
     _build_control_services(settings, store)
+    ensure_source_coverage_runtime_indexes(store)
     print(
         f"permanent runtime schema bootstrap complete: {store.safe_database_url}",
         flush=True,
