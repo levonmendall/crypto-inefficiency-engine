@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import time
 from datetime import datetime, timezone
 
 from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import EvidenceStore, build_evidence_store
 from inefficiency_engine.permanent_source_plane import (
     PERMANENT_SOURCE_WORKER_ID,
+    RESEARCH_MARKET_WORKER_ID,
     PermanentSourcePlane,
+    source_executable_deadline_seconds,
     source_market_interval_seconds,
     source_priority_interval_seconds,
+    source_research_interval_seconds,
 )
 from inefficiency_engine.priority_source_collection import SOURCE_REFRESH_WORKER_ID
 from inefficiency_engine.source_runtime_safety import (
@@ -36,12 +40,44 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _remaining_cycle_delay(
+    *,
+    interval_seconds: float,
+    started_monotonic: float,
+    now_monotonic: float | None = None,
+) -> float:
+    """Anchor cadence to cycle start instead of adding sleep after cycle runtime."""
+
+    current = time.monotonic() if now_monotonic is None else float(now_monotonic)
+    elapsed = max(0.0, current - float(started_monotonic))
+    return max(0.0, float(interval_seconds) - elapsed)
+
+
+async def _wait_for_next_cycle(
+    stop_event: asyncio.Event,
+    *,
+    interval_seconds: float,
+    started_monotonic: float,
+) -> None:
+    delay = _remaining_cycle_delay(
+        interval_seconds=interval_seconds,
+        started_monotonic=started_monotonic,
+    )
+    if delay <= 0.0:
+        await asyncio.sleep(0)
+        return
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=delay)
+    except TimeoutError:
+        return
+
+
 async def _volume_universe_refresh_loop(
     store: EvidenceStore,
     *,
     stop_event: asyncio.Event,
 ) -> None:
-    """Maintain top-volume routing state inside the isolated source process."""
+    """Maintain top-volume routing state outside the executable hot path."""
 
     while not stop_event.is_set():
         try:
@@ -53,6 +89,7 @@ async def _volume_universe_refresh_loop(
                     "asset_count": len(assets),
                     "universe_target_count": TOP_VOLUME_ASSET_COUNT,
                     "force_refreshed": True,
+                    "executable_hot_path_dependency": False,
                     "isolated_source_process": True,
                     "portfolio_authority": False,
                     "allocation_authority": False,
@@ -70,6 +107,7 @@ async def _volume_universe_refresh_loop(
                         "message": str(exc)[:500],
                         "universe_target_count": TOP_VOLUME_ASSET_COUNT,
                         "retrying": True,
+                        "executable_hot_path_dependency": False,
                         "isolated_source_process": True,
                         "portfolio_authority": False,
                         "allocation_authority": False,
@@ -95,7 +133,7 @@ async def _source_cycle_progress_pulse(
     cycle_done: asyncio.Event,
     interval_seconds: float = SOURCE_PROGRESS_PULSE_SECONDS,
 ) -> None:
-    """Publish market/L2 liveness while one bounded refresh is still running."""
+    """Publish process progress without falsely claiming fresh executable evidence."""
 
     interval = max(0.01, float(interval_seconds))
     while not cycle_done.is_set():
@@ -111,12 +149,16 @@ async def _source_cycle_progress_pulse(
                 worker_id=PERMANENT_SOURCE_WORKER_ID,
                 state="running",
                 detail={
-                    "stage": "market_l2_cycle_in_progress",
+                    "stage": "executable_market_l2_cycle_in_progress",
                     "progress_pulse": True,
+                    "fresh_evidence_published": False,
+                    "executable_hot_path": True,
+                    "whole_cycle_deadline_seconds": source_executable_deadline_seconds(),
                     "isolated_source_process": True,
                     "resident_with_portfolio_process": False,
                     "separate_python_process": True,
                     "priority_source_tail_decoupled": True,
+                    "broad_research_sweep_decoupled": True,
                     "disposable_research_required": False,
                     "portfolio_authority": False,
                     "allocation_authority": False,
@@ -169,13 +211,14 @@ async def _permanent_source_refresh_loop(
     *,
     stop_event: asyncio.Event,
 ) -> None:
-    """Refresh market/funding/L2 on its own cadence, independent of slow sources."""
+    """Refresh executable market/funding/L2 on a strict start-to-start cadence."""
 
     source_plane: PermanentSourcePlane | None = None
     sequence = 0
     while not stop_event.is_set():
         sequence += 1
         started_at = _now()
+        started_monotonic = time.monotonic()
         try:
             if source_plane is None:
                 source_plane = PermanentSourcePlane(store)
@@ -184,10 +227,15 @@ async def _permanent_source_refresh_loop(
                 state="running",
                 detail={
                     "sequence": sequence,
-                    "stage": "market_l2_refresh",
+                    "stage": "executable_market_l2_refresh",
+                    "executable_hot_path": True,
+                    "fresh_evidence_published": False,
+                    "whole_cycle_deadline_seconds": source_executable_deadline_seconds(),
+                    "start_to_start_interval_seconds": source_market_interval_seconds(),
                     "isolated_source_process": True,
                     "separate_python_process": True,
                     "priority_source_tail_decoupled": True,
+                    "broad_research_sweep_decoupled": True,
                     "disposable_research_required": False,
                     "portfolio_authority": False,
                     "allocation_authority": False,
@@ -212,15 +260,20 @@ async def _permanent_source_refresh_loop(
                 scan_id=snapshot.scan_id,
                 detail={
                     "sequence": sequence,
-                    "stage": "market_l2_complete",
+                    "stage": "executable_market_l2_complete",
                     "market_scan_id": snapshot.scan_id,
                     "market_quote_count": len(snapshot.market_quotes),
                     "funding_quote_count": len(snapshot.funding_quotes),
                     "order_book_count": len(snapshot.order_books),
                     "cycle_runtime_seconds": max(0.0, (_now() - started_at).total_seconds()),
+                    "executable_hot_path": True,
+                    "fresh_evidence_published": True,
+                    "whole_cycle_deadline_seconds": source_executable_deadline_seconds(),
+                    "start_to_start_interval_seconds": source_market_interval_seconds(),
                     "isolated_source_process": True,
                     "separate_python_process": True,
                     "priority_source_tail_decoupled": True,
+                    "broad_research_sweep_decoupled": True,
                     "disposable_research_required": False,
                     "portfolio_authority": False,
                     "allocation_authority": False,
@@ -236,12 +289,17 @@ async def _permanent_source_refresh_loop(
                     error_type=type(exc).__name__,
                     detail={
                         "sequence": sequence,
-                        "stage": "market_l2_refresh",
+                        "stage": "executable_market_l2_refresh",
                         "message": str(exc)[:500],
                         "retrying": True,
+                        "fresh_evidence_published": False,
+                        "executable_hot_path": True,
+                        "whole_cycle_deadline_seconds": source_executable_deadline_seconds(),
+                        "start_to_start_interval_seconds": source_market_interval_seconds(),
                         "isolated_source_process": True,
                         "separate_python_process": True,
                         "priority_source_tail_decoupled": True,
+                        "broad_research_sweep_decoupled": True,
                         "disposable_research_required": False,
                         "portfolio_authority": False,
                         "allocation_authority": False,
@@ -253,13 +311,92 @@ async def _permanent_source_refresh_loop(
                 pass
             source_plane = None
 
+        await _wait_for_next_cycle(
+            stop_event,
+            interval_seconds=source_market_interval_seconds(),
+            started_monotonic=started_monotonic,
+        )
+
+
+async def _research_market_refresh_loop(
+    store: EvidenceStore,
+    *,
+    stop_event: asyncio.Event,
+) -> None:
+    """Maintain broad 25-asset market history without participating in L2 freshness."""
+
+    source_plane: PermanentSourcePlane | None = None
+    sequence = 0
+    while not stop_event.is_set():
+        sequence += 1
+        started_at = _now()
+        started_monotonic = time.monotonic()
         try:
-            await asyncio.wait_for(
-                stop_event.wait(),
-                timeout=source_market_interval_seconds(),
+            if source_plane is None:
+                source_plane = PermanentSourcePlane(store)
+            store.record_worker_heartbeat(
+                worker_id=RESEARCH_MARKET_WORKER_ID,
+                state="running",
+                detail={
+                    "sequence": sequence,
+                    "stage": "broad_market_research_sweep",
+                    "executable_hot_path": False,
+                    "can_block_executable_freshness": False,
+                    "isolated_source_process": True,
+                    "allocation_authority": False,
+                    "live_execution_authority": False,
+                    "paper_only": True,
+                },
             )
-        except TimeoutError:
-            continue
+            snapshot = await source_plane.refresh_research_market_snapshot()
+            store.record_worker_heartbeat(
+                worker_id=RESEARCH_MARKET_WORKER_ID,
+                state="success",
+                scan_id=snapshot.scan_id,
+                detail={
+                    "sequence": sequence,
+                    "stage": "broad_market_research_complete",
+                    "market_scan_id": snapshot.scan_id,
+                    "market_quote_count": len(snapshot.market_quotes),
+                    "funding_quote_count": len(snapshot.funding_quotes),
+                    "order_book_count": 0,
+                    "cycle_runtime_seconds": max(0.0, (_now() - started_at).total_seconds()),
+                    "executable_hot_path": False,
+                    "can_block_executable_freshness": False,
+                    "isolated_source_process": True,
+                    "allocation_authority": False,
+                    "live_execution_authority": False,
+                    "paper_only": True,
+                },
+            )
+        except Exception as exc:
+            try:
+                store.record_worker_heartbeat(
+                    worker_id=RESEARCH_MARKET_WORKER_ID,
+                    state="degraded",
+                    error_type=type(exc).__name__,
+                    detail={
+                        "sequence": sequence,
+                        "stage": "broad_market_research_sweep",
+                        "message": str(exc)[:500],
+                        "retrying": True,
+                        "executable_hot_path": False,
+                        "can_block_executable_freshness": False,
+                        "isolated_source_process": True,
+                        "allocation_authority": False,
+                        "live_execution_authority": False,
+                        "paper_only": True,
+                    },
+                )
+            except Exception:
+                pass
+            source_plane = None
+
+        await _wait_for_next_cycle(
+            stop_event,
+            interval_seconds=source_research_interval_seconds(),
+            started_monotonic=started_monotonic,
+        )
 
 
 async def _priority_source_refresh_loop(
@@ -271,6 +408,7 @@ async def _priority_source_refresh_loop(
 
     source_plane: PermanentSourcePlane | None = None
     while not stop_event.is_set():
+        started_monotonic = time.monotonic()
         cycle_done: asyncio.Event | None = None
         pulse_task: asyncio.Task[None] | None = None
         try:
@@ -309,13 +447,11 @@ async def _priority_source_refresh_loop(
                 pulse_task.cancel()
                 await asyncio.gather(pulse_task, return_exceptions=True)
 
-        try:
-            await asyncio.wait_for(
-                stop_event.wait(),
-                timeout=source_priority_interval_seconds(),
-            )
-        except TimeoutError:
-            continue
+        await _wait_for_next_cycle(
+            stop_event,
+            interval_seconds=source_priority_interval_seconds(),
+            started_monotonic=started_monotonic,
+        )
 
 
 async def run_permanent_source_worker(
@@ -323,12 +459,13 @@ async def run_permanent_source_worker(
     *,
     stop_event: asyncio.Event | None = None,
 ) -> int:
-    """Own network-facing source/universe work outside portfolio accounting.
+    """Own all network-facing source work outside portfolio accounting.
 
-    Market/L2 and slower priority sources have separate schedules inside this isolated
-    process. A slow protocol or event provider can therefore no longer make executable
-    order-book evidence stale. Both ownership heartbeats remain durable so research
-    falls back only when the corresponding source cadence truly stops advancing.
+    Executable market/L2, broad research market history, slow priority sources, and
+    volume-universe maintenance have independent schedules. The executable cohort is
+    hard-deadlined and start-to-start scheduled, so research breadth or one slow
+    protocol provider cannot consume the freshness budget required by mechanism and
+    qualification stages.
     """
 
     install_bulk_provider_catalog_runtime()
@@ -344,7 +481,11 @@ async def run_permanent_source_worker(
 
     source_task = asyncio.create_task(
         _permanent_source_refresh_loop(store, stop_event=stop),
-        name="permanent-source-refresh",
+        name="permanent-executable-source-refresh",
+    )
+    research_market_task = asyncio.create_task(
+        _research_market_refresh_loop(store, stop_event=stop),
+        name="research-market-universe-refresh",
     )
     priority_task = asyncio.create_task(
         _priority_source_refresh_loop(store, stop_event=stop),
@@ -360,10 +501,12 @@ async def run_permanent_source_worker(
     finally:
         stop.set()
         source_task.cancel()
+        research_market_task.cancel()
         priority_task.cancel()
         volume_task.cancel()
         await asyncio.gather(
             source_task,
+            research_market_task,
             priority_task,
             volume_task,
             return_exceptions=True,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -17,11 +18,18 @@ from inefficiency_engine.priority_source_collection import (
 from inefficiency_engine.provider_gap_collection import ProviderAdmissionLedger
 from inefficiency_engine.research_mechanisms import VolatilityResearchService, YieldResearchService
 from inefficiency_engine.source_coverage import SourceCoveragePlane
+from inefficiency_engine.source_market_cadence import (
+    FastExecutableMarketCollector,
+    rotating_assets,
+)
 
 
 PERMANENT_SOURCE_WORKER_ID = "canonical-source-operating-loop"
+RESEARCH_MARKET_WORKER_ID = "research-market-universe-refresh"
 DEFAULT_SOURCE_MARKET_INTERVAL_SECONDS = 30.0
 DEFAULT_SOURCE_PRIORITY_INTERVAL_SECONDS = 60.0
+DEFAULT_SOURCE_RESEARCH_INTERVAL_SECONDS = 300.0
+DEFAULT_SOURCE_EXECUTABLE_DEADLINE_SECONDS = 45.0
 DEFAULT_SOURCE_L2_ASSET_BATCH_SIZE = 4
 MAX_SOURCE_L2_ASSET_BATCH_SIZE = 8
 
@@ -54,18 +62,34 @@ def source_priority_interval_seconds() -> float:
     )
 
 
+def source_research_interval_seconds() -> float:
+    return _env_float(
+        "CIE_SOURCE_RESEARCH_INTERVAL_SECONDS",
+        DEFAULT_SOURCE_RESEARCH_INTERVAL_SECONDS,
+        minimum=60.0,
+    )
+
+
+def source_executable_deadline_seconds() -> float:
+    return _env_float(
+        "CIE_SOURCE_EXECUTABLE_DEADLINE_SECONDS",
+        DEFAULT_SOURCE_EXECUTABLE_DEADLINE_SECONDS,
+        minimum=15.0,
+    )
+
+
 def permanent_source_plane_current(
     store: EvidenceStore,
     *,
     max_age_seconds: float = 120.0,
     now: datetime | None = None,
 ) -> bool:
-    """Return whether the permanent source owner is alive enough to own provider work.
+    """Return whether the permanent executable-source owner is currently alive.
 
-    A degraded heartbeat still means the permanent source loop is running and already
-    retrying provider-specific failures. Heavy research must not duplicate that network
-    work merely because one provider is degraded. Missing, errored or stale ownership
-    falls back to the disposable research path so source acquisition remains fail-safe.
+    A degraded heartbeat still means the permanent source loop owns provider retries.
+    Heavy research must not duplicate network work merely because one venue is
+    degraded. Missing, errored or stale ownership remains fail-safe and allows the
+    disposable path to recover acquisition if the permanent owner truly stops.
     """
 
     try:
@@ -94,13 +118,7 @@ def permanent_source_plane_current(
 
 
 class _PersistedEventSink:
-    """Minimal ledgers required by provider/source collectors.
-
-    This deliberately does not instantiate the all-lane alpha factory in the permanent
-    portfolio process. It appends only the source-derived event/fundamental records that
-    research already consumes and exposes the bounded L2 refresh callback expected by
-    PrioritySourceCollectionService.
-    """
+    """Minimal ledgers required by provider/source collectors."""
 
     def __init__(self, store: EvidenceStore):
         self.ledger = EventLedger(store)
@@ -128,16 +146,18 @@ class _PersistedEventSink:
 class PermanentSourcePlane:
     """Always-resident provider acquisition independent from disposable research.
 
-    The object lives inside the already-permanent lightweight portfolio process so it
-    adds no extra Python interpreter to the Render memory footprint. It owns public
-    market/funding acquisition, a bounded rotating L2 sample, and the priority
-    protocol/options/event source refresh. Everything is persisted before research
-    consumes it. It has no qualification, sizing, allocation or execution authority.
+    Executable evidence and broad research-history acquisition deliberately have
+    different time budgets. ``refresh_market_l2_snapshot`` refreshes only a rotating
+    four-asset executable cohort and is hard-deadlined well inside the downstream
+    120-second freshness window. ``refresh_research_market_snapshot`` performs the
+    broader top-volume sweep without visible L2 and is scheduled independently.
+    Priority protocol/options/event sources remain a third independent cadence.
     """
 
     def __init__(self, store: EvidenceStore):
         self.store = store
         self.registry = DynamicVolumePublicAdapterRegistry(evidence_store=store)
+        self.fast_market = FastExecutableMarketCollector(self.registry)
         self.coverage = SourceCoveragePlane(store)
         self.event_sink = _PersistedEventSink(store)
         self.admissions = ProviderAdmissionLedger(store)
@@ -167,30 +187,26 @@ class PermanentSourcePlane:
             requested = DEFAULT_SOURCE_L2_ASSET_BATCH_SIZE
         return max(1, min(MAX_SOURCE_L2_ASSET_BATCH_SIZE, requested))
 
-    def _selected_assets(self, market_quotes: list[object]) -> tuple[str, ...]:
+    def _selected_assets(self, market_quotes: list[object] | None = None) -> tuple[str, ...]:
+        """Return the current rotating executable cohort without a network lookup."""
+
+        selected = rotating_assets(
+            self.store,
+            self.registry,
+            cycle=self._market_cycle,
+            count=self._l2_batch_size(),
+        )
+        if selected:
+            return selected
+
         ordered: list[str] = []
         seen: set[str] = set()
-        managed = tuple(
-            getattr(getattr(self.registry, "coinbase", None), "assets", ()) or ()
-        )
-        for raw in managed:
-            asset = str(raw).upper().strip()
+        for quote in list(market_quotes or []):
+            asset = str(getattr(quote, "asset", "")).upper().strip()
             if asset and asset not in seen:
                 ordered.append(asset)
                 seen.add(asset)
-        if not ordered:
-            for quote in market_quotes:
-                asset = str(getattr(quote, "asset", "")).upper().strip()
-                if asset and asset not in seen:
-                    ordered.append(asset)
-                    seen.add(asset)
-        if not ordered:
-            return ()
-        count = min(len(ordered), self._l2_batch_size())
-        start = (self._market_cycle * count) % len(ordered)
-        return tuple(
-            ordered[(start + offset) % len(ordered)] for offset in range(count)
-        )
+        return tuple(ordered[: self._l2_batch_size()])
 
     @staticmethod
     def _book_requests(
@@ -240,14 +256,38 @@ class PermanentSourcePlane:
             )
         return opportunities
 
+    async def _collect_executable_snapshot_payload(self):
+        selected_assets = self._selected_assets()
+        funding, markets, providers = await self.fast_market.collect_inputs(selected_assets)
+        if not selected_assets:
+            selected_assets = self._selected_assets(list(markets))
+        requests = self._book_requests(list(markets), selected_assets)
+        books, book_statuses = await self.fast_market.collect_books(requests)
+        return selected_assets, funding, markets, providers, requests, books, book_statuses
+
     async def refresh_market_l2_snapshot(self) -> ScanSnapshot:
-        """Persist one bounded public market/funding/L2 snapshot."""
+        """Persist one hard-deadlined executable market/funding/L2 snapshot."""
 
         started_at = _now()
-        funding, markets, providers = await self.registry.collect_inputs()
-        selected_assets = self._selected_assets(list(markets))
-        requests = self._book_requests(list(markets), selected_assets)
-        books, book_statuses = await self.registry.collect_books_for_opportunities(requests)
+        deadline = source_executable_deadline_seconds()
+        try:
+            (
+                selected_assets,
+                funding,
+                markets,
+                providers,
+                requests,
+                books,
+                book_statuses,
+            ) = await asyncio.wait_for(
+                self._collect_executable_snapshot_payload(),
+                timeout=deadline,
+            )
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"ExecutableSourceRefreshDeadlineExceeded:{deadline:.1f}s"
+            ) from exc
+
         completed_at = _now()
         scan_id = self.store.record_scan(
             funding_quotes=list(funding),
@@ -259,6 +299,9 @@ class PermanentSourcePlane:
             order_books=list(books),
             analysis_config={
                 "permanent_source_plane": True,
+                "executable_hot_path": True,
+                "broad_research_sweep": False,
+                "whole_cycle_deadline_seconds": deadline,
                 "disposable_research_required": False,
                 "selected_l2_assets": list(selected_assets),
                 "l2_asset_batch_size": len(selected_assets),
@@ -280,12 +323,44 @@ class PermanentSourcePlane:
             error_type=None if books else "PermanentSourceL2Empty",
             detail={
                 "permanent_source_plane": True,
+                "executable_hot_path": True,
                 "selected_assets": list(selected_assets),
                 "requested_instrument_count": len(requests),
                 "retained_book_count": len(books),
                 "provider_status_count": len(book_statuses),
+                "whole_cycle_deadline_seconds": deadline,
                 "structural_opportunity_required": False,
                 "qualification_thresholds_unchanged": True,
+                "allocation_authority": False,
+                "live_execution_authority": False,
+                "paper_only": True,
+            },
+        )
+        return self.store.load_scan(scan_id)
+
+    async def refresh_research_market_snapshot(self) -> ScanSnapshot:
+        """Persist the broad market/funding sweep without blocking executable L2."""
+
+        started_at = _now()
+        funding, markets, providers = await self.registry.collect_inputs()
+        completed_at = _now()
+        scan_id = self.store.record_scan(
+            funding_quotes=list(funding),
+            market_quotes=list(markets),
+            opportunities=[],
+            providers=list(providers),
+            started_at=started_at,
+            completed_at=completed_at,
+            order_books=[],
+            analysis_config={
+                "permanent_source_plane": False,
+                "executable_hot_path": False,
+                "research_market_sweep": True,
+                "broad_research_sweep": True,
+                "market_quote_count": len(markets),
+                "funding_quote_count": len(funding),
+                "order_book_count": 0,
+                "qualification_authority": False,
                 "allocation_authority": False,
                 "live_execution_authority": False,
                 "paper_only": True,
@@ -303,7 +378,7 @@ class PermanentSourcePlane:
         return age >= source_priority_interval_seconds()
 
     async def run_cycle(self) -> dict[str, object]:
-        """Run source work with independent failure domains and durable liveness."""
+        """Compatibility cycle; production schedules each source cadence separately."""
 
         cycle_started = _now()
         self.store.record_worker_heartbeat(
@@ -313,6 +388,7 @@ class PermanentSourcePlane:
                 "stage": "cycle_start",
                 "resident_with_portfolio_process": True,
                 "separate_python_process": False,
+                "executable_hot_path": True,
                 "disposable_research_required": False,
                 "paper_only": True,
                 "allocation_authority": False,
@@ -323,6 +399,7 @@ class PermanentSourcePlane:
         detail: dict[str, object] = {
             "resident_with_portfolio_process": True,
             "separate_python_process": False,
+            "executable_hot_path": True,
             "disposable_research_required": False,
             "paper_only": True,
             "qualification_authority": False,

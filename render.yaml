@@ -34,11 +34,16 @@ services:
       # Deribit/protocol-native surfaces remain the production evidence routes.
       - key: CIE_BYBIT_PUBLIC_ENABLED
         value: "false"
-      # Public source acquisition is permanent inside the already-resident portfolio
-      # process. Heavy research/history may be memory-deferred without stopping these
-      # market, funding, L2, protocol, event, options and trade-flow refreshes.
+      # Executable market/L2 acquisition is a rotating four-asset hot path. It must
+      # complete comfortably inside the unchanged 120-second downstream freshness
+      # boundary. The broad top-25 research sweep runs independently and cannot block
+      # this cadence.
       - key: CIE_SOURCE_MARKET_INTERVAL_SECONDS
         value: "30"
+      - key: CIE_SOURCE_EXECUTABLE_DEADLINE_SECONDS
+        value: "45"
+      - key: CIE_SOURCE_RESEARCH_INTERVAL_SECONDS
+        value: "300"
       - key: CIE_SOURCE_PRIORITY_INTERVAL_SECONDS
         value: "60"
       - key: CIE_SOURCE_L2_ASSET_BATCH_SIZE

@@ -20,6 +20,8 @@ from inefficiency_engine.permanent_source_plane import (
     PERMANENT_SOURCE_WORKER_ID,
     PermanentSourcePlane,
     permanent_source_plane_current,
+    source_executable_deadline_seconds,
+    source_market_interval_seconds,
 )
 from inefficiency_engine.priority_source_collection import SOURCE_REFRESH_WORKER_ID
 
@@ -115,26 +117,59 @@ class _FakeRegistry:
         ]
 
 
+class _FakeFastMarket:
+    def __init__(self, registry):
+        self.registry = registry
+
+    async def collect_inputs(self, assets):
+        assert assets == ("BTC",)
+        return await self.registry.collect_inputs()
+
+    async def collect_books(self, requests):
+        return await self.registry.collect_books_for_opportunities(requests)
+
+
 @pytest.mark.asyncio
 async def test_permanent_market_l2_cycle_persists_source_truth_without_research(tmp_path):
     store = EvidenceStore(tmp_path / "permanent-source.sqlite")
     plane = PermanentSourcePlane(store)
     plane.registry = _FakeRegistry()
+    plane.fast_market = _FakeFastMarket(plane.registry)
 
     snapshot = await plane.refresh_market_l2_snapshot()
 
     assert len(snapshot.market_quotes) == 1
     assert len(snapshot.order_books) == 1
     assert snapshot.analysis_config["permanent_source_plane"] is True
+    assert snapshot.analysis_config["executable_hot_path"] is True
+    assert snapshot.analysis_config["broad_research_sweep"] is False
     assert snapshot.analysis_config["disposable_research_required"] is False
     heartbeat = store.latest_worker_heartbeat(ALPHA_L2_WORKER_ID)
     assert heartbeat is not None
     assert heartbeat.state == "success"
     assert heartbeat.detail["permanent_source_plane"] is True
+    assert heartbeat.detail["executable_hot_path"] is True
 
 
 @pytest.mark.asyncio
-async def test_source_progress_pulse_keeps_long_market_cycle_durably_current(tmp_path):
+async def test_broad_research_market_sweep_never_publishes_executable_authority(tmp_path):
+    store = EvidenceStore(tmp_path / "research-market.sqlite")
+    plane = PermanentSourcePlane(store)
+    plane.registry = _FakeRegistry()
+
+    snapshot = await plane.refresh_research_market_snapshot()
+
+    assert len(snapshot.market_quotes) == 1
+    assert snapshot.order_books == []
+    assert snapshot.analysis_config["research_market_sweep"] is True
+    assert snapshot.analysis_config["broad_research_sweep"] is True
+    assert snapshot.analysis_config["permanent_source_plane"] is False
+    assert snapshot.analysis_config["executable_hot_path"] is False
+    assert snapshot.analysis_config["allocation_authority"] is False
+
+
+@pytest.mark.asyncio
+async def test_source_progress_pulse_does_not_claim_fresh_evidence(tmp_path):
     store = EvidenceStore(tmp_path / "source-progress.sqlite")
     cycle_done = asyncio.Event()
     pulse = asyncio.create_task(
@@ -150,8 +185,11 @@ async def test_source_progress_pulse_keeps_long_market_cycle_durably_current(tmp
     assert heartbeat is not None
     assert heartbeat.state == "running"
     assert heartbeat.detail["progress_pulse"] is True
-    assert heartbeat.detail["stage"] == "market_l2_cycle_in_progress"
+    assert heartbeat.detail["stage"] == "executable_market_l2_cycle_in_progress"
+    assert heartbeat.detail["fresh_evidence_published"] is False
+    assert heartbeat.detail["executable_hot_path"] is True
     assert heartbeat.detail["priority_source_tail_decoupled"] is True
+    assert heartbeat.detail["broad_research_sweep_decoupled"] is True
     assert heartbeat.detail["separate_python_process"] is True
     assert heartbeat.detail["allocation_authority"] is False
 
@@ -194,6 +232,22 @@ async def test_priority_source_progress_pulse_is_independent_from_market_l2(tmp_
     await pulse
 
 
+def test_executable_source_cadence_is_start_to_start_not_runtime_plus_sleep():
+    assert permanent_source_worker._remaining_cycle_delay(
+        interval_seconds=30.0,
+        started_monotonic=100.0,
+        now_monotonic=105.0,
+    ) == 25.0
+    assert permanent_source_worker._remaining_cycle_delay(
+        interval_seconds=30.0,
+        started_monotonic=100.0,
+        now_monotonic=145.0,
+    ) == 0.0
+    assert source_market_interval_seconds() == 30.0
+    assert source_executable_deadline_seconds() == 45.0
+    assert source_executable_deadline_seconds() < 120.0
+
+
 def test_source_provider_work_is_not_hosted_on_portfolio_event_loop():
     portfolio_source = inspect.getsource(lightweight_portfolio_worker)
     source_worker = inspect.getsource(permanent_source_worker)
@@ -206,7 +260,8 @@ def test_source_provider_work_is_not_hosted_on_portfolio_event_loop():
 
     assert "PermanentSourcePlane" in source_worker
     assert "resolve_top_volume_assets" in source_worker
-    assert 'name="permanent-source-refresh"' in source_worker
+    assert 'name="permanent-executable-source-refresh"' in source_worker
+    assert 'name="research-market-universe-refresh"' in source_worker
     assert 'name="priority-source-refresh"' in source_worker
     assert 'name="volume-universe-refresh"' in source_worker
     assert "_source_cycle_progress_pulse" in source_worker
@@ -214,11 +269,19 @@ def test_source_provider_work_is_not_hosted_on_portfolio_event_loop():
     assert "allocation_authority" in source_worker
 
 
-def test_market_l2_loop_does_not_wait_for_priority_source_tail():
+def test_market_l2_loop_does_not_wait_for_research_or_priority_source_tail():
     market_loop = inspect.getsource(permanent_source_worker._permanent_source_refresh_loop)
+    research_loop = inspect.getsource(permanent_source_worker._research_market_refresh_loop)
     priority_loop = inspect.getsource(permanent_source_worker._priority_source_refresh_loop)
 
     assert "refresh_market_l2_snapshot" in market_loop
+    assert "refresh_research_market_snapshot" not in market_loop
     assert ".priority.run_cycle" not in market_loop
+
+    assert "refresh_research_market_snapshot" in research_loop
+    assert "refresh_market_l2_snapshot" not in research_loop
+    assert ".priority.run_cycle" not in research_loop
+
     assert ".priority.run_cycle" in priority_loop
     assert "refresh_market_l2_snapshot" not in priority_loop
+    assert "refresh_research_market_snapshot" not in priority_loop
