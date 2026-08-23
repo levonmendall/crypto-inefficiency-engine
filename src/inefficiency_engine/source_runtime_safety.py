@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import func, insert, inspect, select, text
@@ -12,7 +12,10 @@ from inefficiency_engine.provider_gap_collection import (
     ProviderCatalogLedger,
     _deterministic_id,
 )
-from inefficiency_engine.priority_source_collection import PrioritySourceCollectionService
+from inefficiency_engine.priority_source_collection import (
+    SOURCE_REFRESH_WORKER_ID,
+    PrioritySourceCollectionService,
+)
 from inefficiency_engine.source_coverage import (
     SourceCoverageLedger,
     SourceCoverageObservation,
@@ -37,14 +40,7 @@ def _bulk_catalog_observe(
     observed_at: datetime,
     source_reference: str,
 ) -> tuple[bool, list[dict[str, object]]]:
-    """Persist an exchange catalog in O(1) database round trips, not O(n).
-
-    Production source acquisition runs against remote PostgreSQL. The original
-    implementation issued one existence query per catalog item, which can block an
-    async provider loop for minutes on a several-hundred-product exchange catalog.
-    This implementation loads existing keys once and inserts all new rows with one
-    executemany operation while preserving first-seen semantics.
-    """
+    """Persist an exchange catalog in O(1) database round trips, not O(n)."""
 
     normalized: dict[str, tuple[dict[str, object], dict[str, object]]] = {}
     for item in items:
@@ -200,12 +196,7 @@ def _snapshot_with_table_cache(
 
 
 def install_source_coverage_reconciliation_runtime() -> None:
-    """Install bounded latest-state reads for source coverage once per process.
-
-    This changes only how the same durable truth is retrieved. Evidence freshness,
-    admission, qualification, settlement, sizing, allocation, and execution rules are
-    unchanged.
-    """
+    """Install bounded latest-state reads for source coverage once per process."""
 
     if bool(getattr(SourceCoveragePlane, _COVERAGE_PATCH_MARKER, False)):
         return
@@ -249,13 +240,41 @@ def ensure_source_coverage_runtime_indexes(store: Any) -> None:
             db.execute(text(statement))
 
 
-def _research_source_owner_current(store: Any) -> bool:
-    """Read the durable permanent-source ownership heartbeat lazily.
+def _heartbeat_current(
+    store: Any,
+    worker_id: str,
+    *,
+    max_age_seconds: float,
+) -> bool:
+    """Return whether one durable owner heartbeat is current enough to delegate work."""
 
-    The lazy import avoids introducing a module cycle between the source plane and
-    the priority collector. A current degraded heartbeat still means the permanent
-    source process owns retries; research must consume persisted evidence rather than
-    duplicating the same provider calls.
+    try:
+        heartbeat = store.latest_worker_heartbeat(worker_id)
+    except Exception:
+        return False
+    if heartbeat is None:
+        return False
+    observed_at = heartbeat.observed_at
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    age = max(
+        0.0,
+        (datetime.now(timezone.utc) - observed_at.astimezone(timezone.utc)).total_seconds(),
+    )
+    return bool(
+        age <= max(30.0, float(max_age_seconds))
+        and str(heartbeat.state or "") in {"running", "success", "degraded"}
+    )
+
+
+def _research_source_owner_current(store: Any) -> bool:
+    """Require both the market owner and slow priority-source owner to be current.
+
+    Market/L2 and priority provider work now run on independent schedules in the same
+    isolated source process. A fresh L2 heartbeat therefore no longer proves that the
+    priority source tail is advancing. Disposable research delegates provider work
+    only while both durable ownership signals are current; otherwise the existing
+    fail-safe recovery path remains available.
     """
 
     from inefficiency_engine.permanent_source_plane import permanent_source_plane_current
@@ -264,9 +283,13 @@ def _research_source_owner_current(store: Any) -> bool:
         configured = float(os.getenv("CIE_WORKER_HEARTBEAT_STALE_SECONDS", "180"))
     except ValueError:
         configured = 180.0
-    return permanent_source_plane_current(
+    max_age = max(180.0, configured)
+    if not permanent_source_plane_current(store, max_age_seconds=max_age):
+        return False
+    return _heartbeat_current(
         store,
-        max_age_seconds=max(180.0, configured),
+        SOURCE_REFRESH_WORKER_ID,
+        max_age_seconds=max_age,
     )
 
 
@@ -295,6 +318,7 @@ async def _delegated_source_payload(
             "state": "delegated_to_permanent_source",
             "delegated": True,
             "permanent_source_owner_current": True,
+            "priority_source_owner_current": True,
             "refreshed_sources": [],
             "fresh_cached_sources": [],
             "memory_deferred_sources": [],
@@ -312,10 +336,9 @@ async def _delegated_source_payload(
 def install_research_source_delegation() -> None:
     """Keep disposable research from duplicating a live permanent source owner.
 
-    This patch is installed only inside the disposable research process. If the
-    canonical source owner is current, research receives persisted coverage state and
-    proceeds directly to analysis/mechanism-forward work. If ownership is missing or
-    stale, the original fail-safe collector still runs unchanged.
+    If either the independent market/L2 cadence or the slow priority-source cadence
+    stops advancing, delegation is withdrawn and disposable research may use the
+    original fail-safe collector. No source/economic/qualification threshold changes.
     """
 
     if bool(getattr(PrioritySourceCollectionService, _RESEARCH_DELEGATION_MARKER, False)):
