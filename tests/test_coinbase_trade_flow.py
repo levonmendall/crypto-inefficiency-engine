@@ -1,6 +1,13 @@
 from datetime import datetime, timezone
 
-from inefficiency_engine.coinbase_trade_flow import parse_coinbase_product_trades
+from sqlalchemy import func, select
+
+from inefficiency_engine.coinbase_trade_flow import (
+    _persist_trade_events_bulk,
+    parse_coinbase_product_trades,
+)
+from inefficiency_engine.evidence import EvidenceStore
+from inefficiency_engine.source_coverage import SourceCoveragePlane, SourceEventObservation
 
 
 def test_coinbase_trade_parser_inverts_documented_maker_side_to_aggressor():
@@ -46,3 +53,29 @@ def test_coinbase_trade_parser_fails_closed_on_wrong_payload_shape():
         assert "must be a list" in str(exc)
     else:
         raise AssertionError("invalid Coinbase trade payload did not fail closed")
+
+
+def test_trade_flow_bulk_persistence_is_idempotent_and_bounded(tmp_path):
+    store = EvidenceStore(tmp_path / "trade-flow.sqlite")
+    coverage = SourceCoveragePlane(store)
+    observed_at = datetime(2026, 8, 22, 21, 0, tzinfo=timezone.utc)
+    observations = [
+        SourceEventObservation(
+            event_id=f"trade-{index}",
+            lane_id="microstructure",
+            source_id="public-trade-flow",
+            event_type="public_trade",
+            event_at=observed_at,
+            observed_at=observed_at,
+            asset="BTC",
+            payload={"index": index},
+        )
+        for index in range(600)
+    ]
+
+    assert _persist_trade_events_bulk(coverage, observations) == 600
+    assert _persist_trade_events_bulk(coverage, observations) == 0
+
+    with store.engine.connect() as db:
+        count = db.execute(select(func.count()).select_from(coverage.events.rows)).scalar_one()
+    assert count == 600
