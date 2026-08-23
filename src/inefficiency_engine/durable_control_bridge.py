@@ -95,7 +95,8 @@ class DurableControlQualifiedOpportunityBridgePublisher(
         rows.extend(persisted_cex_dex)
         failures.extend(persisted_failures)
 
-        if self.allocator.alpha_factory is not None:
+        alpha_factory = self.allocator.alpha_factory
+        if alpha_factory is not None:
             try:
                 rows.extend(
                     await self.allocator._alpha_family_candidates(
@@ -103,6 +104,28 @@ class DurableControlQualifiedOpportunityBridgePublisher(
                         total_capital_usd=total_capital_usd,
                     )
                 )
+                diagnostics = (
+                    alpha_factory.durable_promotion_diagnostics()
+                    if callable(getattr(alpha_factory, "durable_promotion_diagnostics", None))
+                    else {}
+                )
+                missing_depth = int(
+                    diagnostics.get("missing_current_executable_depth_count") or 0
+                )
+                if missing_depth > 0:
+                    failures.append(
+                        {
+                            "family": "alpha",
+                            "error_type": "MissingCurrentExecutableDepth",
+                            "reason": (
+                                "statistically eligible alpha candidates lacked a fresh matching "
+                                "persisted order book; canonical control does not perform provider "
+                                "fallback and leaves those candidates fail-closed"
+                            ),
+                            "candidate_count": missing_depth,
+                            "provider_requests_used": 0,
+                        }
+                    )
             except Exception as exc:
                 failures.append(
                     {
