@@ -25,7 +25,8 @@ from inefficiency_engine.evidence_velocity_runtime import (
     EvidenceVelocityLaneSuccessAllocationForwardCertificationService as AllocationForwardCertificationService,
     EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService as UnifiedPaperAllocatorService,
 )
-from inefficiency_engine.service import OpportunityService
+from inefficiency_engine.execution import qualify_opportunity
+from inefficiency_engine.service import OpportunityService, _books_for_opportunity
 from inefficiency_engine.source_runtime_safety import (
     install_bulk_provider_catalog_runtime,
     install_research_source_delegation,
@@ -91,6 +92,29 @@ def _portfolio_nav(store) -> float:
     return float(CANONICAL_INITIAL_CAPITAL_USD)
 
 
+def bridge_snapshot_from_source(service: OpportunityService, snapshot):
+    """Attach fail-closed executability to the already-collected bounded L2 snapshot.
+
+    The mechanism worker already has fresh quotes plus a bounded L2 working set. Reuse
+    those exact observations to qualify any core opportunities that have matching
+    books rather than performing another network scan. Missing books remain blocked.
+    """
+
+    latency_resolver = service.empirical_latency_resolver()
+    executability = [
+        qualify_opportunity(
+            opportunity,
+            _books_for_opportunity(opportunity, list(snapshot.order_books)),
+            service.settings,
+            notionals_usd=service.settings.capital_tiers_usd,
+            now=snapshot.completed_at,
+            latency_model_resolver=latency_resolver.resolve,
+        )
+        for opportunity in snapshot.opportunities
+    ]
+    return snapshot.model_copy(update={"executability": executability})
+
+
 async def refresh_canonical_control_plane(
     *,
     store,
@@ -98,14 +122,15 @@ async def refresh_canonical_control_plane(
     qualified_bridge,
     research_projection,
     settings,
+    bridge_snapshot=None,
 ) -> dict[str, object]:
     """Advance the durable operating -> bridge -> projection handoff.
 
-    This is deliberately independent from disposable research. It creates no new
-    market evidence and grants no execution authority: operating reconciliation reads
-    already-persisted source/forward/settlement truth, the bridge republishes only
-    currently qualified canonical-settleable candidates, and the projection exposes
-    that same durable state to the dashboard.
+    This is independent from disposable research. It creates no new market evidence
+    and grants no execution authority: operating reconciliation reads already-
+    persisted source/forward/settlement truth, the bridge republishes only currently
+    qualified canonical-settleable candidates, and the projection exposes that same
+    durable state to the dashboard.
     """
 
     result: dict[str, object] = {
@@ -131,7 +156,10 @@ async def refresh_canonical_control_plane(
         errors["operating_reconciliation"] = type(exc).__name__
 
     if result["operating_reconciliation_complete"]:
+        original_latest_scan = getattr(qualified_bridge, "_latest_scan", None)
         try:
+            if bridge_snapshot is not None and callable(original_latest_scan):
+                qualified_bridge._latest_scan = lambda: bridge_snapshot
             bridge = await qualified_bridge.publish_latest(
                 total_capital_usd=_portfolio_nav(store)
             )
@@ -143,8 +171,12 @@ async def refresh_canonical_control_plane(
             result["qualified_bridge_observed_at"] = (
                 bridge.observed_at.isoformat() if bridge is not None else None
             )
+            result["qualified_bridge_used_current_bounded_snapshot"] = bridge_snapshot is not None
         except Exception as exc:
             errors["qualified_bridge_publication"] = type(exc).__name__
+        finally:
+            if bridge_snapshot is not None and callable(original_latest_scan):
+                qualified_bridge._latest_scan = original_latest_scan
 
         try:
             payload = await asyncio.to_thread(
@@ -222,9 +254,6 @@ async def _run() -> None:
     factory = DisposableExpandedAlphaFactoryService(service, store)
     execution = factory.mechanism_execution
 
-    # Keep the qualification/portfolio handoff in the same independently supervised
-    # permanent plane as forward evidence. These services only consume persisted
-    # truth here; network-heavy source acquisition remains in the source process.
     universal = UniversalOpportunityService(service)
     composite_service = CexDexCompositeEvidenceService(service, universal=universal)
     promotion = CexDexPaperPromotionService(service, composite_service, store)
@@ -277,6 +306,11 @@ async def _run() -> None:
                 if original_executability is not None:
                     service.collect_live_executability = original_executability
 
+            bridge_snapshot = await asyncio.to_thread(
+                bridge_snapshot_from_source,
+                service,
+                snapshot,
+            )
             funnel = mechanism_forward_funnel(execution, cycle)
             store.record_worker_heartbeat(
                 worker_id=MECHANISM_FORWARD_WORKER_ID,
@@ -298,6 +332,7 @@ async def _run() -> None:
                 qualified_bridge=qualified_bridge,
                 research_projection=research_projection,
                 settings=settings,
+                bridge_snapshot=bridge_snapshot,
             )
             errors = control.get("control_plane_errors")
             error_map = errors if isinstance(errors, dict) else {}
