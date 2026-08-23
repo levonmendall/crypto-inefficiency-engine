@@ -58,10 +58,18 @@ class AllLaneOperatingCertificationService(
                 incomplete_source = True
         return incomplete_source and not complete_source
 
-    def _mechanism_status(self, existing: MechanismOperatingStatus) -> MechanismOperatingStatus:
+    def _mechanism_status(
+        self,
+        existing: MechanismOperatingStatus,
+        *,
+        lane=None,
+        readiness=None,
+    ) -> MechanismOperatingStatus:
         mechanism_id = existing.mechanism_id
-        readiness = self.mechanism_execution.readiness_summary()[mechanism_id]
-        lane = self.source_coverage.lane(mechanism_id)
+        if readiness is None:
+            readiness = self.mechanism_execution.readiness_summary()[mechanism_id]
+        if lane is None:
+            lane = self.source_coverage.lane(mechanism_id)
         source = classify_lane_source_dimensions(lane)
 
         # Research ledgers may intentionally contain modeled or otherwise incomplete
