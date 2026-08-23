@@ -80,9 +80,35 @@ class LaneSuccessQualifiedOpportunityAllocatorService(AllLaneQualifiedOpportunit
         mechanism_candidates, mechanism_stale = self._mechanism_proxy_candidates(
             total_capital_usd=total_capital_usd
         )
+        candidates = [*bridge_candidates, *mechanism_candidates]
+
+        # No eligible candidate means there is nothing for regime calibration or
+        # diversification to rank. Returning the same fail-closed empty allocation
+        # plan immediately keeps canonical accounting live while preserving every
+        # qualification, freshness, risk and sizing gate. This is intentionally not
+        # a fallback candidate path and can never create a nonzero allocation.
+        if not candidates:
+            plan = allocate_prequalified_candidates(
+                self.settings,
+                candidates=[],
+                family_failures=failures,
+                total_capital_usd=total_capital_usd,
+                max_venue_fraction=max_venue_fraction,
+                max_asset_fraction=max_asset_fraction,
+                max_allocations=max_allocations,
+            )
+            return plan.model_copy(
+                update={
+                    "rank_basis": (
+                        "lane_success_calibrated_expected_profit_per_reserved_capital_per_hour"
+                    ),
+                    "skipped": [*bridge_stale, *mechanism_stale, *plan.skipped],
+                }
+            )
+
         current_regime = self.lane_success.market_regime()
         adjusted, lane_skipped, diagnostics = self.lane_success.adjust_and_diversify(
-            [*bridge_candidates, *mechanism_candidates],
+            candidates,
             total_capital_usd=total_capital_usd,
             regime=current_regime,
         )
