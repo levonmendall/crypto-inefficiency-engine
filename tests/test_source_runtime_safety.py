@@ -7,7 +7,13 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import event, inspect as sqlalchemy_inspect
 
-from inefficiency_engine import disposable_heavy_job, permanent_source_worker
+from inefficiency_engine import (
+    disposable_heavy_job,
+    permanent_control_worker,
+    permanent_source_worker,
+    read_api_active_volume_deploy,
+    render_combined,
+)
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.provider_gap_collection import ProviderCatalogLedger
 from inefficiency_engine.priority_source_collection import PrioritySourceCollectionService
@@ -194,3 +200,40 @@ def test_runtime_entrypoints_install_source_safety_without_runtime_ddl():
     assert "install_source_coverage_reconciliation_runtime()" in heavy_worker
     assert "install_research_source_delegation()" in heavy_worker
     assert "ensure_source_coverage_runtime_indexes" not in heavy_worker
+
+
+def test_control_and_api_install_bounded_source_reconciliation_runtime():
+    control_worker = inspect.getsource(permanent_control_worker._run)
+    api_module = inspect.getsource(read_api_active_volume_deploy)
+
+    assert control_worker.index(
+        "install_source_coverage_reconciliation_runtime()"
+    ) < control_worker.index("_build_control_services")
+    assert api_module.index(
+        "install_source_coverage_reconciliation_runtime()"
+    ) < api_module.index("app = _base_deploy.app")
+
+
+def test_schema_bootstrap_installs_source_runtime_indexes_before_child_startup(monkeypatch):
+    events: list[str] = []
+    settings = SimpleNamespace(evidence_db_path="production")
+    store = SimpleNamespace(safe_database_url="postgresql://production")
+
+    monkeypatch.setattr(render_combined.Settings, "from_env", lambda: settings)
+    monkeypatch.setattr(render_combined, "build_evidence_store", lambda path: store)
+    monkeypatch.setattr(
+        render_combined,
+        "ensure_source_coverage_runtime_indexes",
+        lambda received: events.append("indexes"),
+    )
+    monkeypatch.setattr(
+        render_combined,
+        "_build_control_services",
+        lambda received_settings, received_store: events.append("control_graph"),
+    )
+
+    render_combined.bootstrap_permanent_runtime_schema()
+
+    # Constructing the graph creates all optional source/control tables first; the
+    # parent then adds read-path indexes before ``main`` starts any child process.
+    assert events == ["control_graph", "indexes"]
