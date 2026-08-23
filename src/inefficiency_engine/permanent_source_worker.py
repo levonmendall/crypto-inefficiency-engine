@@ -11,7 +11,6 @@ from inefficiency_engine.permanent_source_plane import (
     source_market_interval_seconds,
 )
 from inefficiency_engine.source_runtime_safety import (
-    ensure_source_coverage_runtime_indexes,
     install_bulk_provider_catalog_runtime,
     install_source_coverage_reconciliation_runtime,
 )
@@ -67,6 +66,7 @@ async def _volume_universe_refresh_loop(
                     state="degraded",
                     error_type=type(exc).__name__,
                     detail={
+                        "message": str(exc)[:500],
                         "universe_target_count": TOP_VOLUME_ASSET_COUNT,
                         "retrying": True,
                         "isolated_source_process": True,
@@ -146,10 +146,6 @@ async def _permanent_source_refresh_loop(
         try:
             if source_plane is None:
                 source_plane = PermanentSourcePlane(store)
-                # The source-specific ledgers are created by PermanentSourcePlane.
-                # Add the bounded latest-state indexes after construction so the
-                # reconciliation phase cannot regress into remote PostgreSQL scans.
-                ensure_source_coverage_runtime_indexes(store)
 
             cycle_done = asyncio.Event()
             pulse_task = asyncio.create_task(
@@ -171,6 +167,7 @@ async def _permanent_source_refresh_loop(
                     state="degraded",
                     error_type=type(exc).__name__,
                     detail={
+                        "message": str(exc)[:500],
                         "retrying": True,
                         "isolated_source_process": True,
                         "resident_with_portfolio_process": False,
@@ -215,9 +212,10 @@ async def run_permanent_source_worker(
     # PostgreSQL cannot turn a catalog refresh into hundreds of serial event-loop
     # blocking round trips.
     install_bulk_provider_catalog_runtime()
-    # Source coverage is a derived read of durable evidence. Keep that reconciliation
-    # bounded to latest rows and cache repeated table probes; no evidence or gate
-    # semantics are changed by this runtime optimization.
+    # Source coverage is a derived read of durable evidence. Keep reconciliation
+    # bounded to latest rows and cache repeated table probes. Runtime workers do not
+    # perform schema/index DDL: DDL can block or fail under concurrent production
+    # traffic and must never become a prerequisite for source acquisition.
     install_source_coverage_reconciliation_runtime()
 
     stop = stop_event or asyncio.Event()
