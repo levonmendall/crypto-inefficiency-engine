@@ -80,3 +80,20 @@ def cycle_history_bucket_database_timeout(store: Any) -> Iterator[None]:
         yield
     finally:
         event.remove(engine, "begin", apply_transaction_timeout)
+
+
+# The external supervisor supplies this id only to the disposable canonical-control
+# child. Install the runtime repair there, after aggregate-memory admission but before
+# run_one_control_cycle imports the durable cache symbols. Ordinary test/import paths
+# and every other worker keep the original module untouched.
+if os.getenv("CIE_CONTROL_EXECUTOR_CYCLE_ID"):
+    from inefficiency_engine import durable_control_cycle_history as _legacy_cycle_history
+    from inefficiency_engine.durable_control_cycle_history_target_bridge_runtime import (
+        advance_durable_control_cycle_history_cache as _advance_frozen_cycle_history,
+        load_durable_control_cycle_history as _load_frozen_cycle_history,
+    )
+
+    _legacy_cycle_history.advance_durable_control_cycle_history_cache = (
+        _advance_frozen_cycle_history
+    )
+    _legacy_cycle_history.load_durable_control_cycle_history = _load_frozen_cycle_history
