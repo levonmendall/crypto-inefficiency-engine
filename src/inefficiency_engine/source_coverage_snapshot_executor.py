@@ -54,6 +54,9 @@ def main() -> int:
         SOURCE_COVERAGE_SNAPSHOT_WORKER_ID,
     )
     from inefficiency_engine.evidence import build_evidence_store
+    from inefficiency_engine.operational_source_probe_runtime import (
+        install_current_source_scan_probe_runtime,
+    )
     from inefficiency_engine.source_coverage import SourceCoveragePlane
     from inefficiency_engine.source_coverage_snapshot_stage_runtime import (
         SourceCoverageSnapshotStageProfiler,
@@ -64,6 +67,10 @@ def main() -> int:
     )
 
     install_source_coverage_reconciliation_runtime()
+    # The reconciliation runtime bounds source/provider/admission reads. Install the
+    # current-scan table projection afterwards so market/funding/L2 probes never fall
+    # back to sorting the append-only historical evidence tables.
+    install_current_source_scan_probe_runtime()
     settings = Settings.from_env()
     store = build_evidence_store(settings.evidence_db_path)
     if store is None:
