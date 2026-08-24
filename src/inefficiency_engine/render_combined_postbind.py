@@ -319,7 +319,10 @@ def _control_guard_after_indexes(
     stop_event: threading.Event,
     indexes_ready: threading.Event,
 ) -> None:
-    print("canonical control waiting for required source/history runtime indexes", flush=True)
+    print(
+        "canonical control waiting for required source runtime indexes and cycle-history bucket index",
+        flush=True,
+    )
     while not stop_event.is_set():
         if indexes_ready.wait(1.0):
             print("control-gate indexes ready; starting canonical control supervision", flush=True)
