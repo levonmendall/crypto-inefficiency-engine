@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextvars
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -8,11 +7,6 @@ from typing import Any
 
 SOURCE_COVERAGE_SNAPSHOT_WORKER_ID = "canonical-source-coverage-snapshot"
 _DEFAULT_MAX_SNAPSHOT_AGE_SECONDS = 90.0
-_PUBLISH_CONTEXT: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "cie_source_coverage_snapshot_publish_context",
-    default=False,
-)
-_PRIORITY_PATCH_MARKER = "_cie_durable_source_coverage_priority_context"
 _SNAPSHOT_PUBLISH_PATCH_MARKER = "_cie_durable_source_coverage_snapshot_publisher"
 _CONTROL_READ_PATCH_MARKER = "_cie_durable_source_coverage_control_reader"
 
@@ -76,7 +70,7 @@ def persist_source_coverage_snapshot(store: Any, snapshot: Any) -> bool:
                 "allocation_source_qualified_lane_count": int(
                     snapshot.allocation_source_qualified_lane_count
                 ),
-                "publication_owner": "priority-source-coverage",
+                "publication_owner": "source-coverage-reconciliation",
                 "persisted_complete_snapshot": True,
                 "qualification_thresholds_unchanged": True,
                 "allocation_authority": False,
@@ -260,35 +254,28 @@ def load_persisted_source_coverage_snapshot(
 
 
 def install_source_coverage_snapshot_publisher_runtime() -> None:
-    """Persist snapshots computed inside real priority-source cycles without recomputing them."""
+    """Persist complete source snapshots at their existing computation boundary.
 
-    from inefficiency_engine.priority_source_collection import PrioritySourceCollectionService
+    This wraps only ``SourceCoveragePlane.snapshot``. It does not replace or wrap the
+    priority-source async cycle, so the established ``asyncio.to_thread`` isolation
+    contract and its regression tests remain intact. Any process that already computes
+    the bounded durable source view may publish it, while canonical control replaces
+    this method with the persisted reader before it can perform a reconstruction.
+    """
+
     from inefficiency_engine.source_coverage import SourceCoveragePlane
 
-    if not bool(getattr(PrioritySourceCollectionService, _PRIORITY_PATCH_MARKER, False)):
-        original_run_cycle = PrioritySourceCollectionService.run_cycle
+    if bool(getattr(SourceCoveragePlane, _SNAPSHOT_PUBLISH_PATCH_MARKER, False)):
+        return
+    original_snapshot = SourceCoveragePlane.snapshot
 
-        async def run_cycle_with_snapshot_publication(self, *args, **kwargs):
-            token = _PUBLISH_CONTEXT.set(True)
-            try:
-                return await original_run_cycle(self, *args, **kwargs)
-            finally:
-                _PUBLISH_CONTEXT.reset(token)
+    def snapshot_with_publication(self, *args, **kwargs):
+        snapshot = original_snapshot(self, *args, **kwargs)
+        persist_source_coverage_snapshot(self.store, snapshot)
+        return snapshot
 
-        PrioritySourceCollectionService.run_cycle = run_cycle_with_snapshot_publication  # type: ignore[method-assign]
-        setattr(PrioritySourceCollectionService, _PRIORITY_PATCH_MARKER, True)
-
-    if not bool(getattr(SourceCoveragePlane, _SNAPSHOT_PUBLISH_PATCH_MARKER, False)):
-        original_snapshot = SourceCoveragePlane.snapshot
-
-        def snapshot_with_publication(self, *args, **kwargs):
-            snapshot = original_snapshot(self, *args, **kwargs)
-            if _PUBLISH_CONTEXT.get():
-                persist_source_coverage_snapshot(self.store, snapshot)
-            return snapshot
-
-        SourceCoveragePlane.snapshot = snapshot_with_publication  # type: ignore[method-assign]
-        setattr(SourceCoveragePlane, _SNAPSHOT_PUBLISH_PATCH_MARKER, True)
+    SourceCoveragePlane.snapshot = snapshot_with_publication  # type: ignore[method-assign]
+    setattr(SourceCoveragePlane, _SNAPSHOT_PUBLISH_PATCH_MARKER, True)
 
 
 def install_control_source_coverage_snapshot_reader_runtime() -> None:
