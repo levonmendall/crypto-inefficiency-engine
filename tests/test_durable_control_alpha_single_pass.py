@@ -31,6 +31,9 @@ class _Decision(BaseModel):
 def _factory() -> DurableControlAlphaFactoryService:
     factory = object.__new__(DurableControlAlphaFactoryService)
     factory._durable_stage_reporter = None
+    factory._durable_missing_depth_count = 0
+    factory._durable_history_query_count = 0
+    factory._durable_history_cache_hits = 0
     factory._reset_snapshot_promotion_cache()
     return factory
 
