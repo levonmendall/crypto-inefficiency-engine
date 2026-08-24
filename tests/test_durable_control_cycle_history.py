@@ -187,6 +187,7 @@ def test_cycle_history_bootstrap_is_bounded_checkpointed_and_fail_closed(
     first = advance_durable_control_cycle_history_cache(first_factory, snapshot)
     assert first["complete"] is False
     assert first["bucket_queries"] <= first["query_budget"]
+    assert first["checkpoint_writes"] >= first["bucket_queries"]
     assert first["durable_checkpoint_persisted"] is True
     assert load_durable_control_cycle_history(first_factory, snapshot) is None
 
@@ -240,3 +241,84 @@ def test_raw_boundary_supports_later_cutoff_same_utc_day(monkeypatch, tmp_path):
     boundary = [row.mid for row in spot if row.observed_at.date().isoformat() == "2026-08-23"]
     # At a 13:00 cutoff, 12:30 becomes eligible without rebuilding the boundary day.
     assert boundary == [11.0, 12.5]
+
+
+def test_cycle_history_query_budget_is_hard_and_round_robin(monkeypatch, tmp_path):
+    monkeypatch.setenv("CIE_CONTROL_CACHE_NAMESPACE", "cycle-history-budget-test")
+    monkeypatch.setattr(
+        CycleAwareMultiHorizonTrendStrategy,
+        "required_history_hours",
+        classmethod(lambda cls, settings: 72.0),
+    )
+    monkeypatch.setattr(
+        CycleAwareMultiHorizonTrendStrategy,
+        "rows_per_day",
+        classmethod(lambda cls, settings: 2),
+    )
+    import inefficiency_engine.durable_control_cycle_history as cache_runtime
+
+    monkeypatch.setattr(cache_runtime, "_bucket_query_budget", lambda: 1)
+    store = EvidenceStore(tmp_path / "evidence.db")
+    now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+    snapshot = SimpleNamespace(
+        scan_id="budget-scan",
+        completed_at=now,
+        market_quotes=[
+            _quote(now, mid=100.0, venue="Coinbase", asset="BTC"),
+            _quote(now, mid=200.0, venue="OKX", asset="ETH"),
+        ],
+    )
+
+    first = advance_durable_control_cycle_history_cache(_Factory(store), snapshot)
+    assert first["complete"] is False
+    assert first["bucket_queries"] == 1
+    assert first["query_budget"] == 1
+    assert first["next_pair_index"] == 1
+    assert first["checkpoint_writes"] >= 1
+
+    second = advance_durable_control_cycle_history_cache(_Factory(store), snapshot)
+    assert second["bucket_queries"] == 1
+    assert second["query_budget"] == 1
+    assert second["next_pair_index"] == 0
+    assert second["checkpoint_writes"] >= 1
+
+
+def test_cycle_history_time_budget_checkpoints_before_return(monkeypatch, tmp_path):
+    monkeypatch.setenv("CIE_CONTROL_CACHE_NAMESPACE", "cycle-history-time-test")
+    monkeypatch.setattr(
+        CycleAwareMultiHorizonTrendStrategy,
+        "required_history_hours",
+        classmethod(lambda cls, settings: 240.0),
+    )
+    monkeypatch.setattr(
+        CycleAwareMultiHorizonTrendStrategy,
+        "rows_per_day",
+        classmethod(lambda cls, settings: 2),
+    )
+    import inefficiency_engine.durable_control_cycle_history as cache_runtime
+
+    monkeypatch.setattr(cache_runtime, "_bucket_query_budget", lambda: 10)
+    original_monotonic = cache_runtime.time.monotonic
+    ticks = iter([0.0, 0.0, 9.0, 9.0, 9.0])
+    monkeypatch.setattr(cache_runtime.time, "monotonic", lambda: next(ticks))
+
+    store = EvidenceStore(tmp_path / "evidence.db")
+    now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+    snapshot = _snapshot(now)
+    first = advance_durable_control_cycle_history_cache(_Factory(store), snapshot)
+
+    assert first["complete"] is False
+    assert first["bucket_queries"] == 1
+    assert first["stopped_for_time_budget"] is True
+    assert first["durable_checkpoint_persisted"] is True
+    assert first["checkpoint_writes"] >= first["bucket_queries"]
+    assert first["cached_pair_count"] == 0
+
+    # Restore the real clock and prove the next fresh interpreter advances beyond the
+    # already checkpointed boundary bucket rather than repeating it.
+    monkeypatch.setattr(cache_runtime.time, "monotonic", original_monotonic)
+    monkeypatch.setattr(cache_runtime, "_bucket_query_budget", lambda: 1)
+    second = advance_durable_control_cycle_history_cache(_Factory(store), snapshot)
+    assert second["bucket_queries"] == 1
+    assert second["boundary_rows_retained"] == 0
+    assert second["cached_pair_count"] == 1
