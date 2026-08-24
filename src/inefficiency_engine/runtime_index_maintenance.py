@@ -16,6 +16,12 @@ INDEX_SPECS: dict[str, tuple[str, ...]] = {
     "provider_gap_admissions": ("mechanism_id", "provider", "id"),
     "maker_shadow_outcomes": ("observed_at",),
     "capital_transfer_outcomes": ("observed_at",),
+    # Canonical operating reconciliation consumes append-only strategy evidence.
+    # These indexes keep the initial aggregate/filter pass bounded while subsequent
+    # cycles read only rows newer than the durable primary-key tails.
+    "alpha_forward_events": ("event_type", "strategy_id", "family"),
+    "allocation_forward_trials": ("strategy", "settlement_supported", "id"),
+    "allocation_forward_outcomes": ("strategy", "id"),
 }
 
 
