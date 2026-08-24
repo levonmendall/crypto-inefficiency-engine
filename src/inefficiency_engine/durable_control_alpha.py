@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+from collections import defaultdict
+from datetime import timedelta
+
+from sqlalchemy import and_, func, or_, select
+
 from inefficiency_engine.disposable_alpha_factory import DisposableExpandedAlphaFactoryService
+from inefficiency_engine.models import MarketKind, MarketQuote
 
 
 class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
@@ -15,6 +21,12 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
     the candidate closed instead of turning the control process into an exchange
     client.
 
+    The control bridge also only needs short-history rows for venue/assets present in
+    its current persisted source snapshot. Filter that exact cohort in SQL and cache it
+    for the lifetime of the one-shot control executor. This preserves the same
+    point-in-time history and strategy thresholds while preventing repeated promotion
+    passes from transferring/parsing unrelated append-only market history.
+
     Disposable research keeps its existing bounded provider fallback in its own
     process. This subclass is used only by ``permanent_control_worker`` and therefore
     changes plumbing, not any economic/statistical/source/risk qualification hurdle.
@@ -23,6 +35,76 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._durable_missing_depth_count = 0
+        self._durable_history_cache_key = None
+        self._durable_history_cache: dict[
+            tuple[str, str, MarketKind], list[MarketQuote]
+        ] = {}
+        self._durable_history_cache_hits = 0
+        self._durable_history_query_count = 0
+
+    def _history_for_snapshot(self, snapshot):
+        """Read the unchanged short history only for the current source cohort."""
+
+        current_keys = self._current_keys(snapshot)
+        if not current_keys:
+            self._durable_history_cache_key = None
+            self._durable_history_cache = {}
+            return {}
+
+        cache_key = (
+            str(snapshot.scan_id),
+            snapshot.completed_at.isoformat(),
+            tuple(
+                sorted(
+                    (venue, asset, market_kind.value)
+                    for venue, asset, market_kind in current_keys
+                )
+            ),
+        )
+        if self._durable_history_cache_key == cache_key:
+            self._durable_history_cache_hits = int(
+                getattr(self, "_durable_history_cache_hits", 0)
+            ) + 1
+            return {
+                key: list(values)
+                for key, values in self._durable_history_cache.items()
+            }
+
+        cutoff = snapshot.completed_at - timedelta(hours=self._effective_history_hours())
+        table = self.store.market_quotes
+        pair_filters = [
+            and_(table.c.venue == venue, func.upper(table.c.asset) == asset)
+            for venue, asset in sorted({(venue, asset) for venue, asset, _ in current_keys})
+        ]
+        query = (
+            select(table.c.payload_json)
+            .where(table.c.observed_at >= cutoff.isoformat())
+            .where(table.c.observed_at <= snapshot.completed_at.isoformat())
+            .where(or_(*pair_filters))
+            .order_by(table.c.observed_at)
+        )
+
+        grouped: dict[tuple[str, str, MarketKind], list[MarketQuote]] = defaultdict(list)
+        with self.store.engine.connect() as db:
+            self._durable_history_query_count = int(
+                getattr(self, "_durable_history_query_count", 0)
+            ) + 1
+            payloads = db.execution_options(stream_results=True).execute(query).scalars()
+            for payload in payloads:
+                quote = MarketQuote.model_validate_json(payload)
+                key = (quote.venue, quote.asset.upper(), quote.market_kind)
+                if key in current_keys:
+                    grouped[key].append(quote)
+
+        self._durable_history_cache_key = cache_key
+        self._durable_history_cache = {
+            key: list(values)
+            for key, values in grouped.items()
+        }
+        return {
+            key: list(values)
+            for key, values in self._durable_history_cache.items()
+        }
 
     async def _bounded_current_l2_cost(self, candidate):
         # Deliberately do not call the adapter registry. The caller already attempted
@@ -42,6 +124,10 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
 
     async def promoted_candidates(self, snapshot, *, total_capital_usd: float):
         self._durable_missing_depth_count = 0
+        self._durable_history_cache_key = None
+        self._durable_history_cache = {}
+        self._durable_history_cache_hits = 0
+        self._durable_history_query_count = 0
         rows = await super().promoted_candidates(
             snapshot,
             total_capital_usd=total_capital_usd,
@@ -61,6 +147,13 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
             "provider_requests_allowed": False,
             "provider_requests_used": 0,
             "missing_current_executable_depth_count": self._durable_missing_depth_count,
+            "short_history_query_count": int(
+                getattr(self, "_durable_history_query_count", 0)
+            ),
+            "short_history_cache_hits": int(
+                getattr(self, "_durable_history_cache_hits", 0)
+            ),
+            "short_history_current_cohort_only": True,
             "missing_depth_policy": "fail_closed",
             "qualification_thresholds_unchanged": True,
             "allocation_authority": False,

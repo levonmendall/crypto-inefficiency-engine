@@ -19,6 +19,9 @@ from inefficiency_engine.qualified_opportunity import QualifiedOpportunityBridge
 from inefficiency_engine.service import _books_for_opportunity
 
 
+PERMANENT_SOURCE_WORKER_ID = "canonical-source-operating-loop"
+
+
 class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridgePublisher):
     """Project the newest durable full market/L2 scan into canonical candidates.
 
@@ -28,14 +31,15 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
     row in ``scans`` as a complete decision snapshot therefore allowed an L2-only
     maintenance write to erase the canonical bridge input every cycle.
 
-    The bridge now prefers the newest permanent-source scan, explicitly skips L2-only
-    maintenance rows, and reconstructs only the bounded executability projection
-    needed by the canonical portfolio when the source scan has not already persisted
-    it. If the permanent owner is absent, the newest generic quote-bearing scan
-    remains a fail-safe fallback so an empty-but-fresh control envelope can still be
-    published. No provider request is made here: all inputs come from the durable
-    source ledger. Economic, cost, statistical, freshness, risk, settlement, and
-    paper-only gates remain unchanged.
+    The bridge now prefers the exact scan id published by the successful permanent
+    source heartbeat. That keeps the hot control path independent of total scan
+    history while preserving the older bounded scan walk as startup/test recovery.
+    It reconstructs only the bounded executability projection needed by the canonical
+    portfolio when the source scan has not already persisted it. Empirical latency
+    history is loaded lazily only when an otherwise executable tier actually reaches
+    the unchanged empirical-latency qualification gate. No provider request is made
+    here: all inputs come from the durable source ledger. Economic, cost, statistical,
+    freshness, risk, settlement, and paper-only gates remain unchanged.
     """
 
     _SCAN_LOOKBACK = 200
@@ -58,7 +62,56 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
             .limit(1)
         ).scalar_one_or_none() is not None
 
+    def _heartbeat_source_scan(self, db):
+        """Resolve the canonical source boundary through one durable heartbeat seek."""
+
+        try:
+            scan_id = db.execute(
+                select(self.store.worker_heartbeats.c.scan_id)
+                .where(
+                    self.store.worker_heartbeats.c.worker_id == PERMANENT_SOURCE_WORKER_ID,
+                    self.store.worker_heartbeats.c.state == "success",
+                    self.store.worker_heartbeats.c.scan_id.is_not(None),
+                )
+                .order_by(self.store.worker_heartbeats.c.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        except Exception:
+            return None, {}
+        if scan_id in (None, ""):
+            return None, {}
+
+        row = db.execute(
+            select(
+                self.store.scans.c.scan_id,
+                self.store.scans.c.started_at,
+                self.store.scans.c.completed_at,
+                self.store.scans.c.analysis_config_json,
+            )
+            .where(self.store.scans.c.scan_id == str(scan_id))
+            .limit(1)
+        ).mappings().first()
+        if row is None:
+            return None, {}
+
+        config = self._analysis_config(row["analysis_config_json"])
+        if not bool(config.get("permanent_source_plane")):
+            return None, {}
+        if not self._row_has_market_quote(db, self.store, str(scan_id)):
+            return None, {}
+        return row, {
+            **config,
+            "bridge_source_selection": "permanent_source_heartbeat",
+        }
+
     def _select_full_scan(self, db):
+        # The source worker already publishes the exact completed scan id in its
+        # success heartbeat. Resolve that primary key first instead of repeatedly
+        # sorting/walking the append-only scans table as the ledger grows.
+        heartbeat_row, heartbeat_config = self._heartbeat_source_scan(db)
+        if heartbeat_row is not None:
+            return heartbeat_row, heartbeat_config
+
         rows = list(
             db.execute(
                 select(
@@ -77,28 +130,27 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
             for row in rows
         ]
 
-        # The permanent source process is the canonical owner of current market/L2
-        # truth. Prefer its newest full quote snapshot even when the L2 set is empty:
-        # an empty current depth set is a real fail-closed condition and must not be
-        # replaced by older depth merely to manufacture an opportunity.
+        # Startup/tests can predate the source heartbeat contract. Retain the old
+        # bounded recovery walk and the same fail-closed preference semantics.
         for row, config in parsed:
             if not bool(config.get("permanent_source_plane")):
                 continue
             scan_id = str(row["scan_id"])
             if self._row_has_market_quote(db, self.store, scan_id):
-                return row, config
+                return row, {
+                    **config,
+                    "bridge_source_selection": "bounded_permanent_source_fallback",
+                }
 
-        # During startup/tests/fail-safe recovery there may be no permanent-source
-        # marker yet. Preserve the historical contract by accepting the newest
-        # non-maintenance quote-bearing scan. If it has no depth, candidate
-        # executability remains empty/fail-closed; the control envelope itself can
-        # still advance rather than being mislabeled stale.
         for row, config in parsed:
             if bool(config.get("alpha_l2_sampling")):
                 continue
             scan_id = str(row["scan_id"])
             if self._row_has_market_quote(db, self.store, scan_id):
-                return row, config
+                return row, {
+                    **config,
+                    "bridge_source_selection": "bounded_quote_scan_fallback",
+                }
         return None, {}
 
     def _latest_scan(self) -> ScanSnapshot | None:
@@ -159,6 +211,7 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
                     order_books.append(book)
 
         synthesized = False
+        latency_resolver = None
         can_project = bool(
             callable(getattr(self.core, "analyze", None))
             and callable(getattr(self.core, "empirical_latency_resolver", None))
@@ -171,7 +224,18 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
             # No external provider work is performed and every existing hurdle still
             # lives inside ``analyze`` / ``qualify_opportunity``.
             opportunities = self.core.analyze(funding_quotes, market_quotes)
-            latency_resolver = self.core.empirical_latency_resolver()
+
+            def resolve_latency(opportunity, notional_usd):
+                nonlocal latency_resolver
+                # EmpiricalLatencyResolver reconstructs the full append-only shadow
+                # history. Most fail-closed candidates never reach this gate because
+                # they lack current depth or reserve capacity. Defer the exact same
+                # resolver until qualification genuinely needs it, then reuse one
+                # instance for every remaining tier in this bridge projection.
+                if latency_resolver is None:
+                    latency_resolver = self.core.empirical_latency_resolver()
+                return latency_resolver.resolve(opportunity, notional_usd)
+
             qualification_time = datetime.now(timezone.utc)
             executability = [
                 qualify_opportunity(
@@ -180,7 +244,7 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
                     self.core.settings,
                     notionals_usd=self.core.settings.capital_tiers_usd,
                     now=qualification_time,
-                    latency_model_resolver=latency_resolver.resolve,
+                    latency_model_resolver=resolve_latency,
                 )
                 for opportunity in opportunities
             ]
@@ -193,6 +257,7 @@ class MemoryBoundedQualifiedOpportunityBridgePublisher(QualifiedOpportunityBridg
             "bridge_projection_synthesized_executability": synthesized,
             "bridge_projection_opportunity_count": len(opportunities),
             "bridge_projection_executability_count": len(executability),
+            "bridge_projection_empirical_latency_history_loaded": latency_resolver is not None,
             "bridge_projection_provider_requests": 0,
             "allocation_authority": False,
             "live_execution_authority": False,
