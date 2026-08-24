@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections import defaultdict
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import Column, Index, Integer, MetaData, String, Table, Text, and_, delete, insert, or_, select
@@ -46,7 +47,8 @@ Index(
 
 _CACHE_KEY = "cycle-history-live-compact-v3"
 _CACHE_VERSION = 3
-_DEFAULT_BUCKET_QUERY_BUDGET = 256
+_DEFAULT_BUCKET_QUERY_BUDGET = 32
+_DEFAULT_BOOTSTRAP_TIME_BUDGET_SECONDS = 8.0
 _RETENTION_SAFETY_HOURS = 24.0
 
 
@@ -65,7 +67,19 @@ def _bucket_query_budget() -> int:
         value = int(raw)
     except ValueError:
         value = _DEFAULT_BUCKET_QUERY_BUDGET
-    return max(16, min(2000, value))
+    return max(1, min(256, value))
+
+
+def _bootstrap_time_budget_seconds() -> float:
+    raw = os.getenv(
+        "CIE_CONTROL_CYCLE_HISTORY_TIME_BUDGET_SECONDS",
+        str(_DEFAULT_BOOTSTRAP_TIME_BUDGET_SECONDS),
+    )
+    try:
+        value = float(raw)
+    except ValueError:
+        value = _DEFAULT_BOOTSTRAP_TIME_BUDGET_SECONDS
+    return max(1.0, min(15.0, value))
 
 
 def _pair_token(venue: str, asset: str) -> str:
@@ -100,6 +114,7 @@ def _fresh_checkpoint(factory: Any) -> dict[str, Any]:
         "required_history_hours": required_history_hours,
         "pair_completed_through": {},
         "boundary_days": {},
+        "next_pair_index": 0,
         "last_bucket_queries": 0,
     }
 
@@ -127,7 +142,7 @@ def _reset_namespace_rows(store: Any, namespace: str) -> None:
 
 
 def _day_start(day: date) -> datetime:
-    return datetime.combine(day, time.min, tzinfo=timezone.utc)
+    return datetime.combine(day, datetime_time.min, tzinfo=timezone.utc)
 
 
 def _replace_bucket(
@@ -202,16 +217,23 @@ def _parse_day(raw: object, fallback: date) -> date:
 def advance_durable_control_cycle_history_cache(
     factory: Any,
     snapshot: Any,
+    *,
+    stop_at_monotonic: float | None = None,
 ) -> dict[str, object]:
-    """Build the exact legacy daily projection outside alpha discovery.
+    """Advance the exact legacy daily projection in a resumable bounded slice.
 
-    Stable days are stored as the exact newest N source ids for each venue/asset/day,
-    matching the legacy ``row_number(... order by id desc)`` result. The one moving
-    recent-cutoff day is stored raw once per UTC day; the reader applies the exact
-    cutoff and then the same newest-N rank. This preserves filter-before-rank semantics
-    without rerunning a 180-day PostgreSQL window query in every fresh control process.
-    Partial stable-day progress is durable and never visible to alpha discovery.
+    Each completed venue/asset/day bucket is checkpointed before another bucket starts.
+    A fresh disposable control interpreter therefore resumes after the last durable
+    bucket instead of replaying a large batch after an external deadline. Work is also
+    capped by both a small query budget and a short wall-clock budget. Partial history
+    remains invisible to alpha discovery until every current pair is exact.
     """
+
+    started = time.monotonic()
+    time_budget_seconds = _bootstrap_time_budget_seconds()
+    local_stop = started + time_budget_seconds
+    if stop_at_monotonic is not None:
+        local_stop = min(local_stop, float(stop_at_monotonic))
 
     namespace = durable_control_cache_namespace()
     if namespace is None:
@@ -223,8 +245,25 @@ def advance_durable_control_cycle_history_cache(
 
     ensure_durable_control_cycle_history_schema(factory.store)
     checkpoint, valid = _load_checkpoint(factory)
+    checkpoint_writes = 0
+    persisted = bool(valid)
     if not valid:
         _reset_namespace_rows(factory.store, namespace)
+        persisted = save_control_cache_checkpoint(
+            factory.store,
+            cache_key=_CACHE_KEY,
+            payload=checkpoint,
+            complete=False,
+        )
+        checkpoint_writes += int(bool(persisted))
+        if not persisted:
+            return {
+                "complete": False,
+                "error_type": "CycleHistoryCheckpointPersistFailed",
+                "mode": "resumable_exact_daily_bucket_cache",
+                "durable_checkpoint_persisted": False,
+                "paper_only": True,
+            }
 
     current_pairs = sorted(_current_pairs(factory, snapshot))
     rows_per_day, required_history_hours = _config(factory)
@@ -233,19 +272,31 @@ def advance_durable_control_cycle_history_cache(
         hours=factory._effective_history_hours()
     )
     if recent_cutoff <= long_cutoff or not current_pairs:
+        checkpoint.update(
+            {
+                "version": _CACHE_VERSION,
+                "rows_per_day": rows_per_day,
+                "required_history_hours": required_history_hours,
+                "last_bucket_queries": 0,
+            }
+        )
         persisted = save_control_cache_checkpoint(
             factory.store,
             cache_key=_CACHE_KEY,
             payload=checkpoint,
             complete=True,
         )
+        checkpoint_writes += int(bool(persisted))
         return {
             "complete": bool(persisted),
-            "mode": "bounded_exact_daily_bucket_cache",
+            "mode": "resumable_exact_daily_bucket_cache",
             "current_pair_count": len(current_pairs),
             "bucket_queries": 0,
+            "checkpoint_writes": checkpoint_writes,
             "rows_per_day": rows_per_day,
             "durable_checkpoint_persisted": bool(persisted),
+            "time_budget_seconds": time_budget_seconds,
+            "stopped_for_time_budget": False,
             "qualification_thresholds_unchanged": True,
             "paper_only": True,
         }
@@ -261,56 +312,48 @@ def advance_durable_control_cycle_history_cache(
         str(key): str(value)
         for key, value in dict(checkpoint.get("boundary_days") or {}).items()
     }
-
-    boundary_refresh_count = sum(
-        boundary_days.get(_pair_token(venue, asset)) != boundary_day.isoformat()
-        for venue, asset in current_pairs
-    )
-    configured_budget = _bucket_query_budget()
-    query_budget = min(
-        4000,
-        max(configured_budget, boundary_refresh_count + len(current_pairs)),
-    )
-    stable_budget = max(0, query_budget - boundary_refresh_count)
-    base_stable_quota = stable_budget // len(current_pairs)
-    stable_remainder = stable_budget % len(current_pairs)
+    query_budget = _bucket_query_budget()
+    pair_index = int(checkpoint.get("next_pair_index") or 0) % len(current_pairs)
     bucket_queries = 0
     stable_rows_retained = 0
     boundary_rows_retained = 0
+    idle_visits = 0
+    stopped_for_time_budget = False
+    checkpoint_persist_failed = False
 
-    for index, (venue, asset) in enumerate(current_pairs):
+    def persist_progress(*, complete: bool = False) -> bool:
+        nonlocal checkpoint_writes
+        checkpoint.update(
+            {
+                "version": _CACHE_VERSION,
+                "rows_per_day": rows_per_day,
+                "required_history_hours": required_history_hours,
+                "pair_completed_through": completed,
+                "boundary_days": boundary_days,
+                "next_pair_index": pair_index,
+                "last_bucket_queries": bucket_queries,
+            }
+        )
+        ok = save_control_cache_checkpoint(
+            factory.store,
+            cache_key=_CACHE_KEY,
+            payload=checkpoint,
+            complete=complete,
+        )
+        checkpoint_writes += int(bool(ok))
+        return bool(ok)
+
+    while bucket_queries < query_budget and idle_visits < len(current_pairs):
+        if time.monotonic() >= local_stop:
+            stopped_for_time_budget = True
+            break
+
+        venue, asset = current_pairs[pair_index]
         token = _pair_token(venue, asset)
-        fallback_completed = first_day - timedelta(days=1)
-        completed_day = _parse_day(completed.get(token), fallback_completed)
-        if completed_day < fallback_completed:
-            completed_day = fallback_completed
+        did_work = False
 
-        stable_quota = base_stable_quota + (1 if index < stable_remainder else 0)
-        next_day = max(first_day, completed_day + timedelta(days=1))
-        processed = 0
-        while next_day <= stable_end_day and processed < stable_quota:
-            day_start = _day_start(next_day)
-            stable_rows_retained += _replace_bucket(
-                factory=factory,
-                namespace=namespace,
-                venue=venue,
-                asset=asset,
-                day=next_day,
-                start=max(long_cutoff, day_start),
-                end=day_start + timedelta(days=1),
-                limit=rows_per_day,
-            )
-            bucket_queries += 1
-            processed += 1
-            completed_day = next_day
-            next_day += timedelta(days=1)
-        completed[token] = completed_day.isoformat()
-
-        # Store the complete UTC boundary day raw. It is historical relative to the
-        # short-history cutoff, so ordinary live appends do not mutate it. Keeping the
-        # raw day lets the reader apply any later cutoff from the same UTC day before
-        # ranking, exactly matching the legacy query even if the bridge snapshot moves
-        # by a few seconds after preflight.
+        # Refresh the moving cutoff day first. This keeps every current pair's recent
+        # boundary available early while the older 180-day history catches up.
         if boundary_days.get(token) != boundary_day.isoformat():
             boundary_start = max(long_cutoff, _day_start(boundary_day))
             boundary_rows_retained += _replace_bucket(
@@ -323,27 +366,45 @@ def advance_durable_control_cycle_history_cache(
                 end=_day_start(boundary_day) + timedelta(days=1),
                 limit=None,
             )
-            bucket_queries += 1
             boundary_days[token] = boundary_day.isoformat()
+            bucket_queries += 1
+            did_work = True
+        else:
+            fallback_completed = first_day - timedelta(days=1)
+            completed_day = _parse_day(completed.get(token), fallback_completed)
+            if completed_day < fallback_completed:
+                completed_day = fallback_completed
+            next_day = max(first_day, completed_day + timedelta(days=1))
+            if next_day <= stable_end_day:
+                day_start = _day_start(next_day)
+                stable_rows_retained += _replace_bucket(
+                    factory=factory,
+                    namespace=namespace,
+                    venue=venue,
+                    asset=asset,
+                    day=next_day,
+                    start=max(long_cutoff, day_start),
+                    end=day_start + timedelta(days=1),
+                    limit=rows_per_day,
+                )
+                completed[token] = next_day.isoformat()
+                bucket_queries += 1
+                did_work = True
 
-    retention_floor = long_cutoff - timedelta(hours=_RETENTION_SAFETY_HOURS)
-    with factory.store.engine.begin() as db:
-        db.execute(
-            delete(CONTROL_CYCLE_HISTORY_ROWS)
-            .where(CONTROL_CYCLE_HISTORY_ROWS.c.namespace == namespace)
-            .where(CONTROL_CYCLE_HISTORY_ROWS.c.observed_at < retention_floor.isoformat())
-        )
+        pair_index = (pair_index + 1) % len(current_pairs)
+        checkpoint["next_pair_index"] = pair_index
 
-    checkpoint.update(
-        {
-            "version": _CACHE_VERSION,
-            "rows_per_day": rows_per_day,
-            "required_history_hours": required_history_hours,
-            "pair_completed_through": completed,
-            "boundary_days": boundary_days,
-            "last_bucket_queries": bucket_queries,
-        }
-    )
+        if did_work:
+            idle_visits = 0
+            # Persist after every completed bucket. If the supervisor kills a later
+            # bucket, at most that in-flight idempotent replacement is replayed.
+            persisted = persist_progress(complete=False)
+            if not persisted:
+                checkpoint_persist_failed = True
+                break
+        else:
+            idle_visits += 1
+
     current_tokens = [_pair_token(venue, asset) for venue, asset in current_pairs]
     stable_complete = all(
         _parse_day(completed.get(token), first_day - timedelta(days=1))
@@ -354,35 +415,61 @@ def advance_durable_control_cycle_history_cache(
         boundary_days.get(token) == boundary_day.isoformat()
         for token in current_tokens
     )
-    complete = bool(stable_complete and boundary_complete)
-    persisted = save_control_cache_checkpoint(
-        factory.store,
-        cache_key=_CACHE_KEY,
-        payload=checkpoint,
-        complete=complete,
+    complete = bool(
+        stable_complete
+        and boundary_complete
+        and not checkpoint_persist_failed
     )
-    complete = bool(complete and persisted)
+
+    # Cleanup is non-authoritative and can wait until the exact cache is complete;
+    # keeping it off the rebuild hot path preserves deadline headroom.
+    if complete and time.monotonic() < local_stop:
+        retention_floor = long_cutoff - timedelta(hours=_RETENTION_SAFETY_HOURS)
+        with factory.store.engine.begin() as db:
+            db.execute(
+                delete(CONTROL_CYCLE_HISTORY_ROWS)
+                .where(CONTROL_CYCLE_HISTORY_ROWS.c.namespace == namespace)
+                .where(
+                    CONTROL_CYCLE_HISTORY_ROWS.c.observed_at
+                    < retention_floor.isoformat()
+                )
+            )
+
+    if complete:
+        persisted = persist_progress(complete=True)
+        complete = bool(persisted)
+
+    if time.monotonic() >= local_stop and not complete:
+        stopped_for_time_budget = True
 
     incomplete_pairs = sum(
-        _parse_day(completed.get(token), first_day - timedelta(days=1))
-        < stable_end_day
+        (
+            _parse_day(completed.get(token), first_day - timedelta(days=1))
+            < stable_end_day
+        )
+        or boundary_days.get(token) != boundary_day.isoformat()
         for token in current_tokens
     )
-    return {
+    result: dict[str, object] = {
         "complete": complete,
-        "mode": "bounded_exact_daily_bucket_cache",
+        "mode": "resumable_exact_daily_bucket_cache",
         "query_budget": query_budget,
         "bucket_queries": bucket_queries,
+        "checkpoint_writes": checkpoint_writes,
         "stable_rows_retained": stable_rows_retained,
         "boundary_rows_retained": boundary_rows_retained,
         "current_pair_count": len(current_pairs),
         "cached_pair_count": len(completed),
         "incomplete_pair_count": incomplete_pairs,
+        "next_pair_index": pair_index,
         "rows_per_day": rows_per_day,
         "required_history_hours": required_history_hours,
         "long_cutoff": long_cutoff.isoformat(),
         "recent_cutoff": recent_cutoff.isoformat(),
         "boundary_day": boundary_day.isoformat(),
+        "elapsed_seconds": max(0.0, time.monotonic() - started),
+        "time_budget_seconds": time_budget_seconds,
+        "stopped_for_time_budget": stopped_for_time_budget,
         "durable_checkpoint_persisted": bool(persisted),
         "legacy_window_query_avoided": True,
         "filter_before_daily_rank_preserved": True,
@@ -391,6 +478,9 @@ def advance_durable_control_cycle_history_cache(
         "live_execution_authority": False,
         "paper_only": True,
     }
+    if checkpoint_persist_failed:
+        result["error_type"] = "CycleHistoryCheckpointPersistFailed"
+    return result
 
 
 def load_durable_control_cycle_history(
