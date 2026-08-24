@@ -56,7 +56,10 @@ def _snapshot(at: datetime) -> SimpleNamespace:
     return SimpleNamespace(
         scan_id=f"scan-{int(at.timestamp())}",
         completed_at=at,
-        market_quotes=[_quote(at, mid=999.0)],
+        market_quotes=[
+            _quote(at, mid=999.0),
+            _quote(at, mid=998.0, kind=MarketKind.PERPETUAL),
+        ],
     )
 
 
