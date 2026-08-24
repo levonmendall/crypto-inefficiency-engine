@@ -4,7 +4,10 @@ import asyncio
 
 from inefficiency_engine import permanent_source_plane as source_plane
 from inefficiency_engine import permanent_source_worker as base
-from inefficiency_engine.critical_source_cadence import critical_source_refresh_loop
+from inefficiency_engine.production_source_recovery_runtime import (
+    critical_source_refresh_loop,
+    install_lido_provider_recovery,
+)
 from inefficiency_engine.provider_gap_collection import ProviderProbeResult
 from inefficiency_engine.provider_gap_resilience import ResilientProviderGapCollectionService
 from inefficiency_engine.source_lane_repair_runtime import (
@@ -41,7 +44,7 @@ async def _run_permanent_source_worker_with_critical_cadence(
     *,
     stop_event: asyncio.Event | None = None,
 ) -> int:
-    """Run shortest-TTL source repair independently from the slow priority tail."""
+    """Run shortest-TTL source recovery independently from the slow priority tail."""
 
     stop = stop_event or asyncio.Event()
     critical_task = asyncio.create_task(
@@ -63,6 +66,7 @@ def install_remaining_source_lane_repairs() -> None:
     ResilientProviderGapCollectionService._collect_hyperliquid_distress_surface = (
         _collect_hyperliquid_distress_with_retries
     )
+    install_lido_provider_recovery()
     if not bool(getattr(base, _RUNTIME_PATCH_MARKER, False)):
         base.run_permanent_source_worker = _run_permanent_source_worker_with_critical_cadence
         setattr(base, _RUNTIME_PATCH_MARKER, True)
