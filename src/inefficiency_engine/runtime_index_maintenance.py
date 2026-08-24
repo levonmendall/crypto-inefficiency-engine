@@ -15,11 +15,6 @@ CONTROL_GATE_INDEX_SPECS: dict[str, tuple[str, ...]] = {
     "provider_statuses": ("provider", "id"),
     "source_coverage_observations": ("source_id", "lane_id", "id"),
     "provider_gap_admissions": ("mechanism_id", "provider", "id"),
-    # Dashboard portfolio/research projection builders and runtime watchdogs read
-    # latest durable state by worker id and descending append-only id. The legacy
-    # single-column worker_id index still requires sorting an ever-growing heartbeat
-    # cohort; this composite path keeps those liveness-critical reads bounded.
-    "worker_heartbeats": ("worker_id", "id"),
 }
 
 # Canonical cycle-history bootstrap reads one venue/asset/day from the append-only
