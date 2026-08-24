@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
+
+from sqlalchemy import select
+
+from inefficiency_engine.evidence import WorkerHeartbeat
 
 
 RUNTIME_INDEX_LABEL = "runtime_index_maintenance"
@@ -10,33 +15,128 @@ SOURCE_COVERAGE_REFRESH_LABEL = "source_coverage_refresh"
 SOURCE_COVERAGE_REFRESH_WORKER_ID = "canonical-source-coverage-refresh"
 SOURCE_COVERAGE_SNAPSHOT_LABEL = "source_coverage_snapshot"
 SOURCE_COVERAGE_SNAPSHOT_WORKER_ID = "canonical-source-coverage-snapshot"
+SOURCE_COVERAGE_EXECUTOR_WORKER_ID = "canonical-source-coverage-executor"
 SOURCE_COVERAGE_HANDOFF_STALE_AFTER_SECONDS = 90.0
 _INSTALL_MARKER = "_cie_runtime_index_health_observability_installed"
 
 
-def _detail_payload(base: Any, worker_id: str) -> dict[str, object]:
+def _store(base: Any):
     try:
-        store = base._store()  # noqa: SLF001 - deploy-layer observability hook
+        return base._store()  # noqa: SLF001 - deploy-layer observability hook
     except Exception:
-        return {}
+        return None
+
+
+def _heartbeat(base: Any, worker_id: str) -> WorkerHeartbeat | None:
+    store = _store(base)
     if store is None:
-        return {}
+        return None
     try:
-        heartbeat = store.latest_worker_heartbeat(worker_id)
+        return store.latest_worker_heartbeat(worker_id)
     except Exception:
-        return {}
+        return None
+
+
+def _detail_payload(base: Any, worker_id: str) -> dict[str, object]:
+    heartbeat = _heartbeat(base, worker_id)
     if heartbeat is None:
         return {}
     detail = getattr(heartbeat, "detail", None)
     return dict(detail) if isinstance(detail, dict) else {}
 
 
+def _latest_terminal_refresh(base: Any) -> WorkerHeartbeat | None:
+    """Read the newest completed refresh even while the next attempt is running."""
+
+    store = _store(base)
+    if store is None:
+        return None
+    try:
+        query = (
+            select(store.worker_heartbeats.c.payload_json)
+            .where(
+                store.worker_heartbeats.c.worker_id == SOURCE_COVERAGE_REFRESH_WORKER_ID,
+                store.worker_heartbeats.c.state != "running",
+            )
+            .order_by(store.worker_heartbeats.c.id.desc())
+            .limit(1)
+        )
+        with store.engine.connect() as db:
+            payload = db.execute(query).scalar_one_or_none()
+        return WorkerHeartbeat.model_validate_json(payload) if payload else None
+    except Exception:
+        return None
+
+
+def _executor_stage_for_pid(base: Any, pid: object | None) -> WorkerHeartbeat | None:
+    """Find the latest durable executor stage belonging to one OS process."""
+
+    try:
+        expected_pid = int(pid) if pid is not None else None
+    except (TypeError, ValueError):
+        expected_pid = None
+    if expected_pid is None:
+        return None
+
+    store = _store(base)
+    if store is None:
+        return None
+    try:
+        query = (
+            select(store.worker_heartbeats.c.payload_json)
+            .where(store.worker_heartbeats.c.worker_id == SOURCE_COVERAGE_EXECUTOR_WORKER_ID)
+            .order_by(store.worker_heartbeats.c.id.desc())
+            .limit(64)
+        )
+        with store.engine.connect() as db:
+            payloads = list(db.execute(query).scalars())
+    except Exception:
+        return None
+
+    for payload in payloads:
+        try:
+            heartbeat = WorkerHeartbeat.model_validate_json(payload)
+        except Exception:
+            continue
+        detail = heartbeat.detail if isinstance(heartbeat.detail, dict) else {}
+        try:
+            observed_pid = int(detail.get("executor_pid"))
+        except (TypeError, ValueError):
+            continue
+        if observed_pid == expected_pid:
+            return heartbeat
+    return None
+
+
+def _stage_fields(heartbeat: WorkerHeartbeat | None) -> dict[str, object]:
+    if heartbeat is None:
+        return {
+            "stage": None,
+            "observed_at": None,
+            "age_seconds": None,
+            "error_type": None,
+            "message": None,
+        }
+    detail = heartbeat.detail if isinstance(heartbeat.detail, dict) else {}
+    observed_at = heartbeat.observed_at
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    age_seconds = max(0.0, (datetime.now(timezone.utc) - observed_at).total_seconds())
+    return {
+        "stage": detail.get("stage"),
+        "observed_at": observed_at.isoformat(),
+        "age_seconds": age_seconds,
+        "error_type": heartbeat.error_type,
+        "message": detail.get("message"),
+    }
+
+
 def install_runtime_index_health_observability(base: Any) -> None:
     """Expose post-bind index and durable source-coverage state through public health.
 
-    These supervisors already persist their own progress. This hook only makes that
-    durable state visible through the existing runtime heartbeat contract; it does not
-    change startup, freshness, provider, control, qualification, or trading behavior.
+    These supervisors already persist their own progress. This hook makes current and
+    previous terminal source-refresh state visible without changing startup, freshness,
+    provider, control, qualification, or trading behavior.
     """
 
     if bool(getattr(base, _INSTALL_MARKER, False)):
@@ -99,6 +199,19 @@ def install_runtime_index_health_observability(base: Any) -> None:
         refresh_worker = workers.get(SOURCE_COVERAGE_REFRESH_LABEL)
         if isinstance(refresh_worker, dict) and bool(refresh_worker.get("available")):
             detail = _detail_payload(base, SOURCE_COVERAGE_REFRESH_WORKER_ID)
+            terminal = _latest_terminal_refresh(base)
+            terminal_detail = (
+                terminal.detail
+                if terminal is not None and isinstance(terminal.detail, dict)
+                else {}
+            )
+            current_stage = _stage_fields(
+                _executor_stage_for_pid(base, detail.get("executor_pid"))
+            )
+            terminal_stage = _stage_fields(
+                _executor_stage_for_pid(base, terminal_detail.get("executor_pid"))
+            )
+            snapshot_heartbeat = _heartbeat(base, SOURCE_COVERAGE_SNAPSHOT_WORKER_ID)
             refresh_worker.update(
                 {
                     "ok": detail.get("ok"),
@@ -108,6 +221,43 @@ def install_runtime_index_health_observability(base: Any) -> None:
                     "executor_deadline_seconds": detail.get("executor_deadline_seconds"),
                     "executor_terminated": detail.get("executor_terminated"),
                     "executor_killed": detail.get("executor_killed"),
+                    "executor_current_stage": current_stage["stage"],
+                    "executor_stage_observed_at": current_stage["observed_at"],
+                    "executor_stage_age_seconds": current_stage["age_seconds"],
+                    "executor_stage_error_type": current_stage["error_type"],
+                    "executor_stage_error_message": current_stage["message"],
+                    "last_refresh_result": (
+                        None
+                        if terminal is None
+                        else "success"
+                        if terminal.state == "success"
+                        else "failed"
+                    ),
+                    "last_refresh_error_type": (
+                        terminal.error_type if terminal is not None else None
+                    ),
+                    "last_refresh_error_message": (
+                        terminal_detail.get("message") or terminal_stage["message"]
+                    ),
+                    "last_refresh_runtime_seconds": terminal_detail.get(
+                        "executor_runtime_seconds"
+                    ),
+                    "last_refresh_return_code": terminal_detail.get("return_code"),
+                    "last_refresh_completed_at": (
+                        terminal.observed_at.isoformat() if terminal is not None else None
+                    ),
+                    "last_refresh_executor_pid": terminal_detail.get("executor_pid"),
+                    "last_refresh_executor_stage": terminal_stage["stage"],
+                    "last_refresh_executor_stage_observed_at": terminal_stage[
+                        "observed_at"
+                    ],
+                    "last_refresh_executor_error_type": terminal_stage["error_type"],
+                    "last_refresh_executor_error_message": terminal_stage["message"],
+                    "last_successful_publication_at": (
+                        snapshot_heartbeat.observed_at.isoformat()
+                        if snapshot_heartbeat is not None
+                        else None
+                    ),
                     "independent_publication_cadence": detail.get(
                         "independent_publication_cadence"
                     ),
@@ -165,6 +315,7 @@ def install_runtime_index_health_observability(base: Any) -> None:
         payload["runtime_index_gate_observability"] = True
         payload["source_coverage_refresh_observability"] = True
         payload["source_coverage_snapshot_observability"] = True
+        payload["source_coverage_executor_stage_observability"] = True
         return payload
 
     base._runtime_heartbeats = runtime_heartbeats_with_index_gate  # type: ignore[attr-defined]  # noqa: SLF001

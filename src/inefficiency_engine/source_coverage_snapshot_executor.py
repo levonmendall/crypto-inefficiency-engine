@@ -1,5 +1,48 @@
 from __future__ import annotations
 
+import os
+from typing import Any
+
+
+SOURCE_COVERAGE_EXECUTOR_WORKER_ID = "canonical-source-coverage-executor"
+
+
+def _record_executor_stage(
+    store: Any,
+    *,
+    stage: str,
+    state: str = "running",
+    error_type: str | None = None,
+    message: str | None = None,
+    snapshot_observed_at: str | None = None,
+) -> None:
+    """Persist exact child progress so a parent-side kill still leaves the last stage."""
+
+    detail: dict[str, object] = {
+        "executor_pid": os.getpid(),
+        "parent_sequence": os.getenv("CIE_SOURCE_COVERAGE_REFRESH_SEQUENCE"),
+        "stage": stage,
+        "provider_requests_allowed": False,
+        "provider_requests_used": 0,
+        "qualification_thresholds_unchanged": True,
+        "allocation_authority": False,
+        "live_execution_authority": False,
+        "paper_only": True,
+    }
+    if message:
+        detail["message"] = message[:1000]
+    if snapshot_observed_at:
+        detail["snapshot_observed_at"] = snapshot_observed_at
+    try:
+        store.record_worker_heartbeat(
+            worker_id=SOURCE_COVERAGE_EXECUTOR_WORKER_ID,
+            state=state,
+            error_type=error_type,
+            detail=detail,
+        )
+    except Exception:
+        pass
+
 
 def main() -> int:
     """Compute and persist exactly one source-coverage snapshot without provider calls."""
@@ -20,13 +63,56 @@ def main() -> int:
     if store is None:
         raise RuntimeError("source coverage snapshot executor requires durable persistence")
 
-    snapshot = SourceCoveragePlane(store).snapshot()
+    _record_executor_stage(store, stage="store_open")
+    try:
+        _record_executor_stage(store, stage="snapshot_compute_and_persist")
+        snapshot = SourceCoveragePlane(store).snapshot()
+    except Exception as exc:
+        _record_executor_stage(
+            store,
+            stage="snapshot_compute_and_persist_failed",
+            state="degraded",
+            error_type=type(exc).__name__,
+            message=str(exc),
+        )
+        raise
+
+    _record_executor_stage(
+        store,
+        stage="publication_verify",
+        snapshot_observed_at=snapshot.observed_at.isoformat(),
+    )
     heartbeat = store.latest_worker_heartbeat(SOURCE_COVERAGE_SNAPSHOT_WORKER_ID)
     if heartbeat is None:
-        raise RuntimeError("source coverage snapshot publication was not persisted")
+        message = "source coverage snapshot publication was not persisted"
+        _record_executor_stage(
+            store,
+            stage="publication_verify_failed",
+            state="degraded",
+            error_type="SourceCoverageSnapshotPublicationMissing",
+            message=message,
+            snapshot_observed_at=snapshot.observed_at.isoformat(),
+        )
+        raise RuntimeError(message)
     detail = heartbeat.detail if isinstance(heartbeat.detail, dict) else {}
     if detail.get("snapshot_observed_at") != snapshot.observed_at.isoformat():
-        raise RuntimeError("source coverage snapshot publication does not match calculation")
+        message = "source coverage snapshot publication does not match calculation"
+        _record_executor_stage(
+            store,
+            stage="publication_verify_failed",
+            state="degraded",
+            error_type="SourceCoverageSnapshotPublicationMismatch",
+            message=message,
+            snapshot_observed_at=snapshot.observed_at.isoformat(),
+        )
+        raise RuntimeError(message)
+
+    _record_executor_stage(
+        store,
+        stage="executor_complete",
+        state="success",
+        snapshot_observed_at=snapshot.observed_at.isoformat(),
+    )
     return 0
 
 
