@@ -6,6 +6,9 @@ import os
 import time
 
 from inefficiency_engine import __version__
+from inefficiency_engine.bounded_strategy_evidence_runtime import (
+    install_control_database_timeouts,
+)
 from inefficiency_engine.canonical_control_plane_runtime import refresh_canonical_control_plane
 from inefficiency_engine.cex_dex_evidence_service import CexDexCompositeEvidenceService
 from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
@@ -97,12 +100,20 @@ async def _run() -> None:
     if store is None:
         raise RuntimeError("permanent control worker requires durable evidence persistence")
 
+    interval = _interval_seconds()
+    deadline = _deadline_seconds()
+    statement_timeout_seconds = max(5.0, deadline - 5.0)
+    lock_timeout_seconds = min(3.0, max(1.0, statement_timeout_seconds / 4.0))
+    database_timeouts_enforced = install_control_database_timeouts(
+        store,
+        statement_timeout_seconds=statement_timeout_seconds,
+        lock_timeout_seconds=lock_timeout_seconds,
+    )
+
     operating_certification, qualified_bridge, research_projection = _build_control_services(
         settings,
         store,
     )
-    interval = _interval_seconds()
-    deadline = _deadline_seconds()
     sequence = 0
 
     while True:
@@ -118,9 +129,14 @@ async def _run() -> None:
                     "runtime_plane": "canonical-control",
                     "permanent_process": True,
                     "provider_requests_allowed": False,
+                    "provider_requests_used": 0,
                     "current_execution_cost_source": "persisted_order_books_only",
                     "missing_current_executable_depth_policy": "fail_closed",
                     "cycle_deadline_seconds": deadline,
+                    "database_statement_timeout_enforced": database_timeouts_enforced,
+                    "database_statement_timeout_seconds": statement_timeout_seconds,
+                    "database_lock_timeout_seconds": lock_timeout_seconds,
+                    "strategy_evidence_read_mode": "aggregate_initial_plus_incremental_tail",
                     "mechanism_forward_dependency": False,
                     "disposable_research_dependency": False,
                     "allocation_authority": False,
@@ -162,10 +178,15 @@ async def _run() -> None:
                     "runtime_plane": "canonical-control",
                     "permanent_process": True,
                     "provider_requests_allowed": False,
+                    "provider_requests_used": 0,
                     "current_execution_cost_source": "persisted_order_books_only",
                     "missing_current_executable_depth_policy": "fail_closed",
                     "cycle_deadline_seconds": deadline,
                     "cycle_runtime_seconds": max(0.0, time.monotonic() - started),
+                    "database_statement_timeout_enforced": database_timeouts_enforced,
+                    "database_statement_timeout_seconds": statement_timeout_seconds,
+                    "database_lock_timeout_seconds": lock_timeout_seconds,
+                    "strategy_evidence_read_mode": "aggregate_initial_plus_incremental_tail",
                     "alpha_durable_promotion": alpha_diagnostics,
                     "mechanism_forward_dependency": False,
                     "disposable_research_dependency": False,
@@ -189,10 +210,15 @@ async def _run() -> None:
                         "runtime_plane": "canonical-control",
                         "permanent_process": True,
                         "provider_requests_allowed": False,
+                        "provider_requests_used": 0,
                         "current_execution_cost_source": "persisted_order_books_only",
                         "missing_current_executable_depth_policy": "fail_closed",
                         "cycle_deadline_seconds": deadline,
                         "cycle_runtime_seconds": max(0.0, time.monotonic() - started),
+                        "database_statement_timeout_enforced": database_timeouts_enforced,
+                        "database_statement_timeout_seconds": statement_timeout_seconds,
+                        "database_lock_timeout_seconds": lock_timeout_seconds,
+                        "strategy_evidence_read_mode": "aggregate_initial_plus_incremental_tail",
                         "mechanism_forward_dependency": False,
                         "disposable_research_dependency": False,
                         "qualification_thresholds_unchanged": True,
