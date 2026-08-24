@@ -9,8 +9,10 @@ from inefficiency_engine.source_coverage_catalog import SOURCES
 
 PERMANENT_SOURCE_WORKER_ID = "canonical-source-operating-loop"
 _PROJECTED_TABLES = {"market_quotes", "funding_quotes", "order_books"}
+_OPPORTUNITY_TABLE = "opportunities"
 _INSTALL_MARKER = "_cie_current_source_scan_probe_runtime"
 _SCAN_CACHE_ATTR = "_cie_current_source_scan_id"
+_SHADOW_SCAN_CACHE_ATTR = "_cie_current_shadow_verification_scan_id"
 _PROBE_CACHE_ATTR = "_cie_current_source_probe_cache"
 _PROVIDER_CACHE_ATTR = "_cie_operational_provider_status_cache"
 _MISSING = object()
@@ -64,6 +66,40 @@ def _source_scan_id(self: Any) -> str | None:
         return str(cached) if cached not in (None, "") else None
     value = _latest_successful_source_scan_id(self.store)
     setattr(self, _SCAN_CACHE_ATTR, value)
+    return value
+
+
+def _latest_completed_shadow_scan_id(store: Any) -> str | None:
+    """Return the verification scan from the newest fully persisted shadow cycle.
+
+    ``shadow_cycles.completed_at`` already has a durable runtime index. Using the
+    completed cycle boundary gives opportunity coverage a stable point-in-time scan
+    without sorting the append-only opportunities ledger itself.
+    """
+
+    table = getattr(store, "shadow_cycles", None)
+    if table is None:
+        return None
+    try:
+        query = (
+            select(table.c.verification_scan_id)
+            .where(table.c.verification_scan_id.is_not(None))
+            .order_by(table.c.completed_at.desc())
+            .limit(1)
+        )
+        with store.engine.connect() as db:
+            value = db.execute(query).scalar_one_or_none()
+    except Exception:
+        return None
+    return str(value) if value not in (None, "") else None
+
+
+def _shadow_scan_id(self: Any) -> str | None:
+    cached = getattr(self, _SHADOW_SCAN_CACHE_ATTR, _MISSING)
+    if cached is not _MISSING:
+        return str(cached) if cached not in (None, "") else None
+    value = _latest_completed_shadow_scan_id(self.store)
+    setattr(self, _SHADOW_SCAN_CACHE_ATTR, value)
     return value
 
 
@@ -198,6 +234,78 @@ def _current_source_scan_candidate(
     return dict(candidate)
 
 
+def _current_shadow_opportunity_candidate(
+    self: Any,
+    spec: dict[str, object],
+    available: set[str],
+) -> dict[str, object] | None:
+    """Resolve durable opportunity history from one completed shadow-cycle scan.
+
+    The generic source-coverage fallback used ``ORDER BY observed_at DESC`` across the
+    entire append-only opportunities table. Production telemetry showed that probe
+    consuming the remaining source-coverage deadline after provider reconciliation was
+    fixed. A completed shadow cycle already names its verification scan, and both the
+    shadow completion boundary and opportunity ``scan_id`` are indexed. Restricting
+    the operational probe to that immutable scan makes runtime independent of total
+    opportunity history while preserving point-in-time truth.
+
+    If the latest completed shadow verification scan contains no opportunities, the
+    source remains unobserved. There is intentionally no historical fallback.
+    """
+
+    probe = spec.get("table")
+    if probe != (_OPPORTUNITY_TABLE, None, None):
+        return None
+    if _OPPORTUNITY_TABLE not in available:
+        return None
+
+    cache = getattr(self, _PROBE_CACHE_ATTR, None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(self, _PROBE_CACHE_ATTR, cache)
+    key = (_OPPORTUNITY_TABLE, None, None)
+    if key in cache:
+        cached = cache[key]
+        return dict(cached) if isinstance(cached, dict) else None
+
+    scan_id = _shadow_scan_id(self)
+    if scan_id is None:
+        cache[key] = None
+        return None
+    table = getattr(self.store, _OPPORTUNITY_TABLE, None)
+    if table is None:
+        cache[key] = None
+        return None
+
+    try:
+        query = select(func.max(table.c.observed_at)).where(table.c.scan_id == scan_id)
+        with self.store.engine.connect() as db:
+            observed_at = db.execute(query).scalar_one_or_none()
+    except Exception:
+        cache[key] = None
+        return None
+    if observed_at in (None, ""):
+        cache[key] = None
+        return None
+
+    candidate = {
+        "healthy": True,
+        "observed_at": observed_at,
+        "item_count": 1,
+        "classes": list(spec["classes"]),
+        "authoritative": bool(spec.get("authoritative", True)),
+        "commercial": True,
+        "point_in_time": True,
+        "source_reference": (
+            f"durable:current-shadow-verification-scan:{scan_id}:{_OPPORTUNITY_TABLE}"
+        ),
+        "economic_fields_complete": True,
+        "forward_testable_evidence": True,
+    }
+    cache[key] = candidate
+    return dict(candidate)
+
+
 def install_current_source_scan_probe_runtime() -> None:
     """Keep operational source probes bounded by current truth and indexed seeks."""
 
@@ -213,8 +321,11 @@ def install_current_source_scan_probe_runtime() -> None:
         available: set[str],
     ) -> dict[str, object] | None:
         probe = spec.get("table")
-        if isinstance(probe, tuple) and len(probe) == 3 and probe[0] in _PROJECTED_TABLES:
-            return _current_source_scan_candidate(self, spec, available)
+        if isinstance(probe, tuple) and len(probe) == 3:
+            if probe[0] in _PROJECTED_TABLES:
+                return _current_source_scan_candidate(self, spec, available)
+            if probe == (_OPPORTUNITY_TABLE, None, None):
+                return _current_shadow_opportunity_candidate(self, spec, available)
         return original(self, spec, available)
 
     SourceCoveragePlane._provider_rows = _latest_catalog_provider_rows  # type: ignore[method-assign]
