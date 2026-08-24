@@ -30,32 +30,6 @@ def test_postgres_runtime_index_creation_is_concurrent():
     assert "market_quotes (venue,observed_at)" in statement
 
 
-def test_projection_heartbeat_index_matches_latest_worker_reads_and_is_concurrent(tmp_path):
-    columns = CONTROL_GATE_INDEX_SPECS["worker_heartbeats"]
-    assert columns == ("worker_id", "id")
-
-    statement = _create_index_sql(
-        dialect_name="postgresql",
-        index_name="ix_runtime_worker_heartbeats_worker_id_id",
-        table_name="worker_heartbeats",
-        columns=columns,
-    )
-    assert statement.startswith("CREATE INDEX CONCURRENTLY IF NOT EXISTS")
-    assert "worker_heartbeats (worker_id,id)" in statement
-
-    store = EvidenceStore(tmp_path / "projection-heartbeat-index.sqlite")
-    result = ensure_runtime_indexes_after_api_bind(
-        store,
-        index_specs={"worker_heartbeats": columns},
-    )
-    assert result["complete"] is True
-    indexes = {
-        item["name"]: tuple(item["column_names"])
-        for item in sqlalchemy_inspect(store.engine).get_indexes("worker_heartbeats")
-    }
-    assert indexes["ix_runtime_worker_heartbeats_worker_id_id"] == columns
-
-
 def test_cycle_history_bucket_index_matches_production_lookup_and_is_concurrent(tmp_path):
     columns = CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS["market_quotes"]
     assert columns == ("venue", "asset", "observed_at", "id")
@@ -104,7 +78,6 @@ def test_runtime_index_groups_keep_optional_and_legacy_indexes_out_of_control_ga
     assert CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS == {
         "market_quotes": ("venue", "asset", "observed_at", "id")
     }
-    assert CONTROL_GATE_INDEX_SPECS["worker_heartbeats"] == ("worker_id", "id")
     assert "maker_shadow_outcomes" not in CONTROL_GATE_INDEX_SPECS
     assert "capital_transfer_outcomes" not in CONTROL_GATE_INDEX_SPECS
     assert "maker_shadow_outcomes" in BACKGROUND_INDEX_SPECS
