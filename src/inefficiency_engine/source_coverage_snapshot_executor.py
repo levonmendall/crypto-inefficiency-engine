@@ -46,7 +46,7 @@ def _record_executor_stage(
         pass
 
 
-def main() -> int:
+def _run_source_coverage_snapshot() -> int:
     """Compute and persist exactly one source-coverage snapshot without provider calls."""
 
     from inefficiency_engine.config import Settings
@@ -150,6 +150,25 @@ def main() -> int:
         stage_timings_seconds=timings,
     )
     return 0
+
+
+def main() -> int:
+    from inefficiency_engine.disposable_executor_memory_guard import (
+        MEMORY_PRESSURE_EXIT_CODE,
+        DisposableMemoryAdmissionDeferred,
+        disposable_executor_memory_guard,
+    )
+
+    try:
+        with disposable_executor_memory_guard("source-coverage-snapshot-executor"):
+            return _run_source_coverage_snapshot()
+    except DisposableMemoryAdmissionDeferred as exc:
+        print(
+            "source-coverage-snapshot-executor memory admission deferred: "
+            f"{exc}; memory={exc.snapshot.as_dict()}",
+            flush=True,
+        )
+        return MEMORY_PRESSURE_EXIT_CODE
 
 
 if __name__ == "__main__":
