@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from inefficiency_engine.cycle_trend_strategy import CycleAwareMultiHorizonTrendStrategy
 from inefficiency_engine.durable_control_cycle_history import (
@@ -119,25 +119,24 @@ def test_cycle_history_cache_matches_filter_before_daily_rank(monkeypatch, tmp_p
     assert progress["complete"] is True
     assert progress["legacy_window_query_avoided"] is True
     assert progress["filter_before_daily_rank_preserved"] is True
+    assert progress["boundary_raw_day_materialization_avoided"] is True
+    assert progress["bucket_payload_fetch_bounded"] is True
 
     history = load_durable_control_cycle_history(factory, snapshot)
     assert history is not None
     spot = history[("Coinbase", "BTC", MarketKind.SPOT)]
     perp = history.get(("Coinbase", "BTC", MarketKind.PERPETUAL), [])
 
-    # Aug 21 is the moving long-cutoff boundary (12:00 onward): newest two ids win.
     assert [row.mid for row in spot if row.observed_at.date().isoformat() == "2026-08-21"] == [
         102.0,
         103.0,
     ]
-    # Aug 22 ranks spot and perpetual together by source id, exactly like the legacy
-    # partition which excludes market_kind: ids for 202 and 203 are the newest two.
     assert [row.mid for row in spot if row.observed_at.date().isoformat() == "2026-08-22"] == [
         203.0
     ]
     assert [row.mid for row in perp] == [202.0]
-    # Aug 23 is stored raw but the reader applies the 12:00 recent cutoff first, then
-    # ranks. Rows at 12:30 and 14:00 cannot suppress the eligible 10:00/11:00 rows.
+    # The boundary query applies the 12:00 cutoff before ranking, so later 12:30/14:00
+    # rows never enter the compact bucket and cannot suppress eligible 10:00/11:00 rows.
     assert [row.mid for row in spot if row.observed_at.date().isoformat() == "2026-08-23"] == [
         302.0,
         303.0,
@@ -153,7 +152,7 @@ def test_cycle_history_cache_matches_filter_before_daily_rank(monkeypatch, tmp_p
                 .where(CONTROL_CYCLE_HISTORY_ROWS.c.day == "2026-08-23")
             )
         )
-    assert len(boundary_rows) == 5
+    assert len(boundary_rows) == 2
 
 
 def test_cycle_history_bootstrap_is_bounded_checkpointed_and_fail_closed(
@@ -191,8 +190,6 @@ def test_cycle_history_bootstrap_is_bounded_checkpointed_and_fail_closed(
     assert first["durable_checkpoint_persisted"] is True
     assert load_durable_control_cycle_history(first_factory, snapshot) is None
 
-    # A fresh factory simulates the next short-lived control interpreter. It resumes
-    # from the durable checkpoint rather than restarting the historical bootstrap.
     factory = _Factory(store)
     attempts = 1
     progress = first
@@ -206,7 +203,7 @@ def test_cycle_history_bootstrap_is_bounded_checkpointed_and_fail_closed(
     assert progress["paper_only"] is True
 
 
-def test_raw_boundary_supports_later_cutoff_same_utc_day(monkeypatch, tmp_path):
+def test_boundary_refreshes_for_later_cutoff_same_utc_day(monkeypatch, tmp_path):
     monkeypatch.setenv("CIE_CONTROL_CACHE_NAMESPACE", "cycle-history-test")
     monkeypatch.setattr(
         CycleAwareMultiHorizonTrendStrategy,
@@ -235,12 +232,60 @@ def test_raw_boundary_supports_later_cutoff_same_utc_day(monkeypatch, tmp_path):
     assert advance_durable_control_cycle_history_cache(factory, _snapshot(first_now))["complete"]
 
     later_snapshot = _snapshot(first_now + timedelta(hours=1))
+    # Exact-cutoff compact rows are intentionally not reused across a different source
+    # snapshot. The cache fails closed until the later cutoff is refreshed.
+    assert load_durable_control_cycle_history(factory, later_snapshot) is None
+    refreshed = advance_durable_control_cycle_history_cache(factory, later_snapshot)
+    assert refreshed["complete"] is True
     history = load_durable_control_cycle_history(factory, later_snapshot)
     assert history is not None
     spot = history[("Coinbase", "BTC", MarketKind.SPOT)]
     boundary = [row.mid for row in spot if row.observed_at.date().isoformat() == "2026-08-23"]
-    # At a 13:00 cutoff, 12:30 becomes eligible without rebuilding the boundary day.
     assert boundary == [11.0, 12.5]
+
+
+def test_bucket_seek_ranks_ids_before_fetching_payloads(monkeypatch, tmp_path):
+    monkeypatch.setenv("CIE_CONTROL_CACHE_NAMESPACE", "cycle-history-query-shape-test")
+    monkeypatch.setattr(
+        CycleAwareMultiHorizonTrendStrategy,
+        "required_history_hours",
+        classmethod(lambda cls, settings: 72.0),
+    )
+    monkeypatch.setattr(
+        CycleAwareMultiHorizonTrendStrategy,
+        "rows_per_day",
+        classmethod(lambda cls, settings: 2),
+    )
+    store = EvidenceStore(tmp_path / "evidence.db")
+    now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+    _record(
+        store,
+        [
+            _quote(datetime(2026, 8, 23, hour, 0, tzinfo=timezone.utc), mid=float(hour))
+            for hour in range(1, 15)
+        ],
+        completed_at=now,
+    )
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if "market_quotes" in statement and statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(store.engine, "before_cursor_execute", capture)
+    try:
+        progress = advance_durable_control_cycle_history_cache(_Factory(store), _snapshot(now))
+    finally:
+        event.remove(store.engine, "before_cursor_execute", capture)
+
+    assert progress["complete"] is True
+    candidate_queries = [statement for statement in statements if "observed_at" in statement]
+    assert candidate_queries
+    first = candidate_queries[0].lower()
+    assert "payload_json" not in first
+    assert "order by market_quotes.id desc" in first
+    assert "limit" in first
+    assert any("payload_json" in statement.lower() and " in (" in statement.lower() for statement in statements)
 
 
 def test_cycle_history_query_budget_is_hard_and_round_robin(monkeypatch, tmp_path):
@@ -314,8 +359,6 @@ def test_cycle_history_time_budget_checkpoints_before_return(monkeypatch, tmp_pa
     assert first["checkpoint_writes"] >= first["bucket_queries"]
     assert first["cached_pair_count"] == 0
 
-    # Restore the real clock and prove the next fresh interpreter advances beyond the
-    # already checkpointed boundary bucket rather than repeating it.
     monkeypatch.setattr(cache_runtime.time, "monotonic", original_monotonic)
     monkeypatch.setattr(cache_runtime, "_bucket_query_budget", lambda: 1)
     second = advance_durable_control_cycle_history_cache(_Factory(store), snapshot)

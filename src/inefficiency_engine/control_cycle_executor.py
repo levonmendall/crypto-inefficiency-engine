@@ -138,6 +138,7 @@ def run_one_control_cycle() -> dict[str, object]:
     started = time.monotonic()
     last_progress: dict[str, object] = {}
     cycle_history_progress: dict[str, object] = {}
+    bridge_snapshot = None
 
     def write_stage(stage: str, progress: dict[str, object]) -> None:
         _atomic_json(
@@ -236,11 +237,10 @@ def run_one_control_cycle() -> dict[str, object]:
     write_stage("historical_outcome_cache_ready", last_progress)
 
     # The cycle-aware alpha path used to reconstruct its 180-day live compact history
-    # with one PostgreSQL row_number window query inside discovery. Production proved
-    # that first discovery can consume the whole 25-second control budget. Prime the
-    # algebraically equivalent latest-N-per-day projection in bounded primary-key
-    # slices before entering canonical reconciliation. A partial cache is durable but
-    # invisible to discovery, so no partial history can certify a candidate.
+    # with one PostgreSQL row_number window query inside discovery. Prime the exact
+    # latest-N-per-day projection in bounded slices before canonical reconciliation.
+    # The same source snapshot is then pinned into bridge publication so the moving
+    # boundary cutoff cannot drift between cache preflight and alpha discovery.
     alpha_factory = getattr(qualified_bridge.allocator, "alpha_factory", None)
     if alpha_factory is not None:
         stage_reporter("cycle_history_cache_source_snapshot")
@@ -311,6 +311,7 @@ def run_one_control_cycle() -> dict[str, object]:
                     "provider_requests_used": 0,
                     "paper_only": True,
                 }
+            bridge_snapshot = source_snapshot
             write_stage("cycle_history_cache_ready", last_progress)
 
     set_bridge_reporter = getattr(
@@ -327,7 +328,7 @@ def run_one_control_cycle() -> dict[str, object]:
             qualified_bridge=qualified_bridge,
             research_projection=research_projection,
             settings=settings,
-            bridge_snapshot=None,
+            bridge_snapshot=bridge_snapshot,
             stage_reporter=stage_reporter,
             historical_cache_status=_cache_status,
         )
