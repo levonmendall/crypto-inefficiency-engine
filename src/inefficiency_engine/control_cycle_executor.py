@@ -70,6 +70,9 @@ def run_one_control_cycle() -> dict[str, object]:
     from inefficiency_engine.durable_control_cache import (
         ensure_durable_control_cache_schema,
     )
+    from inefficiency_engine.durable_source_coverage_runtime import (
+        install_control_source_coverage_snapshot_reader_runtime,
+    )
     from inefficiency_engine.evidence import build_evidence_store
     from inefficiency_engine.permanent_control_worker import _build_control_services
     from inefficiency_engine.source_runtime_safety import (
@@ -106,6 +109,10 @@ def run_one_control_cycle() -> dict[str, object]:
 
     stage_reporter("control_executor_starting")
     install_source_coverage_reconciliation_runtime()
+    # Canonical control must consume the complete source snapshot already computed
+    # by the priority-source owner. Never rebuild the multi-table source view inside
+    # this 25-second executor; missing/stale persisted truth fails closed explicitly.
+    install_control_source_coverage_snapshot_reader_runtime()
     install_bounded_control_outcome_ledgers()
     settings = Settings.from_env()
     store = build_evidence_store(settings.evidence_db_path)

@@ -11,6 +11,9 @@ from sqlalchemy import func, insert, inspect, select, text
 from inefficiency_engine.bounded_strategy_evidence_runtime import (
     install_bounded_strategy_evidence_runtime,
 )
+from inefficiency_engine.durable_source_coverage_runtime import (
+    install_source_coverage_snapshot_publisher_runtime,
+)
 from inefficiency_engine.provider_gap_collection import (
     ProviderCatalogLedger,
     _deterministic_id,
@@ -205,14 +208,17 @@ def install_source_coverage_reconciliation_runtime() -> None:
     # read graphs. Keep that stable hook and also replace the append-only strategy
     # history reader with its exact aggregate/incremental implementation.
     install_bounded_strategy_evidence_runtime()
-    if bool(getattr(SourceCoveragePlane, _COVERAGE_PATCH_MARKER, False)):
-        return
-    SourceCoverageLedger.latest = _latest_source_coverage_rows  # type: ignore[method-assign]
-    SourceCoveragePlane._provider_rows = _latest_provider_rows  # type: ignore[method-assign]
-    SourceCoveragePlane._admissions = _latest_admissions  # type: ignore[method-assign]
-    SourceCoveragePlane._table_candidate = _cached_table_candidate  # type: ignore[method-assign]
-    SourceCoveragePlane.snapshot = _snapshot_with_table_cache  # type: ignore[method-assign]
-    setattr(SourceCoveragePlane, _COVERAGE_PATCH_MARKER, True)
+    if not bool(getattr(SourceCoveragePlane, _COVERAGE_PATCH_MARKER, False)):
+        SourceCoverageLedger.latest = _latest_source_coverage_rows  # type: ignore[method-assign]
+        SourceCoveragePlane._provider_rows = _latest_provider_rows  # type: ignore[method-assign]
+        SourceCoveragePlane._admissions = _latest_admissions  # type: ignore[method-assign]
+        SourceCoveragePlane._table_candidate = _cached_table_candidate  # type: ignore[method-assign]
+        SourceCoveragePlane.snapshot = _snapshot_with_table_cache  # type: ignore[method-assign]
+        setattr(SourceCoveragePlane, _COVERAGE_PATCH_MARKER, True)
+    # Persist the already-computed complete snapshots inside real priority-source
+    # cycles. The control process later consumes that durable truth instead of
+    # reconstructing the same multi-table source view under its 25-second budget.
+    install_source_coverage_snapshot_publisher_runtime()
 
 
 def ensure_source_coverage_runtime_indexes(store: Any) -> None:
