@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+
 from inefficiency_engine import permanent_source_plane as source_plane
 from inefficiency_engine import permanent_source_worker as base
+from inefficiency_engine.critical_source_cadence import critical_source_refresh_loop
 from inefficiency_engine.provider_gap_collection import ProviderProbeResult
 from inefficiency_engine.provider_gap_resilience import ResilientProviderGapCollectionService
 from inefficiency_engine.source_lane_repair_runtime import (
     RemainingSourceLaneRepairService,
     collect_hyperliquid_distress_resilient,
 )
+
+
+_ORIGINAL_RUN_PERMANENT_SOURCE_WORKER = base.run_permanent_source_worker
+_RUNTIME_PATCH_MARKER = "_critical_source_cadence_installed"
 
 
 async def _collect_hyperliquid_distress_with_retries(
@@ -29,6 +36,26 @@ async def _collect_hyperliquid_distress_with_retries(
     )
 
 
+async def _run_permanent_source_worker_with_critical_cadence(
+    store,
+    *,
+    stop_event: asyncio.Event | None = None,
+) -> int:
+    """Run shortest-TTL source repair independently from the slow priority tail."""
+
+    stop = stop_event or asyncio.Event()
+    critical_task = asyncio.create_task(
+        critical_source_refresh_loop(store, stop_event=stop),
+        name="critical-source-freshness",
+    )
+    try:
+        return await _ORIGINAL_RUN_PERMANENT_SOURCE_WORKER(store, stop_event=stop)
+    finally:
+        stop.set()
+        critical_task.cancel()
+        await asyncio.gather(critical_task, return_exceptions=True)
+
+
 def install_remaining_source_lane_repairs() -> None:
     """Install source-only repairs before the permanent source plane is built."""
 
@@ -36,6 +63,9 @@ def install_remaining_source_lane_repairs() -> None:
     ResilientProviderGapCollectionService._collect_hyperliquid_distress_surface = (
         _collect_hyperliquid_distress_with_retries
     )
+    if not bool(getattr(base, _RUNTIME_PATCH_MARKER, False)):
+        base.run_permanent_source_worker = _run_permanent_source_worker_with_critical_cadence
+        setattr(base, _RUNTIME_PATCH_MARKER, True)
 
 
 def main() -> int:

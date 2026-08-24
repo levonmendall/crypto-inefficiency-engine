@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from inefficiency_engine import permanent_source_plane
+from inefficiency_engine import permanent_source_worker
 from inefficiency_engine import render_combined_postbind_lane_repair as render_repair
 from inefficiency_engine.provider_gap_resilience import ResilientProviderGapCollectionService
 from inefficiency_engine.permanent_source_worker_lane_repair import (
@@ -13,16 +14,27 @@ from inefficiency_engine.source_lane_repair_runtime import RemainingSourceLaneRe
 def test_source_worker_installs_repaired_priority_and_distress_services(monkeypatch):
     original_priority = permanent_source_plane.PrioritySourceCollectionService
     original_distress = ResilientProviderGapCollectionService._collect_hyperliquid_distress_surface
+    original_run = permanent_source_worker.run_permanent_source_worker
+    marker = "_critical_source_cadence_installed"
+    marker_present = hasattr(permanent_source_worker, marker)
+    marker_value = getattr(permanent_source_worker, marker, None)
     try:
+        monkeypatch.delattr(permanent_source_worker, marker, raising=False)
         install_remaining_source_lane_repairs()
         assert permanent_source_plane.PrioritySourceCollectionService is RemainingSourceLaneRepairService
         assert (
             ResilientProviderGapCollectionService._collect_hyperliquid_distress_surface
             is _collect_hyperliquid_distress_with_retries
         )
+        assert permanent_source_worker.run_permanent_source_worker is not original_run
     finally:
         permanent_source_plane.PrioritySourceCollectionService = original_priority
         ResilientProviderGapCollectionService._collect_hyperliquid_distress_surface = original_distress
+        permanent_source_worker.run_permanent_source_worker = original_run
+        if marker_present:
+            setattr(permanent_source_worker, marker, marker_value)
+        else:
+            monkeypatch.delattr(permanent_source_worker, marker, raising=False)
 
 
 def test_render_child_command_preserves_source_repair_and_bounds_heartbeat_readers(monkeypatch):
