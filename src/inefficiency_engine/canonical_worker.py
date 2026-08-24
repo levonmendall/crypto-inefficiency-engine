@@ -23,6 +23,19 @@ async def _interruptible_wait(seconds: float, stop_event: asyncio.Event) -> None
         return
 
 
+def _portfolio_runtime_diagnostics(
+    portfolio: OperationallyResilientPaperPortfolioService,
+) -> dict[str, object]:
+    reader = getattr(portfolio, "allocation_runtime_diagnostics", None)
+    if not callable(reader):
+        return {}
+    try:
+        payload = reader()
+    except Exception:
+        return {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
 def _publish_dashboard_projection(
     service: OpportunityService,
     store: EvidenceStore,
@@ -109,6 +122,7 @@ async def run_canonical_portfolio_loop(
                 "portfolio_cycle_interval_seconds": interval,
                 "stage": "canonical_accounting_only",
                 "certification_decoupled": True,
+                **_portfolio_runtime_diagnostics(portfolio),
                 "paper_only": True,
             },
         )
@@ -192,6 +206,7 @@ async def run_canonical_portfolio_loop(
                     list(integrity.allocation_family_failures) if integrity is not None else []
                 ),
                 "fallback_snapshot_recorded": fallback_snapshot_recorded,
+                **_portfolio_runtime_diagnostics(portfolio),
                 "paper_only": True,
             },
         )
@@ -204,6 +219,11 @@ async def run_canonical_portfolio_loop(
     store.record_worker_heartbeat(
         worker_id=PORTFOLIO_WORKER_ID,
         state="stopped" if stop_event.is_set() else "completed",
-        detail={"cycles_attempted": attempted, "certification_decoupled": True, "paper_only": True},
+        detail={
+            "cycles_attempted": attempted,
+            "certification_decoupled": True,
+            **_portfolio_runtime_diagnostics(portfolio),
+            "paper_only": True,
+        },
     )
     return attempted
