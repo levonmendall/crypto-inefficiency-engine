@@ -9,7 +9,11 @@ import pytest
 from inefficiency_engine.durable_control_bridge import (
     DurableControlQualifiedOpportunityBridgePublisher,
 )
-from inefficiency_engine import permanent_control_worker, permanent_mechanism_worker
+from inefficiency_engine import (
+    control_cycle_executor,
+    permanent_control_worker,
+    permanent_mechanism_worker,
+)
 
 
 @pytest.mark.asyncio
@@ -66,11 +70,13 @@ def test_mechanism_worker_no_longer_owns_control_publication():
 
 
 def test_control_worker_is_durable_only_and_independent_of_mechanism_cycle():
-    source = inspect.getsource(permanent_control_worker._run)
+    parent_source = inspect.getsource(permanent_control_worker._run)
+    executor_source = inspect.getsource(control_cycle_executor.run_one_control_cycle)
 
-    assert "refresh_canonical_control_plane(" in source
-    assert "run_evidence_cycle" not in source
-    assert "refresh_l2_source_snapshot" not in source
-    assert "collect_live_evidence" not in source
-    assert '"provider_requests_allowed": False' in source
-    assert '"mechanism_forward_dependency": False' in source
+    assert "supervisor.run_cycle" in parent_source
+    assert "refresh_canonical_control_plane(" in executor_source
+    assert "run_evidence_cycle" not in executor_source
+    assert "refresh_l2_source_snapshot" not in executor_source
+    assert "collect_live_evidence" not in executor_source
+    assert '"provider_requests_allowed": False' in parent_source
+    assert '"mechanism_forward_dependency": False' in parent_source

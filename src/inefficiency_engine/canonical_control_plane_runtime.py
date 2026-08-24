@@ -32,6 +32,8 @@ async def refresh_canonical_control_plane(
     research_projection,
     settings,
     bridge_snapshot=None,
+    stage_reporter=None,
+    historical_cache_status=None,
 ) -> dict[str, object]:
     """Advance operating truth -> qualified bridge -> dashboard from durable evidence.
 
@@ -57,7 +59,15 @@ async def refresh_canonical_control_plane(
 
     stage_started = time.monotonic()
     try:
-        reconciled = operating_certification.reconcile_latest_runtime_truth()
+        if callable(stage_reporter):
+            stage_reporter("latest_operating_snapshot")
+        reconciled = (
+            operating_certification.reconcile_latest_runtime_truth(
+                stage_reporter=stage_reporter
+            )
+            if callable(stage_reporter)
+            else operating_certification.reconcile_latest_runtime_truth()
+        )
         if reconciled is None:
             errors["operating_reconciliation"] = "OperatingSnapshotUnavailable"
         else:
@@ -71,10 +81,31 @@ async def refresh_canonical_control_plane(
     finally:
         timings["operating_reconciliation"] = max(0.0, time.monotonic() - stage_started)
 
-    if result["operating_reconciliation_complete"]:
+    historical_cache_complete = True
+    if result["operating_reconciliation_complete"] and callable(historical_cache_status):
+        try:
+            cache_status = historical_cache_status()
+        except Exception as exc:
+            cache_status = {
+                "complete": False,
+                "error_type": type(exc).__name__,
+            }
+        if not isinstance(cache_status, dict):
+            cache_status = {"complete": False, "error_type": "InvalidCacheStatus"}
+        historical_cache_complete = bool(cache_status.get("complete"))
+        result["historical_cache_complete"] = historical_cache_complete
+        result["historical_cache_progress"] = cache_status
+        if not historical_cache_complete:
+            errors["historical_evidence_cache"] = "HistoricalEvidenceCacheRebuilding"
+            if callable(stage_reporter):
+                stage_reporter("historical_evidence_cache_rebuilding")
+
+    if result["operating_reconciliation_complete"] and historical_cache_complete:
         original_latest_scan = getattr(qualified_bridge, "_latest_scan", None)
         stage_started = time.monotonic()
         try:
+            if callable(stage_reporter):
+                stage_reporter("qualified_bridge_publication")
             if bridge_snapshot is not None and callable(original_latest_scan):
                 qualified_bridge._latest_scan = lambda: bridge_snapshot
             bridge = await qualified_bridge.publish_latest(
@@ -103,6 +134,8 @@ async def refresh_canonical_control_plane(
 
         stage_started = time.monotonic()
         try:
+            if callable(stage_reporter):
+                stage_reporter("research_projection_publication")
             payload = research_projection.publish(
                 forward_target=max(1, int(settings.alpha_min_forward_samples)),
                 settled_target=max(
@@ -170,4 +203,6 @@ async def refresh_canonical_control_plane(
     result["control_stage_timings_seconds"] = timings
     result["control_plane_errors"] = errors
     result["control_plane_healthy"] = not errors
+    if callable(stage_reporter):
+        stage_reporter("control_executor_complete")
     return result

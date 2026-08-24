@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from inefficiency_engine.render_combined import (
     API_APP,
     child_commands,
+    control_parent_manages_degraded_cycle,
     control_child_command,
     heavy_commands,
     mechanism_child_command,
@@ -91,6 +92,26 @@ def test_combined_runtime_makes_research_and_history_disposable_and_mutually_sch
 def test_combined_runtime_uses_canonical_card_history_read_plane():
     assert API_APP == "inefficiency_engine.read_api_card_history_deploy:app"
     assert child_commands("10000")["api"][3] == API_APP
+
+
+def test_outer_guard_leaves_current_executor_supervising_parent_alive():
+    assert control_parent_manages_degraded_cycle(
+        {
+            "parent_heartbeat_current": True,
+            "external_process_deadline_enforced": True,
+            "parent_generation": "generation-1",
+            "control_plane_errors": {
+                "control_executor": "ControlExecutorDeadlineExceeded"
+            },
+        }
+    ) is True
+    assert control_parent_manages_degraded_cycle(
+        {
+            "parent_heartbeat_current": False,
+            "external_process_deadline_enforced": True,
+            "parent_generation": "generation-1",
+        }
+    ) is False
 
 
 def _health_row(*, observed_at: datetime, age_seconds: float, state: str = "success"):

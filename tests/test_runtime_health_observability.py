@@ -47,7 +47,30 @@ def test_runtime_health_exposes_control_progress_and_zero_provider_requests(monk
             detail={
                 "sequence": 17,
                 "stage": "durable_control_complete",
+                "parent_process_identity": "123:parent-generation",
+                "parent_pid": 123,
+                "parent_generation": "parent-generation",
+                "parent_sequence": 17,
+                "parent_heartbeat_current": True,
+                "executor_pid": 456,
+                "executor_cycle_id": "cycle-17",
+                "executor_current_stage": "control_executor_complete",
+                "executor_stage_observed_at": NOW.isoformat(),
+                "executor_age_seconds": 1.25,
+                "executor_deadline_seconds": 25.0,
+                "last_executor_result": "success",
+                "last_executor_error_type": None,
+                "last_executor_runtime_seconds": 1.25,
+                "executor_last_stage_before_failure": None,
+                "executor_terminated": False,
+                "executor_killed": False,
+                "retry_count": 0,
+                "historical_cache_progress": {"complete": True},
+                "historical_cache_complete": True,
+                "external_process_deadline_enforced": True,
                 "provider_requests_allowed": False,
+                "provider_requests_used": 0,
+                "paper_only": True,
                 "operating_reconciliation_complete": True,
                 "operating_observed_at": NOW.isoformat(),
                 "qualified_bridge_publication_complete": True,
@@ -76,6 +99,16 @@ def test_runtime_health_exposes_control_progress_and_zero_provider_requests(monk
     assert control["stage"] == "durable_control_complete"
     assert control["provider_requests_allowed"] is False
     assert control["provider_requests_used"] == 0
+    assert control["parent_generation"] == "parent-generation"
+    assert control["parent_sequence"] == 17
+    assert control["executor_pid"] == 456
+    assert control["executor_current_stage"] == "control_executor_complete"
+    assert control["executor_deadline_seconds"] == 25.0
+    assert control["last_executor_result"] == "success"
+    assert control["retry_count"] == 0
+    assert control["historical_cache_complete"] is True
+    assert control["external_process_deadline_enforced"] is True
+    assert control["paper_only"] is True
     assert control["operating_reconciliation_complete"] is True
     assert control["qualified_bridge_publication_complete"] is True
     assert control["qualified_bridge_candidate_count"] == 0

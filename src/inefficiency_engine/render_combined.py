@@ -110,6 +110,18 @@ def _start_control_child() -> subprocess.Popen[bytes]:
     return subprocess.Popen(command)
 
 
+def control_parent_manages_degraded_cycle(detail: object) -> bool:
+    """Return whether a current parent owns retry of a failed disposable executor."""
+
+    return bool(
+        isinstance(detail, dict)
+        and detail.get("parent_heartbeat_current") is True
+        and detail.get("external_process_deadline_enforced") is True
+        and isinstance(detail.get("parent_generation"), str)
+        and bool(str(detail.get("parent_generation") or "").strip())
+    )
+
+
 def _control_plane_guard(stop_event: threading.Event) -> None:
     """Own and supervise canonical reconciliation/publication as its own process.
 
@@ -177,7 +189,12 @@ def _control_plane_guard(stop_event: threading.Event) -> None:
                         f"(limit {_CONTROL_GUARD_STALE_SECONDS:.1f}s)"
                     )
                 elif state == "degraded" and has_control_errors:
-                    if degraded_since is None:
+                    if control_parent_manages_degraded_cycle(detail):
+                        # The durable heartbeat is current and the long-lived parent
+                        # has already isolated/reaped the failed cycle. Staleness above
+                        # remains the last-resort parent-failure boundary.
+                        degraded_since = None
+                    elif degraded_since is None:
                         degraded_since = now_mono
                     elif now_mono - degraded_since >= _CONTROL_GUARD_DEGRADED_SECONDS:
                         reason = (
