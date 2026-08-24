@@ -16,7 +16,12 @@ from inefficiency_engine.dashboard_command_center_v6 import (
     COMMAND_CENTER_LAYOUT_VERSION,
     DASHBOARD_COMMAND_CENTER_HTML,
 )
+from inefficiency_engine.runtime_index_health_observability import (
+    install_runtime_index_health_observability,
+)
 
+
+install_runtime_index_health_observability(_base)
 
 CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"
 
