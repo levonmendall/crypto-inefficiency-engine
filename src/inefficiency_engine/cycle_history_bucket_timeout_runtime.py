@@ -80,3 +80,21 @@ def cycle_history_bucket_database_timeout(store: Any) -> Iterator[None]:
         yield
     finally:
         event.remove(engine, "begin", apply_transaction_timeout)
+
+
+# This module is imported by the disposable canonical-control executor only after its
+# aggregate-memory admission guard has succeeded. Install the frozen-target repair at
+# that exact boundary so the following durable-cycle-history imports receive the
+# bounded implementation without moving any heavyweight imports ahead of admission.
+# The patch is process-local: permanent source/API workers and disposable research keep
+# their existing implementations and authorities.
+from inefficiency_engine import durable_control_cycle_history as _legacy_cycle_history
+from inefficiency_engine.durable_control_cycle_history_target_runtime import (
+    advance_durable_control_cycle_history_cache as _advance_frozen_cycle_history,
+    load_durable_control_cycle_history as _load_frozen_cycle_history,
+)
+
+_legacy_cycle_history.advance_durable_control_cycle_history_cache = (
+    _advance_frozen_cycle_history
+)
+_legacy_cycle_history.load_durable_control_cycle_history = _load_frozen_cycle_history
