@@ -62,7 +62,9 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
             ),
         )
         if self._durable_history_cache_key == cache_key:
-            self._durable_history_cache_hits += 1
+            self._durable_history_cache_hits = int(
+                getattr(self, "_durable_history_cache_hits", 0)
+            ) + 1
             return {
                 key: list(values)
                 for key, values in self._durable_history_cache.items()
@@ -84,7 +86,9 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
 
         grouped: dict[tuple[str, str, MarketKind], list[MarketQuote]] = defaultdict(list)
         with self.store.engine.connect() as db:
-            self._durable_history_query_count += 1
+            self._durable_history_query_count = int(
+                getattr(self, "_durable_history_query_count", 0)
+            ) + 1
             payloads = db.execution_options(stream_results=True).execute(query).scalars()
             for payload in payloads:
                 quote = MarketQuote.model_validate_json(payload)
@@ -143,8 +147,12 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
             "provider_requests_allowed": False,
             "provider_requests_used": 0,
             "missing_current_executable_depth_count": self._durable_missing_depth_count,
-            "short_history_query_count": self._durable_history_query_count,
-            "short_history_cache_hits": self._durable_history_cache_hits,
+            "short_history_query_count": int(
+                getattr(self, "_durable_history_query_count", 0)
+            ),
+            "short_history_cache_hits": int(
+                getattr(self, "_durable_history_cache_hits", 0)
+            ),
             "short_history_current_cohort_only": True,
             "missing_depth_policy": "fail_closed",
             "qualification_thresholds_unchanged": True,
