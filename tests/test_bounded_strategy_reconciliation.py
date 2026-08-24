@@ -8,6 +8,7 @@ from sqlalchemy import event, text
 from inefficiency_engine import permanent_control_worker, source_runtime_safety
 from inefficiency_engine.bounded_strategy_evidence_runtime import (
     bounded_load_evidence,
+    bounded_strategy_evidence_cache_diagnostics,
     install_control_database_timeouts,
 )
 from inefficiency_engine.evidence import EvidenceStore
@@ -55,7 +56,19 @@ def _strategy_tables(store: EvidenceStore) -> None:
         )
 
 
-def test_strategy_reconciliation_aggregates_initial_signal_history_then_reads_tail(tmp_path):
+def _momentum(payload):
+    return next(
+        row
+        for row in payload["trend_momentum"]
+        if row["strategy_id"] == "time_series_momentum_v1"
+    )
+
+
+def test_strategy_reconciliation_cold_start_is_batched_and_fail_closed(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("CIE_CONTROL_STRATEGY_BOOTSTRAP_BATCH_ROWS", "100")
     store = EvidenceStore(tmp_path / "bounded-strategy.sqlite")
     _strategy_tables(store)
     with store.engine.begin() as db:
@@ -65,7 +78,7 @@ def test_strategy_reconciliation_aggregates_initial_signal_history_then_reads_ta
                 "(strategy_id,family,event_type,payload_json) "
                 "VALUES ('time_series_momentum_v1','directional_time_series','signal','{}')"
             ),
-            [{} for _ in range(5000)],
+            [{} for _ in range(250)],
         )
 
     statements: list[str] = []
@@ -79,23 +92,35 @@ def test_strategy_reconciliation_aggregates_initial_signal_history_then_reads_ta
     finally:
         event.remove(store.engine, "before_cursor_execute", before_cursor_execute)
 
-    momentum = next(
-        row
-        for row in first["trend_momentum"]
-        if row["strategy_id"] == "time_series_momentum_v1"
-    )
-    assert momentum["forward_signal_count"] == 5000
+    first_momentum = _momentum(first)
+    assert first_momentum["state"] == "collecting"
+    assert first_momentum["evidence_cache_complete"] is False
+    assert "historical_evidence_cache_rebuilding" in first_momentum["failed_gates"]
     assert any(
-        "count(*)" in statement
-        and "from alpha_forward_events" in statement
-        and "group by strategy_id, family" in statement
+        "from alpha_forward_events" in statement
+        and "where id >" in statement
+        and "limit" in statement
         for statement in statements
     )
     assert not any(
-        "select strategy_id, family, event_type, payload_json from alpha_forward_events order by id"
+        "select strategy_id, family, payload_json from alpha_forward_events "
+        "where event_type='outcome' order by id"
         in statement
         for statement in statements
     )
+
+    diagnostics = bounded_strategy_evidence_cache_diagnostics()
+    cache = diagnostics["caches"][-1]
+    assert cache["cache_complete"] is False
+    assert cache["alpha_processed_tail"] == 100
+    assert cache["alpha_target_tail"] == 250
+
+    second = bounded_load_evidence(store, _settings())
+    assert _momentum(second)["evidence_cache_complete"] is False
+    third = bounded_load_evidence(store, _settings())
+    third_momentum = _momentum(third)
+    assert third_momentum["evidence_cache_complete"] is True
+    assert third_momentum["forward_signal_count"] == 250
 
     with store.engine.begin() as db:
         db.execute(
@@ -106,27 +131,10 @@ def test_strategy_reconciliation_aggregates_initial_signal_history_then_reads_ta
             )
         )
 
-    statements.clear()
-    event.listen(store.engine, "before_cursor_execute", before_cursor_execute)
-    try:
-        second = bounded_load_evidence(store, _settings())
-    finally:
-        event.remove(store.engine, "before_cursor_execute", before_cursor_execute)
-
-    momentum = next(
-        row
-        for row in second["trend_momentum"]
-        if row["strategy_id"] == "time_series_momentum_v1"
-    )
-    assert momentum["forward_signal_count"] == 5001
-    assert any(
-        "from alpha_forward_events where id >" in statement
-        for statement in statements
-    )
-    assert not any(
-        "group by strategy_id, family" in statement
-        for statement in statements
-    )
+    fourth = bounded_load_evidence(store, _settings())
+    fourth_momentum = _momentum(fourth)
+    assert fourth_momentum["evidence_cache_complete"] is True
+    assert fourth_momentum["forward_signal_count"] == 251
 
 
 def test_runtime_indexes_cover_strategy_reconciliation_ledgers():
