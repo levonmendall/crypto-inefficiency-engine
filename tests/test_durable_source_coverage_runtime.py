@@ -153,6 +153,11 @@ def test_missing_or_old_persisted_snapshot_fails_closed():
 
     store = _HeartbeatStore()
     persist_source_coverage_snapshot(store, _snapshot(observed_at=NOW - timedelta(seconds=100)))
+    assert store.heartbeat is not None
+    # Handoff freshness is publication freshness. The snapshot's own older
+    # calculation timestamp is preserved and its individual sources are re-aged,
+    # but only an old publication heartbeat makes the durable handoff itself stale.
+    store.heartbeat.observed_at = NOW - timedelta(seconds=100)
     with pytest.raises(DurableSourceCoverageSnapshotStale):
         load_persisted_source_coverage_snapshot(
             store,
