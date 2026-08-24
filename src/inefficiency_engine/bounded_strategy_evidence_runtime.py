@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from collections import defaultdict
 from typing import Any
@@ -11,7 +12,20 @@ from sqlalchemy import event, inspect, text
 _PATCH_MARKER = "_cie_bounded_strategy_evidence_runtime"
 _TIMEOUT_MARKER = "_cie_control_database_timeouts"
 _CACHE_LOCK = threading.RLock()
+_DEFAULT_BOOTSTRAP_BATCH_ROWS = 5000
 _CACHE: dict[tuple[int, str], dict[str, Any]] = {}
+
+
+def _bootstrap_batch_rows() -> int:
+    raw = os.getenv(
+        "CIE_CONTROL_STRATEGY_BOOTSTRAP_BATCH_ROWS",
+        str(_DEFAULT_BOOTSTRAP_BATCH_ROWS),
+    )
+    try:
+        value = int(raw)
+    except ValueError:
+        value = _DEFAULT_BOOTSTRAP_BATCH_ROWS
+    return max(100, min(20000, value))
 
 
 def _cache_key(store: Any) -> tuple[int, str]:
@@ -26,12 +40,18 @@ def _new_cache_state() -> dict[str, Any]:
         "alpha_tail": 0,
         "trial_tail": 0,
         "allocation_tail": 0,
+        "alpha_target_tail": 0,
+        "trial_target_tail": 0,
+        "allocation_target_tail": 0,
         "signals": defaultdict(int),
         "raw_outcomes": [],
         "observed_identity": {},
         "allocator_by_strategy": defaultdict(list),
         "supported_trials": defaultdict(int),
-        "initialized": False,
+        "cache_complete": False,
+        "last_alpha_batch_rows": 0,
+        "last_trial_batch_rows": 0,
+        "last_allocation_batch_rows": 0,
     }
 
 
@@ -52,45 +72,34 @@ def _decode_payload(raw: object) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _load_alpha_initial(db: Any, state: dict[str, Any]) -> None:
-    signals = state["signals"]
-    observed_identity = state["observed_identity"]
-    for strategy_id, family, count in db.execute(
-        text(
-            "SELECT strategy_id, family, COUNT(*) "
-            "FROM alpha_forward_events "
-            "WHERE event_type='signal' "
-            "GROUP BY strategy_id, family"
+def _load_alpha_batch(
+    db: Any,
+    state: dict[str, Any],
+    *,
+    after_id: int,
+    target_id: int,
+    batch_rows: int,
+) -> tuple[int, int]:
+    if target_id <= after_id:
+        return target_id, 0
+    rows = list(
+        db.execute(
+            text(
+                "SELECT id, strategy_id, family, event_type, payload_json "
+                "FROM alpha_forward_events "
+                "WHERE id > :after_id AND id <= :target_id "
+                "ORDER BY id LIMIT :batch_rows"
+            ),
+            {
+                "after_id": int(after_id),
+                "target_id": int(target_id),
+                "batch_rows": int(batch_rows),
+            },
         )
-    ):
-        strategy = str(strategy_id)
-        family_name = str(family)
-        signals[(strategy, family_name)] = int(count or 0)
-        observed_identity[strategy] = family_name
-
-    for strategy_id, family, payload_json in db.execute(
-        text(
-            "SELECT strategy_id, family, payload_json "
-            "FROM alpha_forward_events "
-            "WHERE event_type='outcome' ORDER BY id"
-        )
-    ):
-        strategy = str(strategy_id)
-        family_name = str(family)
-        observed_identity[strategy] = family_name
-        payload = _decode_payload(payload_json)
-        if payload is not None:
-            state["raw_outcomes"].append(payload)
-
-
-def _load_alpha_incremental(db: Any, state: dict[str, Any], *, after_id: int) -> None:
-    for strategy_id, family, event_type, payload_json in db.execute(
-        text(
-            "SELECT strategy_id, family, event_type, payload_json "
-            "FROM alpha_forward_events WHERE id > :after_id ORDER BY id"
-        ),
-        {"after_id": int(after_id)},
-    ):
+    )
+    processed = int(after_id)
+    for row_id, strategy_id, family, event_type, payload_json in rows:
+        processed = int(row_id)
         strategy = str(strategy_id)
         family_name = str(family)
         state["observed_identity"][strategy] = family_name
@@ -102,116 +111,161 @@ def _load_alpha_incremental(db: Any, state: dict[str, Any], *, after_id: int) ->
         payload = _decode_payload(payload_json)
         if payload is not None:
             state["raw_outcomes"].append(payload)
+    if len(rows) < batch_rows:
+        processed = target_id
+    return processed, len(rows)
 
 
-def _load_allocation_outcomes_initial(db: Any, state: dict[str, Any]) -> None:
-    for strategy_id, payload_json in db.execute(
-        text(
-            "SELECT strategy, payload_json "
-            "FROM allocation_forward_outcomes ORDER BY id"
-        )
-    ):
-        payload = _decode_payload(payload_json)
-        if payload is not None:
-            state["allocator_by_strategy"][str(strategy_id)].append(payload)
-
-
-def _load_allocation_outcomes_incremental(
+def _load_allocation_batch(
     db: Any,
     state: dict[str, Any],
     *,
     after_id: int,
-) -> None:
-    for strategy_id, payload_json in db.execute(
-        text(
-            "SELECT strategy, payload_json "
-            "FROM allocation_forward_outcomes WHERE id > :after_id ORDER BY id"
-        ),
-        {"after_id": int(after_id)},
-    ):
+    target_id: int,
+    batch_rows: int,
+) -> tuple[int, int]:
+    if target_id <= after_id:
+        return target_id, 0
+    rows = list(
+        db.execute(
+            text(
+                "SELECT id, strategy, payload_json "
+                "FROM allocation_forward_outcomes "
+                "WHERE id > :after_id AND id <= :target_id "
+                "ORDER BY id LIMIT :batch_rows"
+            ),
+            {
+                "after_id": int(after_id),
+                "target_id": int(target_id),
+                "batch_rows": int(batch_rows),
+            },
+        )
+    )
+    processed = int(after_id)
+    for row_id, strategy_id, payload_json in rows:
+        processed = int(row_id)
         payload = _decode_payload(payload_json)
         if payload is not None:
             state["allocator_by_strategy"][str(strategy_id)].append(payload)
+    if len(rows) < batch_rows:
+        processed = target_id
+    return processed, len(rows)
 
 
-def _load_trials_initial(db: Any, state: dict[str, Any]) -> None:
-    for strategy_id, count in db.execute(
-        text(
-            "SELECT strategy, COUNT(*) FROM allocation_forward_trials "
-            "WHERE settlement_supported = TRUE GROUP BY strategy"
+def _load_trial_batch(
+    db: Any,
+    state: dict[str, Any],
+    *,
+    after_id: int,
+    target_id: int,
+    batch_rows: int,
+) -> tuple[int, int]:
+    if target_id <= after_id:
+        return target_id, 0
+    rows = list(
+        db.execute(
+            text(
+                "SELECT id, strategy, settlement_supported "
+                "FROM allocation_forward_trials "
+                "WHERE id > :after_id AND id <= :target_id "
+                "ORDER BY id LIMIT :batch_rows"
+            ),
+            {
+                "after_id": int(after_id),
+                "target_id": int(target_id),
+                "batch_rows": int(batch_rows),
+            },
         )
-    ):
-        state["supported_trials"][str(strategy_id)] = int(count or 0)
-
-
-def _load_trials_incremental(db: Any, state: dict[str, Any], *, after_id: int) -> None:
-    for strategy_id, supported in db.execute(
-        text(
-            "SELECT strategy, settlement_supported FROM allocation_forward_trials "
-            "WHERE id > :after_id ORDER BY id"
-        ),
-        {"after_id": int(after_id)},
-    ):
+    )
+    processed = int(after_id)
+    for row_id, strategy_id, supported in rows:
+        processed = int(row_id)
         if bool(supported):
             state["supported_trials"][str(strategy_id)] += 1
+    if len(rows) < batch_rows:
+        processed = target_id
+    return processed, len(rows)
 
 
 def _refresh_cached_ledgers(store: Any) -> dict[str, Any]:
+    """Advance exact strategy evidence by bounded primary-key batches.
+
+    No partially loaded history is allowed to authorize qualification. The returned
+    cache is marked complete only when all three append-only evidence ledgers have
+    been consumed through the durable tails observed for this refresh.
+    """
+
     available = set(inspect(store.engine).get_table_names())
     cache_key = _cache_key(store)
+    batch_rows = _bootstrap_batch_rows()
     with _CACHE_LOCK:
         state = _CACHE.setdefault(cache_key, _new_cache_state())
         with store.engine.connect() as db:
-            alpha_tail = _tail_id(db, "alpha_forward_events", available)
-            trial_tail = _tail_id(db, "allocation_forward_trials", available)
-            allocation_tail = _tail_id(db, "allocation_forward_outcomes", available)
+            alpha_target = _tail_id(db, "alpha_forward_events", available)
+            trial_target = _tail_id(db, "allocation_forward_trials", available)
+            allocation_target = _tail_id(db, "allocation_forward_outcomes", available)
 
             reset_required = bool(
-                state["initialized"]
-                and (
-                    alpha_tail < int(state["alpha_tail"])
-                    or trial_tail < int(state["trial_tail"])
-                    or allocation_tail < int(state["allocation_tail"])
-                )
+                alpha_target < int(state["alpha_tail"])
+                or trial_target < int(state["trial_tail"])
+                or allocation_target < int(state["allocation_tail"])
             )
             if reset_required:
                 state = _new_cache_state()
                 _CACHE[cache_key] = state
 
-            if not state["initialized"]:
-                if "alpha_forward_events" in available:
-                    _load_alpha_initial(db, state)
-                if "allocation_forward_outcomes" in available:
-                    _load_allocation_outcomes_initial(db, state)
-                if "allocation_forward_trials" in available:
-                    _load_trials_initial(db, state)
-                state["initialized"] = True
-            else:
-                if alpha_tail > int(state["alpha_tail"]):
-                    _load_alpha_incremental(
-                        db,
-                        state,
-                        after_id=int(state["alpha_tail"]),
-                    )
-                if allocation_tail > int(state["allocation_tail"]):
-                    _load_allocation_outcomes_incremental(
-                        db,
-                        state,
-                        after_id=int(state["allocation_tail"]),
-                    )
-                if trial_tail > int(state["trial_tail"]):
-                    _load_trials_incremental(
-                        db,
-                        state,
-                        after_id=int(state["trial_tail"]),
-                    )
+            alpha_processed, alpha_rows = (
+                _load_alpha_batch(
+                    db,
+                    state,
+                    after_id=int(state["alpha_tail"]),
+                    target_id=alpha_target,
+                    batch_rows=batch_rows,
+                )
+                if "alpha_forward_events" in available
+                else (0, 0)
+            )
+            allocation_processed, allocation_rows = (
+                _load_allocation_batch(
+                    db,
+                    state,
+                    after_id=int(state["allocation_tail"]),
+                    target_id=allocation_target,
+                    batch_rows=batch_rows,
+                )
+                if "allocation_forward_outcomes" in available
+                else (0, 0)
+            )
+            trial_processed, trial_rows = (
+                _load_trial_batch(
+                    db,
+                    state,
+                    after_id=int(state["trial_tail"]),
+                    target_id=trial_target,
+                    batch_rows=batch_rows,
+                )
+                if "allocation_forward_trials" in available
+                else (0, 0)
+            )
 
-            state["alpha_tail"] = alpha_tail
-            state["trial_tail"] = trial_tail
-            state["allocation_tail"] = allocation_tail
+            state["alpha_tail"] = alpha_processed
+            state["trial_tail"] = trial_processed
+            state["allocation_tail"] = allocation_processed
+            state["alpha_target_tail"] = alpha_target
+            state["trial_target_tail"] = trial_target
+            state["allocation_target_tail"] = allocation_target
+            state["last_alpha_batch_rows"] = alpha_rows
+            state["last_trial_batch_rows"] = trial_rows
+            state["last_allocation_batch_rows"] = allocation_rows
+            state["cache_complete"] = bool(
+                alpha_processed >= alpha_target
+                and trial_processed >= trial_target
+                and allocation_processed >= allocation_target
+            )
 
         return {
-            "key": (alpha_tail, trial_tail, allocation_tail),
+            "key": (alpha_target, trial_target, allocation_target),
+            "cache_complete": bool(state["cache_complete"]),
             "signals": dict(state["signals"]),
             "raw_outcomes": list(state["raw_outcomes"]),
             "observed_identity": dict(state["observed_identity"]),
@@ -220,21 +274,127 @@ def _refresh_cached_ledgers(store: Any) -> dict[str, Any]:
                 for key, value in state["allocator_by_strategy"].items()
             },
             "supported_trials": dict(state["supported_trials"]),
+            "diagnostics": {
+                "alpha_processed_tail": int(state["alpha_tail"]),
+                "alpha_target_tail": alpha_target,
+                "trial_processed_tail": int(state["trial_tail"]),
+                "trial_target_tail": trial_target,
+                "allocation_processed_tail": int(state["allocation_tail"]),
+                "allocation_target_tail": allocation_target,
+                "last_alpha_batch_rows": alpha_rows,
+                "last_trial_batch_rows": trial_rows,
+                "last_allocation_batch_rows": allocation_rows,
+            },
         }
 
 
-def bounded_load_evidence(store: Any, settings: Any) -> dict[str, list[dict[str, Any]]]:
-    """Load exact strategy evidence without rescanning append-only signal history.
+def _rebuilding_evidence(settings: Any) -> dict[str, list[dict[str, Any]]]:
+    """Return explicit fail-closed strategy state while exact history catches up."""
 
-    Initial startup aggregates signal/trial counts in SQL and reads only outcome
-    payloads needed by the existing statistical calculations. Subsequent calls read
-    only rows newer than each durable table tail. No evidence is truncated and no
-    qualification threshold changes.
+    from inefficiency_engine import strategy_evidence_read as legacy
+
+    by_mechanism: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    required_forward = max(1, int(getattr(settings, "alpha_min_forward_samples", 30)))
+    for mechanism_id, family, strategy_id, name in legacy._CANONICAL_ALPHA_STRATEGIES:
+        by_mechanism[mechanism_id].append(
+            {
+                "strategy_id": strategy_id,
+                "name": name,
+                "family": family,
+                "state": "collecting",
+                "qualification_scope": "exact historical strategy evidence cache",
+                "forward_signal_count": 0,
+                "independent_forward_outcome_count": 0,
+                "mean_forward_net_return": None,
+                "mean_forward_net_return_ci_lower": None,
+                "forward_hit_rate": None,
+                "forward_hit_rate_ci_lower": None,
+                "observed_regime_count": 0,
+                "required_forward_outcomes": required_forward,
+                "required_mean_return_ci_lower": None,
+                "required_hit_rate_ci_lower": None,
+                "required_regimes": max(1, int(getattr(settings, "alpha_min_regimes", 1))),
+                "settled_allocator_outcome_count": 0,
+                "required_allocator_outcomes": max(
+                    5,
+                    int(getattr(settings, "operating_certification_min_settled_trials", 20)),
+                ),
+                "allocator_mean_net_return_ci_lower": None,
+                "allocator_profitable_rate_ci_lower": None,
+                "allocator_realized_profit_usd": None,
+                "failed_gates": ["historical_evidence_cache_rebuilding"],
+                "primary_reason": (
+                    "exact historical evidence is rebuilding in bounded batches; "
+                    "qualification is withheld until the durable cache is complete"
+                ),
+                "diagnostic_aggregate_only": False,
+                "evidence_cache_complete": False,
+                "allocation_authority_unchanged": True,
+                "paper_only": True,
+            }
+        )
+
+    settled_required = max(
+        5,
+        int(getattr(settings, "operating_certification_min_settled_trials", 20)),
+    )
+    for mechanism_id, specs in legacy._STRUCTURAL_STRATEGIES.items():
+        for strategy_id, name in specs:
+            by_mechanism[mechanism_id].append(
+                {
+                    "strategy_id": strategy_id,
+                    "name": name,
+                    "family": "structural",
+                    "state": "collecting",
+                    "qualification_scope": "exact historical allocator evidence cache",
+                    "forward_signal_count": 0,
+                    "independent_forward_outcome_count": 0,
+                    "mean_forward_net_return": None,
+                    "mean_forward_net_return_ci_lower": None,
+                    "forward_hit_rate": None,
+                    "forward_hit_rate_ci_lower": None,
+                    "observed_regime_count": 0,
+                    "required_forward_outcomes": 0,
+                    "required_mean_return_ci_lower": None,
+                    "required_hit_rate_ci_lower": None,
+                    "required_regimes": 0,
+                    "settled_allocator_outcome_count": 0,
+                    "required_allocator_outcomes": settled_required,
+                    "allocator_mean_net_return_ci_lower": None,
+                    "allocator_profitable_rate_ci_lower": None,
+                    "allocator_realized_profit_usd": None,
+                    "failed_gates": ["historical_evidence_cache_rebuilding"],
+                    "primary_reason": (
+                        "exact historical allocator evidence is rebuilding in bounded batches; "
+                        "qualification is withheld until the durable cache is complete"
+                    ),
+                    "diagnostic_aggregate_only": False,
+                    "evidence_cache_complete": False,
+                    "allocation_authority_unchanged": True,
+                    "paper_only": True,
+                }
+            )
+    return {
+        key: sorted(value, key=lambda row: str(row.get("strategy_id")))
+        for key, value in by_mechanism.items()
+    }
+
+
+def bounded_load_evidence(store: Any, settings: Any) -> dict[str, list[dict[str, Any]]]:
+    """Load exact strategy evidence with a bounded, fail-closed cold start.
+
+    Every call consumes at most one primary-key batch from each append-only strategy
+    ledger. Partial history is never passed to statistical qualification. Once all
+    durable tails are caught up, existing exact de-overlap/statistical calculations
+    run over the complete accumulated history and later calls consume only new tails.
     """
 
     from inefficiency_engine import strategy_evidence_read as legacy
 
     cached = _refresh_cached_ledgers(store)
+    if not bool(cached["cache_complete"]):
+        return _rebuilding_evidence(settings)
+
     raw_outcomes = list(cached["raw_outcomes"])
     signals = dict(cached["signals"])
     observed_identity = dict(cached["observed_identity"])
@@ -272,6 +432,7 @@ def bounded_load_evidence(store: Any, settings: Any) -> dict[str, list[dict[str,
             settings=settings,
             strategy_count=strategy_count,
         )
+        row["evidence_cache_complete"] = True
         by_mechanism[mechanism_id].append(row)
 
     settled_required = max(
@@ -287,13 +448,13 @@ def bounded_load_evidence(store: Any, settings: Any) -> dict[str, list[dict[str,
             trial_count = int(supported_trials.get(strategy_id, 0))
             settled = int(allocator.get("count") or 0)
             if trial_count <= 0:
-                state = "collecting"
+                state_name = "collecting"
                 reason = "canonical settlement is enabled and awaiting an eligible allocator trial"
             elif settled < settled_required:
-                state = "certifying"
+                state_name = "certifying"
                 reason = f"allocator settlements are accumulating ({settled}/{settled_required})"
             elif isinstance(allocator.get("mean"), (float, int)) and float(allocator["mean"]) <= 0:
-                state = "poor_economics"
+                state_name = "poor_economics"
                 reason = "realized paper economics are non-positive after observed settlement and costs"
             elif (
                 allocator.get("mean_lower") is None
@@ -301,20 +462,20 @@ def bounded_load_evidence(store: Any, settings: Any) -> dict[str, list[dict[str,
                 or allocator.get("hit_lower") is None
                 or float(allocator["hit_lower"]) < hit_required
             ):
-                state = "statistical_failure"
+                state_name = "statistical_failure"
                 reason = "realized paper returns have not cleared the conservative profitability confidence hurdle"
             elif float(allocator.get("realized_profit") or 0.0) > 0:
-                state = "certified"
+                state_name = "certified"
                 reason = "allocator-level forward paper profitability is certified"
             else:
-                state = "poor_economics"
+                state_name = "poor_economics"
                 reason = "settled cohort has not produced positive aggregate realized paper profit"
             by_mechanism[mechanism_id].append(
                 {
                     "strategy_id": strategy_id,
                     "name": name,
                     "family": "structural",
-                    "state": state,
+                    "state": state_name,
                     "qualification_scope": "strategy allocator settlement cohort",
                     "forward_signal_count": trial_count,
                     "independent_forward_outcome_count": 0,
@@ -335,6 +496,7 @@ def bounded_load_evidence(store: Any, settings: Any) -> dict[str, list[dict[str,
                     "failed_gates": [],
                     "primary_reason": reason,
                     "diagnostic_aggregate_only": False,
+                    "evidence_cache_complete": True,
                     "allocation_authority_unchanged": True,
                     "paper_only": True,
                 }
@@ -344,6 +506,36 @@ def bounded_load_evidence(store: Any, settings: Any) -> dict[str, list[dict[str,
         key: sorted(value, key=lambda row: str(row.get("strategy_id")))
         for key, value in by_mechanism.items()
     }
+
+
+def bounded_strategy_evidence_cache_diagnostics() -> dict[str, object]:
+    with _CACHE_LOCK:
+        caches = []
+        for (_engine_id, database_url), state in _CACHE.items():
+            caches.append(
+                {
+                    "database": database_url,
+                    "cache_complete": bool(state["cache_complete"]),
+                    "alpha_processed_tail": int(state["alpha_tail"]),
+                    "alpha_target_tail": int(state["alpha_target_tail"]),
+                    "trial_processed_tail": int(state["trial_tail"]),
+                    "trial_target_tail": int(state["trial_target_tail"]),
+                    "allocation_processed_tail": int(state["allocation_tail"]),
+                    "allocation_target_tail": int(state["allocation_target_tail"]),
+                    "raw_outcome_count": len(state["raw_outcomes"]),
+                    "last_alpha_batch_rows": int(state["last_alpha_batch_rows"]),
+                    "last_trial_batch_rows": int(state["last_trial_batch_rows"]),
+                    "last_allocation_batch_rows": int(state["last_allocation_batch_rows"]),
+                }
+            )
+        return {
+            "mode": "bounded_exact_bootstrap_then_incremental_tail",
+            "batch_rows": _bootstrap_batch_rows(),
+            "cache_count": len(caches),
+            "all_caches_complete": bool(caches)
+            and all(bool(row["cache_complete"]) for row in caches),
+            "caches": caches,
+        }
 
 
 def install_bounded_strategy_evidence_runtime() -> None:
@@ -368,10 +560,9 @@ def install_control_database_timeouts(
 ) -> bool:
     """Give the control process a real PostgreSQL-side SQL/lock deadline.
 
-    ``asyncio.wait_for`` cannot terminate a synchronous DBAPI call already running in
-    an executor thread. Applying PostgreSQL session timeouts on every pool checkout
-    makes blocked or unexpectedly expensive SQL abort inside the database before the
-    25-second control-cycle deadline.
+    PostgreSQL session timeouts bound SQL after checkout; the control process also
+    carries a separate pool-checkout and wall-clock deadline. These settings do not
+    change evidence or qualification semantics.
     """
 
     engine = store.engine
