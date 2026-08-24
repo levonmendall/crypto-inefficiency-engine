@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import time
 
 from inefficiency_engine.canonical_paper_portfolio import CANONICAL_INITIAL_CAPITAL_USD
+from inefficiency_engine.control_cycle_runtime import ControlCycleDeadlineExceeded
 from inefficiency_engine.dashboard_projection import DASHBOARD_RESEARCH_PROJECTION_WORKER_ID
 
 
@@ -37,9 +37,10 @@ async def refresh_canonical_control_plane(
 
     The caller owns no market acquisition. Reconciliation reads append-only durable
     state, bridge publication consumes persisted source/research evidence, and the
-    dashboard projection is published only after reconciliation succeeds. The helper
-    therefore remains safe to run in a dedicated control process with provider work
-    explicitly disabled.
+    dashboard projection is published only after reconciliation succeeds. Database-
+    only synchronous work intentionally remains on the dedicated control process's
+    main thread so a process-level hard deadline can interrupt it without orphaning
+    executor threads after a timeout.
     """
 
     result: dict[str, object] = {
@@ -56,15 +57,15 @@ async def refresh_canonical_control_plane(
 
     stage_started = time.monotonic()
     try:
-        reconciled = await asyncio.to_thread(
-            operating_certification.reconcile_latest_runtime_truth
-        )
+        reconciled = operating_certification.reconcile_latest_runtime_truth()
         if reconciled is None:
             errors["operating_reconciliation"] = "OperatingSnapshotUnavailable"
         else:
             result["operating_reconciliation_complete"] = True
             result["operating_snapshot_id"] = reconciled.snapshot_id
             result["operating_observed_at"] = reconciled.observed_at.isoformat()
+    except ControlCycleDeadlineExceeded:
+        raise
     except Exception as exc:
         errors["operating_reconciliation"] = type(exc).__name__
     finally:
@@ -88,6 +89,8 @@ async def refresh_canonical_control_plane(
                 bridge.observed_at.isoformat() if bridge is not None else None
             )
             result["qualified_bridge_used_current_bounded_snapshot"] = bridge_snapshot is not None
+        except ControlCycleDeadlineExceeded:
+            raise
         except Exception as exc:
             errors["qualified_bridge_publication"] = type(exc).__name__
         finally:
@@ -100,8 +103,7 @@ async def refresh_canonical_control_plane(
 
         stage_started = time.monotonic()
         try:
-            payload = await asyncio.to_thread(
-                research_projection.publish,
+            payload = research_projection.publish(
                 forward_target=max(1, int(settings.alpha_min_forward_samples)),
                 settled_target=max(
                     5,
@@ -136,6 +138,8 @@ async def refresh_canonical_control_plane(
                     "paper_only": True,
                 },
             )
+        except ControlCycleDeadlineExceeded:
+            raise
         except Exception as exc:
             errors["research_projection_publication"] = type(exc).__name__
             try:
