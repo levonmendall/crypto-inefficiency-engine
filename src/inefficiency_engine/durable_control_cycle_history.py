@@ -44,8 +44,8 @@ Index(
     CONTROL_CYCLE_HISTORY_ROWS.c.observed_at,
 )
 
-_CACHE_KEY = "cycle-history-live-compact-v2"
-_CACHE_VERSION = 2
+_CACHE_KEY = "cycle-history-live-compact-v3"
+_CACHE_VERSION = 3
 _DEFAULT_BUCKET_QUERY_BUDGET = 256
 _RETENTION_SAFETY_HOURS = 24.0
 
@@ -99,7 +99,7 @@ def _fresh_checkpoint(factory: Any) -> dict[str, Any]:
         "rows_per_day": rows_per_day,
         "required_history_hours": required_history_hours,
         "pair_completed_through": {},
-        "boundary_cutoffs": {},
+        "boundary_days": {},
         "last_bucket_queries": 0,
     }
 
@@ -139,9 +139,9 @@ def _replace_bucket(
     day: date,
     start: datetime,
     end: datetime,
-    rows_per_day: int,
+    limit: int | None,
 ) -> int:
-    """Replace one venue/asset/day bucket with the exact legacy top-N rows."""
+    """Replace one venue/asset/day cache bucket from an indexed bounded time seek."""
 
     table = factory.store.market_quotes
     selected: list[dict[str, object]] = []
@@ -159,8 +159,9 @@ def _replace_bucket(
             .where(table.c.observed_at >= start.isoformat())
             .where(table.c.observed_at < end.isoformat())
             .order_by(table.c.id.desc())
-            .limit(rows_per_day)
         )
+        if limit is not None:
+            query = query.limit(limit)
         with factory.store.engine.connect() as db:
             rows = list(db.execute(query))
         for source_id, row_venue, row_asset, observed_at, payload_json in rows:
@@ -202,13 +203,14 @@ def advance_durable_control_cycle_history_cache(
     factory: Any,
     snapshot: Any,
 ) -> dict[str, object]:
-    """Build exact cycle-history buckets outside alpha discovery under a hard budget.
+    """Build the exact legacy daily projection outside alpha discovery.
 
-    The legacy query ranks every live ``market_quotes`` row in the 180-day window with
-    ``row_number()`` partitioned by venue/asset/day and keeps the newest N ids. This
-    preflight computes the same answer as a series of small indexed day seeks. Stable
-    days are checkpointed once; only the moving recent-cutoff boundary is refreshed on
-    every control cycle. Partial progress is durable and never visible to discovery.
+    Stable days are stored as the exact newest N source ids for each venue/asset/day,
+    matching the legacy ``row_number(... order by id desc)`` result. The one moving
+    recent-cutoff day is stored raw once per UTC day; the reader applies the exact
+    cutoff and then the same newest-N rank. This preserves filter-before-rank semantics
+    without rerunning a 180-day PostgreSQL window query in every fresh control process.
+    Partial stable-day progress is durable and never visible to alpha discovery.
     """
 
     namespace = durable_control_cache_namespace()
@@ -255,21 +257,26 @@ def advance_durable_control_cycle_history_cache(
         str(key): str(value)
         for key, value in dict(checkpoint.get("pair_completed_through") or {}).items()
     }
-    boundary_cutoffs = {
+    boundary_days = {
         str(key): str(value)
-        for key, value in dict(checkpoint.get("boundary_cutoffs") or {}).items()
+        for key, value in dict(checkpoint.get("boundary_days") or {}).items()
     }
 
+    boundary_refresh_count = sum(
+        boundary_days.get(_pair_token(venue, asset)) != boundary_day.isoformat()
+        for venue, asset in current_pairs
+    )
     configured_budget = _bucket_query_budget()
-    # One boundary query per current pair is required for exactness because the recent
-    # cutoff moves continuously. Give every pair that refresh plus at least one stable
-    # day of bootstrap work, while retaining an explicit finite upper bound.
-    query_budget = min(4000, max(configured_budget, len(current_pairs) * 2))
-    stable_budget = max(0, query_budget - len(current_pairs))
+    query_budget = min(
+        4000,
+        max(configured_budget, boundary_refresh_count + len(current_pairs)),
+    )
+    stable_budget = max(0, query_budget - boundary_refresh_count)
     base_stable_quota = stable_budget // len(current_pairs)
     stable_remainder = stable_budget % len(current_pairs)
     bucket_queries = 0
-    bucket_rows = 0
+    stable_rows_retained = 0
+    boundary_rows_retained = 0
 
     for index, (venue, asset) in enumerate(current_pairs):
         token = _pair_token(venue, asset)
@@ -283,17 +290,15 @@ def advance_durable_control_cycle_history_cache(
         processed = 0
         while next_day <= stable_end_day and processed < stable_quota:
             day_start = _day_start(next_day)
-            start = max(long_cutoff, day_start)
-            end = day_start + timedelta(days=1)
-            bucket_rows += _replace_bucket(
+            stable_rows_retained += _replace_bucket(
                 factory=factory,
                 namespace=namespace,
                 venue=venue,
                 asset=asset,
                 day=next_day,
-                start=start,
-                end=end,
-                rows_per_day=rows_per_day,
+                start=max(long_cutoff, day_start),
+                end=day_start + timedelta(days=1),
+                limit=rows_per_day,
             )
             bucket_queries += 1
             processed += 1
@@ -301,22 +306,25 @@ def advance_durable_control_cycle_history_cache(
             next_day += timedelta(days=1)
         completed[token] = completed_day.isoformat()
 
-        # The recent boundary is not stable yet. Recompute it from the exact cutoff on
-        # every cycle so rows later in that UTC day can never suppress earlier eligible
-        # rows, which would differ from the legacy filter-before-row_number semantics.
-        boundary_start = max(long_cutoff, _day_start(boundary_day))
-        bucket_rows += _replace_bucket(
-            factory=factory,
-            namespace=namespace,
-            venue=venue,
-            asset=asset,
-            day=boundary_day,
-            start=boundary_start,
-            end=recent_cutoff,
-            rows_per_day=rows_per_day,
-        )
-        bucket_queries += 1
-        boundary_cutoffs[token] = recent_cutoff.isoformat()
+        # Store the complete UTC boundary day raw. It is historical relative to the
+        # short-history cutoff, so ordinary live appends do not mutate it. Keeping the
+        # raw day lets the reader apply any later cutoff from the same UTC day before
+        # ranking, exactly matching the legacy query even if the bridge snapshot moves
+        # by a few seconds after preflight.
+        if boundary_days.get(token) != boundary_day.isoformat():
+            boundary_start = max(long_cutoff, _day_start(boundary_day))
+            boundary_rows_retained += _replace_bucket(
+                factory=factory,
+                namespace=namespace,
+                venue=venue,
+                asset=asset,
+                day=boundary_day,
+                start=boundary_start,
+                end=_day_start(boundary_day) + timedelta(days=1),
+                limit=None,
+            )
+            bucket_queries += 1
+            boundary_days[token] = boundary_day.isoformat()
 
     retention_floor = long_cutoff - timedelta(hours=_RETENTION_SAFETY_HOURS)
     with factory.store.engine.begin() as db:
@@ -332,7 +340,7 @@ def advance_durable_control_cycle_history_cache(
             "rows_per_day": rows_per_day,
             "required_history_hours": required_history_hours,
             "pair_completed_through": completed,
-            "boundary_cutoffs": boundary_cutoffs,
+            "boundary_days": boundary_days,
             "last_bucket_queries": bucket_queries,
         }
     )
@@ -343,7 +351,7 @@ def advance_durable_control_cycle_history_cache(
         for token in current_tokens
     )
     boundary_complete = all(
-        boundary_cutoffs.get(token) == recent_cutoff.isoformat()
+        boundary_days.get(token) == boundary_day.isoformat()
         for token in current_tokens
     )
     complete = bool(stable_complete and boundary_complete)
@@ -365,7 +373,8 @@ def advance_durable_control_cycle_history_cache(
         "mode": "bounded_exact_daily_bucket_cache",
         "query_budget": query_budget,
         "bucket_queries": bucket_queries,
-        "bucket_rows_retained": bucket_rows,
+        "stable_rows_retained": stable_rows_retained,
+        "boundary_rows_retained": boundary_rows_retained,
         "current_pair_count": len(current_pairs),
         "cached_pair_count": len(completed),
         "incomplete_pair_count": incomplete_pairs,
@@ -388,7 +397,7 @@ def load_durable_control_cycle_history(
     factory: Any,
     snapshot: Any,
 ) -> dict[tuple[str, str, MarketKind], list[MarketQuote]] | None:
-    """Return the exact compact live projection only after this snapshot is ready."""
+    """Return exact compact live history only after all current pairs are ready."""
 
     namespace = durable_control_cache_namespace()
     if namespace is None:
@@ -409,20 +418,21 @@ def load_durable_control_cycle_history(
         hours=factory._effective_history_hours()
     )
     first_day = long_cutoff.date()
-    stable_end_day = recent_cutoff.date() - timedelta(days=1)
+    boundary_day = recent_cutoff.date()
+    stable_end_day = boundary_day - timedelta(days=1)
     completed = {
         str(key): str(value)
         for key, value in dict(checkpoint.get("pair_completed_through") or {}).items()
     }
-    boundary_cutoffs = {
+    boundary_days = {
         str(key): str(value)
-        for key, value in dict(checkpoint.get("boundary_cutoffs") or {}).items()
+        for key, value in dict(checkpoint.get("boundary_days") or {}).items()
     }
     for venue, asset in current_pairs:
         token = _pair_token(venue, asset)
         if _parse_day(completed.get(token), first_day - timedelta(days=1)) < stable_end_day:
             return None
-        if boundary_cutoffs.get(token) != recent_cutoff.isoformat():
+        if boundary_days.get(token) != boundary_day.isoformat():
             return None
 
     pair_filters = [
@@ -433,19 +443,32 @@ def load_durable_control_cycle_history(
         for venue, asset in current_pairs
     ]
     query = (
-        select(CONTROL_CYCLE_HISTORY_ROWS.c.payload_json)
+        select(
+            CONTROL_CYCLE_HISTORY_ROWS.c.source_id,
+            CONTROL_CYCLE_HISTORY_ROWS.c.venue,
+            CONTROL_CYCLE_HISTORY_ROWS.c.asset,
+            CONTROL_CYCLE_HISTORY_ROWS.c.day,
+            CONTROL_CYCLE_HISTORY_ROWS.c.payload_json,
+        )
         .where(CONTROL_CYCLE_HISTORY_ROWS.c.namespace == namespace)
         .where(CONTROL_CYCLE_HISTORY_ROWS.c.observed_at >= long_cutoff.isoformat())
         .where(CONTROL_CYCLE_HISTORY_ROWS.c.observed_at < recent_cutoff.isoformat())
         .where(or_(*pair_filters))
-        .order_by(CONTROL_CYCLE_HISTORY_ROWS.c.observed_at)
     )
-    grouped: dict[tuple[str, str, MarketKind], list[MarketQuote]] = defaultdict(list)
+    ranked: dict[tuple[str, str, str], list[tuple[int, str]]] = defaultdict(list)
     with factory.store.engine.connect() as db:
-        payloads = db.execute(query).scalars()
-        for payload in payloads:
+        for source_id, venue, asset, day, payload_json in db.execute(query):
+            ranked[(str(venue), str(asset).upper(), str(day))].append(
+                (int(source_id), str(payload_json))
+            )
+
+    grouped: dict[tuple[str, str, MarketKind], list[MarketQuote]] = defaultdict(list)
+    for rows in ranked.values():
+        for _source_id, payload in sorted(rows, reverse=True)[:rows_per_day]:
             quote = MarketQuote.model_validate_json(payload)
             key = (quote.venue, quote.asset.upper(), quote.market_kind)
             if key in current_keys:
                 grouped[key].append(quote)
+    for values in grouped.values():
+        values.sort(key=lambda item: item.observed_at)
     return grouped
