@@ -14,7 +14,7 @@ def test_render_blueprint_defines_single_paid_combined_runtime():
     assert runtime["type"] == "web"
     assert runtime["plan"] == "standard"
     assert runtime["startCommand"] == (
-        "PYTHONPATH=src python -m inefficiency_engine.render_combined_postbind"
+        "PYTHONPATH=src python -m inefficiency_engine.render_combined_postbind_lane_repair"
     )
 
     canonical = Path("src/inefficiency_engine/render_combined.py").read_text()
@@ -25,6 +25,13 @@ def test_render_blueprint_defines_single_paid_combined_runtime():
     assert "API bound; starting deferred runtime index maintenance" in postbind
     assert "canonical control waiting for required source runtime indexes" in postbind
     assert "control-gate indexes ready; starting canonical control supervision" in postbind
+
+    repair_bootstrap = Path(
+        "src/inefficiency_engine/render_combined_postbind_lane_repair.py"
+    ).read_text()
+    assert "from inefficiency_engine import render_combined_postbind as base" in repair_bootstrap
+    assert 'commands["source"] = list(SOURCE_REPAIR_COMMAND)' in repair_bootstrap
+    assert "return base.main()" in repair_bootstrap
 
     # Keep the former Blueprint command as a compatibility alias so an existing
     # Render service cannot fall back to the old dashboard application while its
