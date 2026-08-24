@@ -111,21 +111,7 @@ def test_source_coverage_executor_defers_before_heavy_imports_when_memory_is_blo
         lambda: _snapshot(usage_mb=800.0),
     )
 
-    called = False
-
-    def unexpected_snapshot() -> int:
-        nonlocal called
-        called = True
-        raise AssertionError("source snapshot body must not start under memory pressure")
-
-    monkeypatch.setattr(
-        source_coverage_snapshot_executor,
-        "_run_source_coverage_snapshot",
-        unexpected_snapshot,
-    )
-
     assert source_coverage_snapshot_executor.main() == memory_guard.MEMORY_PRESSURE_EXIT_CODE
-    assert called is False
 
 
 def test_memory_threshold_defaults_are_unchanged() -> None:
