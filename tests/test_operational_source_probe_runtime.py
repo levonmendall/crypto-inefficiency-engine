@@ -13,6 +13,7 @@ from inefficiency_engine.operational_source_probe_runtime import (
     _latest_catalog_provider_rows,
 )
 from inefficiency_engine.source_coverage import SourceCoveragePlane
+from inefficiency_engine.source_coverage_catalog import SOURCES
 
 
 def _quote(*, venue: str, observed_at: datetime, mid: float = 100.0) -> MarketQuote:
