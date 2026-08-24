@@ -107,7 +107,7 @@ def test_render_combined_service_uses_restored_command_center_with_v5_mechanism_
     assert runtime["type"] == "web"
     assert runtime["plan"] == "standard"
     assert runtime["startCommand"] == (
-        "PYTHONPATH=src python -m inefficiency_engine.render_combined_postbind"
+        "PYTHONPATH=src python -m inefficiency_engine.render_combined_postbind_lane_repair"
     )
 
     canonical = Path("src/inefficiency_engine/render_combined.py").read_text()
@@ -117,6 +117,13 @@ def test_render_combined_service_uses_restored_command_center_with_v5_mechanism_
     postbind = Path("src/inefficiency_engine/render_combined_postbind.py").read_text()
     assert "from inefficiency_engine import render_combined as base" in postbind
     assert "base._ORIGINAL_MAIN()" in postbind
+
+    repair_bootstrap = Path(
+        "src/inefficiency_engine/render_combined_postbind_lane_repair.py"
+    ).read_text()
+    assert "from inefficiency_engine import render_combined_postbind as base" in repair_bootstrap
+    assert 'commands["source"] = list(SOURCE_REPAIR_COMMAND)' in repair_bootstrap
+    assert "return base.main()" in repair_bootstrap
 
     deploy = Path("src/inefficiency_engine/read_api_card_history_deploy.py").read_text()
     assert "dashboard_cards_v5" in deploy
