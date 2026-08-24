@@ -51,10 +51,29 @@ def _cache_status() -> dict[str, object]:
     }
 
 
+def _cache_rebuilding_control_payload(cache: dict[str, object]) -> dict[str, object]:
+    """Return a normal fail-closed control result while exact outcome cache advances."""
+
+    return {
+        "canonical_control_plane_refresh": True,
+        "operating_reconciliation_complete": False,
+        "qualified_bridge_publication_complete": False,
+        "research_projection_publication_complete": False,
+        "historical_cache_complete": False,
+        "historical_cache_progress": cache,
+        "control_plane_errors": {
+            "historical_evidence_cache": "HistoricalEvidenceCacheRebuilding"
+        },
+        "control_stage_timings_seconds": {},
+        "control_plane_healthy": False,
+    }
+
+
 def run_one_control_cycle() -> dict[str, object]:
     """Run exactly one durable control cycle in this disposable process."""
 
     from inefficiency_engine.bounded_control_evidence_runtime import (
+        advance_bounded_control_outcome_caches,
         install_bounded_control_outcome_ledgers,
     )
     from inefficiency_engine.bounded_strategy_evidence_runtime import (
@@ -145,6 +164,39 @@ def run_one_control_cycle() -> dict[str, object]:
     operating_certification, qualified_bridge, research_projection = (
         _build_control_services(settings, store)
     )
+
+    # A disposable executor must never discover a cold historical-outcome bootstrap
+    # for the first time inside mechanism readiness. Advance exactly one bounded batch
+    # for each exact append-only outcome ledger at a named preflight boundary. If the
+    # durable cache is not yet exact, finish this cycle normally but fail closed before
+    # operating reconciliation. The next fresh executor resumes from the checkpoint.
+    stage_reporter("historical_outcome_cache_bootstrap")
+    outcome_cache = advance_bounded_control_outcome_caches(
+        mechanism_execution=operating_certification.mechanism_execution,
+        allocation_certification=operating_certification.allocation_certification,
+    )
+    last_progress = _cache_status()
+    if not bool(outcome_cache.get("all_caches_complete")):
+        write_stage("historical_outcome_cache_rebuilding", last_progress)
+        return {
+            "ok": True,
+            "stage": "control_executor_complete",
+            "control": _cache_rebuilding_control_payload(last_progress),
+            "alpha_durable_promotion": {
+                "provider_requests_used": 0,
+                "deferred_for_historical_outcome_cache": True,
+            },
+            "historical_cache_progress": last_progress,
+            "historical_cache_complete": False,
+            "database_identity": str(
+                getattr(store, "safe_database_url", "durable")
+            ),
+            "provider_requests_allowed": False,
+            "provider_requests_used": 0,
+            "paper_only": True,
+        }
+    write_stage("historical_outcome_cache_ready", last_progress)
+
     set_bridge_reporter = getattr(
         qualified_bridge,
         "set_control_stage_reporter",
