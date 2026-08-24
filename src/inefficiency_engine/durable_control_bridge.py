@@ -69,7 +69,27 @@ class DurableControlQualifiedOpportunityBridgePublisher(
     qualification remains owned by disposable research; this publisher carries a
     previously qualified CEX↔DEX candidate forward only while its own source evidence
     remains inside the unchanged candidate freshness window.
+
+    The external control supervisor owns the 25-second hard deadline. Expose exact
+    durable bridge substages to that supervisor before each potentially blocking
+    operation so a killed executor leaves behind the precise production boundary
+    instead of the coarse ``qualified_bridge_publication`` label. Reporting is
+    diagnostic only and never changes qualification, freshness, or allocation state.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._control_stage_reporter = None
+
+    def set_control_stage_reporter(self, reporter) -> None:
+        """Attach the one-shot executor's lightweight status reporter."""
+
+        self._control_stage_reporter = reporter
+
+    def _report_control_stage(self, stage: str) -> None:
+        reporter = getattr(self, "_control_stage_reporter", None)
+        if callable(reporter):
+            reporter(f"qualified_bridge:{stage}")
 
     def _current_persisted_cex_dex(
         self,
@@ -107,19 +127,24 @@ class DurableControlQualifiedOpportunityBridgePublisher(
         if total_capital_usd <= 0:
             raise ValueError("total_capital_usd must be positive")
 
+        self._report_control_stage("source_scan_selection")
         snapshot = self._latest_scan()
         if snapshot is None:
+            self._report_control_stage("source_scan_unavailable")
             return None
 
+        self._report_control_stage("source_freshness_gate")
         now = _now()
         candidate_freshness = _candidate_freshness_seconds(self.core.settings)
         source_age = max(0.0, (now - snapshot.completed_at).total_seconds())
         if source_age > candidate_freshness:
+            self._report_control_stage("source_scan_stale")
             return None
 
         rows: list[UnifiedPaperCandidate] = []
         failures: list[dict[str, object]] = []
 
+        self._report_control_stage("core_cex_projection")
         try:
             core_rows = _core_candidates(snapshot.opportunities, snapshot.executability)
             rows.extend(core_rows)
@@ -133,6 +158,7 @@ class DurableControlQualifiedOpportunityBridgePublisher(
                 }
             )
 
+        self._report_control_stage("persisted_cex_dex_projection")
         persisted_cex_dex, persisted_failures = self._current_persisted_cex_dex(
             now=now,
             max_age_seconds=candidate_freshness,
@@ -142,6 +168,7 @@ class DurableControlQualifiedOpportunityBridgePublisher(
 
         alpha_factory = self.allocator.alpha_factory
         if alpha_factory is not None:
+            self._report_control_stage("alpha_promotion")
             try:
                 rows.extend(
                     await self.allocator._alpha_family_candidates(
@@ -180,6 +207,7 @@ class DurableControlQualifiedOpportunityBridgePublisher(
                     }
                 )
 
+        self._report_control_stage("canonical_settlement_filter")
         deployable = [
             item
             for item in rows
@@ -202,5 +230,7 @@ class DurableControlQualifiedOpportunityBridgePublisher(
             candidates=deployable,
             family_failures=failures,
         )
+        self._report_control_stage("ledger_record")
         self.ledger.record(result)
+        self._report_control_stage("complete")
         return result

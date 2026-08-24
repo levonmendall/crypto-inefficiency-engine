@@ -87,9 +87,9 @@ def run_one_control_cycle() -> dict[str, object]:
         float(os.getenv("CIE_CONTROL_CYCLE_DEADLINE_SECONDS", "25.0")),
     )
     started = time.monotonic()
+    last_progress: dict[str, object] = {}
 
-    def stage_reporter(stage: str) -> None:
-        progress = _cache_status()
+    def write_stage(stage: str, progress: dict[str, object]) -> None:
         _atomic_json(
             status_path,
             {
@@ -100,12 +100,23 @@ def run_one_control_cycle() -> dict[str, object]:
                 "observed_at": datetime.now(timezone.utc).isoformat(),
                 "executor_age_seconds": max(0.0, time.monotonic() - started),
                 "historical_cache_progress": progress,
-                "historical_cache_complete": bool(progress["complete"]),
+                "historical_cache_complete": bool(progress.get("complete")),
                 "provider_requests_allowed": False,
                 "provider_requests_used": 0,
                 "paper_only": True,
             },
         )
+
+    def stage_reporter(stage: str) -> None:
+        nonlocal last_progress
+        last_progress = _cache_status()
+        write_stage(stage, last_progress)
+
+    def bridge_stage_reporter(stage: str) -> None:
+        # Exact bridge telemetry must not itself consume the remaining control budget.
+        # Reuse the most recently computed cache status instead of querying durable
+        # cache tables at every diagnostic substage.
+        write_stage(stage, last_progress)
 
     stage_reporter("control_executor_starting")
     install_source_coverage_reconciliation_runtime()
@@ -134,6 +145,13 @@ def run_one_control_cycle() -> dict[str, object]:
     operating_certification, qualified_bridge, research_projection = (
         _build_control_services(settings, store)
     )
+    set_bridge_reporter = getattr(
+        qualified_bridge,
+        "set_control_stage_reporter",
+        None,
+    )
+    if callable(set_bridge_reporter):
+        set_bridge_reporter(bridge_stage_reporter)
     control = asyncio.run(
         refresh_canonical_control_plane(
             store=store,
