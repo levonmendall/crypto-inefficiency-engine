@@ -169,9 +169,30 @@ def run_one_control_cycle() -> dict[str, object]:
 
 
 def main() -> int:
+    from inefficiency_engine.disposable_executor_memory_guard import (
+        MEMORY_PRESSURE_EXIT_CODE,
+        DisposableMemoryAdmissionDeferred,
+        disposable_executor_memory_guard,
+    )
+
     result_path = Path(os.environ["CIE_CONTROL_EXECUTOR_RESULT_PATH"])
     try:
-        payload = run_one_control_cycle()
+        with disposable_executor_memory_guard("canonical-control-executor"):
+            payload = run_one_control_cycle()
+    except DisposableMemoryAdmissionDeferred as exc:
+        payload = {
+            "ok": False,
+            "stage": "control_executor_memory_admission",
+            "error_type": "ControlExecutorMemoryAdmissionDeferred",
+            "message": str(exc)[:500],
+            "memory": exc.snapshot.as_dict(),
+            "provider_requests_allowed": False,
+            "provider_requests_used": 0,
+            "qualification_thresholds_unchanged": True,
+            "paper_only": True,
+        }
+        _atomic_json(result_path, payload)
+        return MEMORY_PRESSURE_EXIT_CODE
     except BaseException as exc:
         status_path = Path(os.environ["CIE_CONTROL_EXECUTOR_STATUS_PATH"])
         status = {}
