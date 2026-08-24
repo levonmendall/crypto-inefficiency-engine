@@ -2,19 +2,27 @@ from __future__ import annotations
 
 from inefficiency_engine import permanent_source_plane
 from inefficiency_engine import render_combined_postbind_lane_repair as render_repair
+from inefficiency_engine.provider_gap_resilience import ResilientProviderGapCollectionService
 from inefficiency_engine.permanent_source_worker_lane_repair import (
+    _collect_hyperliquid_distress_with_retries,
     install_remaining_source_lane_repairs,
 )
 from inefficiency_engine.source_lane_repair_runtime import RemainingSourceLaneRepairService
 
 
-def test_source_worker_installs_repaired_priority_service(monkeypatch):
-    original = permanent_source_plane.PrioritySourceCollectionService
+def test_source_worker_installs_repaired_priority_and_distress_services(monkeypatch):
+    original_priority = permanent_source_plane.PrioritySourceCollectionService
+    original_distress = ResilientProviderGapCollectionService._collect_hyperliquid_distress_surface
     try:
         install_remaining_source_lane_repairs()
         assert permanent_source_plane.PrioritySourceCollectionService is RemainingSourceLaneRepairService
+        assert (
+            ResilientProviderGapCollectionService._collect_hyperliquid_distress_surface
+            is _collect_hyperliquid_distress_with_retries
+        )
     finally:
-        permanent_source_plane.PrioritySourceCollectionService = original
+        permanent_source_plane.PrioritySourceCollectionService = original_priority
+        ResilientProviderGapCollectionService._collect_hyperliquid_distress_surface = original_distress
 
 
 def test_render_child_command_routes_only_source_through_repair(monkeypatch):
