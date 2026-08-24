@@ -22,8 +22,9 @@ def test_render_blueprint_defines_single_paid_combined_runtime():
     assert "render_combined_runtime" in canonical
 
     postbind = Path("src/inefficiency_engine/render_combined_postbind.py").read_text()
-    assert "API bound; starting deferred source-coverage runtime index maintenance" in postbind
-    assert "canonical control waiting for deferred runtime indexes" in postbind
+    assert "API bound; starting deferred runtime index maintenance" in postbind
+    assert "canonical control waiting for required source runtime indexes" in postbind
+    assert "control-gate indexes ready; starting canonical control supervision" in postbind
 
     # Keep the former Blueprint command as a compatibility alias so an existing
     # Render service cannot fall back to the old dashboard application while its
