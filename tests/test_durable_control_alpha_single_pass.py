@@ -7,6 +7,9 @@ from pydantic import BaseModel
 
 from inefficiency_engine.disposable_alpha_factory import DisposableExpandedAlphaFactoryService
 from inefficiency_engine.durable_control_alpha import DurableControlAlphaFactoryService
+from inefficiency_engine.durable_control_bridge import (
+    DurableControlQualifiedOpportunityBridgePublisher,
+)
 
 
 class _Candidate(BaseModel):
@@ -137,3 +140,23 @@ def test_control_alpha_cache_key_changes_across_source_snapshot_boundary(monkeyp
     assert calls["count"] == 2
     assert first[0].value == 1
     assert second[0].value == 2
+
+
+def test_bridge_routes_alpha_substages_into_exact_control_stage_telemetry():
+    observed: list[str] = []
+    installed = {}
+
+    class AlphaFactory:
+        def set_control_stage_reporter(self, reporter):
+            installed["reporter"] = reporter
+
+    bridge = object.__new__(DurableControlQualifiedOpportunityBridgePublisher)
+    bridge.allocator = SimpleNamespace(alpha_factory=AlphaFactory())
+    bridge._control_stage_reporter = None
+    bridge.set_control_stage_reporter(observed.append)
+
+    installed["reporter"]("qualification_compute")
+
+    assert observed == [
+        "qualified_bridge:alpha_promotion:qualification_compute"
+    ]
