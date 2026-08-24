@@ -89,7 +89,7 @@ def cycle_history_bucket_database_timeout(store: Any) -> Iterator[None]:
 # The patch is process-local: permanent source/API workers and disposable research keep
 # their existing implementations and authorities.
 from inefficiency_engine import durable_control_cycle_history as _legacy_cycle_history
-from inefficiency_engine.durable_control_cycle_history_target_runtime import (
+from inefficiency_engine.durable_control_cycle_history_target_bridge_runtime import (
     advance_durable_control_cycle_history_cache as _advance_frozen_cycle_history,
     load_durable_control_cycle_history as _load_frozen_cycle_history,
 )
