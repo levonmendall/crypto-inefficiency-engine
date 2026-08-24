@@ -19,6 +19,7 @@ from inefficiency_engine.runtime_index_maintenance import (
 
 RUNTIME_INDEX_WORKER_ID = "source-coverage-runtime-index-maintenance"
 INDEX_RETRY_SECONDS = 30.0
+BACKGROUND_INDEX_RETRY_SECONDS = 300.0
 API_BIND_POLL_SECONDS = 2.0
 API_BIND_READ_TIMEOUT_SECONDS = 2.0
 
@@ -111,44 +112,22 @@ def _first_failure_type(result: dict[str, object]) -> str:
     return "RuntimeIndexMaintenanceFailed"
 
 
-def _merge_required_index_results(
-    source_result: dict[str, object],
-    cycle_history_result: dict[str, object],
-) -> dict[str, object]:
-    """Preserve observability for both required post-bind index scopes."""
-
-    def rows(result: dict[str, object], key: str) -> list[object]:
-        value = result.get(key)
-        return list(value) if isinstance(value, list) else []
-
-    return {
-        "complete": bool(source_result.get("complete"))
-        and bool(cycle_history_result.get("complete")),
-        "dialect": cycle_history_result.get("dialect") or source_result.get("dialect"),
-        "attempted": rows(source_result, "attempted")
-        + rows(cycle_history_result, "attempted"),
-        "failures": rows(source_result, "failures")
-        + rows(cycle_history_result, "failures"),
-        "skipped": rows(source_result, "skipped")
-        + rows(cycle_history_result, "skipped"),
-        "requested_tables": rows(source_result, "requested_tables")
-        + rows(cycle_history_result, "requested_tables"),
-        "startup_critical_path": False,
-        "api_bound_before_maintenance": True,
-        "cycle_history_bucket_index_required": True,
-    }
-
-
 def _runtime_index_guard(
     stop_event: threading.Event,
     indexes_ready: threading.Event,
 ) -> None:
-    """Release control after required source/history indexes, then optimize.
+    """Release control after the exact cycle-history index, then optimize.
 
-    Source-coverage indexes and the exact cycle-history bucket access path are allowed
-    to gate canonical control because both are required to keep bounded fail-closed
-    reads inside the control deadline. Strategy-evidence indexes improve incremental
-    readers but remain background optimizations after the control gate is released.
+    The purpose-built cycle-history bucket index remains a hard prerequisite because
+    canonical control has already demonstrated that exact historical read can exceed its
+    bounded statement budget without the planner-usable access path.
+
+    The broader source-read indexes are performance optimizations rather than authority
+    prerequisites. Source coverage already has its own bounded executor, durable
+    publication, freshness contract, and fail-closed handoff. Production telemetry also
+    proves those reads are completing inside their executor deadline while two of these
+    optional DDL operations are blocked. Keep maintaining them after control starts, but
+    never let a lock- or statement-timeout on optional DDL suppress canonical control.
     """
 
     port = os.getenv("PORT", "10000")
@@ -176,38 +155,22 @@ def _runtime_index_guard(
             state="running",
             detail={
                 "attempt": gate_attempt,
-                "stage": "building_control_gate_indexes",
-                "scope": "control_gate",
+                "stage": "building_cycle_history_control_gate_index",
+                "scope": "cycle_history_control_gate",
                 "control_gate_released": False,
                 "background_indexes_complete": False,
             },
         )
-        source_result = ensure_runtime_indexes_after_api_bind(
+        result = ensure_runtime_indexes_after_api_bind(
             store,
-            index_specs=CONTROL_GATE_INDEX_SPECS,
+            index_specs=CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
             progress=_progress_callback(
                 store,
                 attempt=gate_attempt,
-                scope="control_gate",
+                scope="cycle_history_control_gate",
                 control_gate_released=False,
             ),
         )
-        result = source_result
-        if bool(source_result.get("complete")):
-            cycle_history_result = ensure_runtime_indexes_after_api_bind(
-                store,
-                index_specs=CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
-                progress=_progress_callback(
-                    store,
-                    attempt=gate_attempt,
-                    scope="cycle_history_control_gate",
-                    control_gate_released=False,
-                ),
-            )
-            result = _merge_required_index_results(
-                source_result,
-                cycle_history_result,
-            )
 
         elapsed = max(0.0, time.monotonic() - started)
         if bool(result.get("complete")):
@@ -218,7 +181,7 @@ def _runtime_index_guard(
                 detail={
                     "attempt": gate_attempt,
                     "stage": "control_gate_indexes_ready",
-                    "scope": "control_gate",
+                    "scope": "cycle_history_control_gate",
                     "runtime_seconds": elapsed,
                     "result": result,
                     "control_gate_released": True,
@@ -226,7 +189,7 @@ def _runtime_index_guard(
                 },
             )
             print(
-                f"control-gate runtime indexes ready in {elapsed:.2f}s; releasing canonical control",
+                f"cycle-history control-gate index ready in {elapsed:.2f}s; releasing canonical control",
                 flush=True,
             )
             break
@@ -238,7 +201,7 @@ def _runtime_index_guard(
             detail={
                 "attempt": gate_attempt,
                 "stage": "control_gate_index_retry_pending",
-                "scope": "control_gate",
+                "scope": "cycle_history_control_gate",
                 "runtime_seconds": elapsed,
                 "result": result,
                 "retry_seconds": INDEX_RETRY_SECONDS,
@@ -251,6 +214,13 @@ def _runtime_index_guard(
     if stop_event.is_set() or not indexes_ready.is_set():
         return
 
+    # Preserve all previously requested source/read and strategy optimization indexes,
+    # but maintain them only after canonical control has been released. Their failures
+    # remain visible and retryable without becoming investment-authority prerequisites.
+    post_control_index_specs = {
+        **CONTROL_GATE_INDEX_SPECS,
+        **BACKGROUND_INDEX_SPECS,
+    }
     background_attempt = 0
     while not stop_event.is_set():
         background_attempt += 1
@@ -260,19 +230,19 @@ def _runtime_index_guard(
             state="running",
             detail={
                 "attempt": background_attempt,
-                "stage": "building_background_strategy_indexes",
-                "scope": "background_strategy",
+                "stage": "building_post_control_indexes",
+                "scope": "post_control_background",
                 "control_gate_released": True,
                 "background_indexes_complete": False,
             },
         )
         result = ensure_runtime_indexes_after_api_bind(
             store,
-            index_specs=BACKGROUND_INDEX_SPECS,
+            index_specs=post_control_index_specs,
             progress=_progress_callback(
                 store,
                 attempt=background_attempt,
-                scope="background_strategy",
+                scope="post_control_background",
                 control_gate_released=True,
             ),
         )
@@ -284,7 +254,7 @@ def _runtime_index_guard(
                 detail={
                     "attempt": background_attempt,
                     "stage": "runtime_indexes_ready",
-                    "scope": "background_strategy",
+                    "scope": "post_control_background",
                     "runtime_seconds": elapsed,
                     "result": result,
                     "control_gate_released": True,
@@ -292,7 +262,7 @@ def _runtime_index_guard(
                 },
             )
             print(
-                f"background strategy runtime indexes ready in {elapsed:.2f}s",
+                f"post-control runtime indexes ready in {elapsed:.2f}s",
                 flush=True,
             )
             return
@@ -303,16 +273,16 @@ def _runtime_index_guard(
             error_type=_first_failure_type(result),
             detail={
                 "attempt": background_attempt,
-                "stage": "background_strategy_index_retry_pending",
-                "scope": "background_strategy",
+                "stage": "background_index_retry_pending",
+                "scope": "post_control_background",
                 "runtime_seconds": elapsed,
                 "result": result,
-                "retry_seconds": INDEX_RETRY_SECONDS,
+                "retry_seconds": BACKGROUND_INDEX_RETRY_SECONDS,
                 "control_gate_released": True,
                 "background_indexes_complete": False,
             },
         )
-        stop_event.wait(INDEX_RETRY_SECONDS)
+        stop_event.wait(BACKGROUND_INDEX_RETRY_SECONDS)
 
 
 def _control_guard_after_indexes(
@@ -320,12 +290,12 @@ def _control_guard_after_indexes(
     indexes_ready: threading.Event,
 ) -> None:
     print(
-        "canonical control waiting for required source runtime indexes and cycle-history bucket index",
+        "canonical control waiting for exact cycle-history bucket index",
         flush=True,
     )
     while not stop_event.is_set():
         if indexes_ready.wait(1.0):
-            print("control-gate indexes ready; starting canonical control supervision", flush=True)
+            print("control-gate index ready; starting canonical control supervision", flush=True)
             base._control_plane_guard(stop_event)
             return
 
