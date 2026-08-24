@@ -21,6 +21,14 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
     the candidate closed instead of turning the control process into an exchange
     client.
 
+    Canonical promotion traverses the inherited full-promotion and probationary paths.
+    Both paths may ask for the same discovery, qualification, and strategy-health
+    result for the same immutable source snapshot. Recompute none of that durable
+    evidence twice inside the one-shot control executor: cache the exact first result
+    and return deep copies on later passes so downstream mutation cannot contaminate
+    the cached baseline. The cache is reset for every ``promoted_candidates`` call and
+    therefore never crosses a source-snapshot boundary.
+
     The control bridge also only needs short-history rows for venue/assets present in
     its current persisted source snapshot. Filter that exact cohort in SQL and cache it
     for the lifetime of the one-shot control executor. This preserves the same
@@ -41,6 +49,107 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
         ] = {}
         self._durable_history_cache_hits = 0
         self._durable_history_query_count = 0
+        self._durable_stage_reporter = None
+        self._reset_snapshot_promotion_cache()
+
+    @staticmethod
+    def _copy_model(value):
+        copier = getattr(value, "model_copy", None)
+        return copier(deep=True) if callable(copier) else value
+
+    @classmethod
+    def _copy_candidates(cls, rows):
+        return [cls._copy_model(row) for row in rows]
+
+    @staticmethod
+    def _snapshot_cache_key(snapshot, total_capital_usd: float) -> tuple[object, ...]:
+        return (
+            str(snapshot.scan_id),
+            snapshot.completed_at.isoformat(),
+            float(total_capital_usd),
+        )
+
+    @staticmethod
+    def _candidate_cache_key(candidate) -> tuple[object, ...]:
+        market_kind = getattr(candidate, "market_kind", None)
+        market_kind = getattr(market_kind, "value", market_kind)
+        return (
+            str(getattr(candidate, "strategy_id", "")),
+            str(getattr(candidate, "family", "")),
+            str(getattr(candidate, "asset", "")).upper(),
+            str(getattr(candidate, "direction", "")),
+            str(getattr(candidate, "venue", "")),
+            str(market_kind or ""),
+            str(getattr(candidate, "symbol", "")),
+        )
+
+    def _reset_snapshot_promotion_cache(self) -> None:
+        self._durable_discovery_cache_key = None
+        self._durable_discovery_cache = []
+        self._durable_qualification_cache = {}
+        self._durable_strategy_health_cache = {}
+        self._durable_discovery_compute_count = 0
+        self._durable_discovery_cache_hits = 0
+        self._durable_qualification_compute_count = 0
+        self._durable_qualification_cache_hits = 0
+        self._durable_strategy_health_compute_count = 0
+        self._durable_strategy_health_cache_hits = 0
+
+    def set_control_stage_reporter(self, reporter) -> None:
+        self._durable_stage_reporter = reporter
+
+    def _report_control_stage(self, stage: str) -> None:
+        reporter = getattr(self, "_durable_stage_reporter", None)
+        if callable(reporter):
+            reporter(stage)
+
+    def discover(self, snapshot, *, total_capital_usd: float):
+        """Compute one exact discovery projection per source snapshot and capital input."""
+
+        cache_key = self._snapshot_cache_key(snapshot, total_capital_usd)
+        if self._durable_discovery_cache_key == cache_key:
+            self._durable_discovery_cache_hits += 1
+            self._report_control_stage("discovery_cache_reuse")
+            return self._copy_candidates(self._durable_discovery_cache)
+
+        self._report_control_stage("discovery_compute")
+        rows = super().discover(snapshot, total_capital_usd=total_capital_usd)
+        self._durable_discovery_compute_count += 1
+        self._durable_discovery_cache_key = cache_key
+        self._durable_discovery_cache = self._copy_candidates(rows)
+        return self._copy_candidates(self._durable_discovery_cache)
+
+    def qualification(self, candidate):
+        """Reuse the unchanged forward-statistics decision within this snapshot."""
+
+        cache_key = self._candidate_cache_key(candidate)
+        cached = self._durable_qualification_cache.get(cache_key)
+        if cached is not None:
+            self._durable_qualification_cache_hits += 1
+            self._report_control_stage("qualification_cache_reuse")
+            return self._copy_model(cached)
+
+        self._report_control_stage("qualification_compute")
+        result = super().qualification(candidate)
+        self._durable_qualification_compute_count += 1
+        self._durable_qualification_cache[cache_key] = self._copy_model(result)
+        return self._copy_model(result)
+
+    def strategy_health(self, candidate):
+        """Reuse the unchanged health decision for repeated promotion passes."""
+
+        cache_key = self._candidate_cache_key(candidate)
+        cached = self._durable_strategy_health_cache.get(cache_key)
+        if cached is not None:
+            self._durable_strategy_health_cache_hits += 1
+            self._report_control_stage("strategy_health_cache_reuse")
+            return self._copy_model(cached)
+
+        self._report_control_stage("strategy_health_compute")
+        result = super().strategy_health(candidate)
+        self._durable_strategy_health_compute_count += 1
+        self._durable_strategy_health_cache[cache_key] = self._copy_model(result)
+        return self._copy_model(result)
 
     def _history_for_snapshot(self, snapshot):
         """Read the unchanged short history only for the current source cohort."""
@@ -128,6 +237,8 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
         self._durable_history_cache = {}
         self._durable_history_cache_hits = 0
         self._durable_history_query_count = 0
+        self._reset_snapshot_promotion_cache()
+        self._report_control_stage("promotion_start")
         rows = await super().promoted_candidates(
             snapshot,
             total_capital_usd=total_capital_usd,
@@ -140,6 +251,7 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
                     "provider_requests_used_for_promotion": False,
                 }
             )
+        self._report_control_stage("promotion_complete")
         return rows
 
     def durable_promotion_diagnostics(self) -> dict[str, object]:
@@ -154,6 +266,26 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
                 getattr(self, "_durable_history_cache_hits", 0)
             ),
             "short_history_current_cohort_only": True,
+            "snapshot_discovery_compute_count": int(
+                getattr(self, "_durable_discovery_compute_count", 0)
+            ),
+            "snapshot_discovery_cache_hits": int(
+                getattr(self, "_durable_discovery_cache_hits", 0)
+            ),
+            "qualification_compute_count": int(
+                getattr(self, "_durable_qualification_compute_count", 0)
+            ),
+            "qualification_cache_hits": int(
+                getattr(self, "_durable_qualification_cache_hits", 0)
+            ),
+            "strategy_health_compute_count": int(
+                getattr(self, "_durable_strategy_health_compute_count", 0)
+            ),
+            "strategy_health_cache_hits": int(
+                getattr(self, "_durable_strategy_health_cache_hits", 0)
+            ),
+            "snapshot_scoped_single_pass_reuse": True,
+            "cached_results_returned_as_deep_copies": True,
             "missing_depth_policy": "fail_closed",
             "qualification_thresholds_unchanged": True,
             "allocation_authority": False,
