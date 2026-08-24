@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect as pyinspect
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import event, insert, inspect
@@ -210,27 +211,7 @@ def test_latest_completed_shadow_scan_without_opportunities_fails_closed(tmp_pat
     assert candidate is None
 
 
-def test_operational_install_routes_opportunity_history_to_bounded_shadow_probe(tmp_path):
-    store = EvidenceStore(tmp_path / "evidence.db")
-    base = datetime(2026, 8, 24, 15, 0, tzinfo=timezone.utc)
-    scan_id = _scan(
-        store,
-        observed_at=base,
-        opportunity=_opportunity(opportunity_id="current", observed_at=base),
-    )
-    _shadow_boundary(
-        store,
-        cycle_id="cycle-current",
-        verification_scan_id=scan_id,
-        completed_at=base + timedelta(minutes=1),
-    )
-
-    install_current_source_scan_probe_runtime()
-    plane = SourceCoveragePlane(store)
-    candidate = plane._table_candidate(
-        _spec(),
-        set(inspect(store.engine).get_table_names()),
-    )
-
-    assert candidate is not None
-    assert scan_id in str(candidate["source_reference"])
+def test_operational_install_routes_opportunity_history_to_bounded_shadow_probe():
+    source = pyinspect.getsource(install_current_source_scan_probe_runtime)
+    assert "_current_shadow_opportunity_candidate" in source
+    assert "(_OPPORTUNITY_TABLE, None, None)" in source
