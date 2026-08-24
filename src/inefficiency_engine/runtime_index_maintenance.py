@@ -15,16 +15,16 @@ CONTROL_GATE_INDEX_SPECS: dict[str, tuple[str, ...]] = {
     "provider_statuses": ("provider", "id"),
     "source_coverage_observations": ("source_id", "lane_id", "id"),
     "provider_gap_admissions": ("mechanism_id", "provider", "id"),
-    "maker_shadow_outcomes": ("observed_at",),
-    "capital_transfer_outcomes": ("observed_at",),
 }
 
-# These indexes improve the strategy-evidence initial aggregate/filter pass, but the
-# bounded loader and PostgreSQL statement timeout make them optimization indexes, not
-# a prerequisite for starting canonical control. Building them can legitimately take
-# minutes on a large append-only production ledger, so they must not hold the control
-# plane behind the deployment gate.
+# These indexes improve bounded read paths but are not prerequisites for starting
+# canonical control. In particular, the maker/transfer ledgers can exist in legacy
+# production databases with an older schema. Their absence or schema drift must stay
+# fail-closed for those individual evidence sources without freezing the whole control
+# plane behind optional index DDL.
 BACKGROUND_INDEX_SPECS: dict[str, tuple[str, ...]] = {
+    "maker_shadow_outcomes": ("observed_at",),
+    "capital_transfer_outcomes": ("observed_at",),
     "alpha_forward_events": ("event_type", "strategy_id", "family"),
     "allocation_forward_trials": ("strategy", "settlement_supported", "id"),
     "allocation_forward_outcomes": ("strategy", "id"),
@@ -69,29 +69,64 @@ def ensure_runtime_indexes_after_api_bind(
     Render from binding the API port. SQLite and test stores keep the ordinary
     idempotent ``CREATE INDEX IF NOT EXISTS`` form.
 
-    ``index_specs`` lets the supervisor separate indexes required for the source
-    coverage control gate from slower strategy-evidence optimization indexes. This
-    prevents a long background index build from suppressing canonical control while
-    preserving all bounded-read and fail-closed database deadlines.
+    The helper validates each table's actual deployed columns before issuing DDL.
+    Missing columns remain a hard failure for control-gate indexes, but background
+    optimization indexes are terminally skipped. This makes legacy auxiliary schema
+    drift observable without turning it into system-wide control unavailability.
     """
 
     requested = dict(index_specs or INDEX_SPECS)
-    available = set(inspect(store.engine).get_table_names())
+    inspector = inspect(store.engine)
+    available = set(inspector.get_table_names())
     dialect_name = str(getattr(store.engine.dialect, "name", ""))
     attempted: list[dict[str, object]] = []
     failures: list[dict[str, object]] = []
+    skipped: list[dict[str, object]] = []
 
     for table_name, columns in requested.items():
         if table_name not in available:
             continue
         index_name = _index_name(table_name, columns)
+        started = time.monotonic()
+        actual_columns = {
+            str(row.get("name"))
+            for row in inspector.get_columns(table_name)
+            if row.get("name") is not None
+        }
+        missing_columns = [column for column in columns if column not in actual_columns]
+        if missing_columns:
+            row = {
+                "index": index_name,
+                "table": table_name,
+                "runtime_seconds": max(0.0, time.monotonic() - started),
+                "concurrent": dialect_name == "postgresql",
+                "ok": False,
+                "error_type": "SchemaColumnMissing",
+                "message": (
+                    f"deployed table {table_name} is missing runtime-index columns: "
+                    + ",".join(missing_columns)
+                ),
+                "missing_columns": missing_columns,
+                "schema_compatible": False,
+            }
+            attempted.append(row)
+            if table_name in BACKGROUND_INDEX_SPECS:
+                skipped_row = {**row, "skipped": True, "optional": True}
+                skipped.append(skipped_row)
+                if progress is not None:
+                    progress({"phase": "skipped", **skipped_row})
+                continue
+            failures.append(row)
+            if progress is not None:
+                progress({"phase": "failed", **row})
+            continue
+
         statement = _create_index_sql(
             dialect_name=dialect_name,
             index_name=index_name,
             table_name=table_name,
             columns=columns,
         )
-        started = time.monotonic()
         if progress is not None:
             progress(
                 {
@@ -99,6 +134,7 @@ def ensure_runtime_indexes_after_api_bind(
                     "index": index_name,
                     "table": table_name,
                     "concurrent": dialect_name == "postgresql",
+                    "schema_compatible": True,
                 }
             )
         try:
@@ -116,6 +152,7 @@ def ensure_runtime_indexes_after_api_bind(
                 "runtime_seconds": max(0.0, time.monotonic() - started),
                 "concurrent": dialect_name == "postgresql",
                 "ok": True,
+                "schema_compatible": True,
             }
             attempted.append(row)
             if progress is not None:
@@ -129,6 +166,7 @@ def ensure_runtime_indexes_after_api_bind(
                 "ok": False,
                 "error_type": type(exc).__name__,
                 "message": str(exc)[:500],
+                "schema_compatible": True,
             }
             attempted.append(failure)
             failures.append(failure)
@@ -140,6 +178,7 @@ def ensure_runtime_indexes_after_api_bind(
         "dialect": dialect_name,
         "attempted": attempted,
         "failures": failures,
+        "skipped": skipped,
         "requested_tables": list(requested),
         "startup_critical_path": False,
         "api_bound_before_maintenance": True,
