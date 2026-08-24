@@ -116,18 +116,21 @@ def _stage_fields(heartbeat: WorkerHeartbeat | None) -> dict[str, object]:
             "age_seconds": None,
             "error_type": None,
             "message": None,
+            "timings_seconds": None,
         }
     detail = heartbeat.detail if isinstance(heartbeat.detail, dict) else {}
     observed_at = heartbeat.observed_at
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=timezone.utc)
     age_seconds = max(0.0, (datetime.now(timezone.utc) - observed_at).total_seconds())
+    timings = detail.get("stage_timings_seconds")
     return {
         "stage": detail.get("stage"),
         "observed_at": observed_at.isoformat(),
         "age_seconds": age_seconds,
         "error_type": heartbeat.error_type,
         "message": detail.get("message"),
+        "timings_seconds": dict(timings) if isinstance(timings, dict) else None,
     }
 
 
@@ -226,6 +229,7 @@ def install_runtime_index_health_observability(base: Any) -> None:
                     "executor_stage_age_seconds": current_stage["age_seconds"],
                     "executor_stage_error_type": current_stage["error_type"],
                     "executor_stage_error_message": current_stage["message"],
+                    "executor_stage_timings_seconds": current_stage["timings_seconds"],
                     "last_refresh_result": (
                         None
                         if terminal is None
@@ -253,6 +257,9 @@ def install_runtime_index_health_observability(base: Any) -> None:
                     ],
                     "last_refresh_executor_error_type": terminal_stage["error_type"],
                     "last_refresh_executor_error_message": terminal_stage["message"],
+                    "last_refresh_executor_stage_timings_seconds": terminal_stage[
+                        "timings_seconds"
+                    ],
                     "last_successful_publication_at": (
                         snapshot_heartbeat.observed_at.isoformat()
                         if snapshot_heartbeat is not None
@@ -316,6 +323,7 @@ def install_runtime_index_health_observability(base: Any) -> None:
         payload["source_coverage_refresh_observability"] = True
         payload["source_coverage_snapshot_observability"] = True
         payload["source_coverage_executor_stage_observability"] = True
+        payload["source_coverage_executor_timing_observability"] = True
         return payload
 
     base._runtime_heartbeats = runtime_heartbeats_with_index_gate  # type: ignore[attr-defined]  # noqa: SLF001
