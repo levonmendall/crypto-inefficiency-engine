@@ -3,6 +3,9 @@ from __future__ import annotations
 from inefficiency_engine import permanent_source_plane
 from inefficiency_engine import permanent_source_worker
 from inefficiency_engine import render_combined_postbind_lane_repair as render_repair
+from inefficiency_engine.production_source_recovery_runtime import (
+    collect_lido_provider_resilient,
+)
 from inefficiency_engine.provider_gap_resilience import ResilientProviderGapCollectionService
 from inefficiency_engine.permanent_source_worker_lane_repair import (
     _collect_hyperliquid_distress_with_retries,
@@ -14,6 +17,7 @@ from inefficiency_engine.source_lane_repair_runtime import RemainingSourceLaneRe
 def test_source_worker_installs_repaired_priority_and_distress_services(monkeypatch):
     original_priority = permanent_source_plane.PrioritySourceCollectionService
     original_distress = ResilientProviderGapCollectionService._collect_hyperliquid_distress_surface
+    original_lido = ResilientProviderGapCollectionService._collect_lido_yield_surface
     original_run = permanent_source_worker.run_permanent_source_worker
     marker = "_critical_source_cadence_installed"
     marker_present = hasattr(permanent_source_worker, marker)
@@ -26,10 +30,15 @@ def test_source_worker_installs_repaired_priority_and_distress_services(monkeypa
             ResilientProviderGapCollectionService._collect_hyperliquid_distress_surface
             is _collect_hyperliquid_distress_with_retries
         )
+        assert (
+            ResilientProviderGapCollectionService._collect_lido_yield_surface
+            is collect_lido_provider_resilient
+        )
         assert permanent_source_worker.run_permanent_source_worker is not original_run
     finally:
         permanent_source_plane.PrioritySourceCollectionService = original_priority
         ResilientProviderGapCollectionService._collect_hyperliquid_distress_surface = original_distress
+        ResilientProviderGapCollectionService._collect_lido_yield_surface = original_lido
         permanent_source_worker.run_permanent_source_worker = original_run
         if marker_present:
             setattr(permanent_source_worker, marker, marker_value)
