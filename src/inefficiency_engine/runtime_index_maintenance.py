@@ -46,6 +46,13 @@ INDEX_SPECS: dict[str, tuple[str, ...]] = {
 
 ProgressCallback = Callable[[dict[str, object]], None]
 
+# Runtime index maintenance is deliberately outside API startup, but required indexes
+# still gate canonical control. Bound PostgreSQL DDL at the database session so a
+# blocked concurrent build cannot freeze that gate indefinitely. A timed-out required
+# index stays fail-closed and is retried by the post-bind supervisor.
+POSTGRES_INDEX_STATEMENT_TIMEOUT_MS = 30_000
+POSTGRES_INDEX_LOCK_TIMEOUT_MS = 5_000
+
 
 class RuntimeIndexVerificationError(RuntimeError):
     """Raised when PostgreSQL cannot certify a required runtime index as usable."""
@@ -96,6 +103,13 @@ def _postgres_index_state(db: Any, *, index_name: str) -> dict[str, bool] | None
     }
 
 
+def _configure_postgres_index_deadlines(db: Any) -> None:
+    """Apply finite session deadlines before any runtime-index DDL is issued."""
+
+    db.execute(text(f"SET statement_timeout TO '{POSTGRES_INDEX_STATEMENT_TIMEOUT_MS}ms'"))
+    db.execute(text(f"SET lock_timeout TO '{POSTGRES_INDEX_LOCK_TIMEOUT_MS}ms'"))
+
+
 def _ensure_postgres_index(
     db: Any,
     *,
@@ -103,42 +117,53 @@ def _ensure_postgres_index(
     table_name: str,
     columns: tuple[str, ...],
 ) -> dict[str, object]:
-    """Create, verify, and self-heal one concurrent PostgreSQL runtime index.
+    """Verify first, then create or self-heal one PostgreSQL runtime index.
 
-    ``CREATE INDEX CONCURRENTLY`` can leave an invalid catalog entry after an
-    interrupted build. A later ``IF NOT EXISTS`` then succeeds without rebuilding it,
-    even though PostgreSQL cannot use that index for query planning. Required runtime
-    indexes therefore are not considered complete until ``pg_index`` reports both
-    ``indisvalid`` and ``indisready``. An invalid leftover is dropped/recreated
-    concurrently in autocommit mode and verified again before the control gate opens.
+    A planner-usable existing index is returned immediately without issuing DDL. This
+    matters on small production databases because even ``CREATE INDEX CONCURRENTLY IF
+    NOT EXISTS`` can wait behind another catalog/DDL operation before PostgreSQL reaches
+    its no-op decision.
+
+    Missing or invalid indexes are repaired under finite ``statement_timeout`` and
+    ``lock_timeout`` session settings. If PostgreSQL cancels a build, the exception is
+    surfaced to the outer maintenance loop, which records the failure and retries while
+    canonical control remains fail-closed. Interrupted concurrent builds are detected
+    through ``pg_index`` and dropped/rebuilt on the next bounded attempt.
     """
 
-    create_if_missing = _create_index_sql(
-        dialect_name="postgresql",
-        index_name=index_name,
-        table_name=table_name,
-        columns=columns,
-        if_not_exists=True,
-    )
-    db.execute(text(create_if_missing))
     state = _postgres_index_state(db, index_name=index_name)
-    repaired_invalid_index = False
+    if state is not None and bool(state["valid"] and state["ready"]):
+        return {
+            "postgres_index_valid": True,
+            "postgres_index_ready": True,
+            "repaired_invalid_index": False,
+            "existing_index_reused": True,
+            "ddl_required": False,
+        }
 
-    if state is not None and not bool(state["valid"] and state["ready"]):
+    _configure_postgres_index_deadlines(db)
+    repaired_invalid_index = state is not None
+
+    if repaired_invalid_index:
         db.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}"))
-        db.execute(
-            text(
-                _create_index_sql(
-                    dialect_name="postgresql",
-                    index_name=index_name,
-                    table_name=table_name,
-                    columns=columns,
-                    if_not_exists=False,
-                )
-            )
+        create_statement = _create_index_sql(
+            dialect_name="postgresql",
+            index_name=index_name,
+            table_name=table_name,
+            columns=columns,
+            if_not_exists=False,
         )
-        repaired_invalid_index = True
-        state = _postgres_index_state(db, index_name=index_name)
+    else:
+        create_statement = _create_index_sql(
+            dialect_name="postgresql",
+            index_name=index_name,
+            table_name=table_name,
+            columns=columns,
+            if_not_exists=True,
+        )
+
+    db.execute(text(create_statement))
+    state = _postgres_index_state(db, index_name=index_name)
 
     if state is None:
         raise RuntimeIndexVerificationError(
@@ -153,6 +178,10 @@ def _ensure_postgres_index(
         "postgres_index_valid": True,
         "postgres_index_ready": True,
         "repaired_invalid_index": repaired_invalid_index,
+        "existing_index_reused": False,
+        "ddl_required": True,
+        "postgres_statement_timeout_ms": POSTGRES_INDEX_STATEMENT_TIMEOUT_MS,
+        "postgres_lock_timeout_ms": POSTGRES_INDEX_LOCK_TIMEOUT_MS,
     }
 
 
@@ -169,7 +198,9 @@ def ensure_runtime_indexes_after_api_bind(
     Render from binding the API port. PostgreSQL index existence alone is insufficient:
     every maintained index is verified as planner-usable through ``pg_index`` and any
     invalid leftover from an interrupted concurrent build is rebuilt before success is
-    reported. SQLite and test stores keep ordinary idempotent index creation.
+    reported. Existing valid indexes are reused without DDL, and all required DDL is
+    database-time-bounded so maintenance cannot block the control gate indefinitely.
+    SQLite and test stores keep ordinary idempotent index creation.
 
     The helper validates each table's actual deployed columns before issuing DDL.
     Missing columns remain a hard failure for control-gate indexes, but background
