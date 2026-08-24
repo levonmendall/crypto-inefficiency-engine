@@ -7,6 +7,8 @@ from urllib.request import urlopen
 
 from inefficiency_engine import render_combined as base
 from inefficiency_engine.runtime_index_maintenance import (
+    BACKGROUND_INDEX_SPECS,
+    CONTROL_GATE_INDEX_SPECS,
     ensure_runtime_indexes_after_api_bind,
 )
 
@@ -21,9 +23,7 @@ def bootstrap_permanent_runtime_schema() -> None:
     """Create shared tables before children without building large data indexes.
 
     PR #181 proved that serial table bootstrap is required to prevent concurrent
-    ``create_all`` collisions. PR #182 accidentally put multimillion-row index DDL
-    in the same pre-bind critical path. Keep table creation here, but defer read-path
-    indexes until the web API is already healthy.
+    ``create_all`` collisions. Large read-path indexes remain post-bind maintenance.
     """
 
     settings = base.Settings.from_env()
@@ -67,16 +67,56 @@ def _record_index_heartbeat(store, *, state: str, detail: dict[str, object], err
         pass
 
 
+def _progress_callback(
+    store,
+    *,
+    attempt: int,
+    scope: str,
+    control_gate_released: bool,
+):
+    def publish(row: dict[str, object]) -> None:
+        phase = str(row.get("phase") or "running")
+        state = "degraded" if phase == "failed" else "running"
+        _record_index_heartbeat(
+            store,
+            state=state,
+            error_type=str(row.get("error_type")) if row.get("error_type") else None,
+            detail={
+                "attempt": attempt,
+                "stage": f"runtime_index_{phase}",
+                "scope": scope,
+                "current_index": row.get("index"),
+                "current_table": row.get("table"),
+                "current_index_runtime_seconds": row.get("runtime_seconds"),
+                "current_index_ok": row.get("ok"),
+                "current_index_concurrent": row.get("concurrent"),
+                "message": row.get("message"),
+                "control_gate_released": control_gate_released,
+                "background_indexes_complete": False,
+            },
+        )
+
+    return publish
+
+
+def _first_failure_type(result: dict[str, object]) -> str:
+    failures = result.get("failures")
+    if isinstance(failures, list) and failures and isinstance(failures[0], dict):
+        return str(failures[0].get("error_type") or "RuntimeIndexMaintenanceFailed")
+    return "RuntimeIndexMaintenanceFailed"
+
+
 def _runtime_index_guard(
     stop_event: threading.Event,
     indexes_ready: threading.Event,
 ) -> None:
-    """Build expensive read indexes only after Render can reach the API.
+    """Release control after required source indexes, then maintain optimizations.
 
-    PostgreSQL index creation is concurrent and autocommitted by the maintenance
-    helper. Until the indexes are ready the control worker is intentionally held
-    back, preventing unindexed reconciliation from hammering production tables or
-    timing out repeatedly.
+    Source-coverage indexes are the only indexes allowed to gate canonical control.
+    Strategy-evidence indexes improve the bounded aggregate reader but are not needed
+    for correctness: canonical control already has bounded incremental reads and a
+    PostgreSQL statement timeout. They therefore build concurrently in the background
+    after the control gate is released instead of freezing operating reconciliation.
     """
 
     port = os.getenv("PORT", "10000")
@@ -85,7 +125,7 @@ def _runtime_index_guard(
     if stop_event.is_set():
         return
 
-    print("API bound; starting deferred source-coverage runtime index maintenance", flush=True)
+    print("API bound; starting deferred runtime index maintenance", flush=True)
     try:
         settings = base.Settings.from_env()
         store = base.build_evidence_store(settings.evidence_db_path)
@@ -95,63 +135,132 @@ def _runtime_index_guard(
         print(f"runtime index maintenance unavailable: {type(exc).__name__}: {exc}", flush=True)
         return
 
-    attempt = 0
-    while not stop_event.is_set():
-        attempt += 1
+    gate_attempt = 0
+    while not stop_event.is_set() and not indexes_ready.is_set():
+        gate_attempt += 1
         started = time.monotonic()
         _record_index_heartbeat(
             store,
             state="running",
-            detail={"attempt": attempt, "stage": "building_runtime_indexes"},
+            detail={
+                "attempt": gate_attempt,
+                "stage": "building_control_gate_indexes",
+                "scope": "control_gate",
+                "control_gate_released": False,
+                "background_indexes_complete": False,
+            },
         )
-        result = ensure_runtime_indexes_after_api_bind(store)
+        result = ensure_runtime_indexes_after_api_bind(
+            store,
+            index_specs=CONTROL_GATE_INDEX_SPECS,
+            progress=_progress_callback(
+                store,
+                attempt=gate_attempt,
+                scope="control_gate",
+                control_gate_released=False,
+            ),
+        )
         elapsed = max(0.0, time.monotonic() - started)
-        failures = result.get("failures")
-        failure_rows = failures if isinstance(failures, list) else []
-        print(
-            "runtime index maintenance attempt "
-            f"{attempt} complete={bool(result.get('complete'))} "
-            f"runtime_seconds={elapsed:.2f} failures={len(failure_rows)}",
-            flush=True,
-        )
-        for row in result.get("attempted", []):
-            if isinstance(row, dict):
-                print(
-                    "runtime index result "
-                    f"index={row.get('index')} ok={row.get('ok')} "
-                    f"concurrent={row.get('concurrent')} "
-                    f"runtime_seconds={float(row.get('runtime_seconds') or 0.0):.2f} "
-                    f"error_type={row.get('error_type')}",
-                    flush=True,
-                )
+        if bool(result.get("complete")):
+            indexes_ready.set()
+            _record_index_heartbeat(
+                store,
+                state="success",
+                detail={
+                    "attempt": gate_attempt,
+                    "stage": "control_gate_indexes_ready",
+                    "scope": "control_gate",
+                    "runtime_seconds": elapsed,
+                    "result": result,
+                    "control_gate_released": True,
+                    "background_indexes_complete": False,
+                },
+            )
+            print(
+                f"control-gate runtime indexes ready in {elapsed:.2f}s; releasing canonical control",
+                flush=True,
+            )
+            break
 
+        _record_index_heartbeat(
+            store,
+            state="degraded",
+            error_type=_first_failure_type(result),
+            detail={
+                "attempt": gate_attempt,
+                "stage": "control_gate_index_retry_pending",
+                "scope": "control_gate",
+                "runtime_seconds": elapsed,
+                "result": result,
+                "retry_seconds": INDEX_RETRY_SECONDS,
+                "control_gate_released": False,
+                "background_indexes_complete": False,
+            },
+        )
+        stop_event.wait(INDEX_RETRY_SECONDS)
+
+    if stop_event.is_set() or not indexes_ready.is_set():
+        return
+
+    background_attempt = 0
+    while not stop_event.is_set():
+        background_attempt += 1
+        started = time.monotonic()
+        _record_index_heartbeat(
+            store,
+            state="running",
+            detail={
+                "attempt": background_attempt,
+                "stage": "building_background_strategy_indexes",
+                "scope": "background_strategy",
+                "control_gate_released": True,
+                "background_indexes_complete": False,
+            },
+        )
+        result = ensure_runtime_indexes_after_api_bind(
+            store,
+            index_specs=BACKGROUND_INDEX_SPECS,
+            progress=_progress_callback(
+                store,
+                attempt=background_attempt,
+                scope="background_strategy",
+                control_gate_released=True,
+            ),
+        )
+        elapsed = max(0.0, time.monotonic() - started)
         if bool(result.get("complete")):
             _record_index_heartbeat(
                 store,
                 state="success",
                 detail={
-                    "attempt": attempt,
+                    "attempt": background_attempt,
                     "stage": "runtime_indexes_ready",
+                    "scope": "background_strategy",
                     "runtime_seconds": elapsed,
                     "result": result,
+                    "control_gate_released": True,
+                    "background_indexes_complete": True,
                 },
             )
-            indexes_ready.set()
+            print(
+                f"background strategy runtime indexes ready in {elapsed:.2f}s",
+                flush=True,
+            )
             return
 
-        error_type = None
-        if failure_rows and isinstance(failure_rows[0], dict):
-            error_type = str(failure_rows[0].get("error_type") or "RuntimeIndexMaintenanceFailed")
         _record_index_heartbeat(
             store,
             state="degraded",
-            error_type=error_type or "RuntimeIndexMaintenanceFailed",
+            error_type=_first_failure_type(result),
             detail={
-                "attempt": attempt,
-                "stage": "runtime_index_retry_pending",
+                "attempt": background_attempt,
+                "stage": "background_strategy_index_retry_pending",
+                "scope": "background_strategy",
                 "runtime_seconds": elapsed,
                 "result": result,
                 "retry_seconds": INDEX_RETRY_SECONDS,
+                "control_gate_released": True,
+                "background_indexes_complete": False,
             },
         )
         stop_event.wait(INDEX_RETRY_SECONDS)
@@ -161,10 +270,10 @@ def _control_guard_after_indexes(
     stop_event: threading.Event,
     indexes_ready: threading.Event,
 ) -> None:
-    print("canonical control waiting for deferred runtime indexes", flush=True)
+    print("canonical control waiting for required source runtime indexes", flush=True)
     while not stop_event.is_set():
         if indexes_ready.wait(1.0):
-            print("runtime indexes ready; starting canonical control supervision", flush=True)
+            print("control-gate indexes ready; starting canonical control supervision", flush=True)
             base._control_plane_guard(stop_event)
             return
 
