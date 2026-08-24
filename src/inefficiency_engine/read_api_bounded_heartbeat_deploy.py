@@ -3,6 +3,9 @@ from __future__ import annotations
 from inefficiency_engine.bounded_heartbeat_runtime import (
     install_bounded_evidence_heartbeat_read,
 )
+from inefficiency_engine.cycle_history_health_observability import (
+    install_cycle_history_health_observability,
+)
 
 
 # Install before importing the composed API so every health/readiness layer uses the
@@ -27,5 +30,6 @@ active._RUNTIME_STALE_AFTER_SECONDS.update(
         "research_projection": 600.0,
     }
 )
+install_cycle_history_health_observability(active)
 
 from inefficiency_engine.read_api_card_history_deploy import app  # noqa: E402,F401
