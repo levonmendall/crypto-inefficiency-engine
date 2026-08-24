@@ -25,7 +25,7 @@ def test_source_worker_installs_repaired_priority_and_distress_services(monkeypa
         ResilientProviderGapCollectionService._collect_hyperliquid_distress_surface = original_distress
 
 
-def test_render_child_command_routes_only_source_through_repair(monkeypatch):
+def test_render_child_command_preserves_source_repair_and_bounds_heartbeat_readers(monkeypatch):
     base = render_repair.base.base
     original = base._BASE_RUNTIME_CHILD_COMMANDS
     monkeypatch.delattr(base, "_remaining_source_lane_repair_installed", raising=False)
@@ -33,7 +33,8 @@ def test_render_child_command_routes_only_source_through_repair(monkeypatch):
         render_repair.install_source_repair_child_command()
         commands = base._BASE_RUNTIME_CHILD_COMMANDS(10000)
         assert commands["source"] == render_repair.SOURCE_REPAIR_COMMAND
-        assert commands["portfolio"][-1] == "inefficiency_engine.lightweight_portfolio_worker"
+        assert commands["portfolio"] == render_repair.PORTFOLIO_BOUNDED_HEARTBEAT_COMMAND
+        assert render_repair.BOUNDED_HEARTBEAT_API_APP in commands["api"]
         assert commands["api"][-1] == "10000"
     finally:
         base._BASE_RUNTIME_CHILD_COMMANDS = original
