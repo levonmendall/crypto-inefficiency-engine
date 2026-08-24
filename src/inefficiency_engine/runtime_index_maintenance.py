@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from sqlalchemy import inspect, text
 
 
-INDEX_SPECS: dict[str, tuple[str, ...]] = {
+CONTROL_GATE_INDEX_SPECS: dict[str, tuple[str, ...]] = {
     "market_quotes": ("venue", "observed_at"),
     "funding_quotes": ("venue", "observed_at"),
     "order_books": ("venue", "observed_at"),
@@ -16,13 +17,25 @@ INDEX_SPECS: dict[str, tuple[str, ...]] = {
     "provider_gap_admissions": ("mechanism_id", "provider", "id"),
     "maker_shadow_outcomes": ("observed_at",),
     "capital_transfer_outcomes": ("observed_at",),
-    # Canonical operating reconciliation consumes append-only strategy evidence.
-    # These indexes keep the initial aggregate/filter pass bounded while subsequent
-    # cycles read only rows newer than the durable primary-key tails.
+}
+
+# These indexes improve the strategy-evidence initial aggregate/filter pass, but the
+# bounded loader and PostgreSQL statement timeout make them optimization indexes, not
+# a prerequisite for starting canonical control. Building them can legitimately take
+# minutes on a large append-only production ledger, so they must not hold the control
+# plane behind the deployment gate.
+BACKGROUND_INDEX_SPECS: dict[str, tuple[str, ...]] = {
     "alpha_forward_events": ("event_type", "strategy_id", "family"),
     "allocation_forward_trials": ("strategy", "settlement_supported", "id"),
     "allocation_forward_outcomes": ("strategy", "id"),
 }
+
+INDEX_SPECS: dict[str, tuple[str, ...]] = {
+    **CONTROL_GATE_INDEX_SPECS,
+    **BACKGROUND_INDEX_SPECS,
+}
+
+ProgressCallback = Callable[[dict[str, object]], None]
 
 
 def _index_name(table_name: str, columns: tuple[str, ...]) -> str:
@@ -43,7 +56,12 @@ def _create_index_sql(
     )
 
 
-def ensure_runtime_indexes_after_api_bind(store: Any) -> dict[str, object]:
+def ensure_runtime_indexes_after_api_bind(
+    store: Any,
+    *,
+    index_specs: Mapping[str, tuple[str, ...]] | None = None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, object]:
     """Create bounded-read indexes outside the web-service startup critical path.
 
     Production PostgreSQL uses ``CREATE INDEX CONCURRENTLY`` in autocommit mode so
@@ -51,17 +69,19 @@ def ensure_runtime_indexes_after_api_bind(store: Any) -> dict[str, object]:
     Render from binding the API port. SQLite and test stores keep the ordinary
     idempotent ``CREATE INDEX IF NOT EXISTS`` form.
 
-    The caller is expected to run this from a background maintenance thread after
-    the API is already healthy. Failures are returned per index so the supervisor can
-    retry without taking the service offline.
+    ``index_specs`` lets the supervisor separate indexes required for the source
+    coverage control gate from slower strategy-evidence optimization indexes. This
+    prevents a long background index build from suppressing canonical control while
+    preserving all bounded-read and fail-closed database deadlines.
     """
 
+    requested = dict(index_specs or INDEX_SPECS)
     available = set(inspect(store.engine).get_table_names())
     dialect_name = str(getattr(store.engine.dialect, "name", ""))
     attempted: list[dict[str, object]] = []
     failures: list[dict[str, object]] = []
 
-    for table_name, columns in INDEX_SPECS.items():
+    for table_name, columns in requested.items():
         if table_name not in available:
             continue
         index_name = _index_name(table_name, columns)
@@ -72,6 +92,15 @@ def ensure_runtime_indexes_after_api_bind(store: Any) -> dict[str, object]:
             columns=columns,
         )
         started = time.monotonic()
+        if progress is not None:
+            progress(
+                {
+                    "phase": "starting",
+                    "index": index_name,
+                    "table": table_name,
+                    "concurrent": dialect_name == "postgresql",
+                }
+            )
         try:
             if dialect_name == "postgresql":
                 with store.engine.connect().execution_options(
@@ -81,15 +110,16 @@ def ensure_runtime_indexes_after_api_bind(store: Any) -> dict[str, object]:
             else:
                 with store.engine.begin() as db:
                     db.execute(text(statement))
-            attempted.append(
-                {
-                    "index": index_name,
-                    "table": table_name,
-                    "runtime_seconds": max(0.0, time.monotonic() - started),
-                    "concurrent": dialect_name == "postgresql",
-                    "ok": True,
-                }
-            )
+            row = {
+                "index": index_name,
+                "table": table_name,
+                "runtime_seconds": max(0.0, time.monotonic() - started),
+                "concurrent": dialect_name == "postgresql",
+                "ok": True,
+            }
+            attempted.append(row)
+            if progress is not None:
+                progress({"phase": "complete", **row})
         except Exception as exc:
             failure = {
                 "index": index_name,
@@ -102,12 +132,15 @@ def ensure_runtime_indexes_after_api_bind(store: Any) -> dict[str, object]:
             }
             attempted.append(failure)
             failures.append(failure)
+            if progress is not None:
+                progress({"phase": "failed", **failure})
 
     return {
         "complete": not failures,
         "dialect": dialect_name,
         "attempted": attempted,
         "failures": failures,
+        "requested_tables": list(requested),
         "startup_critical_path": False,
         "api_bound_before_maintenance": True,
     }
