@@ -47,6 +47,17 @@ from inefficiency_engine.source_coverage import SourceCoverageObservation, Sourc
 SOURCE_REFRESH_WORKER_ID = "priority-source-refresh-plane"
 ALPHA_L2_WORKER_ID = "alpha-l2-research-sampling"
 L2_SOURCE_RECOVERY_STALE_SECONDS = 180.0
+BASE_PROVIDER_REFRESH_TTL_SECONDS = 120.0
+# These are already-supported authoritative partner surfaces for the five
+# provider-gap families. They are collection priorities only; they do not alter
+# source sufficiency, qualification, economic, risk, settlement, or allocation gates.
+CRITICAL_REDUNDANCY_SOURCES_BY_LANE: dict[str, tuple[str, ...]] = {
+    "liquidation_distress": ("aave-liquidations",),
+    "event_driven": ("snapshot-governance",),
+    "yield": ("morpho-markets",),
+    "volatility": ("okx-options", "deribit-option-capacity"),
+    "fundamental_onchain": ("morpho-markets",),
+}
 # Collection TTLs remain deliberately faster than the source-coverage validity
 # windows. They control refresh effort, not qualification authority.
 SOURCE_REFRESH_TTL_SECONDS: dict[str, float] = {
@@ -153,6 +164,92 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                 return False
         return True
 
+    def _base_provider_candidates(self) -> dict[str, tuple[str, ...]]:
+        """Return only policy-permitted authoritative base-provider identities."""
+
+        if bybit_public_enabled():
+            event = (self.BYBIT_CATALOG_PROVIDER, self.COINBASE_CATALOG_PROVIDER)
+            distress = (
+                self.BYBIT_ADL_PROVIDER,
+                self.BYBIT_DISTRESS_PROVIDER,
+                self.HYPERLIQUID_DISTRESS_PROVIDER,
+            )
+        else:
+            event = (self.COINBASE_CATALOG_PROVIDER,)
+            distress = (self.HYPERLIQUID_DISTRESS_PROVIDER,)
+        return {
+            "fundamental_onchain": (self.ETHEREUM_PROVIDER,),
+            "event_driven": event,
+            "yield": (self.LIDO_PROVIDER,),
+            "volatility": (self.DERIBIT_PROVIDER,),
+            "liquidation_distress": distress,
+        }
+
+    def _fresh_base_provider_summary(self) -> dict[str, dict[str, object]] | None:
+        """Reuse a very recent admitted base provider instead of refetching all five.
+
+        This TTL is deliberately much shorter than every affected source-coverage
+        validity window. It reduces repeated network work in the source-refresh stage
+        but never extends evidence freshness or changes qualification authority.
+        """
+
+        latest_by_provider = getattr(self.admissions, "latest_by_provider", None)
+        if not callable(latest_by_provider):
+            return None
+        now = _now()
+        result: dict[str, dict[str, object]] = {}
+        for mechanism_id, allowed_providers in self._base_provider_candidates().items():
+            try:
+                rows = latest_by_provider(mechanism_id)
+            except Exception:
+                return None
+            candidates: list[tuple[datetime, str, object]] = []
+            for provider in allowed_providers:
+                row = rows.get(provider) if isinstance(rows, dict) else None
+                if row is None or not bool(getattr(row, "admitted", False)):
+                    continue
+                observed_at = getattr(row, "observed_at", None)
+                if not isinstance(observed_at, datetime):
+                    continue
+                if observed_at.tzinfo is None:
+                    observed_at = observed_at.replace(tzinfo=timezone.utc)
+                observed_at = observed_at.astimezone(timezone.utc)
+                age = max(0.0, (now - observed_at).total_seconds())
+                if age > BASE_PROVIDER_REFRESH_TTL_SECONDS:
+                    continue
+                candidates.append((observed_at, provider, row))
+            if not candidates:
+                return None
+            _, provider, row = max(candidates, key=lambda item: item[0])
+            result[mechanism_id] = {
+                "provider": provider,
+                "healthy": True,
+                "item_count": int(getattr(row, "item_count", 0) or 0),
+                "source_reference": getattr(row, "source_reference", None),
+                "fallback_used": provider != {
+                    "fundamental_onchain": self.ETHEREUM_PROVIDER,
+                    "event_driven": self.BYBIT_CATALOG_PROVIDER,
+                    "yield": self.LIDO_PROVIDER,
+                    "volatility": self.DERIBIT_PROVIDER,
+                    "liquidation_distress": self.BYBIT_DISTRESS_PROVIDER,
+                }[mechanism_id],
+                "refresh_state": "fresh_cached",
+                "refresh_ttl_seconds": BASE_PROVIDER_REFRESH_TTL_SECONDS,
+            }
+        return result
+
+    @staticmethod
+    def _critical_redundancy_source_ids(coverage: object) -> set[str]:
+        """Identify existing partner sources for lanes still short of allocation redundancy."""
+
+        result: set[str] = set()
+        for lane in list(getattr(coverage, "lanes", ()) or ()):
+            lane_id = str(getattr(lane, "lane_id", "") or "")
+            if not lane_id or bool(getattr(lane, "allocation_source_qualified", False)):
+                continue
+            result.update(CRITICAL_REDUNDANCY_SOURCES_BY_LANE.get(lane_id, ()))
+        return result
+
     def _record_memory(self, stage: str, **detail: object) -> dict[str, float | None]:
         snapshot = memory_snapshot()
         rss = snapshot.get("rss_mb")
@@ -185,6 +282,7 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                     "independent_source_refresh": True,
                     "dynamic_distance_to_gate_scheduler": True,
                     "automatic_stagnation_remediation": True,
+                    "policy_aware_authoritative_redundancy_repair": True,
                     "memory_deferral_preserves_last_truthful_observation": True,
                     "qualification_thresholds_unchanged": True,
                     "paper_only": True,
@@ -253,8 +351,22 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
             state="running",
             stage="provider_admission",
         )
-        base = await super().run_cycle()
-        await asyncio.to_thread(self._record_memory, "base_provider_gap_complete")
+        cached_base = await asyncio.to_thread(self._fresh_base_provider_summary)
+        if cached_base is None:
+            base = await super().run_cycle()
+            base_provider_refresh_state = "refreshed"
+        else:
+            base = {
+                "mechanisms": cached_base,
+                "paper_only": True,
+                "live_execution_authority": False,
+            }
+            base_provider_refresh_state = "fresh_cached"
+        await asyncio.to_thread(
+            self._record_memory,
+            "base_provider_gap_complete",
+            base_provider_refresh_state=base_provider_refresh_state,
+        )
 
         # Visible L2 is source evidence, not an optional consequence of an already
         # discovered arbitrage/carry candidate. Recover the existing bounded sampler
@@ -338,6 +450,17 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
             coverage_before.lanes,
             tuple(probes),
         )
+        critical_redundancy_sources = self._critical_redundancy_source_ids(coverage_before)
+        original_order = {
+            str(probe[0]): index for index, probe in enumerate(ordered_probes)
+        }
+        ordered_probes = sorted(
+            ordered_probes,
+            key=lambda probe: (
+                0 if str(probe[0]) in critical_redundancy_sources else 1,
+                original_order.get(str(probe[0]), len(original_order)),
+            ),
+        )
         # One point-in-time source-state read serves every TTL check in this cycle.
         latest_source_rows = await asyncio.to_thread(self.source_coverage.ledger.latest)
         priority: dict[str, object] = {}
@@ -360,6 +483,7 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                     "healthy": True,
                     "refresh_state": "fresh_cached",
                     "refresh_ttl_seconds": ttl_seconds,
+                    "critical_redundancy_source": source_id in critical_redundancy_sources,
                 }
                 continue
 
@@ -373,6 +497,7 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                     "memory_deferred": True,
                     "preserved_previous_source_observation": True,
                     "refresh_ttl_seconds": ttl_seconds,
+                    "critical_redundancy_source": source_id in critical_redundancy_sources,
                 }
                 gc.collect()
                 memory_by_source[source_id] = await asyncio.to_thread(
@@ -393,6 +518,7 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                     "authoritative": probe.authoritative,
                     "refresh_state": "refreshed",
                     "refresh_ttl_seconds": ttl_seconds,
+                    "critical_redundancy_source": source_id in critical_redundancy_sources,
                 }
                 del probe
             except Exception as exc:
@@ -410,6 +536,7 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                     "error_type": type(exc).__name__,
                     "refresh_state": "provider_failed",
                     "refresh_ttl_seconds": ttl_seconds,
+                    "critical_redundancy_source": source_id in critical_redundancy_sources,
                 }
             finally:
                 gc.collect()
@@ -431,7 +558,16 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
             sufficient_lane_count=coverage.sufficient_lane_count,
             forward_test_eligible_lane_count=coverage.forward_test_eligible_lane_count,
         )
-        refresh_state = "degraded" if (deferred_sources or failed_sources) else "success"
+        base_provider_failures = sorted(
+            str(mechanism_id)
+            for mechanism_id, row in dict(base.get("mechanisms") or {}).items()
+            if isinstance(row, dict) and row.get("healthy") is False
+        )
+        refresh_state = (
+            "degraded"
+            if (deferred_sources or failed_sources or base_provider_failures)
+            else "success"
+        )
         await asyncio.to_thread(
             self._record_refresh_heartbeat,
             state=refresh_state,
@@ -443,6 +579,9 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
             fresh_cached_sources=cached_sources,
             memory_deferred_sources=deferred_sources,
             failed_sources=failed_sources,
+            base_provider_failures=base_provider_failures,
+            base_provider_refresh_state=base_provider_refresh_state,
+            critical_redundancy_sources=sorted(critical_redundancy_sources),
             policy_disabled_sources=policy_disabled_sources,
             bybit_public_enabled=bybit_public_enabled(),
             l2_source_refresh=l2_source_refresh,
@@ -461,6 +600,20 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                     coverage.allocation_source_qualified_lane_count
                 ),
                 "priority_order": coverage.priority_order,
+                "lanes": {
+                    row.lane_id: {
+                        "source_state": row.source_state,
+                        "missing_evidence_classes": row.missing_evidence_classes,
+                        "admitted_authoritative_source_groups": (
+                            row.admitted_authoritative_source_groups
+                        ),
+                        "missing_authoritative_source_count": (
+                            row.missing_authoritative_source_count
+                        ),
+                        "policy_disabled_source_ids": row.policy_disabled_source_ids,
+                    }
+                    for row in coverage.lanes
+                },
             },
             "source_refresh": {
                 "state": refresh_state,
@@ -468,11 +621,16 @@ class PrioritySourceCollectionService(ResilientProviderGapCollectionService):
                 "fresh_cached_sources": cached_sources,
                 "memory_deferred_sources": deferred_sources,
                 "failed_sources": failed_sources,
+                "base_provider_failures": base_provider_failures,
+                "base_provider_refresh_state": base_provider_refresh_state,
+                "base_provider_refresh_ttl_seconds": BASE_PROVIDER_REFRESH_TTL_SECONDS,
+                "critical_redundancy_sources": sorted(critical_redundancy_sources),
                 "policy_disabled_sources": policy_disabled_sources,
                 "bybit_public_enabled": bybit_public_enabled(),
                 "l2_source_refresh": l2_source_refresh,
                 "source_specific_ttls": dict(SOURCE_REFRESH_TTL_SECONDS),
                 "dynamic_distance_to_gate_scheduler": True,
+                "policy_aware_authoritative_redundancy_repair": True,
                 "dynamic_lane_priority_order": coverage.priority_order,
             },
             "stagnation_control": {

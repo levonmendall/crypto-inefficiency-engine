@@ -11,6 +11,7 @@ from sqlalchemy import Column, Index, Integer, MetaData, String, Table, Text, in
 
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.evidence_velocity import dynamic_lane_priority, evidence_freshness_seconds
+from inefficiency_engine.runtime_provider_policy import env_flag
 from inefficiency_engine.source_coverage_catalog import LANES, SOURCES
 
 
@@ -191,6 +192,9 @@ class LaneSourceCoverage(BaseModel):
     target_independent_authoritative_sources: int = 2
     healthy_source_count: int
     independent_authoritative_source_count: int
+    admitted_authoritative_source_groups: list[str] = Field(default_factory=list)
+    missing_authoritative_source_count: int = 0
+    policy_disabled_source_ids: list[str] = Field(default_factory=list)
     source_redundancy_satisfied: bool
     evidence_class_coverage_satisfied: bool
     research_eligible: bool = False
@@ -366,6 +370,19 @@ class SourceCoveragePlane:
             "tier": spec["tier"],
             "authoritative": bool(spec.get("authoritative", True)),
         }
+        enabled_env = spec.get("enabled_env")
+        if enabled_env and not env_flag(str(enabled_env), default=True):
+            return {
+                **base,
+                "state": "not_applicable",
+                "healthy": False,
+                "fresh": False,
+                "admitted": False,
+                "observed_at": None,
+                "item_count": 0,
+                "policy_disabled": True,
+                "enabled_env": str(enabled_env),
+            }
         if credential and not os.getenv(str(credential)):
             return {
                 **base,
@@ -541,6 +558,12 @@ class SourceCoveragePlane:
                 for row in admitted
                 if bool(row.get("authoritative"))
             }
+            groups_sorted = sorted(groups)
+            policy_disabled_source_ids = sorted(
+                str(row.get("source_id") or "")
+                for row in source_rows
+                if row.get("state") == "not_applicable" and row.get("source_id")
+            )
             redundancy = len(groups) >= 2
             class_ok = not missing
             research_eligible = bool(admitted)
@@ -567,6 +590,9 @@ class SourceCoveragePlane:
                     ],
                     healthy_source_count=len(admitted),
                     independent_authoritative_source_count=len(groups),
+                    admitted_authoritative_source_groups=groups_sorted,
+                    missing_authoritative_source_count=max(0, 2 - len(groups)),
+                    policy_disabled_source_ids=policy_disabled_source_ids,
                     source_redundancy_satisfied=redundancy,
                     evidence_class_coverage_satisfied=class_ok,
                     research_eligible=research_eligible,
