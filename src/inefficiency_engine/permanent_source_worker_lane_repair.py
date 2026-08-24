@@ -4,7 +4,7 @@ import asyncio
 
 from inefficiency_engine import permanent_source_plane as source_plane
 from inefficiency_engine import permanent_source_worker as base
-from inefficiency_engine.production_source_recovery_runtime import (
+from inefficiency_engine.production_source_recovery_v2_runtime import (
     critical_source_refresh_loop,
     install_lido_provider_recovery,
 )
