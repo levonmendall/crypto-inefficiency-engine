@@ -8,6 +8,9 @@ from typing import Any
 
 from sqlalchemy import func, insert, inspect, select, text
 
+from inefficiency_engine.bounded_strategy_evidence_runtime import (
+    install_bounded_strategy_evidence_runtime,
+)
 from inefficiency_engine.provider_gap_collection import (
     ProviderCatalogLedger,
     _deterministic_id,
@@ -196,8 +199,12 @@ def _snapshot_with_table_cache(
 
 
 def install_source_coverage_reconciliation_runtime() -> None:
-    """Install bounded latest-state reads for source coverage once per process."""
+    """Install bounded latest-state reads for source and strategy reconciliation."""
 
+    # API and canonical control already call this installer before constructing their
+    # read graphs. Keep that stable hook and also replace the append-only strategy
+    # history reader with its exact aggregate/incremental implementation.
+    install_bounded_strategy_evidence_runtime()
     if bool(getattr(SourceCoveragePlane, _COVERAGE_PATCH_MARKER, False)):
         return
     SourceCoverageLedger.latest = _latest_source_coverage_rows  # type: ignore[method-assign]
