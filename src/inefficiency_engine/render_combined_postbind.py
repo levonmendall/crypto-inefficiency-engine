@@ -118,9 +118,11 @@ def _runtime_index_guard(
 ) -> None:
     """Release control after the exact cycle-history index, then optimize.
 
-    The purpose-built cycle-history bucket index remains a hard prerequisite because
-    canonical control has already demonstrated that exact historical read can exceed its
-    bounded statement budget without the planner-usable access path.
+    The legacy ``CONTROL_GATE_INDEX_SPECS`` source-read group is now maintained only
+    after release; only ``CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS`` remains a hard gate.
+    The purpose-built cycle-history bucket index remains a prerequisite because canonical
+    control has already demonstrated that exact historical read can exceed its bounded
+    statement budget without the planner-usable access path.
 
     The broader source-read indexes are performance optimizations rather than authority
     prerequisites. Source coverage already has its own bounded executor, durable
