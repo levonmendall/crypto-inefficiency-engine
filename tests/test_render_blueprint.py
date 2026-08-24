@@ -23,8 +23,8 @@ def test_render_blueprint_defines_single_paid_combined_runtime():
 
     postbind = Path("src/inefficiency_engine/render_combined_postbind.py").read_text()
     assert "API bound; starting deferred runtime index maintenance" in postbind
-    assert "canonical control waiting for required source runtime indexes" in postbind
-    assert "control-gate indexes ready; starting canonical control supervision" in postbind
+    assert "canonical control waiting for exact cycle-history bucket index" in postbind
+    assert "control-gate index ready; starting canonical control supervision" in postbind
 
     repair_bootstrap = Path(
         "src/inefficiency_engine/render_combined_postbind_lane_repair.py"
