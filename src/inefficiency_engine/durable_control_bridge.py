@@ -85,7 +85,8 @@ class DurableControlQualifiedOpportunityBridgePublisher(
         """Attach the one-shot executor's lightweight status reporter."""
 
         self._control_stage_reporter = reporter
-        alpha_factory = getattr(self.allocator, "alpha_factory", None)
+        allocator = getattr(self, "allocator", None)
+        alpha_factory = getattr(allocator, "alpha_factory", None)
         set_alpha_reporter = getattr(alpha_factory, "set_control_stage_reporter", None)
         if callable(set_alpha_reporter):
             set_alpha_reporter(self._report_alpha_control_stage)
