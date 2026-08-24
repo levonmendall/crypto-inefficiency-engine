@@ -18,7 +18,7 @@ from inefficiency_engine.durable_control_cache import (
 _PATCH_MARKER = "_cie_bounded_control_outcome_ledgers"
 _CACHE_LOCK = threading.RLock()
 _CACHE_CHECK_SECONDS = 5.0
-_DEFAULT_BOOTSTRAP_BATCH_ROWS = 5000
+_DEFAULT_BOOTSTRAP_BATCH_ROWS = 500
 _CACHE: dict[tuple[int, str], dict[str, Any]] = {}
 
 
@@ -201,6 +201,39 @@ def install_bounded_control_outcome_ledgers() -> None:
     if not bool(getattr(AllocationCertificationLedger, _PATCH_MARKER, False)):
         AllocationCertificationLedger.outcomes = bounded_allocation_outcomes
         setattr(AllocationCertificationLedger, _PATCH_MARKER, True)
+
+
+def advance_bounded_control_outcome_caches(
+    *,
+    mechanism_execution: Any,
+    allocation_certification: Any,
+) -> dict[str, object]:
+    """Advance both exact outcome caches once before operating reconciliation.
+
+    The canonical control executor is intentionally short-lived. If its first access
+    to historical mechanism/allocation evidence happens deep inside mechanism
+    readiness, a cold bootstrap can consume the entire process deadline before the
+    durable checkpoint is written. Prime each patched ledger exactly once at the
+    explicit cache boundary instead. A partial batch remains invisible to all
+    qualification callers, is checkpointed durably, and the caller can fail closed
+    for this control cycle without entering the heavier reconciliation graph.
+    """
+
+    mechanism_ledger = getattr(
+        getattr(mechanism_execution, "ledger", None),
+        "_base",
+        getattr(mechanism_execution, "ledger", None),
+    )
+    allocation_ledger = getattr(allocation_certification, "ledger", None)
+    if mechanism_ledger is None or allocation_ledger is None:
+        raise RuntimeError("control outcome cache priming requires both durable ledgers")
+
+    # The return values are deliberately ignored. During bootstrap they are empty by
+    # contract, which preserves fail-closed qualification. The purpose of these calls
+    # is solely to advance and persist one bounded exact-history batch per ledger.
+    mechanism_ledger.outcomes()
+    allocation_ledger.outcomes()
+    return bounded_control_outcome_cache_diagnostics()
 
 
 def bounded_control_outcome_cache_diagnostics() -> dict[str, object]:
