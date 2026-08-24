@@ -7,6 +7,7 @@ from sqlalchemy import Column, Integer, MetaData, Table, Text
 from sqlalchemy import inspect as sqlalchemy_inspect
 
 from inefficiency_engine import render_combined_postbind
+from inefficiency_engine import runtime_index_maintenance
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.runtime_index_maintenance import (
     BACKGROUND_INDEX_SPECS,
@@ -14,6 +15,7 @@ from inefficiency_engine.runtime_index_maintenance import (
     CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
     INDEX_SPECS,
     _create_index_sql,
+    _ensure_postgres_index,
     ensure_runtime_indexes_after_api_bind,
 )
 
@@ -56,6 +58,75 @@ def test_cycle_history_bucket_index_matches_production_lookup_and_is_concurrent(
     assert indexes["ix_runtime_market_quotes_venue_asset_observed_at_id"] == columns
 
 
+class _RecordingDb:
+    def __init__(self):
+        self.statements: list[str] = []
+
+    def execute(self, statement, _parameters=None):
+        self.statements.append(str(statement).strip())
+        return None
+
+
+def test_postgres_invalid_runtime_index_is_dropped_rebuilt_and_reverified(monkeypatch):
+    states = iter(
+        [
+            {"valid": False, "ready": True},
+            {"valid": True, "ready": True},
+        ]
+    )
+    monkeypatch.setattr(
+        runtime_index_maintenance,
+        "_postgres_index_state",
+        lambda _db, *, index_name: next(states),
+    )
+    db = _RecordingDb()
+    index_name = "ix_runtime_market_quotes_venue_asset_observed_at_id"
+
+    result = _ensure_postgres_index(
+        db,
+        index_name=index_name,
+        table_name="market_quotes",
+        columns=("venue", "asset", "observed_at", "id"),
+    )
+
+    assert result == {
+        "postgres_index_valid": True,
+        "postgres_index_ready": True,
+        "repaired_invalid_index": True,
+    }
+    assert db.statements[0].startswith(
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_runtime_market_quotes_venue_asset_observed_at_id"
+    )
+    assert db.statements[1] == (
+        "DROP INDEX CONCURRENTLY IF EXISTS "
+        "ix_runtime_market_quotes_venue_asset_observed_at_id"
+    )
+    assert db.statements[2].startswith(
+        "CREATE INDEX CONCURRENTLY ix_runtime_market_quotes_venue_asset_observed_at_id"
+    )
+    assert "IF NOT EXISTS" not in db.statements[2]
+
+
+def test_postgres_valid_runtime_index_is_not_rebuilt(monkeypatch):
+    monkeypatch.setattr(
+        runtime_index_maintenance,
+        "_postgres_index_state",
+        lambda _db, *, index_name: {"valid": True, "ready": True},
+    )
+    db = _RecordingDb()
+
+    result = _ensure_postgres_index(
+        db,
+        index_name="ix_runtime_market_quotes_venue_asset_observed_at_id",
+        table_name="market_quotes",
+        columns=("venue", "asset", "observed_at", "id"),
+    )
+
+    assert result["repaired_invalid_index"] is False
+    assert len(db.statements) == 1
+    assert db.statements[0].startswith("CREATE INDEX CONCURRENTLY IF NOT EXISTS")
+
+
 def test_sqlite_runtime_index_maintenance_remains_idempotent(tmp_path):
     store = EvidenceStore(tmp_path / "postbind-indexes.sqlite")
 
@@ -65,6 +136,7 @@ def test_sqlite_runtime_index_maintenance_remains_idempotent(tmp_path):
     assert first["complete"] is True
     assert second["complete"] is True
     assert first["startup_critical_path"] is False
+    assert first["postgres_index_validity_verified"] is False
     indexes = {
         item["name"]
         for item in sqlalchemy_inspect(store.engine).get_indexes("market_quotes")
