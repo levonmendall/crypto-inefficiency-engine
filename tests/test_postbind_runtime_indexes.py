@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
+from sqlalchemy import Column, Integer, MetaData, Table, Text
 from sqlalchemy import inspect as sqlalchemy_inspect
 
 from inefficiency_engine import render_combined_postbind
@@ -44,9 +45,13 @@ def test_sqlite_runtime_index_maintenance_remains_idempotent(tmp_path):
     assert "ix_runtime_market_quotes_venue_observed_at" in indexes
 
 
-def test_runtime_index_groups_keep_strategy_optimizations_out_of_control_gate():
+def test_runtime_index_groups_keep_optional_and_legacy_indexes_out_of_control_gate():
     assert set(CONTROL_GATE_INDEX_SPECS).isdisjoint(BACKGROUND_INDEX_SPECS)
     assert set(INDEX_SPECS) == set(CONTROL_GATE_INDEX_SPECS) | set(BACKGROUND_INDEX_SPECS)
+    assert "maker_shadow_outcomes" not in CONTROL_GATE_INDEX_SPECS
+    assert "capital_transfer_outcomes" not in CONTROL_GATE_INDEX_SPECS
+    assert "maker_shadow_outcomes" in BACKGROUND_INDEX_SPECS
+    assert "capital_transfer_outcomes" in BACKGROUND_INDEX_SPECS
     assert "alpha_forward_events" not in CONTROL_GATE_INDEX_SPECS
     assert "allocation_forward_trials" not in CONTROL_GATE_INDEX_SPECS
     assert "allocation_forward_outcomes" not in CONTROL_GATE_INDEX_SPECS
@@ -67,6 +72,40 @@ def test_runtime_index_helper_can_maintain_one_scope_only(tmp_path):
     assert progress[0]["phase"] == "starting"
     assert progress[-1]["phase"] == "complete"
     assert progress[-1]["ok"] is True
+
+
+def test_legacy_auxiliary_table_missing_observed_at_is_terminally_skipped(tmp_path):
+    store = EvidenceStore(tmp_path / "legacy-maker-index.sqlite")
+    metadata = MetaData()
+    Table(
+        "maker_shadow_outcomes",
+        metadata,
+        Column("id", Integer, primary_key=True, autoincrement=True),
+        Column("outcome_id", Text, nullable=False),
+        Column("venue", Text, nullable=False),
+        Column("asset", Text, nullable=False),
+        Column("payload_json", Text, nullable=False),
+    )
+    metadata.create_all(store.engine)
+    progress: list[dict[str, object]] = []
+
+    result = ensure_runtime_indexes_after_api_bind(
+        store,
+        index_specs={
+            "maker_shadow_outcomes": BACKGROUND_INDEX_SPECS["maker_shadow_outcomes"]
+        },
+        progress=progress.append,
+    )
+
+    assert result["complete"] is True
+    assert result["failures"] == []
+    assert len(result["skipped"]) == 1
+    skipped = result["skipped"][0]
+    assert skipped["table"] == "maker_shadow_outcomes"
+    assert skipped["error_type"] == "SchemaColumnMissing"
+    assert skipped["missing_columns"] == ["observed_at"]
+    assert skipped["optional"] is True
+    assert progress[-1]["phase"] == "skipped"
 
 
 def test_production_bootstrap_does_not_build_large_runtime_indexes():
