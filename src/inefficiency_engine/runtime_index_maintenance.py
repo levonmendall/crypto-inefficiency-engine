@@ -17,6 +17,15 @@ CONTROL_GATE_INDEX_SPECS: dict[str, tuple[str, ...]] = {
     "provider_gap_admissions": ("mechanism_id", "provider", "id"),
 }
 
+# Canonical cycle-history bootstrap reads one venue/asset/day from the append-only
+# market quote ledger, then retains the newest source ids. Keep the existing
+# venue/observed_at source-read index above and add this second, purpose-built index as
+# a separate control-gate scope because one dict cannot represent two indexes for the
+# same table. Canonical control must not start until both access paths are available.
+CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS: dict[str, tuple[str, ...]] = {
+    "market_quotes": ("venue", "asset", "observed_at", "id"),
+}
+
 # These indexes improve bounded read paths but are not prerequisites for starting
 # canonical control. In particular, the maker/transfer ledgers can exist in legacy
 # production databases with an older schema. Their absence or schema drift must stay
