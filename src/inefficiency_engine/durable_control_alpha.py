@@ -5,7 +5,11 @@ from datetime import timedelta
 
 from sqlalchemy import and_, func, or_, select
 
+from inefficiency_engine.cycle_trend_strategy import CycleAwareMultiHorizonTrendStrategy
 from inefficiency_engine.disposable_alpha_factory import DisposableExpandedAlphaFactoryService
+from inefficiency_engine.durable_control_cycle_history import (
+    load_durable_control_cycle_history,
+)
 from inefficiency_engine.models import MarketKind, MarketQuote
 
 
@@ -31,9 +35,12 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
 
     The control bridge also only needs short-history rows for venue/assets present in
     its current persisted source snapshot. Filter that exact cohort in SQL and cache it
-    for the lifetime of the one-shot control executor. This preserves the same
-    point-in-time history and strategy thresholds while preventing repeated promotion
-    passes from transferring/parsing unrelated append-only market history.
+    for the lifetime of the one-shot control executor. The slow cycle-aware strategy's
+    live long-history component is different: canonical control consumes the durable
+    latest-N-per-day cache populated by a bounded preflight instead of rerunning the
+    full append-only PostgreSQL window query inside discovery. Until that exact cache
+    is complete, the slow strategy fails closed and the control executor does not enter
+    discovery.
 
     Disposable research keeps its existing bounded provider fallback in its own
     process. This subclass is used only by ``permanent_control_worker`` and therefore
@@ -49,6 +56,7 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
         ] = {}
         self._durable_history_cache_hits = 0
         self._durable_history_query_count = 0
+        self._durable_cycle_history_cache_reads = 0
         self._durable_stage_reporter = None
         self._reset_snapshot_promotion_cache()
 
@@ -215,6 +223,53 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
             for key, values in self._durable_history_cache.items()
         }
 
+    def _compact_cycle_history(self, snapshot, current_keys):
+        """Read exact long live history from the durable daily-compaction cache."""
+
+        compact_live = load_durable_control_cycle_history(self, snapshot)
+        if compact_live is None:
+            self._report_control_stage("cycle_history_cache_incomplete")
+            raise RuntimeError("DurableControlCycleHistoryCacheIncomplete")
+
+        self._durable_cycle_history_cache_reads = int(
+            getattr(self, "_durable_cycle_history_cache_reads", 0)
+        ) + 1
+        self._report_control_stage("cycle_history_cache_read")
+        grouped: dict[tuple[str, str, MarketKind], list[MarketQuote]] = defaultdict(list)
+        for key, values in compact_live.items():
+            grouped[key].extend(values)
+
+        long_cutoff = snapshot.completed_at - timedelta(
+            hours=CycleAwareMultiHorizonTrendStrategy.required_history_hours(
+                self._expanded_settings
+            )
+        )
+        recent_cutoff = snapshot.completed_at - timedelta(
+            hours=self._effective_history_hours()
+        )
+        try:
+            historical = self._historical_research.history(
+                start=long_cutoff,
+                end=recent_cutoff,
+                assets={asset for _, asset, _ in current_keys},
+            )
+            for key, values in historical.items():
+                if key in current_keys:
+                    grouped[key].extend(values)
+        except Exception:
+            pass
+
+        compact = {
+            key: sorted(values, key=lambda item: item.observed_at)
+            for key, values in grouped.items()
+        }
+        self._cycle_history_cache = compact
+        self._cycle_history_pairs = frozenset(
+            (venue, asset) for venue, asset, _ in current_keys
+        )
+        self._cycle_history_refreshed_at = snapshot.completed_at
+        return compact
+
     async def _bounded_current_l2_cost(self, candidate):
         # Deliberately do not call the adapter registry. The caller already attempted
         # to locate a fresh matching book inside the current persisted ScanSnapshot.
@@ -237,6 +292,7 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
         self._durable_history_cache = {}
         self._durable_history_cache_hits = 0
         self._durable_history_query_count = 0
+        self._durable_cycle_history_cache_reads = 0
         self._reset_snapshot_promotion_cache()
         self._report_control_stage("promotion_start")
         rows = await super().promoted_candidates(
@@ -266,6 +322,10 @@ class DurableControlAlphaFactoryService(DisposableExpandedAlphaFactoryService):
                 getattr(self, "_durable_history_cache_hits", 0)
             ),
             "short_history_current_cohort_only": True,
+            "cycle_history_durable_cache_reads": int(
+                getattr(self, "_durable_cycle_history_cache_reads", 0)
+            ),
+            "cycle_history_full_window_query_used": False,
             "snapshot_discovery_compute_count": int(
                 getattr(self, "_durable_discovery_compute_count", 0)
             ),

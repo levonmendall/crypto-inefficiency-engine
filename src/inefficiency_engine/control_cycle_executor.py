@@ -69,6 +69,29 @@ def _cache_rebuilding_control_payload(cache: dict[str, object]) -> dict[str, obj
     }
 
 
+def _cycle_history_rebuilding_control_payload(
+    cache: dict[str, object],
+    cycle_history: dict[str, object],
+    *,
+    error_type: str = "CycleHistoryCacheRebuilding",
+) -> dict[str, object]:
+    """Fail closed while the exact compact long-history projection catches up."""
+
+    return {
+        "canonical_control_plane_refresh": True,
+        "operating_reconciliation_complete": False,
+        "qualified_bridge_publication_complete": False,
+        "research_projection_publication_complete": False,
+        "historical_cache_complete": False,
+        "historical_cache_progress": cache,
+        "cycle_history_cache_complete": False,
+        "cycle_history_cache_progress": cycle_history,
+        "control_plane_errors": {"cycle_history_cache": error_type},
+        "control_stage_timings_seconds": {},
+        "control_plane_healthy": False,
+    }
+
+
 def run_one_control_cycle() -> dict[str, object]:
     """Run exactly one durable control cycle in this disposable process."""
 
@@ -89,6 +112,10 @@ def run_one_control_cycle() -> dict[str, object]:
     from inefficiency_engine.durable_control_cache import (
         ensure_durable_control_cache_schema,
     )
+    from inefficiency_engine.durable_control_cycle_history import (
+        advance_durable_control_cycle_history_cache,
+        ensure_durable_control_cycle_history_schema,
+    )
     from inefficiency_engine.durable_source_coverage_runtime import (
         install_control_source_coverage_snapshot_reader_runtime,
     )
@@ -107,6 +134,7 @@ def run_one_control_cycle() -> dict[str, object]:
     )
     started = time.monotonic()
     last_progress: dict[str, object] = {}
+    cycle_history_progress: dict[str, object] = {}
 
     def write_stage(stage: str, progress: dict[str, object]) -> None:
         _atomic_json(
@@ -120,6 +148,12 @@ def run_one_control_cycle() -> dict[str, object]:
                 "executor_age_seconds": max(0.0, time.monotonic() - started),
                 "historical_cache_progress": progress,
                 "historical_cache_complete": bool(progress.get("complete")),
+                "cycle_history_cache_progress": dict(cycle_history_progress),
+                "cycle_history_cache_complete": (
+                    bool(cycle_history_progress.get("complete"))
+                    if cycle_history_progress
+                    else None
+                ),
                 "provider_requests_allowed": False,
                 "provider_requests_used": 0,
                 "paper_only": True,
@@ -149,6 +183,7 @@ def run_one_control_cycle() -> dict[str, object]:
     if store is None:
         raise RuntimeError("control executor requires durable evidence persistence")
     ensure_durable_control_cache_schema(store)
+    ensure_durable_control_cycle_history_schema(store)
     statement_timeout_seconds = max(5.0, deadline - 5.0)
     lock_timeout_seconds = min(3.0, max(1.0, statement_timeout_seconds / 4.0))
     pool_checkout_timeout_seconds = min(5.0, max(1.0, deadline / 5.0))
@@ -197,6 +232,83 @@ def run_one_control_cycle() -> dict[str, object]:
         }
     write_stage("historical_outcome_cache_ready", last_progress)
 
+    # The cycle-aware alpha path used to reconstruct its 180-day live compact history
+    # with one PostgreSQL row_number window query inside discovery. Production proved
+    # that first discovery can consume the whole 25-second control budget. Prime the
+    # algebraically equivalent latest-N-per-day projection in bounded primary-key
+    # slices before entering canonical reconciliation. A partial cache is durable but
+    # invisible to discovery, so no partial history can certify a candidate.
+    alpha_factory = getattr(qualified_bridge.allocator, "alpha_factory", None)
+    if alpha_factory is not None:
+        stage_reporter("cycle_history_cache_source_snapshot")
+        source_snapshot = qualified_bridge._latest_scan()
+        if source_snapshot is not None:
+            stage_reporter("cycle_history_cache_bootstrap")
+            try:
+                cycle_history_progress = advance_durable_control_cycle_history_cache(
+                    alpha_factory,
+                    source_snapshot,
+                )
+            except Exception as exc:
+                cycle_history_progress = {
+                    "complete": False,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:500],
+                    "qualification_thresholds_unchanged": True,
+                    "paper_only": True,
+                }
+                write_stage("cycle_history_cache_failed", last_progress)
+                control = _cycle_history_rebuilding_control_payload(
+                    last_progress,
+                    cycle_history_progress,
+                    error_type="CycleHistoryCacheError",
+                )
+                return {
+                    "ok": True,
+                    "stage": "control_executor_complete",
+                    "control": control,
+                    "alpha_durable_promotion": {
+                        "provider_requests_used": 0,
+                        "deferred_for_cycle_history_cache": True,
+                    },
+                    "historical_cache_progress": last_progress,
+                    "historical_cache_complete": False,
+                    "cycle_history_cache_progress": cycle_history_progress,
+                    "cycle_history_cache_complete": False,
+                    "database_identity": str(
+                        getattr(store, "safe_database_url", "durable")
+                    ),
+                    "provider_requests_allowed": False,
+                    "provider_requests_used": 0,
+                    "paper_only": True,
+                }
+            if not bool(cycle_history_progress.get("complete")):
+                write_stage("cycle_history_cache_rebuilding", last_progress)
+                control = _cycle_history_rebuilding_control_payload(
+                    last_progress,
+                    cycle_history_progress,
+                )
+                return {
+                    "ok": True,
+                    "stage": "control_executor_complete",
+                    "control": control,
+                    "alpha_durable_promotion": {
+                        "provider_requests_used": 0,
+                        "deferred_for_cycle_history_cache": True,
+                    },
+                    "historical_cache_progress": last_progress,
+                    "historical_cache_complete": False,
+                    "cycle_history_cache_progress": cycle_history_progress,
+                    "cycle_history_cache_complete": False,
+                    "database_identity": str(
+                        getattr(store, "safe_database_url", "durable")
+                    ),
+                    "provider_requests_allowed": False,
+                    "provider_requests_used": 0,
+                    "paper_only": True,
+                }
+            write_stage("cycle_history_cache_ready", last_progress)
+
     set_bridge_reporter = getattr(
         qualified_bridge,
         "set_control_stage_reporter",
@@ -216,6 +328,14 @@ def run_one_control_cycle() -> dict[str, object]:
             historical_cache_status=_cache_status,
         )
     )
+    if cycle_history_progress:
+        control = {
+            **control,
+            "cycle_history_cache_complete": bool(
+                cycle_history_progress.get("complete")
+            ),
+            "cycle_history_cache_progress": cycle_history_progress,
+        }
     alpha_factory = getattr(qualified_bridge.allocator, "alpha_factory", None)
     alpha_diagnostics = (
         alpha_factory.durable_promotion_diagnostics()
@@ -224,13 +344,23 @@ def run_one_control_cycle() -> dict[str, object]:
         else {"provider_requests_used": 0}
     )
     cache = _cache_status()
+    all_historical_complete = bool(cache["complete"]) and (
+        not cycle_history_progress
+        or bool(cycle_history_progress.get("complete"))
+    )
     return {
         "ok": True,
         "stage": "control_executor_complete",
         "control": control,
         "alpha_durable_promotion": alpha_diagnostics,
         "historical_cache_progress": cache,
-        "historical_cache_complete": bool(cache["complete"]),
+        "historical_cache_complete": all_historical_complete,
+        "cycle_history_cache_progress": cycle_history_progress,
+        "cycle_history_cache_complete": (
+            bool(cycle_history_progress.get("complete"))
+            if cycle_history_progress
+            else None
+        ),
         "database_identity": str(getattr(store, "safe_database_url", "durable")),
         "provider_requests_allowed": False,
         "provider_requests_used": 0,

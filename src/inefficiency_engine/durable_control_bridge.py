@@ -80,6 +80,18 @@ class DurableControlQualifiedOpportunityBridgePublisher(
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._control_stage_reporter = None
+        self._preloaded_source_snapshot = None
+
+    def preload_source_snapshot(self, snapshot) -> None:
+        """Reuse the exact snapshot validated by control preflight in this one-shot process."""
+
+        self._preloaded_source_snapshot = snapshot
+
+    def _latest_scan(self):
+        preloaded = getattr(self, "_preloaded_source_snapshot", None)
+        if preloaded is not None:
+            return preloaded
+        return super()._latest_scan()
 
     def set_control_stage_reporter(self, reporter) -> None:
         """Attach the one-shot executor's lightweight status reporter."""
