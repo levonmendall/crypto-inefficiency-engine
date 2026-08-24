@@ -47,6 +47,10 @@ INDEX_SPECS: dict[str, tuple[str, ...]] = {
 ProgressCallback = Callable[[dict[str, object]], None]
 
 
+class RuntimeIndexVerificationError(RuntimeError):
+    """Raised when PostgreSQL cannot certify a required runtime index as usable."""
+
+
 def _index_name(table_name: str, columns: tuple[str, ...]) -> str:
     return f"ix_runtime_{table_name}_{'_'.join(columns)}"
 
@@ -57,12 +61,99 @@ def _create_index_sql(
     index_name: str,
     table_name: str,
     columns: tuple[str, ...],
+    if_not_exists: bool = True,
 ) -> str:
     concurrent = " CONCURRENTLY" if dialect_name == "postgresql" else ""
+    existence = " IF NOT EXISTS" if if_not_exists else ""
     return (
-        f"CREATE INDEX{concurrent} IF NOT EXISTS {index_name} "
+        f"CREATE INDEX{concurrent}{existence} {index_name} "
         f"ON {table_name} ({','.join(columns)})"
     )
+
+
+def _postgres_index_state(db: Any, *, index_name: str) -> dict[str, bool] | None:
+    """Return PostgreSQL planner-usable state for one index in the active search path."""
+
+    row = (
+        db.execute(
+            text(
+                """
+                SELECT i.indisvalid AS valid, i.indisready AS ready
+                FROM pg_index AS i
+                WHERE i.indexrelid = to_regclass(:index_name)
+                """
+            ),
+            {"index_name": index_name},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    return {
+        "valid": bool(row.get("valid")),
+        "ready": bool(row.get("ready")),
+    }
+
+
+def _ensure_postgres_index(
+    db: Any,
+    *,
+    index_name: str,
+    table_name: str,
+    columns: tuple[str, ...],
+) -> dict[str, object]:
+    """Create, verify, and self-heal one concurrent PostgreSQL runtime index.
+
+    ``CREATE INDEX CONCURRENTLY`` can leave an invalid catalog entry after an
+    interrupted build. A later ``IF NOT EXISTS`` then succeeds without rebuilding it,
+    even though PostgreSQL cannot use that index for query planning. Required runtime
+    indexes therefore are not considered complete until ``pg_index`` reports both
+    ``indisvalid`` and ``indisready``. An invalid leftover is dropped/recreated
+    concurrently in autocommit mode and verified again before the control gate opens.
+    """
+
+    create_if_missing = _create_index_sql(
+        dialect_name="postgresql",
+        index_name=index_name,
+        table_name=table_name,
+        columns=columns,
+        if_not_exists=True,
+    )
+    db.execute(text(create_if_missing))
+    state = _postgres_index_state(db, index_name=index_name)
+    repaired_invalid_index = False
+
+    if state is not None and not bool(state["valid"] and state["ready"]):
+        db.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}"))
+        db.execute(
+            text(
+                _create_index_sql(
+                    dialect_name="postgresql",
+                    index_name=index_name,
+                    table_name=table_name,
+                    columns=columns,
+                    if_not_exists=False,
+                )
+            )
+        )
+        repaired_invalid_index = True
+        state = _postgres_index_state(db, index_name=index_name)
+
+    if state is None:
+        raise RuntimeIndexVerificationError(
+            f"PostgreSQL runtime index {index_name} is missing after maintenance"
+        )
+    if not bool(state["valid"] and state["ready"]):
+        raise RuntimeIndexVerificationError(
+            f"PostgreSQL runtime index {index_name} remains invalid or unready after repair"
+        )
+
+    return {
+        "postgres_index_valid": True,
+        "postgres_index_ready": True,
+        "repaired_invalid_index": repaired_invalid_index,
+    }
 
 
 def ensure_runtime_indexes_after_api_bind(
@@ -75,8 +166,10 @@ def ensure_runtime_indexes_after_api_bind(
 
     Production PostgreSQL uses ``CREATE INDEX CONCURRENTLY`` in autocommit mode so
     multimillion-row index builds do not hold the normal table-write lock or prevent
-    Render from binding the API port. SQLite and test stores keep the ordinary
-    idempotent ``CREATE INDEX IF NOT EXISTS`` form.
+    Render from binding the API port. PostgreSQL index existence alone is insufficient:
+    every maintained index is verified as planner-usable through ``pg_index`` and any
+    invalid leftover from an interrupted concurrent build is rebuilt before success is
+    reported. SQLite and test stores keep ordinary idempotent index creation.
 
     The helper validates each table's actual deployed columns before issuing DDL.
     Missing columns remain a hard failure for control-gate indexes, but background
@@ -147,11 +240,17 @@ def ensure_runtime_indexes_after_api_bind(
                 }
             )
         try:
+            postgres_state: dict[str, object] = {}
             if dialect_name == "postgresql":
                 with store.engine.connect().execution_options(
                     isolation_level="AUTOCOMMIT"
                 ) as db:
-                    db.execute(text(statement))
+                    postgres_state = _ensure_postgres_index(
+                        db,
+                        index_name=index_name,
+                        table_name=table_name,
+                        columns=columns,
+                    )
             else:
                 with store.engine.begin() as db:
                     db.execute(text(statement))
@@ -162,6 +261,7 @@ def ensure_runtime_indexes_after_api_bind(
                 "concurrent": dialect_name == "postgresql",
                 "ok": True,
                 "schema_compatible": True,
+                **postgres_state,
             }
             attempted.append(row)
             if progress is not None:
@@ -191,4 +291,5 @@ def ensure_runtime_indexes_after_api_bind(
         "requested_tables": list(requested),
         "startup_critical_path": False,
         "api_bound_before_maintenance": True,
+        "postgres_index_validity_verified": dialect_name == "postgresql",
     }
