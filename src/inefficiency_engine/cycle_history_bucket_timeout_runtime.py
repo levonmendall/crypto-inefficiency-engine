@@ -4,7 +4,7 @@ import os
 from contextlib import contextmanager
 from typing import Any, Iterator
 
-from sqlalchemy import event
+from sqlalchemy import delete, event, insert, select
 
 
 _DEFAULT_STATEMENT_TIMEOUT_SECONDS = 4.0
@@ -51,6 +51,98 @@ def _postgres_timeout_statements() -> tuple[str, str]:
     )
 
 
+def _index_aligned_replace_bucket(
+    *,
+    factory: Any,
+    namespace: str,
+    venue: str,
+    asset: str,
+    day: Any,
+    start: Any,
+    end: Any,
+    limit: int,
+) -> int:
+    """Replace one compact bucket with an index-aligned chronological top-N seek.
+
+    Production has a required ``market_quotes(venue, asset, observed_at, id)`` index.
+    The legacy bucket query filtered on the first three index columns but ranked only
+    by ``id DESC``. PostgreSQL could therefore fall back to a bounded sort/scan and hit
+    the deliberately short per-bucket statement timeout. Rank by ``observed_at DESC,
+    id DESC`` instead: this preserves the intended newest-observation semantics, uses
+    ``id`` only as a deterministic tie-breaker, and matches the existing index order.
+    """
+
+    from inefficiency_engine import durable_control_cycle_history as legacy
+    from inefficiency_engine.models import MarketQuote
+
+    table = factory.store.market_quotes
+    selected: list[dict[str, object]] = []
+    if end > start and limit > 0:
+        id_query = (
+            select(table.c.id)
+            .where(table.c.venue == venue)
+            .where(table.c.asset == asset)
+            .where(table.c.observed_at >= start.isoformat())
+            .where(table.c.observed_at < end.isoformat())
+            .order_by(table.c.observed_at.desc(), table.c.id.desc())
+            .limit(limit)
+        )
+        with factory.store.engine.connect() as db:
+            source_ids = [int(source_id) for source_id in db.scalars(id_query)]
+            rows = (
+                list(
+                    db.execute(
+                        select(
+                            table.c.id,
+                            table.c.venue,
+                            table.c.asset,
+                            table.c.observed_at,
+                            table.c.payload_json,
+                        ).where(table.c.id.in_(source_ids))
+                    )
+                )
+                if source_ids
+                else []
+            )
+        rows.sort(key=lambda row: (str(row[3]), int(row[0])), reverse=True)
+        for source_id, row_venue, row_asset, observed_at, payload_json in rows:
+            quote = MarketQuote.model_validate_json(payload_json)
+            selected.append(
+                {
+                    "namespace": namespace,
+                    "source_id": int(source_id),
+                    "venue": str(row_venue),
+                    "asset": str(row_asset).upper(),
+                    "market_kind": quote.market_kind.value,
+                    "day": day.isoformat(),
+                    "observed_at": str(observed_at),
+                    "payload_json": str(payload_json),
+                }
+            )
+
+    with factory.store.engine.begin() as db:
+        db.execute(
+            delete(legacy.CONTROL_CYCLE_HISTORY_ROWS)
+            .where(legacy.CONTROL_CYCLE_HISTORY_ROWS.c.namespace == namespace)
+            .where(legacy.CONTROL_CYCLE_HISTORY_ROWS.c.venue == venue)
+            .where(legacy.CONTROL_CYCLE_HISTORY_ROWS.c.asset == asset)
+            .where(legacy.CONTROL_CYCLE_HISTORY_ROWS.c.day == day.isoformat())
+        )
+        if selected:
+            db.execute(insert(legacy.CONTROL_CYCLE_HISTORY_ROWS), selected)
+    return len(selected)
+
+
+def install_index_aligned_cycle_history_bucket_runtime() -> None:
+    """Install the indexed bucket reader in both legacy and frozen-target runtimes."""
+
+    from inefficiency_engine import durable_control_cycle_history as legacy
+    from inefficiency_engine import durable_control_cycle_history_target_runtime as target_runtime
+
+    legacy._replace_bucket = _index_aligned_replace_bucket
+    target_runtime._replace_bucket = _index_aligned_replace_bucket
+
+
 @contextmanager
 def cycle_history_bucket_database_timeout(store: Any) -> Iterator[None]:
     """Apply a short transaction-local timeout only while cycle history advances.
@@ -93,6 +185,7 @@ if os.getenv("CIE_CONTROL_EXECUTOR_CYCLE_ID"):
         load_durable_control_cycle_history as _load_frozen_cycle_history,
     )
 
+    install_index_aligned_cycle_history_bucket_runtime()
     _legacy_cycle_history.advance_durable_control_cycle_history_cache = (
         _advance_frozen_cycle_history
     )
