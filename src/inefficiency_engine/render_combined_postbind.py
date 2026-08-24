@@ -12,6 +12,7 @@ from inefficiency_engine.durable_control_cache import (
 from inefficiency_engine.runtime_index_maintenance import (
     BACKGROUND_INDEX_SPECS,
     CONTROL_GATE_INDEX_SPECS,
+    CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
     ensure_runtime_indexes_after_api_bind,
 )
 
@@ -110,17 +111,44 @@ def _first_failure_type(result: dict[str, object]) -> str:
     return "RuntimeIndexMaintenanceFailed"
 
 
+def _merge_required_index_results(
+    source_result: dict[str, object],
+    cycle_history_result: dict[str, object],
+) -> dict[str, object]:
+    """Preserve observability for both required post-bind index scopes."""
+
+    def rows(result: dict[str, object], key: str) -> list[object]:
+        value = result.get(key)
+        return list(value) if isinstance(value, list) else []
+
+    return {
+        "complete": bool(source_result.get("complete"))
+        and bool(cycle_history_result.get("complete")),
+        "dialect": cycle_history_result.get("dialect") or source_result.get("dialect"),
+        "attempted": rows(source_result, "attempted")
+        + rows(cycle_history_result, "attempted"),
+        "failures": rows(source_result, "failures")
+        + rows(cycle_history_result, "failures"),
+        "skipped": rows(source_result, "skipped")
+        + rows(cycle_history_result, "skipped"),
+        "requested_tables": rows(source_result, "requested_tables")
+        + rows(cycle_history_result, "requested_tables"),
+        "startup_critical_path": False,
+        "api_bound_before_maintenance": True,
+        "cycle_history_bucket_index_required": True,
+    }
+
+
 def _runtime_index_guard(
     stop_event: threading.Event,
     indexes_ready: threading.Event,
 ) -> None:
-    """Release control after required source indexes, then maintain optimizations.
+    """Release control after required source/history indexes, then optimize.
 
-    Source-coverage indexes are the only indexes allowed to gate canonical control.
-    Strategy-evidence indexes improve the bounded aggregate reader but are not needed
-    for correctness: canonical control already has bounded incremental reads and a
-    PostgreSQL statement timeout. They therefore build concurrently in the background
-    after the control gate is released instead of freezing operating reconciliation.
+    Source-coverage indexes and the exact cycle-history bucket access path are allowed
+    to gate canonical control because both are required to keep bounded fail-closed
+    reads inside the control deadline. Strategy-evidence indexes improve incremental
+    readers but remain background optimizations after the control gate is released.
     """
 
     port = os.getenv("PORT", "10000")
@@ -154,7 +182,7 @@ def _runtime_index_guard(
                 "background_indexes_complete": False,
             },
         )
-        result = ensure_runtime_indexes_after_api_bind(
+        source_result = ensure_runtime_indexes_after_api_bind(
             store,
             index_specs=CONTROL_GATE_INDEX_SPECS,
             progress=_progress_callback(
@@ -164,6 +192,23 @@ def _runtime_index_guard(
                 control_gate_released=False,
             ),
         )
+        result = source_result
+        if bool(source_result.get("complete")):
+            cycle_history_result = ensure_runtime_indexes_after_api_bind(
+                store,
+                index_specs=CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
+                progress=_progress_callback(
+                    store,
+                    attempt=gate_attempt,
+                    scope="cycle_history_control_gate",
+                    control_gate_released=False,
+                ),
+            )
+            result = _merge_required_index_results(
+                source_result,
+                cycle_history_result,
+            )
+
         elapsed = max(0.0, time.monotonic() - started)
         if bool(result.get("complete")):
             indexes_ready.set()
@@ -274,7 +319,10 @@ def _control_guard_after_indexes(
     stop_event: threading.Event,
     indexes_ready: threading.Event,
 ) -> None:
-    print("canonical control waiting for required source runtime indexes", flush=True)
+    print(
+        "canonical control waiting for required source runtime indexes and cycle-history bucket index",
+        flush=True,
+    )
     while not stop_event.is_set():
         if indexes_ready.wait(1.0):
             print("control-gate indexes ready; starting canonical control supervision", flush=True)

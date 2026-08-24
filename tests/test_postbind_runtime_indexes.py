@@ -11,6 +11,7 @@ from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.runtime_index_maintenance import (
     BACKGROUND_INDEX_SPECS,
     CONTROL_GATE_INDEX_SPECS,
+    CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
     INDEX_SPECS,
     _create_index_sql,
     ensure_runtime_indexes_after_api_bind,
@@ -27,6 +28,32 @@ def test_postgres_runtime_index_creation_is_concurrent():
 
     assert statement.startswith("CREATE INDEX CONCURRENTLY IF NOT EXISTS")
     assert "market_quotes (venue,observed_at)" in statement
+
+
+def test_cycle_history_bucket_index_matches_production_lookup_and_is_concurrent(tmp_path):
+    columns = CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS["market_quotes"]
+    assert columns == ("venue", "asset", "observed_at", "id")
+
+    statement = _create_index_sql(
+        dialect_name="postgresql",
+        index_name="ix_runtime_market_quotes_venue_asset_observed_at_id",
+        table_name="market_quotes",
+        columns=columns,
+    )
+    assert statement.startswith("CREATE INDEX CONCURRENTLY IF NOT EXISTS")
+    assert "market_quotes (venue,asset,observed_at,id)" in statement
+
+    store = EvidenceStore(tmp_path / "cycle-history-index.sqlite")
+    result = ensure_runtime_indexes_after_api_bind(
+        store,
+        index_specs=CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
+    )
+    assert result["complete"] is True
+    indexes = {
+        item["name"]: tuple(item["column_names"])
+        for item in sqlalchemy_inspect(store.engine).get_indexes("market_quotes")
+    }
+    assert indexes["ix_runtime_market_quotes_venue_asset_observed_at_id"] == columns
 
 
 def test_sqlite_runtime_index_maintenance_remains_idempotent(tmp_path):
@@ -48,6 +75,9 @@ def test_sqlite_runtime_index_maintenance_remains_idempotent(tmp_path):
 def test_runtime_index_groups_keep_optional_and_legacy_indexes_out_of_control_gate():
     assert set(CONTROL_GATE_INDEX_SPECS).isdisjoint(BACKGROUND_INDEX_SPECS)
     assert set(INDEX_SPECS) == set(CONTROL_GATE_INDEX_SPECS) | set(BACKGROUND_INDEX_SPECS)
+    assert CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS == {
+        "market_quotes": ("venue", "asset", "observed_at", "id")
+    }
     assert "maker_shadow_outcomes" not in CONTROL_GATE_INDEX_SPECS
     assert "capital_transfer_outcomes" not in CONTROL_GATE_INDEX_SPECS
     assert "maker_shadow_outcomes" in BACKGROUND_INDEX_SPECS
@@ -124,7 +154,7 @@ def test_production_bootstrap_does_not_build_large_runtime_indexes():
     )
 
 
-def test_canonical_control_waits_only_for_required_source_indexes():
+def test_canonical_control_waits_for_source_and_cycle_history_indexes():
     control_source = inspect.getsource(render_combined_postbind._control_guard_after_indexes)
     maintenance_source = inspect.getsource(render_combined_postbind._runtime_index_guard)
 
@@ -132,8 +162,11 @@ def test_canonical_control_waits_only_for_required_source_indexes():
         "_control_plane_guard"
     )
     assert maintenance_source.index("CONTROL_GATE_INDEX_SPECS") < maintenance_source.index(
-        "indexes_ready.set()"
+        "CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS"
     )
+    assert maintenance_source.index(
+        "CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS"
+    ) < maintenance_source.index("indexes_ready.set()")
     assert maintenance_source.index("indexes_ready.set()") < maintenance_source.index(
         "BACKGROUND_INDEX_SPECS"
     )
