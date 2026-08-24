@@ -7,9 +7,11 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from pydantic import BaseModel
 from sqlalchemy import Column, Integer, MetaData, Table, Text, insert
 
 from inefficiency_engine import canonical_control_plane_runtime
+from inefficiency_engine import control_cycle_executor
 from inefficiency_engine import permanent_control_worker
 from inefficiency_engine import bounded_control_evidence_runtime as bounded_control
 from inefficiency_engine.bounded_control_evidence_runtime import (
@@ -25,13 +27,15 @@ from inefficiency_engine.control_cycle_runtime import (
 from inefficiency_engine.evidence import EvidenceStore
 
 
-def test_canonical_reconciliation_never_uses_executor_threads():
+def test_canonical_reconciliation_runs_in_killable_executor_process():
     source = inspect.getsource(canonical_control_plane_runtime.refresh_canonical_control_plane)
     worker_source = inspect.getsource(permanent_control_worker._run)
 
     assert "asyncio.to_thread" not in source
     assert "asyncio.wait_for" not in worker_source
-    assert "hard_control_cycle_deadline" in worker_source
+    assert "ControlExecutorSupervisor" in worker_source
+    assert "supervisor.run_cycle" in worker_source
+    assert "hard_control_cycle_deadline" not in worker_source
     assert '"reconciliation_executor_threads": 0' in worker_source
 
 
@@ -137,9 +141,64 @@ def test_outcome_cache_uses_bounded_incremental_primary_key_tail():
     assert 'state["bootstrap_complete"]' in source
 
 
+def test_outcome_bootstrap_progress_survives_executor_process_cache_reset(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("CIE_CONTROL_CACHE_NAMESPACE", "test-control")
+    monkeypatch.setenv("CIE_CONTROL_OUTCOME_BOOTSTRAP_BATCH_ROWS", "100")
+    monkeypatch.setattr(bounded_control, "_CACHE_CHECK_SECONDS", 0.0)
+    database = tmp_path / "durable-bounded-control.sqlite"
+    bounded_control._CACHE.clear()
+    store = EvidenceStore(database)
+    metadata = MetaData()
+    table = Table(
+        "test_durable_outcome_history",
+        metadata,
+        Column("id", Integer, primary_key=True, autoincrement=True),
+        Column("payload_json", Text, nullable=False),
+    )
+    metadata.create_all(store.engine)
+
+    class Model(BaseModel):
+        value: int
+
+    with store.engine.begin() as db:
+        db.execute(
+            insert(table),
+            [{"payload_json": Model(value=index).model_dump_json()} for index in range(250)],
+        )
+    ledger = SimpleNamespace(store=store)
+
+    assert _refresh_rows(ledger, table, Model) == []
+    first = bounded_control_outcome_cache_diagnostics()["tables"][
+        "test_durable_outcome_history"
+    ]
+    assert first["processed_tail"] == 100
+
+    store.engine.dispose()
+    bounded_control._CACHE.clear()
+    restarted_store = EvidenceStore(database)
+    restarted_ledger = SimpleNamespace(store=restarted_store)
+    assert _refresh_rows(restarted_ledger, table, Model) == []
+    second = bounded_control_outcome_cache_diagnostics()["tables"][
+        "test_durable_outcome_history"
+    ]
+    assert second["durable_checkpoint_loaded"] is True
+    assert second["processed_tail"] == 200
+
+    restarted_store.engine.dispose()
+    bounded_control._CACHE.clear()
+    final_store = EvidenceStore(database)
+    rows = _refresh_rows(SimpleNamespace(store=final_store), table, Model)
+    assert [row.value for row in rows] == list(range(250))
+
+
 def test_control_installs_bounded_mechanism_and_allocator_history():
-    source = inspect.getsource(permanent_control_worker._run)
+    source = inspect.getsource(control_cycle_executor.run_one_control_cycle)
+    parent_source = inspect.getsource(permanent_control_worker._run)
 
     assert "install_bounded_control_outcome_ledgers()" in source
-    assert '"mechanism_evidence_read_mode": "initial_exact_history_plus_incremental_tail"' in source
-    assert '"database_pool_checkout_timeout_enforced"' in source
+    assert "CIE_CONTROL_CACHE_NAMESPACE" in parent_source
+    assert '"mechanism_evidence_read_mode"' in parent_source
+    assert '"database_pool_checkout_timeout_enforced"' in parent_source

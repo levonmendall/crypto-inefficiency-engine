@@ -8,6 +8,12 @@ from typing import Any
 
 from sqlalchemy import event, inspect, text
 
+from inefficiency_engine.durable_control_cache import (
+    durable_control_cache_namespace,
+    load_control_cache_checkpoint,
+    save_control_cache_checkpoint,
+)
+
 
 _PATCH_MARKER = "_cie_bounded_strategy_evidence_runtime"
 _TIMEOUT_MARKER = "_cie_control_database_timeouts"
@@ -52,7 +58,67 @@ def _new_cache_state() -> dict[str, Any]:
         "last_alpha_batch_rows": 0,
         "last_trial_batch_rows": 0,
         "last_allocation_batch_rows": 0,
+        "durable_checkpoint_active": durable_control_cache_namespace() is not None,
+        "durable_checkpoint_loaded": False,
+        "durable_checkpoint_persisted": False,
     }
+
+
+def _serialize_cache_state(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "alpha_tail": int(state["alpha_tail"]),
+        "trial_tail": int(state["trial_tail"]),
+        "allocation_tail": int(state["allocation_tail"]),
+        "alpha_target_tail": int(state["alpha_target_tail"]),
+        "trial_target_tail": int(state["trial_target_tail"]),
+        "allocation_target_tail": int(state["allocation_target_tail"]),
+        "signals": [
+            [str(strategy), str(family), int(count)]
+            for (strategy, family), count in state["signals"].items()
+        ],
+        "raw_outcomes": list(state["raw_outcomes"]),
+        "observed_identity": dict(state["observed_identity"]),
+        "allocator_by_strategy": {
+            str(key): list(value)
+            for key, value in state["allocator_by_strategy"].items()
+        },
+        "supported_trials": {
+            str(key): int(value) for key, value in state["supported_trials"].items()
+        },
+        "cache_complete": bool(state["cache_complete"]),
+    }
+
+
+def _restore_cache_state(payload: dict[str, Any]) -> dict[str, Any]:
+    state = _new_cache_state()
+    for key in (
+        "alpha_tail",
+        "trial_tail",
+        "allocation_tail",
+        "alpha_target_tail",
+        "trial_target_tail",
+        "allocation_target_tail",
+    ):
+        state[key] = int(payload.get(key) or 0)
+    for row in payload.get("signals", []):
+        if isinstance(row, list) and len(row) == 3:
+            state["signals"][(str(row[0]), str(row[1]))] = int(row[2])
+    state["raw_outcomes"] = [
+        dict(row) for row in payload.get("raw_outcomes", []) if isinstance(row, dict)
+    ]
+    state["observed_identity"] = {
+        str(key): str(value)
+        for key, value in dict(payload.get("observed_identity") or {}).items()
+    }
+    for key, rows in dict(payload.get("allocator_by_strategy") or {}).items():
+        state["allocator_by_strategy"][str(key)] = [
+            dict(row) for row in rows if isinstance(row, dict)
+        ]
+    for key, value in dict(payload.get("supported_trials") or {}).items():
+        state["supported_trials"][str(key)] = int(value)
+    state["cache_complete"] = bool(payload.get("cache_complete"))
+    state["durable_checkpoint_loaded"] = True
+    return state
 
 
 def _tail_id(db: Any, table_name: str, available: set[str]) -> int:
@@ -199,7 +265,18 @@ def _refresh_cached_ledgers(store: Any) -> dict[str, Any]:
     cache_key = _cache_key(store)
     batch_rows = _bootstrap_batch_rows()
     with _CACHE_LOCK:
-        state = _CACHE.setdefault(cache_key, _new_cache_state())
+        state = _CACHE.get(cache_key)
+        if state is None:
+            checkpoint = load_control_cache_checkpoint(
+                store,
+                cache_key="strategy-evidence",
+            )
+            state = (
+                _restore_cache_state(checkpoint)
+                if checkpoint is not None
+                else _new_cache_state()
+            )
+            _CACHE[cache_key] = state
         with store.engine.connect() as db:
             alpha_target = _tail_id(db, "alpha_forward_events", available)
             trial_target = _tail_id(db, "allocation_forward_trials", available)
@@ -263,6 +340,13 @@ def _refresh_cached_ledgers(store: Any) -> dict[str, Any]:
                 and allocation_processed >= allocation_target
             )
 
+        state["durable_checkpoint_persisted"] = save_control_cache_checkpoint(
+            store,
+            cache_key="strategy-evidence",
+            payload=_serialize_cache_state(state),
+            complete=bool(state["cache_complete"]),
+        )
+
         return {
             "key": (alpha_target, trial_target, allocation_target),
             "cache_complete": bool(state["cache_complete"]),
@@ -284,6 +368,11 @@ def _refresh_cached_ledgers(store: Any) -> dict[str, Any]:
                 "last_alpha_batch_rows": alpha_rows,
                 "last_trial_batch_rows": trial_rows,
                 "last_allocation_batch_rows": allocation_rows,
+                "durable_checkpoint_active": bool(state["durable_checkpoint_active"]),
+                "durable_checkpoint_loaded": bool(state["durable_checkpoint_loaded"]),
+                "durable_checkpoint_persisted": bool(
+                    state["durable_checkpoint_persisted"]
+                ),
             },
         }
 
@@ -526,11 +615,21 @@ def bounded_strategy_evidence_cache_diagnostics() -> dict[str, object]:
                     "last_alpha_batch_rows": int(state["last_alpha_batch_rows"]),
                     "last_trial_batch_rows": int(state["last_trial_batch_rows"]),
                     "last_allocation_batch_rows": int(state["last_allocation_batch_rows"]),
+                    "durable_checkpoint_active": bool(
+                        state["durable_checkpoint_active"]
+                    ),
+                    "durable_checkpoint_loaded": bool(
+                        state["durable_checkpoint_loaded"]
+                    ),
+                    "durable_checkpoint_persisted": bool(
+                        state["durable_checkpoint_persisted"]
+                    ),
                 }
             )
         return {
             "mode": "bounded_exact_bootstrap_then_incremental_tail",
             "batch_rows": _bootstrap_batch_rows(),
+            "durable_namespace": durable_control_cache_namespace(),
             "cache_count": len(caches),
             "all_caches_complete": bool(caches)
             and all(bool(row["cache_complete"]) for row in caches),

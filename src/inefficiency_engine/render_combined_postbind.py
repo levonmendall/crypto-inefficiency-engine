@@ -6,6 +6,9 @@ import time
 from urllib.request import urlopen
 
 from inefficiency_engine import render_combined as base
+from inefficiency_engine.durable_control_cache import (
+    ensure_durable_control_cache_schema,
+)
 from inefficiency_engine.runtime_index_maintenance import (
     BACKGROUND_INDEX_SPECS,
     CONTROL_GATE_INDEX_SPECS,
@@ -31,6 +34,7 @@ def bootstrap_permanent_runtime_schema() -> None:
     if store is None:
         raise RuntimeError("combined runtime requires durable evidence persistence")
     base._build_control_services(settings, store)
+    ensure_durable_control_cache_schema(store)
     print(
         f"permanent runtime schema bootstrap complete before child startup: {store.safe_database_url}",
         flush=True,

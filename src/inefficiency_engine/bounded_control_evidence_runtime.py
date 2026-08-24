@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
 from typing import Any
 
 from sqlalchemy import select
+
+from inefficiency_engine.durable_control_cache import (
+    durable_control_cache_namespace,
+    load_control_cache_checkpoint,
+    save_control_cache_checkpoint,
+)
 
 
 _PATCH_MARKER = "_cie_bounded_control_outcome_ledgers"
@@ -27,18 +34,56 @@ def _bootstrap_batch_rows() -> int:
     return max(100, min(20000, value))
 
 
-def _state(engine: Any, table_name: str) -> dict[str, Any]:
-    return _CACHE.setdefault(
-        (id(engine), table_name),
-        {
-            "tail": 0,
-            "target_tail": 0,
-            "rows": [],
-            "checked_at": 0.0,
-            "bootstrap_complete": False,
-            "last_batch_rows": 0,
-        },
+def _new_state() -> dict[str, Any]:
+    return {
+        "tail": 0,
+        "target_tail": 0,
+        "rows": [],
+        "checked_at": 0.0,
+        "bootstrap_complete": False,
+        "last_batch_rows": 0,
+        "durable_checkpoint_active": durable_control_cache_namespace() is not None,
+        "durable_checkpoint_loaded": False,
+        "durable_checkpoint_persisted": False,
+    }
+
+
+def _state(ledger: Any, table_name: str, model: Any) -> dict[str, Any]:
+    key = (id(ledger.store.engine), table_name)
+    state = _CACHE.get(key)
+    if state is not None:
+        return state
+    checkpoint = load_control_cache_checkpoint(
+        ledger.store,
+        cache_key=f"outcome-history:{table_name}",
     )
+    state = _new_state()
+    if checkpoint is not None:
+        state["tail"] = int(checkpoint.get("tail") or 0)
+        state["target_tail"] = int(checkpoint.get("target_tail") or 0)
+        state["rows"] = [
+            model.model_validate_json(payload)
+            for payload in checkpoint.get("rows", [])
+            if isinstance(payload, str)
+        ]
+        state["bootstrap_complete"] = bool(checkpoint.get("bootstrap_complete"))
+        state["durable_checkpoint_loaded"] = True
+    _CACHE[key] = state
+    return state
+
+
+def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "tail": int(state["tail"]),
+        "target_tail": int(state["target_tail"]),
+        "rows": [
+            row.model_dump_json()
+            if callable(getattr(row, "model_dump_json", None))
+            else json.dumps(row)
+            for row in state["rows"]
+        ],
+        "bootstrap_complete": bool(state["bootstrap_complete"]),
+    }
 
 
 def _refresh_rows(ledger: Any, table: Any, model: Any) -> list[Any]:
@@ -55,7 +100,7 @@ def _refresh_rows(ledger: Any, table: Any, model: Any) -> list[Any]:
     now = time.monotonic()
     batch_rows = _bootstrap_batch_rows()
     with _CACHE_LOCK:
-        state = _state(engine, table.name)
+        state = _state(ledger, table.name, model)
         if now - float(state["checked_at"]) < _CACHE_CHECK_SECONDS:
             return list(state["rows"]) if bool(state["bootstrap_complete"]) else []
 
@@ -105,6 +150,12 @@ def _refresh_rows(ledger: Any, table: Any, model: Any) -> list[Any]:
             state["last_batch_rows"] = len(additions)
             state["bootstrap_complete"] = int(state["tail"]) >= target_tail
 
+        state["durable_checkpoint_persisted"] = save_control_cache_checkpoint(
+            ledger.store,
+            cache_key=f"outcome-history:{table.name}",
+            payload=_serialize_state(state),
+            complete=bool(state["bootstrap_complete"]),
+        )
         state["checked_at"] = now
         return list(state["rows"]) if bool(state["bootstrap_complete"]) else []
 
@@ -161,12 +212,18 @@ def bounded_control_outcome_cache_diagnostics() -> dict[str, object]:
                 "row_count": len(state["rows"]),
                 "bootstrap_complete": bool(state["bootstrap_complete"]),
                 "last_batch_rows": int(state["last_batch_rows"]),
+                "durable_checkpoint_active": bool(state["durable_checkpoint_active"]),
+                "durable_checkpoint_loaded": bool(state["durable_checkpoint_loaded"]),
+                "durable_checkpoint_persisted": bool(
+                    state["durable_checkpoint_persisted"]
+                ),
             }
             for (_engine_id, table_name), state in _CACHE.items()
         }
         return {
             "mode": "bounded_exact_bootstrap_then_incremental_tail",
             "batch_rows": _bootstrap_batch_rows(),
+            "durable_namespace": durable_control_cache_namespace(),
             "table_count": len(_CACHE),
             "all_caches_complete": bool(tables)
             and all(bool(row["bootstrap_complete"]) for row in tables.values()),

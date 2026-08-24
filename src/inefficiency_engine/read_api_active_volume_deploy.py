@@ -168,7 +168,50 @@ def _runtime_heartbeats() -> dict[str, object]:
             worker.update(
                 {
                     "provider_requests_allowed": detail.get("provider_requests_allowed"),
-                    "provider_requests_used": alpha.get("provider_requests_used"),
+                    "provider_requests_used": detail.get(
+                        "provider_requests_used",
+                        alpha.get("provider_requests_used"),
+                    ),
+                    "parent_process_identity": detail.get("parent_process_identity"),
+                    "parent_pid": detail.get("parent_pid"),
+                    "parent_generation": detail.get("parent_generation"),
+                    "parent_sequence": detail.get("parent_sequence"),
+                    "parent_heartbeat_current": detail.get(
+                        "parent_heartbeat_current"
+                    ),
+                    "executor_pid": detail.get("executor_pid"),
+                    "executor_cycle_id": detail.get("executor_cycle_id"),
+                    "executor_current_stage": detail.get("executor_current_stage"),
+                    "executor_stage_observed_at": detail.get(
+                        "executor_stage_observed_at"
+                    ),
+                    "executor_age_seconds": detail.get("executor_age_seconds"),
+                    "executor_deadline_seconds": detail.get(
+                        "executor_deadline_seconds"
+                    ),
+                    "last_executor_result": detail.get("last_executor_result"),
+                    "last_executor_error_type": detail.get(
+                        "last_executor_error_type"
+                    ),
+                    "last_executor_runtime_seconds": detail.get(
+                        "last_executor_runtime_seconds"
+                    ),
+                    "executor_last_stage_before_failure": detail.get(
+                        "executor_last_stage_before_failure"
+                    ),
+                    "executor_terminated": detail.get("executor_terminated"),
+                    "executor_killed": detail.get("executor_killed"),
+                    "retry_count": detail.get("retry_count"),
+                    "historical_cache_progress": detail.get(
+                        "historical_cache_progress"
+                    ),
+                    "historical_cache_complete": detail.get(
+                        "historical_cache_complete"
+                    ),
+                    "external_process_deadline_enforced": detail.get(
+                        "external_process_deadline_enforced"
+                    ),
+                    "paper_only": detail.get("paper_only"),
                     "operating_reconciliation_complete": detail.get(
                         "operating_reconciliation_complete"
                     ),

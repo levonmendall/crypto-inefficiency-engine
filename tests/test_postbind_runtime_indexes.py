@@ -115,6 +115,9 @@ def test_production_bootstrap_does_not_build_large_runtime_indexes():
     maintenance_source = inspect.getsource(render_combined_postbind._runtime_index_guard)
 
     assert "_build_control_services" in bootstrap_source
+    assert bootstrap_source.index("_build_control_services") < bootstrap_source.index(
+        "ensure_durable_control_cache_schema"
+    )
     assert "ensure_runtime_indexes_after_api_bind" not in bootstrap_source
     assert maintenance_source.index("_api_is_bound") < maintenance_source.index(
         "ensure_runtime_indexes_after_api_bind"

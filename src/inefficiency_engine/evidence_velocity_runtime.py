@@ -399,7 +399,7 @@ class EvidenceVelocityAllLaneOperatingCertificationService(
             }
         )
 
-    def reconcile_latest_runtime_truth(self):
+    def reconcile_latest_runtime_truth(self, *, stage_reporter=None):
         """Persist one post-evidence operating snapshot using durable state only.
 
         This intentionally does *not* call provider collection, live market scans, L2
@@ -408,17 +408,27 @@ class EvidenceVelocityAllLaneOperatingCertificationService(
         otherwise publish evidence newer than its operating-certification snapshot.
         """
 
+        if callable(stage_reporter):
+            stage_reporter("latest_operating_snapshot")
         latest = self.ledger.latest()
         if latest is None:
             return None
+        if callable(stage_reporter):
+            stage_reporter("strategy_evidence")
         strategy_evidence = _load_strategy_evidence(self.store, self.core.settings)
+        if callable(stage_reporter):
+            stage_reporter("source_snapshot")
         source_snapshot = self.source_coverage.snapshot()
         source_by_id = {row.lane_id: row for row in source_snapshot.lanes}
+        if callable(stage_reporter):
+            stage_reporter("mechanism_readiness")
         mechanism_readiness = (
             self.mechanism_execution.readiness_summary()
             if any(row.mechanism_id in MECHANISM_IDS for row in latest.mechanisms)
             else {}
         )
+        if callable(stage_reporter):
+            stage_reporter("status_rollup")
         statuses = []
         for existing in latest.mechanisms:
             lane = source_by_id.get(existing.mechanism_id)
@@ -451,6 +461,8 @@ class EvidenceVelocityAllLaneOperatingCertificationService(
                 "certified_count": sum(row.state == "certified" for row in statuses),
             }
         )
+        if callable(stage_reporter):
+            stage_reporter("operating_ledger_record")
         self.ledger.record(corrected)
         return corrected
 

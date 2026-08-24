@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import event, inspect as sqlalchemy_inspect
 
 from inefficiency_engine import (
+    control_cycle_executor,
     disposable_heavy_job,
     permanent_control_worker,
     permanent_source_worker,
@@ -203,12 +204,12 @@ def test_runtime_entrypoints_install_source_safety_without_runtime_ddl():
 
 
 def test_control_and_api_install_bounded_source_reconciliation_runtime():
-    control_worker = inspect.getsource(permanent_control_worker._run)
+    control_executor = inspect.getsource(control_cycle_executor.run_one_control_cycle)
     api_module = inspect.getsource(read_api_active_volume_deploy)
 
-    assert control_worker.index(
+    assert control_executor.index(
         "install_source_coverage_reconciliation_runtime()"
-    ) < control_worker.index("_build_control_services")
+    ) < control_executor.rindex("_build_control_services")
     assert api_module.index(
         "install_source_coverage_reconciliation_runtime()"
     ) < api_module.index("app = _base_deploy.app")
