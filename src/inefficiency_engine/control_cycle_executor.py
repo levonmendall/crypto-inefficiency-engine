@@ -109,6 +109,9 @@ def run_one_control_cycle() -> dict[str, object]:
     from inefficiency_engine.control_cycle_runtime import (
         install_control_pool_checkout_timeout,
     )
+    from inefficiency_engine.cycle_history_bucket_timeout_runtime import (
+        cycle_history_bucket_database_timeout,
+    )
     from inefficiency_engine.durable_control_cache import (
         ensure_durable_control_cache_schema,
     )
@@ -245,10 +248,11 @@ def run_one_control_cycle() -> dict[str, object]:
         if source_snapshot is not None:
             stage_reporter("cycle_history_cache_bootstrap")
             try:
-                cycle_history_progress = advance_durable_control_cycle_history_cache(
-                    alpha_factory,
-                    source_snapshot,
-                )
+                with cycle_history_bucket_database_timeout(store):
+                    cycle_history_progress = advance_durable_control_cycle_history_cache(
+                        alpha_factory,
+                        source_snapshot,
+                    )
             except Exception as exc:
                 cycle_history_progress = {
                     "complete": False,
