@@ -15,6 +15,7 @@ from inefficiency_engine import control_cycle_executor
 from inefficiency_engine import permanent_control_worker
 from inefficiency_engine import bounded_control_evidence_runtime as bounded_control
 from inefficiency_engine.bounded_control_evidence_runtime import (
+    _bootstrap_batch_rows,
     _refresh_rows,
     bounded_control_outcome_cache_diagnostics,
 )
@@ -87,6 +88,12 @@ def test_postgres_pool_checkout_wait_is_bounded_below_control_deadline():
 
     assert install_control_pool_checkout_timeout(store, timeout_seconds=5.0) is True
     assert pool._timeout == 5.0
+
+
+def test_outcome_cache_default_batch_is_small_enough_for_disposable_preflight(monkeypatch):
+    monkeypatch.delenv("CIE_CONTROL_OUTCOME_BOOTSTRAP_BATCH_ROWS", raising=False)
+
+    assert _bootstrap_batch_rows() == 500
 
 
 def test_outcome_cache_cold_start_is_batched_and_partial_history_is_never_exposed(
@@ -194,11 +201,40 @@ def test_outcome_bootstrap_progress_survives_executor_process_cache_reset(
     assert [row.value for row in rows] == list(range(250))
 
 
-def test_control_installs_bounded_mechanism_and_allocator_history():
+def test_partial_outcome_cache_returns_normal_fail_closed_control_payload():
+    cache = {
+        "complete": False,
+        "strategy": {"all_caches_complete": True},
+        "outcomes": {
+            "all_caches_complete": False,
+            "batch_rows": 500,
+        },
+    }
+
+    payload = control_cycle_executor._cache_rebuilding_control_payload(cache)
+
+    assert payload["operating_reconciliation_complete"] is False
+    assert payload["qualified_bridge_publication_complete"] is False
+    assert payload["research_projection_publication_complete"] is False
+    assert payload["historical_cache_complete"] is False
+    assert payload["control_plane_healthy"] is False
+    assert payload["control_plane_errors"] == {
+        "historical_evidence_cache": "HistoricalEvidenceCacheRebuilding"
+    }
+
+
+def test_control_installs_and_prewarms_bounded_outcome_history_before_reconciliation():
     source = inspect.getsource(control_cycle_executor.run_one_control_cycle)
     parent_source = inspect.getsource(permanent_control_worker._run)
 
     assert "install_bounded_control_outcome_ledgers()" in source
+    assert "advance_bounded_control_outcome_caches(" in source
+    assert 'stage_reporter("historical_outcome_cache_bootstrap")' in source
+    assert 'write_stage("historical_outcome_cache_rebuilding"' in source
+    assert "refresh_canonical_control_plane(" in source
+    assert source.index("advance_bounded_control_outcome_caches(") < source.index(
+        "refresh_canonical_control_plane("
+    )
     assert "CIE_CONTROL_CACHE_NAMESPACE" in parent_source
     assert '"mechanism_evidence_read_mode"' in parent_source
     assert '"database_pool_checkout_timeout_enforced"' in parent_source
