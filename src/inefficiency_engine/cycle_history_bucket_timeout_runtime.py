@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -9,6 +10,9 @@ from sqlalchemy import delete, event, insert, select
 
 _DEFAULT_STATEMENT_TIMEOUT_SECONDS = 4.0
 _DEFAULT_LOCK_TIMEOUT_SECONDS = 1.0
+_DEFAULT_CONTROL_EXECUTOR_SLICE_SECONDS = 3.0
+_CONTROL_EXECUTOR_BUCKET_QUERY_CAP = 1
+_BUCKET_QUERY_BUDGET_ENV = "CIE_CONTROL_CYCLE_HISTORY_BUCKET_QUERY_BUDGET"
 
 
 def _bounded_seconds(name: str, default: float, *, minimum: float, maximum: float) -> float:
@@ -42,6 +46,23 @@ def cycle_history_bucket_lock_timeout_seconds() -> float:
     )
 
 
+def control_executor_cycle_history_slice_seconds() -> float:
+    """Soft work slice used only by the disposable canonical-control child.
+
+    Production control reaches cycle-history bootstrap late in its unchanged 25-second
+    lifetime. The durable history cache is resumable, so one child should make a small
+    checkpointed advance and return normally rather than spending the cache's ordinary
+    eight-second bootstrap allowance and being killed by the external supervisor.
+    """
+
+    return _bounded_seconds(
+        "CIE_CONTROL_CYCLE_HISTORY_EXECUTOR_SLICE_SECONDS",
+        _DEFAULT_CONTROL_EXECUTOR_SLICE_SECONDS,
+        minimum=1.0,
+        maximum=4.0,
+    )
+
+
 def _postgres_timeout_statements() -> tuple[str, str]:
     statement_ms = max(1, int(cycle_history_bucket_statement_timeout_seconds() * 1000.0))
     lock_ms = max(1, int(cycle_history_bucket_lock_timeout_seconds() * 1000.0))
@@ -49,6 +70,63 @@ def _postgres_timeout_statements() -> tuple[str, str]:
         f"SET LOCAL statement_timeout = {statement_ms}",
         f"SET LOCAL lock_timeout = {lock_ms}",
     )
+
+
+@contextmanager
+def _single_bucket_query_budget() -> Iterator[None]:
+    """Temporarily cap one disposable control child to one durable history bucket."""
+
+    previous = os.environ.get(_BUCKET_QUERY_BUDGET_ENV)
+    os.environ[_BUCKET_QUERY_BUDGET_ENV] = str(_CONTROL_EXECUTOR_BUCKET_QUERY_CAP)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_BUCKET_QUERY_BUDGET_ENV, None)
+        else:
+            os.environ[_BUCKET_QUERY_BUDGET_ENV] = previous
+
+
+def advance_control_executor_cycle_history_cache(
+    advance: Any,
+    factory: Any,
+    snapshot: Any,
+    *,
+    stop_at_monotonic: float | None = None,
+) -> dict[str, object]:
+    """Advance at most one checkpointed bucket inside a short control-child slice.
+
+    The exact cache remains fail-closed and resumes from its durable checkpoint on the
+    next fresh control interpreter. This wrapper changes only how much maintenance one
+    disposable child may attempt; evidence requirements, the external 25-second
+    deadline, PostgreSQL statement/lock limits, and allocation authority are untouched.
+    """
+
+    slice_seconds = control_executor_cycle_history_slice_seconds()
+    local_stop = time.monotonic() + slice_seconds
+    if stop_at_monotonic is not None:
+        local_stop = min(local_stop, float(stop_at_monotonic))
+
+    with _single_bucket_query_budget():
+        progress = dict(
+            advance(
+                factory,
+                snapshot,
+                stop_at_monotonic=local_stop,
+            )
+        )
+
+    progress.update(
+        {
+            "control_executor_slice_seconds": slice_seconds,
+            "control_executor_bucket_query_cap": _CONTROL_EXECUTOR_BUCKET_QUERY_CAP,
+            "control_executor_supervisor_safe_slice": True,
+            "external_process_deadline_unchanged": True,
+            "qualification_thresholds_unchanged": True,
+            "paper_only": True,
+        }
+    )
+    return progress
 
 
 def _index_aligned_replace_bucket(
@@ -185,8 +263,21 @@ if os.getenv("CIE_CONTROL_EXECUTOR_CYCLE_ID"):
         load_durable_control_cycle_history as _load_frozen_cycle_history,
     )
 
+    def _advance_supervisor_safe_cycle_history(
+        factory: Any,
+        snapshot: Any,
+        *,
+        stop_at_monotonic: float | None = None,
+    ) -> dict[str, object]:
+        return advance_control_executor_cycle_history_cache(
+            _advance_frozen_cycle_history,
+            factory,
+            snapshot,
+            stop_at_monotonic=stop_at_monotonic,
+        )
+
     install_index_aligned_cycle_history_bucket_runtime()
     _legacy_cycle_history.advance_durable_control_cycle_history_cache = (
-        _advance_frozen_cycle_history
+        _advance_supervisor_safe_cycle_history
     )
     _legacy_cycle_history.load_durable_control_cycle_history = _load_frozen_cycle_history
