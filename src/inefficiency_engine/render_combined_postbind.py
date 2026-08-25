@@ -6,6 +6,9 @@ import time
 from urllib.request import urlopen
 
 from inefficiency_engine import render_combined as base
+from inefficiency_engine.cycle_history_brin_runtime import (
+    ensure_cycle_history_brin_after_api_bind,
+)
 from inefficiency_engine.durable_control_cache import (
     ensure_durable_control_cache_schema,
 )
@@ -96,6 +99,8 @@ def _progress_callback(
                 "current_index_runtime_seconds": row.get("runtime_seconds"),
                 "current_index_ok": row.get("ok"),
                 "current_index_concurrent": row.get("concurrent"),
+                "current_index_access_method": row.get("access_method"),
+                "current_index_pages_per_range": row.get("pages_per_range"),
                 "message": row.get("message"),
                 "control_gate_released": control_gate_released,
                 "background_indexes_complete": False,
@@ -121,19 +126,20 @@ def _runtime_index_guard(
     ``CONTROL_GATE_INDEX_SPECS`` and ``CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS`` are
     retained as index-definition groups for compatibility and observability, but neither
     group is an investment-authority prerequisite anymore. Production has proved that a
-    concurrent build of the exact cycle-history index can exceed both 30-second and
-    120-second bounded DDL windows while the API, source plane, research plane, durable
-    cycle-history cache, and bounded control executor remain healthy.
+    concurrent build of the exact cycle-history btree can exceed bounded DDL windows
+    while the API, source plane, research plane, durable cycle-history cache, and bounded
+    control executor remain healthy.
 
     Canonical control therefore starts as soon as the API is bound. Exact cycle-history
-    reads remain fail-closed inside the disposable control child: the history cache is
-    checkpointed/resumable and PostgreSQL bucket reads retain their short statement
-    timeout. A missing optimization index can make one history advance incomplete, but it
-    cannot make the canonical-control worker entirely unobserved.
+    reads remain fail-closed inside the disposable control child. Immediately after
+    release, maintenance first installs a compact BRIN over append-only ``observed_at``.
+    That gives the exact day-range query a cheap planner path without waiting for the
+    much larger four-column btree. Source/strategy indexes and the exact btree continue
+    afterward as optional performance maintenance.
 
-    Runtime indexes, including the exact cycle-history composite index, remain post-bind
-    performance maintenance. Their failures stay visible and retryable without becoming
-    allocation authority or suppressing control liveness.
+    None of these indexes grant evidence, qualification, allocation, or execution
+    authority. Their failures stay visible and retryable without suppressing control
+    liveness.
     """
 
     port = os.getenv("PORT", "10000")
@@ -176,7 +182,7 @@ def _runtime_index_guard(
     )
 
     # Keep the source/read and strategy indexes in their existing group. The exact
-    # cycle-history index is maintained as a separate scope because both groups contain
+    # cycle-history btree is maintained as a separate scope because both groups contain
     # a market_quotes entry and a dict merge would otherwise overwrite one definition.
     post_control_index_specs = {
         **CONTROL_GATE_INDEX_SPECS,
@@ -188,6 +194,33 @@ def _runtime_index_guard(
         background_attempt += 1
         round_started = time.monotonic()
         round_results: list[tuple[str, dict[str, object]]] = []
+
+        # Repair the actual production failure first. BRIN summarizes the append-only
+        # observed-at ranges with a tiny index and lets the exact venue/asset/day query
+        # avoid a full market_quotes scan while the larger btree is still unavailable.
+        brin_scope = "post_control_cycle_history_brin"
+        _record_index_heartbeat(
+            store,
+            state="running",
+            detail={
+                "attempt": background_attempt,
+                "stage": "building_post_control_cycle_history_brin",
+                "scope": brin_scope,
+                "control_gate_released": True,
+                "background_indexes_complete": False,
+                "cycle_history_index_authority_required": False,
+            },
+        )
+        brin_result = ensure_cycle_history_brin_after_api_bind(
+            store,
+            progress=_progress_callback(
+                store,
+                attempt=background_attempt,
+                scope=brin_scope,
+                control_gate_released=True,
+            ),
+        )
+        round_results.append((brin_scope, brin_result))
 
         for scope, index_specs in (
             ("post_control_source_strategy", post_control_index_specs),
