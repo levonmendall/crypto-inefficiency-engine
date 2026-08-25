@@ -12,6 +12,7 @@ from inefficiency_engine.production_source_recovery_v2_runtime import (
 )
 from inefficiency_engine.provider_gap_collection import ProviderProbeResult
 from inefficiency_engine.provider_gap_resilience import ResilientProviderGapCollectionService
+from inefficiency_engine.source_flap_repair import install_source_flap_repair
 from inefficiency_engine.source_lane_repair_runtime import (
     RemainingSourceLaneRepairService,
     collect_hyperliquid_distress_resilient,
@@ -98,6 +99,12 @@ def install_remaining_source_lane_repairs() -> None:
     # evidence-class freshness window is still valid, and single-flight the identical
     # Deribit option acquisition across its runtime owners.
     install_source_refresh_truth_repair()
+
+    # Production telemetry also proved overlapping Aave/trade-flow/OKX refresh owners
+    # and transient Coinbase/OKX hot-path transport misses. Join identical in-flight
+    # source requests, give the executable market surface one fresh bounded retry, and
+    # leave all source-validity and qualification thresholds unchanged.
+    install_source_flap_repair()
 
     if not bool(getattr(base, _RUNTIME_PATCH_MARKER, False)):
         base.run_permanent_source_worker = _run_permanent_source_worker_with_critical_cadence
