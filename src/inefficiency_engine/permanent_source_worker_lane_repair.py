@@ -16,6 +16,9 @@ from inefficiency_engine.source_lane_repair_runtime import (
     RemainingSourceLaneRepairService,
     collect_hyperliquid_distress_resilient,
 )
+from inefficiency_engine.remaining_source_transport_repair import (
+    install_remaining_source_transport_repairs,
+)
 
 
 _ORIGINAL_RUN_PERMANENT_SOURCE_WORKER = base.run_permanent_source_worker
@@ -77,10 +80,15 @@ def install_remaining_source_lane_repairs() -> None:
 
     # Preserve the exact Aave V3 Ethereum Pool + LiquidationCall query while adding
     # one independent documented Ethereum JSON-RPC transport. Keep the total fallback
-    # sequence inside the existing 15-second preflight boundary.
+    # sequence inside the existing bounded source-acquisition path.
     recovery_v1.AAVE_RPC_FALLBACK_URLS = AAVE_RPC_FALLBACK_URLS
     recovery_v1.AAVE_TRANSPORT_BUDGET_SECONDS = AAVE_TRANSPORT_BUDGET_SECONDS
     recovery_v2.AAVE_TRANSPORT_BUDGET_SECONDS = AAVE_TRANSPORT_BUDGET_SECONDS
+
+    # Repair the three remaining production transport failures without changing the
+    # underlying evidence source, required product breadth, source-validity windows,
+    # qualification gates, allocation authority, or paper-only safeguards.
+    install_remaining_source_transport_repairs()
 
     if not bool(getattr(base, _RUNTIME_PATCH_MARKER, False)):
         base.run_permanent_source_worker = _run_permanent_source_worker_with_critical_cadence
