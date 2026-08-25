@@ -111,7 +111,7 @@ def test_render_combined_service_uses_restored_command_center_with_v5_mechanism_
     )
 
     canonical = Path("src/inefficiency_engine/render_combined.py").read_text()
-    assert 'CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"' in canonical
+    assert 'CANONICAL_API_APP = "inefficiency_engine.read_api_liveness_deploy:app"' in canonical
     assert "render_combined_runtime" in canonical
 
     postbind = Path("src/inefficiency_engine/render_combined_postbind.py").read_text()
