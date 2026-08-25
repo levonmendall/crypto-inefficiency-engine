@@ -41,6 +41,9 @@ function laneForHistoricalFunnel(name,item,funnel,cards){
   for(const c of cards){if(laneHistoryStrategyIds(c).has(String(name||'')))return String(c.mechanism_id||'')}
   return null;
 }
+function laneCoverageFor(p,lane){
+  return p?.runtime?.detail?.lane_coverage?.lanes?.[lane]||null;
+}
 function laneHistoryIndex(p,cards){
   const byLane=new Map(cards.map(c=>[String(c.mechanism_id||''),{selected:[],funnels:[]}]))
   const unassigned=[];
@@ -85,7 +88,25 @@ function laneHistoryFunnelRow(row){
   if(Number.isFinite(+f.required_net_economics))parts.push(`hurdle ${laneHistoryPct(f.required_net_economics)}`);
   if(Number.isFinite(+f.gap_to_hurdle))parts.push(`gap ${laneHistoryPct(f.gap_to_hurdle)}`);
   if(f.economics_unit)parts.push(String(f.economics_unit).replaceAll('_',' '));
-  return `<div class="lane-history-row"><div class="historical-detail">${esc(row.kind)} history · ${esc(parts.join(' · ')||'persisted funnel')} · ${esc(when(row?.item?.observed_at))}</div></div>`;
+  return `<div class="lane-history-row"><div class="historical-detail">${esc(row.kind)} candidate-funnel history · ${esc(parts.join(' · ')||'persisted funnel')} · ${esc(when(row?.item?.observed_at))}</div></div>`;
+}
+function laneHistoryCoverageRow(coverage){
+  if(!coverage)return '';
+  const classes=Array.isArray(coverage.historical_evidence_classes)?coverage.historical_evidence_classes:[];
+  const missing=Array.isArray(coverage.missing_historical_evidence_classes)?coverage.missing_historical_evidence_classes:[];
+  const parts=[
+    `source observations ${num(+(coverage.recovered_source_observations||0))}`,
+    `operating snapshots ${num(+(coverage.recovered_operating_snapshots||0))}`,
+    `candidate funnels ${num(+(coverage.recovered_funnel_records||0))}`
+  ];
+  if(Number.isFinite(+coverage.max_economic_candidate_count))parts.push(`max candidates ${num(+coverage.max_economic_candidate_count)}`);
+  if(Number.isFinite(+coverage.max_forward_signal_count))parts.push(`max forward signals ${num(+coverage.max_forward_signal_count)}`);
+  if(Number.isFinite(+coverage.max_independent_forward_outcome_count))parts.push(`max independent outcomes ${num(+coverage.max_independent_forward_outcome_count)}`);
+  const timing=(coverage.earliest_recovered_at||coverage.latest_recovered_at)?`history ${when(coverage.earliest_recovered_at)} → ${when(coverage.latest_recovered_at)}`:'no recovered historical timestamps';
+  const evidence=classes.length?`evidence ${classes.join(', ')}`:'no recovered evidence classes';
+  const missingText=missing.length?` · missing ${missing.join(', ')}`:'';
+  const reason=coverage.reason?` · ${coverage.reason}`:'';
+  return `<div class="lane-history-row"><div class="historical-detail"><strong>Recovered source / operating history</strong> · ${esc(parts.join(' · '))}<br>${esc(timing)}<br>${esc(evidence+missingText+reason)}</div></div>`;
 }
 function laneHistoryCardNode(lane){return Array.from(document.querySelectorAll('#cards .card[data-mechanism-id]')).find(node=>String(node.dataset.mechanismId||'')===lane)||null}
 function renderLaneHistoricalEvidence(cards,p){
@@ -98,17 +119,23 @@ function renderLaneHistoricalEvidence(cards,p){
     let host=node.querySelector('.lane-history');
     if(!host){host=document.createElement('div');host.className='lane-history';node.appendChild(host)}
     const data=indexed.byLane.get(lane)||{selected:[],funnels:[]};
+    const coverage=laneCoverageFor(p,lane);
     const funnels=[...data.funnels].sort((a,b)=>new Date(b.item?.observed_at||0)-new Date(a.item?.observed_at||0));
     const selected=[...data.selected].sort((a,b)=>new Date(b.observed_at||b?.candidate?.observed_at||0)-new Date(a.observed_at||a?.candidate?.observed_at||0));
     const rawTotal=funnels.reduce((sum,row)=>sum+(Number.isFinite(+row?.funnel?.raw_candidate_count)?+row.funnel.raw_candidate_count:0),0);
     const emittedTotal=funnels.reduce((sum,row)=>sum+(Number.isFinite(+row?.funnel?.emitted_candidate_count)?+row.funnel.emitted_candidate_count:0),0);
     const hurdleClears=funnels.filter(row=>Number.isFinite(+row?.funnel?.gap_to_hurdle)&&+row.funnel.gap_to_hurdle>0).length;
-    const state=p?.complete?'complete':p?.runtime?.detail?.waiting_for_live_observatory_boundary?'caught up / waiting':'running';
+    const state=String(coverage?.state||'unavailable');
+    const coverageHtml=laneHistoryCoverageRow(coverage);
     const recent=[...selected.slice(0,2).map(row=>({kind:'candidate',row})),...funnels.slice(0,2).map(row=>({kind:'funnel',row}))];
     const allRows=[...selected.map(row=>({kind:'candidate',row})),...funnels.map(row=>({kind:'funnel',row}))];
     const recentHtml=recent.map(item=>item.kind==='candidate'?laneHistoryCandidateRow(item.row):laneHistoryFunnelRow(item.row)).join('');
     const allHtml=allRows.map(item=>item.kind==='candidate'?laneHistoryCandidateRow(item.row):laneHistoryFunnelRow(item.row)).join('');
-    host.innerHTML=`<div class="lane-history-head"><div><div class="lane-history-title">Historical opportunity evidence</div><div class="lane-history-summary">Aug. 21 → live boundary · diagnostic only · mapped by persisted lane/strategy identifiers</div></div><span class="badge">${esc(state.toUpperCase())}</span></div><div class="lane-history-grid"><div class="lane-history-stat"><div class="k">Historical raw</div><div class="v">${num(rawTotal)}</div></div><div class="lane-history-stat"><div class="k">Historical emitted</div><div class="v">${num(emittedTotal)}</div></div><div class="lane-history-stat"><div class="k">Forward selections</div><div class="v">${num(selected.length)}</div></div><div class="lane-history-stat"><div class="k">Hurdle-clearing snapshots</div><div class="v">${num(hurdleClears)} / ${num(funnels.length)}</div></div></div>${recentHtml||'<div class="lane-history-unassigned">No persisted historical evidence has been mapped to this lane yet.</div>'}${allRows.length>4?`<details><summary>All mapped historical evidence (${num(allRows.length)})</summary>${allHtml}</details>`:''}`;
+    const sourceObs=+(coverage?.recovered_source_observations||0);
+    const operating=+(coverage?.recovered_operating_snapshots||0);
+    const hasRecoveredCoverage=!!coverage&&(sourceObs>0||operating>0||+(coverage?.recovered_funnel_records||0)>0||coverage?.earliest_recovered_at||coverage?.latest_recovered_at);
+    const emptyMessage=hasRecoveredCoverage?'No candidate-level historical selections or funnels were persisted for this lane; recovered source / operating history is shown above.':'No persisted historical evidence has been recovered for this lane yet.';
+    host.innerHTML=`<div class="lane-history-head"><div><div class="lane-history-title">Historical opportunity evidence</div><div class="lane-history-summary">Aug. 21 → live boundary · diagnostic only · source/operating history is separate from candidate funnels</div></div><span class="badge">${esc(state.toUpperCase())}</span></div><div class="lane-history-grid"><div class="lane-history-stat"><div class="k">Source observations</div><div class="v">${num(sourceObs)}</div></div><div class="lane-history-stat"><div class="k">Operating snapshots</div><div class="v">${num(operating)}</div></div><div class="lane-history-stat"><div class="k">Historical raw</div><div class="v">${num(rawTotal)}</div></div><div class="lane-history-stat"><div class="k">Forward selections</div><div class="v">${num(selected.length)}</div></div></div>${coverageHtml}${recentHtml||`<div class="lane-history-unassigned">${esc(emptyMessage)}</div>`}${allRows.length>4?`<details><summary>All mapped historical candidate evidence (${num(allRows.length)})</summary>${allHtml}</details>`:''}`;
   }
   const globalNote=document.getElementById('historicalOpportunityNote');
   if(globalNote&&indexed.unassigned.length){globalNote.textContent=`${globalNote.textContent} ${indexed.unassigned.length} historical record(s) could not be mapped to a lane from persisted identifiers and remain visible in the global history section.`}
@@ -137,12 +164,11 @@ _original_dashboard_html = cards._dashboard_html
 
 
 def lane_history_dashboard_html() -> str:
-    """Reflect historical observatory evidence inside its canonical mechanism card.
+    """Reflect reconstructed historical evidence inside each canonical mechanism card.
 
-    This is presentation-only. Historical replay remains a separate diagnostic source
-    and is never merged into live forward, qualification, allocation, or execution
-    state. Records without a durable lane identifier remain in the global historical
-    section rather than being guessed into a card.
+    Source/operating history remains visibly distinct from persisted candidate funnels.
+    Historical replay never changes forward samples, qualification, allocation, or execution.
+    Records without a durable lane identifier remain in the global historical section.
     """
 
     html = _original_dashboard_html()
