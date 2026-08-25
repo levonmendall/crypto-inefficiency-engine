@@ -85,8 +85,8 @@ def install_remaining_source_lane_repairs() -> None:
     recovery_v1.AAVE_TRANSPORT_BUDGET_SECONDS = AAVE_TRANSPORT_BUDGET_SECONDS
     recovery_v2.AAVE_TRANSPORT_BUDGET_SECONDS = AAVE_TRANSPORT_BUDGET_SECONDS
 
-    # Repair the three remaining production transport failures without changing the
-    # underlying evidence source, required product breadth, source-validity windows,
+    # Repair only telemetry-proven production transport failures without changing the
+    # underlying evidence sources, required breadth, source-validity windows,
     # qualification gates, allocation authority, or paper-only safeguards.
     install_remaining_source_transport_repairs()
 
