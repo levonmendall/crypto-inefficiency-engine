@@ -19,7 +19,7 @@ PORTFOLIO_BOUNDED_HEARTBEAT_COMMAND = [
     "-m",
     "inefficiency_engine.lightweight_portfolio_worker_bounded_heartbeat",
 ]
-BOUNDED_HEARTBEAT_API_APP = "inefficiency_engine.read_api_bounded_heartbeat_deploy:app"
+BOUNDED_HEARTBEAT_API_APP = "inefficiency_engine.read_api_mobile_truth_deploy:app"
 
 
 def install_source_repair_child_command() -> None:
