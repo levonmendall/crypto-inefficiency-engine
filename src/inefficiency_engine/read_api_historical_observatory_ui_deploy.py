@@ -79,7 +79,7 @@ async function refreshHistoricalReplay(){
   if(historicalReplayInFlight)return historicalReplayInFlight;
   const task=(async()=>{
     try{
-      const r=await fetch('/v3/research/candidate-observatory/history?limit=50',{cache:'no-store'});
+      const r=await fetch('/v3/research/candidate-observatory/history?limit=500',{cache:'no-store'});
       if(!r.ok)throw new Error(`HTTP ${r.status}`);
       renderHistoricalReplay(await r.json());
     }catch(e){
