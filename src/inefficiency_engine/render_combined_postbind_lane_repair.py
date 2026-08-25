@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import sys
+import threading
 
 from inefficiency_engine import render_combined_postbind as base
+from inefficiency_engine.cycle_history_background_supervisor import (
+    run_cycle_history_background_supervisor,
+)
 
 
 SOURCE_REPAIR_COMMAND = [
@@ -47,7 +51,19 @@ def install_source_repair_child_command() -> None:
 
 def main() -> int:
     install_source_repair_child_command()
-    return base.main()
+    stop_event = threading.Event()
+    cycle_history_guard = threading.Thread(
+        target=run_cycle_history_background_supervisor,
+        args=(stop_event,),
+        name="cycle-history-background-supervisor",
+        daemon=True,
+    )
+    cycle_history_guard.start()
+    try:
+        return base.main()
+    finally:
+        stop_event.set()
+        cycle_history_guard.join(timeout=10.0)
 
 
 if __name__ == "__main__":
