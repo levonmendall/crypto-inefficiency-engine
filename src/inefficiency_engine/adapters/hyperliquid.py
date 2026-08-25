@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
@@ -10,6 +11,10 @@ from inefficiency_engine.models import FundingQuote, MarketKind, MarketQuote, Or
 
 
 INFO_URL = "https://api.hyperliquid.xyz/info"
+HYPERLIQUID_REQUEST_ATTEMPTS = 3
+HYPERLIQUID_RETRY_BACKOFF_SECONDS = 0.25
+HYPERLIQUID_MAX_RETRY_AFTER_SECONDS = 1.0
+HYPERLIQUID_TRANSIENT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
 def _utc_from_ms(value: int | float | None) -> datetime | None:
@@ -121,17 +126,66 @@ def parse_l2_book(payload: Any) -> OrderBookSnapshot:
     )
 
 
+def _retry_delay(response: httpx.Response | None, attempt: int) -> float:
+    if response is not None:
+        raw = response.headers.get("Retry-After")
+        if raw:
+            try:
+                return min(
+                    HYPERLIQUID_MAX_RETRY_AFTER_SECONDS,
+                    max(0.0, float(raw)),
+                )
+            except ValueError:
+                pass
+    return min(
+        HYPERLIQUID_MAX_RETRY_AFTER_SECONDS,
+        HYPERLIQUID_RETRY_BACKOFF_SECONDS * max(1, attempt),
+    )
+
+
 class HyperliquidAdapter:
     def __init__(self, client: httpx.AsyncClient | None = None):
         self._client = client
 
     async def _post_payload(self, payload: dict[str, Any]) -> Any:
+        """POST one documented info request with bounded transport-only retries.
+
+        Hyperliquid's info API is rate-limited per IP and can transiently return 429
+        or 5xx responses. Retrying only transient HTTP/transport failures preserves the
+        exact request type and response semantics while preventing one short provider
+        rejection from marking funding, market data, and visible L2 failed together.
+        Permanent 4xx responses remain fail-closed immediately.
+        """
+
         owns_client = self._client is None
-        client = self._client or httpx.AsyncClient(timeout=10.0)
+        client = self._client or httpx.AsyncClient(
+            timeout=10.0,
+            headers={
+                "Accept": "application/json",
+                "Cache-Control": "no-cache",
+                "User-Agent": "crypto-inefficiency-engine/hyperliquid-resilient",
+            },
+        )
         try:
-            response = await client.post(INFO_URL, json=payload)
-            response.raise_for_status()
-            return response.json()
+            for attempt in range(1, HYPERLIQUID_REQUEST_ATTEMPTS + 1):
+                response: httpx.Response | None = None
+                try:
+                    response = await client.post(INFO_URL, json=payload)
+                    response.raise_for_status()
+                    return response.json()
+                except httpx.HTTPStatusError as exc:
+                    status = int(exc.response.status_code)
+                    if (
+                        status not in HYPERLIQUID_TRANSIENT_STATUS_CODES
+                        or attempt >= HYPERLIQUID_REQUEST_ATTEMPTS
+                    ):
+                        raise
+                    await asyncio.sleep(_retry_delay(exc.response, attempt))
+                except httpx.TransportError:
+                    if attempt >= HYPERLIQUID_REQUEST_ATTEMPTS:
+                        raise
+                    await asyncio.sleep(_retry_delay(response, attempt))
+            raise RuntimeError("Hyperliquid retry loop exhausted unexpectedly")
         finally:
             if owns_client:
                 await client.aclose()
