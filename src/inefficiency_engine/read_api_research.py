@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from inefficiency_engine.candidate_observatory import OBSERVATORY_WORKER_ID
 from inefficiency_engine.dashboard_v5_router import build_v5_dashboard_router
 from inefficiency_engine.read_api import _latest_payload, _payload_history, _require_store
 from inefficiency_engine.read_api_fast import app
@@ -8,6 +11,7 @@ from inefficiency_engine.research_reset_runtime import RESEARCH_RESET_POLICY_VER
 
 RESEARCH_CLOSURE_WORKER_ID = "research-closure-diagnostic-loop"
 RESEARCH_RESET_WORKER_ID = "research-qualification-reset"
+RESEARCH_CLOSURE_PRESENTATION_STALE_SECONDS = 1_800.0
 
 
 # Replace the inherited HTML presentation routes at the shared research read-plane
@@ -25,15 +29,49 @@ app.openapi_schema = None
 app.include_router(build_v5_dashboard_router())
 
 
+def _payload_freshness(
+    payload: dict[str, object],
+    *,
+    stale_after_seconds: float = RESEARCH_CLOSURE_PRESENTATION_STALE_SECONDS,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    raw = payload.get("observed_at")
+    try:
+        observed_at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return {
+            "fresh": False,
+            "stale": True,
+            "age_seconds": None,
+            "freshness_sla_seconds": float(stale_after_seconds),
+            "freshness_error": "invalid_observed_at",
+        }
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    age_seconds = max(
+        0.0,
+        (current.astimezone(timezone.utc) - observed_at.astimezone(timezone.utc)).total_seconds(),
+    )
+    stale = age_seconds > max(1.0, float(stale_after_seconds))
+    return {
+        "fresh": not stale,
+        "stale": stale,
+        "age_seconds": age_seconds,
+        "freshness_sla_seconds": float(stale_after_seconds),
+    }
+
+
 @app.get("/v3/operations/research-closure")
 def research_closure_status():
     """Return the latest compact research-closure checkpoint and runtime state.
 
-    This endpoint is read-only. It exposes diagnostic funnels, capability truth,
-    provider admission readiness, and forward-research cohort summaries without
-    creating strategy, allocation, or execution authority. If summary publication
-    has not succeeded yet, the dedicated worker heartbeat makes the failed stage
-    visible instead of presenting an unexplained empty state.
+    ``available`` means a durable record exists. Freshness is reported separately so
+    an old checkpoint can never be mistaken for current production diagnosis. This
+    endpoint is read-only and does not create strategy, allocation, or execution
+    authority.
     """
 
     store = _require_store()
@@ -48,6 +86,8 @@ def research_closure_status():
     if latest is None:
         return {
             "available": False,
+            "fresh": False,
+            "stale": True,
             "paper_only": True,
             "live_execution_authority": False,
             "runtime": runtime,
@@ -57,9 +97,11 @@ def research_closure_status():
                 else "no research closure cycle has been recorded yet"
             ),
         }
+    freshness = _payload_freshness(latest)
     return {
         "available": True,
         **latest,
+        **freshness,
         "runtime": runtime,
         "paper_only": True,
         "live_execution_authority": False,
@@ -79,13 +121,20 @@ def candidate_observatory_status(limit: int = 50):
     latest = _latest_payload(store, "candidate_observatory_snapshots")
     recent_candidates = _payload_history(store, "candidate_observatory_events", limit=bounded)
     recent_shadow_events = _payload_history(store, "candidate_observatory_shadow_events", limit=bounded)
+    heartbeat = None
+    try:
+        heartbeat = store.latest_worker_heartbeat(OBSERVATORY_WORKER_ID)
+    except Exception:
+        heartbeat = None
+    runtime = heartbeat.model_dump(mode="json") if heartbeat is not None else None
     if latest is None:
         return {
             "available": False,
             "recent_candidates": recent_candidates,
             "recent_diagnostic_shadow_events": recent_shadow_events,
+            "runtime": runtime,
             "qualification_policy_version": RESEARCH_RESET_POLICY_VERSION,
-            "qualification_thresholds_unchanged": False,
+            "qualification_thresholds_unchanged": True,
             "observatory_allocation_authority": False,
             "allocation_authority": False,
             "paper_only": True,
@@ -97,8 +146,9 @@ def candidate_observatory_status(limit: int = 50):
         **latest,
         "recent_candidates": recent_candidates,
         "recent_diagnostic_shadow_events": recent_shadow_events,
+        "runtime": runtime,
         "qualification_policy_version": RESEARCH_RESET_POLICY_VERSION,
-        "qualification_thresholds_unchanged": False,
+        "qualification_thresholds_unchanged": True,
         "observatory_allocation_authority": False,
         "allocation_authority": False,
         "paper_only": True,

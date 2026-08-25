@@ -11,8 +11,11 @@ from inefficiency_engine.research_closure_worker import (
 )
 
 
-# Microstructure already owns a dedicated raw order-book rejection funnel in the
-# research-closure service. Do not overwrite that richer venue-specific diagnostic.
+# Every alpha lane, including microstructure, is projected from one discovery cycle.
+# Structural closure still exposes source/usable order-book counts separately, but it
+# must not combine those counts with an emitted-candidate count borrowed from a later
+# operating snapshot. The alpha diagnostic carries both raw and emitted counts from
+# the same cycle and is therefore the canonical dashboard funnel for microstructure.
 DASHBOARD_ALPHA_FUNNEL_LANES = frozenset(
     {
         "trend_momentum",
@@ -20,6 +23,7 @@ DASHBOARD_ALPHA_FUNNEL_LANES = frozenset(
         "fundamental_onchain",
         "cross_sectional_relative_value",
         "event_driven",
+        "microstructure",
     }
 )
 
@@ -30,12 +34,12 @@ def publish_alpha_funnel_projection(
     *,
     observed_at: datetime,
 ) -> bool:
-    """Merge latest alpha funnels without refreshing structural closure freshness.
+    """Merge latest same-cycle alpha funnels without refreshing structural closure freshness.
 
-    The structural closure cycle runs earlier than alpha on the disposable cadence.
-    Rather than reorder heavy research work, append a compact projection after alpha
-    completes. Existing structural/capital-location/maker diagnostics and the parent
-    closure timestamp are preserved exactly. Each refreshed alpha funnel carries its
+    Structural closure owns price/carry reconstruction, source order-book counts,
+    capital-location diagnostics, and maker-shadow diagnostics. Alpha discovery owns
+    the six alpha-lane candidate funnels. Existing structural fields and the parent
+    closure timestamp are preserved exactly; each refreshed alpha funnel carries its
     own observation timestamp so the dashboard can distinguish their freshness.
 
     This function has no allocation authority and never changes qualification state.
@@ -60,6 +64,7 @@ def publish_alpha_funnel_projection(
             continue
         projected_row = dict(row)
         projected_row["alpha_funnel_observed_at"] = observed_at.isoformat()
+        projected_row["same_cycle_candidate_funnel"] = True
         merged[lane] = projected_row
         changed = True
     if not changed:
