@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -47,20 +48,19 @@ INDEX_SPECS: dict[str, tuple[str, ...]] = {
 
 ProgressCallback = Callable[[dict[str, object]], None]
 
-# Runtime index maintenance is deliberately outside API startup, but required indexes
-# still gate canonical control. Bound PostgreSQL DDL at the database session so a
-# blocked concurrent build cannot freeze that gate indefinitely. A timed-out required
-# index stays fail-closed and is retried by the post-bind supervisor.
+# Runtime index maintenance is deliberately outside API startup. Keep ordinary
+# post-control optimization DDL short, but give the one exact cycle-history access path
+# enough bounded time to complete on the small production PostgreSQL instance. API
+# liveness remains independent while this build runs.
 POSTGRES_INDEX_STATEMENT_TIMEOUT_MS = 30_000
+CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS = 120_000
 POSTGRES_INDEX_LOCK_TIMEOUT_MS = 5_000
 
-# An interrupted CREATE INDEX CONCURRENTLY can leave an invalid catalog entry. PostgreSQL
-# resolves IF NOT EXISTS by name, and DROP INDEX CONCURRENTLY can itself wait on locks.
-# Never make canonical control depend on deleting that unusable catalog object. Instead,
-# build the same access path under a bounded sequence of deterministic replacement names
-# and verify the replacement through pg_index. The planner can use the replacement by
-# definition; the stale invalid object can be reclaimed later without authority impact.
-POSTGRES_INVALID_INDEX_REPLACEMENT_SUFFIXES: tuple[str, ...] = ("_v2", "_v3", "_v4")
+# Interrupted CREATE INDEX CONCURRENTLY statements can leave invalid catalog entries.
+# Replacement names are intentionally dynamic rather than a fixed _v2/_v3/_v4 set:
+# every retry discovers already-used versions from pg_catalog and advances to a fresh
+# deterministic suffix. Invalid predecessors are never dropped on the authority path.
+_REPLACEMENT_VERSION_RE = re.compile(r"_v(?P<version>[2-9][0-9]*)$")
 
 
 class RuntimeIndexVerificationError(RuntimeError):
@@ -116,17 +116,108 @@ def _postgres_index_is_usable(state: dict[str, bool] | None) -> bool:
     return bool(state is not None and state.get("valid") and state.get("ready"))
 
 
-def _configure_postgres_index_deadlines(db: Any) -> None:
+def _postgres_replacement_index_states(
+    db: Any,
+    *,
+    index_name: str,
+) -> dict[str, dict[str, bool]]:
+    """Return existing versioned replacements for one canonical runtime index.
+
+    Query pg_catalog by a literal prefix so underscores in the canonical index name are
+    not treated as LIKE wildcards. Unknown similarly-prefixed names are ignored unless
+    their suffix is exactly ``_vN`` with N >= 2.
+    """
+
+    prefix = f"{index_name}_v"
+    rows = (
+        db.execute(
+            text(
+                """
+                SELECT c.relname AS name, i.indisvalid AS valid, i.indisready AS ready
+                FROM pg_class AS c
+                JOIN pg_index AS i ON i.indexrelid = c.oid
+                WHERE left(c.relname, char_length(:prefix)) = :prefix
+                """
+            ),
+            {"prefix": prefix},
+        )
+        .mappings()
+        .all()
+    )
+    states: dict[str, dict[str, bool]] = {}
+    for row in rows:
+        name = str(row.get("name") or "")
+        suffix = name[len(index_name) :]
+        if not _REPLACEMENT_VERSION_RE.fullmatch(suffix):
+            continue
+        states[name] = {
+            "valid": bool(row.get("valid")),
+            "ready": bool(row.get("ready")),
+        }
+    return states
+
+
+def _replacement_version(index_name: str, replacement_name: str) -> int | None:
+    if not replacement_name.startswith(index_name):
+        return None
+    match = _REPLACEMENT_VERSION_RE.fullmatch(replacement_name[len(index_name) :])
+    if match is None:
+        return None
+    return int(match.group("version"))
+
+
+def _next_replacement_index_name(
+    *,
+    index_name: str,
+    existing_states: Mapping[str, dict[str, bool]],
+) -> str:
+    versions = [
+        version
+        for name in existing_states
+        if (version := _replacement_version(index_name, name)) is not None
+    ]
+    next_version = max(versions, default=1) + 1
+    return f"{index_name}_v{next_version}"
+
+
+def _usable_replacement_index_name(
+    *,
+    index_name: str,
+    existing_states: Mapping[str, dict[str, bool]],
+) -> str | None:
+    usable: list[tuple[int, str]] = []
+    for name, state in existing_states.items():
+        version = _replacement_version(index_name, name)
+        if version is not None and _postgres_index_is_usable(state):
+            usable.append((version, name))
+    if not usable:
+        return None
+    # Prefer the newest valid replacement so recovery stays monotonic across retries.
+    return max(usable)[1]
+
+
+def _statement_timeout_for_index(
+    *,
+    table_name: str,
+    columns: tuple[str, ...],
+) -> int:
+    if (
+        table_name == "market_quotes"
+        and columns == CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS["market_quotes"]
+    ):
+        return CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
+    return POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
+
+
+def _configure_postgres_index_deadlines(
+    db: Any,
+    *,
+    statement_timeout_ms: int,
+) -> None:
     """Apply finite session deadlines before any runtime-index DDL is issued."""
 
-    db.execute(text(f"SET statement_timeout TO '{POSTGRES_INDEX_STATEMENT_TIMEOUT_MS}ms'"))
+    db.execute(text(f"SET statement_timeout TO '{statement_timeout_ms}ms'"))
     db.execute(text(f"SET lock_timeout TO '{POSTGRES_INDEX_LOCK_TIMEOUT_MS}ms'"))
-
-
-def _replacement_index_names(index_name: str) -> tuple[str, ...]:
-    return tuple(
-        f"{index_name}{suffix}" for suffix in POSTGRES_INVALID_INDEX_REPLACEMENT_SUFFIXES
-    )
 
 
 def _verified_index_result(
@@ -164,21 +255,21 @@ def _ensure_postgres_index(
     index_name: str,
     table_name: str,
     columns: tuple[str, ...],
+    statement_timeout_ms: int | None = None,
 ) -> dict[str, object]:
     """Verify first, then create or self-heal one PostgreSQL runtime index.
 
-    A planner-usable existing index is returned immediately without issuing DDL. This
-    matters on small production databases because even ``CREATE INDEX CONCURRENTLY IF
-    NOT EXISTS`` can wait behind another catalog/DDL operation before PostgreSQL reaches
-    its no-op decision.
+    A planner-usable existing index is returned immediately without issuing DDL.
 
-    Missing indexes are built under finite ``statement_timeout`` and ``lock_timeout``
-    settings. If an interrupted concurrent build left the canonical index name invalid,
-    do not DROP it on the control-gate path: DROP INDEX CONCURRENTLY can wait on exactly
-    the lock conflict that production telemetry has shown. Instead, verify/reuse or build
-    a versioned replacement with identical columns. A valid replacement satisfies the
-    access-path requirement and lets canonical control start; cleanup of the unusable
-    catalog object is explicitly advisory and deferred.
+    Missing indexes are built under finite statement/lock deadlines. If an interrupted
+    concurrent build left the canonical name invalid, do not DROP it on the control-gate
+    path. Discover every existing ``_vN`` replacement in pg_catalog, reuse the newest
+    planner-usable one, or create the next unused version. This means repeated cancelled
+    builds cannot permanently exhaust a fixed replacement-name set.
+
+    A valid replacement has identical columns and therefore satisfies the required access
+    path. Obsolete invalid catalog objects remain explicitly deferred for later fail-soft
+    reclamation after canonical control is operating.
     """
 
     state = _postgres_index_state(db, index_name=index_name)
@@ -191,66 +282,80 @@ def _ensure_postgres_index(
             ddl_required=False,
         )
 
-    _configure_postgres_index_deadlines(db)
+    effective_timeout_ms = (
+        statement_timeout_ms
+        if statement_timeout_ms is not None
+        else _statement_timeout_for_index(table_name=table_name, columns=columns)
+    )
+    _configure_postgres_index_deadlines(
+        db,
+        statement_timeout_ms=effective_timeout_ms,
+    )
 
     if state is not None:
-        # The canonical name exists but is not planner-usable. Do not try to delete it
-        # before control can proceed. Reuse a previously completed replacement if one
-        # exists; otherwise build the first unused deterministic replacement name. If a
-        # prior replacement build was itself interrupted, leave it untouched and move to
-        # the next bounded name on the next/current attempt.
-        for replacement_name in _replacement_index_names(index_name):
-            replacement_state = _postgres_index_state(db, index_name=replacement_name)
-            if _postgres_index_is_usable(replacement_state):
-                return _verified_index_result(
-                    canonical_index_name=index_name,
-                    effective_index_name=replacement_name,
-                    repaired_invalid_index=True,
-                    existing_index_reused=True,
-                    ddl_required=False,
-                    deferred_invalid_index_name=index_name,
-                )
-            if replacement_state is not None:
-                continue
-
-            create_statement = _create_index_sql(
-                dialect_name="postgresql",
-                index_name=replacement_name,
-                table_name=table_name,
-                columns=columns,
-                if_not_exists=False,
-            )
-            db.execute(text(create_statement))
-            replacement_state = _postgres_index_state(
-                db,
-                index_name=replacement_name,
-            )
-            if not _postgres_index_is_usable(replacement_state):
-                raise RuntimeIndexVerificationError(
-                    "PostgreSQL replacement runtime index "
-                    f"{replacement_name} remains invalid or unready after repair"
-                )
+        replacement_states = _postgres_replacement_index_states(
+            db,
+            index_name=index_name,
+        )
+        reusable_name = _usable_replacement_index_name(
+            index_name=index_name,
+            existing_states=replacement_states,
+        )
+        if reusable_name is not None:
             result = _verified_index_result(
                 canonical_index_name=index_name,
-                effective_index_name=replacement_name,
+                effective_index_name=reusable_name,
                 repaired_invalid_index=True,
-                existing_index_reused=False,
-                ddl_required=True,
+                existing_index_reused=True,
+                ddl_required=False,
                 deferred_invalid_index_name=index_name,
             )
             result.update(
                 {
-                    "postgres_statement_timeout_ms": POSTGRES_INDEX_STATEMENT_TIMEOUT_MS,
+                    "postgres_statement_timeout_ms": effective_timeout_ms,
                     "postgres_lock_timeout_ms": POSTGRES_INDEX_LOCK_TIMEOUT_MS,
+                    "replacement_versions_observed": len(replacement_states),
                 }
             )
             return result
 
-        raise RuntimeIndexVerificationError(
-            "PostgreSQL runtime index "
-            f"{index_name} is invalid and all bounded replacement names are occupied "
-            "by invalid or unready indexes"
+        replacement_name = _next_replacement_index_name(
+            index_name=index_name,
+            existing_states=replacement_states,
         )
+        create_statement = _create_index_sql(
+            dialect_name="postgresql",
+            index_name=replacement_name,
+            table_name=table_name,
+            columns=columns,
+            if_not_exists=False,
+        )
+        db.execute(text(create_statement))
+        replacement_state = _postgres_index_state(
+            db,
+            index_name=replacement_name,
+        )
+        if not _postgres_index_is_usable(replacement_state):
+            raise RuntimeIndexVerificationError(
+                "PostgreSQL replacement runtime index "
+                f"{replacement_name} remains invalid or unready after repair"
+            )
+        result = _verified_index_result(
+            canonical_index_name=index_name,
+            effective_index_name=replacement_name,
+            repaired_invalid_index=True,
+            existing_index_reused=False,
+            ddl_required=True,
+            deferred_invalid_index_name=index_name,
+        )
+        result.update(
+            {
+                "postgres_statement_timeout_ms": effective_timeout_ms,
+                "postgres_lock_timeout_ms": POSTGRES_INDEX_LOCK_TIMEOUT_MS,
+                "replacement_versions_observed": len(replacement_states),
+            }
+        )
+        return result
 
     create_statement = _create_index_sql(
         dialect_name="postgresql",
@@ -280,7 +385,7 @@ def _ensure_postgres_index(
     )
     result.update(
         {
-            "postgres_statement_timeout_ms": POSTGRES_INDEX_STATEMENT_TIMEOUT_MS,
+            "postgres_statement_timeout_ms": effective_timeout_ms,
             "postgres_lock_timeout_ms": POSTGRES_INDEX_LOCK_TIMEOUT_MS,
         }
     )
@@ -300,9 +405,12 @@ def ensure_runtime_indexes_after_api_bind(
     Render from binding the API port. PostgreSQL index existence alone is insufficient:
     every maintained index is verified as planner-usable through ``pg_index``. Invalid
     leftovers from interrupted concurrent builds are recovered through a verified,
-    same-column versioned replacement instead of making the control gate depend on a
-    potentially lock-blocked DROP. Existing valid indexes are reused without DDL, and
-    all required DDL is database-time-bounded so maintenance cannot block indefinitely.
+    same-column dynamically versioned replacement instead of making the control gate
+    depend on a potentially lock-blocked DROP.
+
+    The exact cycle-history index gets a longer but still finite statement deadline than
+    optional optimization indexes because production telemetry proved 30 seconds could
+    leave repeated invalid concurrent-build artifacts on the small PostgreSQL instance.
     SQLite and test stores keep ordinary idempotent index creation.
 
     The helper validates each table's actual deployed columns before issuing DDL.
@@ -384,6 +492,10 @@ def ensure_runtime_indexes_after_api_bind(
                         index_name=index_name,
                         table_name=table_name,
                         columns=columns,
+                        statement_timeout_ms=_statement_timeout_for_index(
+                            table_name=table_name,
+                            columns=columns,
+                        ),
                     )
             else:
                 with store.engine.begin() as db:
