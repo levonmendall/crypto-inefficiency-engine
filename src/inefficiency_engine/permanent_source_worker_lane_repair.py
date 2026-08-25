@@ -19,6 +19,9 @@ from inefficiency_engine.source_lane_repair_runtime import (
 from inefficiency_engine.remaining_source_transport_repair import (
     install_remaining_source_transport_repairs,
 )
+from inefficiency_engine.source_refresh_truth_repair import (
+    install_source_refresh_truth_repair,
+)
 
 
 _ORIGINAL_RUN_PERMANENT_SOURCE_WORKER = base.run_permanent_source_worker
@@ -89,6 +92,12 @@ def install_remaining_source_lane_repairs() -> None:
     # underlying evidence sources, required breadth, source-validity windows,
     # qualification gates, allocation authority, or paper-only safeguards.
     install_remaining_source_transport_repairs()
+
+    # A failed refresh is transport telemetry, not newer evidence about the market.
+    # Preserve the last successful Aave/Deribit observation only while its unchanged
+    # evidence-class freshness window is still valid, and single-flight the identical
+    # Deribit option acquisition across its runtime owners.
+    install_source_refresh_truth_repair()
 
     if not bool(getattr(base, _RUNTIME_PATCH_MARKER, False)):
         base.run_permanent_source_worker = _run_permanent_source_worker_with_critical_cadence
