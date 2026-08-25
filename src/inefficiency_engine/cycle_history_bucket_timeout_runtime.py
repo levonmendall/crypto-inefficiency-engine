@@ -63,12 +63,13 @@ def control_executor_cycle_history_slice_seconds() -> float:
     )
 
 
-def _postgres_timeout_statements() -> tuple[str, str]:
+def _postgres_timeout_statements() -> tuple[str, str, str]:
     statement_ms = max(1, int(cycle_history_bucket_statement_timeout_seconds() * 1000.0))
     lock_ms = max(1, int(cycle_history_bucket_lock_timeout_seconds() * 1000.0))
     return (
         f"SET LOCAL statement_timeout = {statement_ms}",
         f"SET LOCAL lock_timeout = {lock_ms}",
+        "SET LOCAL enable_seqscan = off",
     )
 
 
@@ -143,10 +144,11 @@ def _index_aligned_replace_bucket(
     """Replace one compact bucket with an index-aligned chronological top-N seek.
 
     Production may have the optional ``market_quotes(venue, asset, observed_at, id)``
-    runtime index. The query keeps exact filter-before-rank semantics whether PostgreSQL
-    can use that optimization or must fall back to its bounded statement budget. Rank
-    by ``observed_at DESC, id DESC`` so the newest observations are exact and ``id`` is
-    only a deterministic tie-breaker.
+    runtime index. A lightweight BRIN on ``observed_at`` is also maintained after API
+    bind so the same exact range predicate can avoid a full ledger scan while the larger
+    btree is unavailable. The query keeps exact filter-before-rank semantics in either
+    case. Rank by ``observed_at DESC, id DESC`` so the newest observations are exact and
+    ``id`` is only a deterministic tie-breaker.
     """
 
     from inefficiency_engine import durable_control_cycle_history as legacy
@@ -222,14 +224,15 @@ def install_index_aligned_cycle_history_bucket_runtime() -> None:
 
 @contextmanager
 def cycle_history_bucket_database_timeout(store: Any) -> Iterator[None]:
-    """Apply a short transaction-local timeout only while cycle history advances.
+    """Apply bounded transaction-local controls only while cycle history advances.
 
     Canonical control already has a broader database timeout. Production telemetry
-    proved that one market-history bucket can consume that entire allowance. This
-    scoped hook overrides it only for transactions opened by the durable cycle-history
-    cache, so one pathological indexed seek or cache replacement fails closed instead
-    of consuming the 25-second executor deadline. The listener is removed immediately
-    after the cache slice returns or raises.
+    proved that one market-history bucket can consume that entire allowance. This scoped
+    hook retains the short statement/lock bounds and makes PostgreSQL prefer available
+    range indexes over a sequential scan. ``enable_seqscan=off`` is planner guidance,
+    not a correctness shortcut: PostgreSQL can still use a sequential scan when no other
+    path exists, and the setting disappears with the transaction. The listener is
+    removed immediately after the cache slice returns or raises.
     """
 
     engine = store.engine
