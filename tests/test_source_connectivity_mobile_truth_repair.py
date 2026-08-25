@@ -90,9 +90,11 @@ def test_mobile_dashboard_repairs_truth_label_and_narrow_cards():
     assert ".badge{white-space:normal" in html
 
 
-def test_production_entrypoint_uses_mobile_truth_api():
+def test_production_entrypoint_wraps_mobile_truth_with_database_independent_liveness():
     from inefficiency_engine import render_combined_postbind_lane_repair as runtime
+    from inefficiency_engine import read_api_liveness_deploy as liveness
 
     assert runtime.BOUNDED_HEARTBEAT_API_APP == (
-        "inefficiency_engine.read_api_mobile_truth_deploy:app"
+        "inefficiency_engine.read_api_liveness_deploy:app"
     )
+    assert liveness.app.inner is not None
