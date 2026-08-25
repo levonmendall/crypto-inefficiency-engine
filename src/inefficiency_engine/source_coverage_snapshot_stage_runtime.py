@@ -76,9 +76,10 @@ def profile_source_coverage_snapshot(
 ) -> Iterator[SourceCoverageSnapshotStageProfiler]:
     """Expose exact internal source-snapshot boundaries in the disposable executor.
 
-    The production source-coverage implementation is already patched with bounded
-    latest-state reads before this context is entered. This wrapper times those exact
-    production calls and restores every patched symbol when the calculation exits.
+    Production reconciliation now consumes bounded attempt histories so a newer
+    failed refresh cannot erase still-fresh evidence. Historical stage names remain
+    stable for health/telemetry compatibility even though the reads are no longer
+    latest-only authority views.
     """
 
     import inefficiency_engine.durable_source_coverage_runtime as durable_runtime
@@ -87,9 +88,9 @@ def profile_source_coverage_snapshot(
     profiler = SourceCoverageSnapshotStageProfiler(callback)
 
     original_inspect = source_coverage.inspect
-    original_ledger_latest = source_coverage.SourceCoverageLedger.latest
-    original_provider_rows = source_coverage.SourceCoveragePlane._provider_rows
-    original_admissions = source_coverage.SourceCoveragePlane._admissions
+    original_ledger_recent = source_coverage.SourceCoverageLedger.recent
+    original_provider_history = source_coverage.SourceCoveragePlane._provider_history_rows
+    original_admission_history = source_coverage.SourceCoveragePlane._admission_history_rows
     original_source_status = source_coverage.SourceCoveragePlane._source_status
     original_table_candidate = source_coverage.SourceCoveragePlane._table_candidate
     original_dynamic_lane_priority = source_coverage.dynamic_lane_priority
@@ -100,17 +101,18 @@ def profile_source_coverage_snapshot(
         profiler.enter("table_discovery")
         return original_inspect(bind)
 
-    def ledger_latest_profiled(self, *args: object, **kwargs: object):
+    def ledger_recent_profiled(self, *args: object, **kwargs: object):
+        # Keep the established telemetry label to avoid a health-schema change.
         profiler.enter("source_observation_latest")
-        return original_ledger_latest(self, *args, **kwargs)
+        return original_ledger_recent(self, *args, **kwargs)
 
-    def provider_rows_profiled(self, *args: object, **kwargs: object):
+    def provider_history_profiled(self, *args: object, **kwargs: object):
         profiler.enter("provider_status_latest")
-        return original_provider_rows(self, *args, **kwargs)
+        return original_provider_history(self, *args, **kwargs)
 
-    def admissions_profiled(self, *args: object, **kwargs: object):
+    def admission_history_profiled(self, *args: object, **kwargs: object):
         profiler.enter("admission_latest")
-        return original_admissions(self, *args, **kwargs)
+        return original_admission_history(self, *args, **kwargs)
 
     def source_status_profiled(self, *args: object, **kwargs: object):
         profiler.enter("lane_reconciliation")
@@ -148,9 +150,9 @@ def profile_source_coverage_snapshot(
         return result
 
     source_coverage.inspect = inspect_profiled  # type: ignore[assignment]
-    source_coverage.SourceCoverageLedger.latest = ledger_latest_profiled  # type: ignore[method-assign]
-    source_coverage.SourceCoveragePlane._provider_rows = provider_rows_profiled  # type: ignore[method-assign]
-    source_coverage.SourceCoveragePlane._admissions = admissions_profiled  # type: ignore[method-assign]
+    source_coverage.SourceCoverageLedger.recent = ledger_recent_profiled  # type: ignore[method-assign]
+    source_coverage.SourceCoveragePlane._provider_history_rows = provider_history_profiled  # type: ignore[method-assign]
+    source_coverage.SourceCoveragePlane._admission_history_rows = admission_history_profiled  # type: ignore[method-assign]
     source_coverage.SourceCoveragePlane._source_status = source_status_profiled  # type: ignore[method-assign]
     source_coverage.SourceCoveragePlane._table_candidate = table_candidate_profiled  # type: ignore[method-assign]
     source_coverage.dynamic_lane_priority = dynamic_lane_priority_profiled  # type: ignore[assignment]
@@ -161,9 +163,9 @@ def profile_source_coverage_snapshot(
         yield profiler
     finally:
         source_coverage.inspect = original_inspect  # type: ignore[assignment]
-        source_coverage.SourceCoverageLedger.latest = original_ledger_latest  # type: ignore[method-assign]
-        source_coverage.SourceCoveragePlane._provider_rows = original_provider_rows  # type: ignore[method-assign]
-        source_coverage.SourceCoveragePlane._admissions = original_admissions  # type: ignore[method-assign]
+        source_coverage.SourceCoverageLedger.recent = original_ledger_recent  # type: ignore[method-assign]
+        source_coverage.SourceCoveragePlane._provider_history_rows = original_provider_history  # type: ignore[method-assign]
+        source_coverage.SourceCoveragePlane._admission_history_rows = original_admission_history  # type: ignore[method-assign]
         source_coverage.SourceCoveragePlane._source_status = original_source_status  # type: ignore[method-assign]
         source_coverage.SourceCoveragePlane._table_candidate = original_table_candidate  # type: ignore[method-assign]
         source_coverage.dynamic_lane_priority = original_dynamic_lane_priority  # type: ignore[assignment]
