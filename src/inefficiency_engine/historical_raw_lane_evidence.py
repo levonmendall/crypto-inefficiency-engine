@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,10 +13,23 @@ SOURCE_EVENT_TABLE = "source_event_observations"
 MECHANISM_RESEARCH_TABLE = "mechanism_research_observations"
 FUNDAMENTAL_TABLE = "alpha_fundamental_observations"
 OPTION_CAPACITY_TABLE = "option_capacity_observations"
+PROVIDER_STATUS_TABLE = "provider_statuses"
+PROVIDER_ADMISSION_TABLE = "provider_gap_admissions"
 
 
 def _utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _parse_time(value: object | None) -> datetime | None:
+    if isinstance(value, datetime):
+        return _utc(value)
+    if value in (None, ""):
+        return None
+    try:
+        return _utc(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    except (TypeError, ValueError):
+        return None
 
 
 def _source_spec(source_id: str) -> dict[str, object] | None:
@@ -64,6 +78,41 @@ def _merge_observation(
     state["source_ledgers"].add(ledger)
 
 
+def _merge_provider_history(
+    result: dict[str, dict[str, object]],
+    *,
+    provider: str,
+    count: int,
+    earliest: datetime | None,
+    latest: datetime | None,
+    ledger: str,
+) -> None:
+    """Map trusted provider attempts through the same catalog prefixes as live coverage."""
+    if count <= 0 or earliest is None or latest is None:
+        return
+    for spec in SOURCES:
+        if spec.get("authoritative") is False:
+            continue
+        prefixes = [str(value) for value in list(spec.get("provider") or [])]
+        if not prefixes or not any(provider.startswith(prefix) for prefix in prefixes):
+            continue
+        source_id = str(spec.get("id") or "")
+        classes = {str(item) for item in list(spec.get("classes") or [])}
+        for lane_id in list(spec.get("lanes") or []):
+            lane_id = str(lane_id)
+            required = {str(item) for item in list(LANES.get(lane_id, {}).get("required") or [])}
+            _merge_observation(
+                result,
+                lane_id=lane_id,
+                source_id=source_id,
+                classes=classes & required,
+                count=count,
+                earliest=earliest,
+                latest=latest,
+                ledger=ledger,
+            )
+
+
 def _aggregate(
     store,
     table: Table,
@@ -82,19 +131,7 @@ def _aggregate(
     count = int(row[0] or 0)
     if count <= 0:
         return 0, None, None
-
-    def parsed(value: Any) -> datetime | None:
-        if isinstance(value, datetime):
-            return _utc(value)
-        if value in (None, ""):
-            return None
-        try:
-            result = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return _utc(result)
-
-    return count, parsed(row[1]), parsed(row[2])
+    return count, _parse_time(row[1]), _parse_time(row[2])
 
 
 def _recover_catalog_table_sources(store, available: set[str], result, start_text: str, boundary_text: str) -> None:
@@ -148,6 +185,96 @@ def _recover_catalog_table_sources(store, available: set[str], result, start_tex
             )
 
 
+def _recover_provider_statuses(store, available: set[str], result, start_text: str, boundary_text: str) -> None:
+    """Recover successful public-provider attempts accepted by the live coverage plane."""
+    if PROVIDER_STATUS_TABLE not in available:
+        return
+    table = Table(PROVIDER_STATUS_TABLE, MetaData(), autoload_with=store.engine)
+    required_columns = {"provider", "ok", "observed_at"}
+    if not required_columns <= set(table.c.keys()):
+        return
+    query = (
+        select(
+            table.c.provider,
+            func.count(),
+            func.min(table.c.observed_at),
+            func.max(table.c.observed_at),
+        )
+        .where(table.c.observed_at >= start_text)
+        .where(table.c.observed_at < boundary_text)
+        .where(table.c.ok.is_(True))
+        .group_by(table.c.provider)
+    )
+    with store.engine.connect() as db:
+        rows = list(db.execute(query))
+    for provider, count, earliest_raw, latest_raw in rows:
+        _merge_provider_history(
+            result,
+            provider=str(provider or ""),
+            count=int(count or 0),
+            earliest=_parse_time(earliest_raw),
+            latest=_parse_time(latest_raw),
+            ledger=PROVIDER_STATUS_TABLE,
+        )
+
+
+def _recover_provider_admissions(store, available: set[str], result, start_text: str, boundary_text: str) -> None:
+    """Recover admitted provider-gap observations without loading the ledger into memory."""
+    if PROVIDER_ADMISSION_TABLE not in available:
+        return
+    table = Table(PROVIDER_ADMISSION_TABLE, MetaData(), autoload_with=store.engine)
+    required_columns = {"provider", "observed_at", "payload_json"}
+    if not required_columns <= set(table.c.keys()):
+        return
+    query = (
+        select(table.c.provider, table.c.observed_at, table.c.payload_json)
+        .where(table.c.observed_at >= start_text)
+        .where(table.c.observed_at < boundary_text)
+        .order_by(table.c.id)
+    )
+    aggregates: dict[str, dict[str, object]] = {}
+    with store.engine.connect() as db:
+        for provider_raw, observed_raw, payload_raw in db.execution_options(stream_results=True).execute(query):
+            try:
+                payload = json.loads(str(payload_raw))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if not bool(payload.get("healthy")):
+                continue
+            if payload.get("authoritative") is False:
+                continue
+            if payload.get("commercial_use_permitted") is False:
+                continue
+            if payload.get("point_in_time") is False:
+                continue
+            observed_at = _parse_time(payload.get("observed_at") or observed_raw)
+            if observed_at is None:
+                continue
+            provider = str(payload.get("provider") or provider_raw or "")
+            if not provider:
+                continue
+            state = aggregates.setdefault(
+                provider,
+                {"count": 0, "earliest": observed_at, "latest": observed_at},
+            )
+            state["count"] = int(state["count"]) + 1
+            if observed_at < state["earliest"]:
+                state["earliest"] = observed_at
+            if observed_at > state["latest"]:
+                state["latest"] = observed_at
+    for provider, state in aggregates.items():
+        _merge_provider_history(
+            result,
+            provider=provider,
+            count=int(state["count"]),
+            earliest=state["earliest"],
+            latest=state["latest"],
+            ledger=PROVIDER_ADMISSION_TABLE,
+        )
+
+
 def _recover_source_events(store, available: set[str], result, start_text: str, boundary_text: str) -> None:
     if SOURCE_EVENT_TABLE not in available:
         return
@@ -172,8 +299,8 @@ def _recover_source_events(store, available: set[str], result, start_text: str, 
         spec = _source_spec(source_id)
         if lane_id not in LANES or spec is None or spec.get("authoritative") is False:
             continue
-        earliest = datetime.fromisoformat(str(earliest_raw).replace("Z", "+00:00"))
-        latest = datetime.fromisoformat(str(latest_raw).replace("Z", "+00:00"))
+        earliest = _parse_time(earliest_raw)
+        latest = _parse_time(latest_raw)
         required = {str(item) for item in list(LANES[lane_id].get("required") or [])}
         classes = {str(item) for item in list(spec.get("classes") or [])} & required
         _merge_observation(
@@ -182,8 +309,8 @@ def _recover_source_events(store, available: set[str], result, start_text: str, 
             source_id=source_id,
             classes=classes,
             count=int(count or 0),
-            earliest=_utc(earliest),
-            latest=_utc(latest),
+            earliest=earliest,
+            latest=latest,
             ledger=SOURCE_EVENT_TABLE,
         )
 
@@ -224,8 +351,8 @@ def _recover_mechanism_research(store, available: set[str], result, start_text: 
                 mappings.append(("volatility", "bybit-options", {"option_quotes", "option_greeks"}))
         if not mappings:
             continue
-        earliest = _utc(datetime.fromisoformat(str(earliest_raw).replace("Z", "+00:00")))
-        latest = _utc(datetime.fromisoformat(str(latest_raw).replace("Z", "+00:00")))
+        earliest = _parse_time(earliest_raw)
+        latest = _parse_time(latest_raw)
         for lane_id, source_id, classes in mappings:
             _merge_observation(
                 result,
@@ -285,8 +412,8 @@ def _recover_fundamental(store, available: set[str], result, start_text: str, bo
             source_ids.extend(["ethereum-publicnode", "morpho-markets"])
         if not classes:
             continue
-        earliest = _utc(datetime.fromisoformat(str(earliest_raw).replace("Z", "+00:00")))
-        latest = _utc(datetime.fromisoformat(str(latest_raw).replace("Z", "+00:00")))
+        earliest = _parse_time(earliest_raw)
+        latest = _parse_time(latest_raw)
         for source_id in source_ids:
             source_classes = _source_spec(source_id)
             allowed = {str(item) for item in list((source_classes or {}).get("classes") or [])}
@@ -307,7 +434,8 @@ def recover_raw_lane_history(store, *, start: datetime, boundary: datetime) -> d
 
     This is a diagnostic reconstruction only. It never creates candidate identities,
     forward samples, qualification, allocation, or execution authority. SQL aggregate
-    reads keep the operation bounded even when raw market tables are large.
+    reads keep large market tables bounded; provider-admission rows are streamed and
+    reduced to provider-level edge/count summaries.
     """
     result = _empty()
     try:
@@ -317,6 +445,8 @@ def recover_raw_lane_history(store, *, start: datetime, boundary: datetime) -> d
     start_text = _utc(start).isoformat()
     boundary_text = _utc(boundary).isoformat()
     _recover_catalog_table_sources(store, available, result, start_text, boundary_text)
+    _recover_provider_statuses(store, available, result, start_text, boundary_text)
+    _recover_provider_admissions(store, available, result, start_text, boundary_text)
     _recover_source_events(store, available, result, start_text, boundary_text)
     _recover_mechanism_research(store, available, result, start_text, boundary_text)
     _recover_option_capacity(store, available, result, start_text, boundary_text)
