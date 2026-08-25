@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import signal
+import sys
+import time
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from inefficiency_engine.bounded_control_evidence_runtime import (
     install_bounded_control_outcome_ledgers,
@@ -33,6 +36,11 @@ from inefficiency_engine.evidence_velocity_runtime import (
     EvidenceVelocityLaneSuccessOperationallyResilientPaperPortfolioService,
     EvidenceVelocityLaneSuccessQualifiedOpportunityAllocatorService,
 )
+from inefficiency_engine.portfolio_operational_recovery_runtime import (
+    is_retryable_postgres_operational_error,
+    operational_recovery_delay_seconds,
+    recycle_pool_after_operational_error,
+)
 from inefficiency_engine.resilient_paper_portfolio import (
     CANONICAL_ALLOCATION_TIMEOUT_SECONDS,
 )
@@ -42,6 +50,8 @@ from inefficiency_engine.service import OpportunityService
 # Presentation publication is deliberately independent from the disposable heavy
 # research child. It projects already-persisted truth only and makes no provider calls.
 RESEARCH_PROJECTION_MAINTENANCE_SECONDS = 60.0
+PORTFOLIO_DB_RECOVERY_MAX_SECONDS = 300.0
+PORTFOLIO_DB_RECOVERY_WORKER_ID = "canonical-portfolio-db-recovery"
 
 
 class PermanentSourceExecutableSnapshotUnavailable(RuntimeError):
@@ -359,6 +369,102 @@ async def _research_projection_refresh_loop(
             continue
 
 
+def _log_db_recovery(stage: str, exc: OperationalError, delay_seconds: float) -> None:
+    print(
+        "portfolio database temporarily unavailable; "
+        f"stage={stage} error={type(exc).__name__} retry_in={delay_seconds:.2f}s",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _record_db_recovery_success(store: EvidenceStore, *, stage: str) -> None:
+    try:
+        store.record_worker_heartbeat(
+            worker_id=PORTFOLIO_DB_RECOVERY_WORKER_ID,
+            state="success",
+            detail={
+                "stage": stage,
+                "database_recovered": True,
+                "qualification_thresholds_unchanged": True,
+                "allocation_authority": False,
+                "live_execution_authority": False,
+                "paper_only": True,
+            },
+        )
+    except Exception:
+        pass
+
+
+async def _wait_for_database_recovery(
+    store: EvidenceStore,
+    *,
+    stop_event: asyncio.Event,
+    initial_error: OperationalError,
+) -> bool:
+    """Wait for PostgreSQL to accept connections without replaying failed work."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + PORTFOLIO_DB_RECOVERY_MAX_SECONDS
+    attempt = 0
+    current_error = initial_error
+    while not stop_event.is_set():
+        recycle_pool_after_operational_error(store, current_error)
+        remaining = deadline - loop.time()
+        if remaining <= 0.0:
+            raise current_error
+        delay = min(operational_recovery_delay_seconds(attempt), remaining)
+        _log_db_recovery("runtime", current_error, delay)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+            return False
+        except TimeoutError:
+            pass
+
+        try:
+            with store.engine.connect() as db:
+                db.exec_driver_sql("SELECT 1")
+        except OperationalError as exc:
+            if not is_retryable_postgres_operational_error(exc):
+                raise
+            current_error = exc
+            attempt += 1
+            continue
+
+        _record_db_recovery_success(store, stage="runtime_reconnected")
+        return True
+    return False
+
+
+def _build_evidence_store_with_retry(settings: Settings) -> EvidenceStore:
+    """Survive a bounded PostgreSQL startup/recovery window before worker launch."""
+
+    started_at = time.monotonic()
+    attempt = 0
+    current_error: OperationalError | None = None
+    while True:
+        try:
+            store = build_evidence_store(settings.evidence_db_path)
+        except OperationalError as exc:
+            if not is_retryable_postgres_operational_error(exc):
+                raise
+            current_error = exc
+            elapsed = time.monotonic() - started_at
+            remaining = PORTFOLIO_DB_RECOVERY_MAX_SECONDS - elapsed
+            if remaining <= 0.0:
+                raise
+            delay = min(operational_recovery_delay_seconds(attempt), remaining)
+            _log_db_recovery("bootstrap", exc, delay)
+            time.sleep(delay)
+            attempt += 1
+            continue
+        if store is None:
+            raise RuntimeError("canonical portfolio requires durable evidence persistence")
+        if current_error is not None:
+            _record_db_recovery_success(store, stage="bootstrap_reconnected")
+        return store
+
+
 async def run_lightweight_portfolio_worker(
     store: EvidenceStore,
     *,
@@ -368,46 +474,6 @@ async def run_lightweight_portfolio_worker(
     """Run canonical accounting with no external-provider work on its event loop."""
 
     settings = settings or Settings.from_env()
-
-    # The canonical portfolio is a dedicated process, so install exact durable-read
-    # liveness controls here before constructing any allocator/service graph. These
-    # alter only operational waiting behavior; every economic/statistical/source/risk
-    # gate sees the same complete evidence and remains unchanged.
-    allocation_deadline = float(CANONICAL_ALLOCATION_TIMEOUT_SECONDS)
-    statement_timeout_seconds = max(5.0, allocation_deadline - 5.0)
-    lock_timeout_seconds = min(
-        3.0,
-        max(1.0, statement_timeout_seconds / 4.0),
-    )
-    pool_timeout_seconds = min(
-        5.0,
-        max(1.0, allocation_deadline / 4.0),
-    )
-    install_bounded_control_outcome_ledgers()
-    database_timeouts_enforced = install_control_database_timeouts(
-        store,
-        statement_timeout_seconds=statement_timeout_seconds,
-        lock_timeout_seconds=lock_timeout_seconds,
-    )
-    pool_timeout_enforced = install_control_pool_checkout_timeout(
-        store,
-        timeout_seconds=pool_timeout_seconds,
-    )
-
-    service = OpportunityService(settings=settings, evidence_store=store)
-    state_handle = _DurableQualifiedStateHandle(store)
-    allocator = CanonicalPortfolioAllocatorService(
-        service,
-        None,
-        state_handle,
-    )  # type: ignore[arg-type]
-    portfolio = CanonicalPaperPortfolioService(service, allocator, store)
-    portfolio._allocation_database_timeouts_enforced = database_timeouts_enforced
-    portfolio._allocation_pool_timeout_enforced = pool_timeout_enforced
-    portfolio._allocation_statement_timeout_seconds = statement_timeout_seconds
-    portfolio._allocation_lock_timeout_seconds = lock_timeout_seconds
-    portfolio._allocation_pool_timeout_seconds = pool_timeout_seconds
-
     stop = stop_event or asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -415,6 +481,60 @@ async def run_lightweight_portfolio_worker(
             loop.add_signal_handler(sig, stop.set)
         except (NotImplementedError, RuntimeError):
             pass
+
+    # The canonical portfolio is a dedicated process, so install exact durable-read
+    # liveness controls here before constructing any allocator/service graph. These
+    # alter only operational waiting behavior; every economic/statistical/source/risk
+    # gate sees the same complete evidence and remains unchanged. A transient database
+    # recovery window is retried here so it cannot terminate the permanent child.
+    while not stop.is_set():
+        try:
+            allocation_deadline = float(CANONICAL_ALLOCATION_TIMEOUT_SECONDS)
+            statement_timeout_seconds = max(5.0, allocation_deadline - 5.0)
+            lock_timeout_seconds = min(
+                3.0,
+                max(1.0, statement_timeout_seconds / 4.0),
+            )
+            pool_timeout_seconds = min(
+                5.0,
+                max(1.0, allocation_deadline / 4.0),
+            )
+            install_bounded_control_outcome_ledgers()
+            database_timeouts_enforced = install_control_database_timeouts(
+                store,
+                statement_timeout_seconds=statement_timeout_seconds,
+                lock_timeout_seconds=lock_timeout_seconds,
+            )
+            pool_timeout_enforced = install_control_pool_checkout_timeout(
+                store,
+                timeout_seconds=pool_timeout_seconds,
+            )
+
+            service = OpportunityService(settings=settings, evidence_store=store)
+            state_handle = _DurableQualifiedStateHandle(store)
+            allocator = CanonicalPortfolioAllocatorService(
+                service,
+                None,
+                state_handle,
+            )  # type: ignore[arg-type]
+            portfolio = CanonicalPaperPortfolioService(service, allocator, store)
+            portfolio._allocation_database_timeouts_enforced = database_timeouts_enforced
+            portfolio._allocation_pool_timeout_enforced = pool_timeout_enforced
+            portfolio._allocation_statement_timeout_seconds = statement_timeout_seconds
+            portfolio._allocation_lock_timeout_seconds = lock_timeout_seconds
+            portfolio._allocation_pool_timeout_seconds = pool_timeout_seconds
+            break
+        except OperationalError as exc:
+            if not is_retryable_postgres_operational_error(exc):
+                raise
+            if not await _wait_for_database_recovery(
+                store,
+                stop_event=stop,
+                initial_error=exc,
+            ):
+                return 0
+    else:
+        return 0
 
     # Persisted read-model projection is the only maintenance task allowed to share
     # this process. It performs no provider calls and runs its database work in a
@@ -424,12 +544,24 @@ async def run_lightweight_portfolio_worker(
         name="research-dashboard-projection-refresh",
     )
     try:
-        return await run_canonical_portfolio_loop(
-            service,
-            store,
-            portfolio=portfolio,
-            stop_event=stop,
-        )
+        while not stop.is_set():
+            try:
+                return await run_canonical_portfolio_loop(
+                    service,
+                    store,
+                    portfolio=portfolio,
+                    stop_event=stop,
+                )
+            except OperationalError as exc:
+                if not is_retryable_postgres_operational_error(exc):
+                    raise
+                if not await _wait_for_database_recovery(
+                    store,
+                    stop_event=stop,
+                    initial_error=exc,
+                ):
+                    return 0
+        return 0
     finally:
         stop.set()
         try:
@@ -440,9 +572,7 @@ async def run_lightweight_portfolio_worker(
 
 def main() -> int:
     settings = Settings.from_env()
-    store = build_evidence_store(settings.evidence_db_path)
-    if store is None:
-        raise RuntimeError("canonical portfolio requires durable evidence persistence")
+    store = _build_evidence_store_with_retry(settings)
     return asyncio.run(run_lightweight_portfolio_worker(store, settings=settings))
 
 
