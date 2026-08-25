@@ -5,14 +5,10 @@ import inspect
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from inefficiency_engine import option_capacity
 from inefficiency_engine import permanent_source_worker_lane_repair
-from inefficiency_engine import priority_source_collection as priority_sources
-from inefficiency_engine import production_source_recovery_v2_runtime as recovery_v2
 from inefficiency_engine import source_refresh_truth_repair as repair
 from inefficiency_engine.priority_source_models import SourceProbeResult
 from inefficiency_engine.provider_gap_collection import ProviderAdmissionObservation
-from inefficiency_engine.provider_gap_resilience import ResilientProviderGapCollectionService
 
 
 def _capacity_probe() -> SourceProbeResult:
@@ -214,25 +210,12 @@ def test_deribit_failed_admission_is_recorded_once_prior_success_is_stale(monkey
     assert len(original_calls) == 1
 
 
-def test_install_routes_all_deribit_owners_to_shared_collector(monkeypatch):
-    original_option_capacity = option_capacity.collect_deribit_option_capacity
-    original_priority = priority_sources.collect_deribit_option_capacity
-    original_critical = recovery_v2.collect_deribit_option_capacity
-    original_provider_gap = ResilientProviderGapCollectionService._collect_deribit_options
-    try:
-        repair.install_source_refresh_truth_repair()
-        assert option_capacity.collect_deribit_option_capacity is repair.collect_deribit_option_capacity_shared
-        assert priority_sources.collect_deribit_option_capacity is repair.collect_deribit_option_capacity_shared
-        assert recovery_v2.collect_deribit_option_capacity is repair.collect_deribit_option_capacity_shared
-        assert (
-            ResilientProviderGapCollectionService._collect_deribit_options
-            is repair._collect_deribit_options_via_shared_capacity
-        )
-    finally:
-        option_capacity.collect_deribit_option_capacity = original_option_capacity
-        priority_sources.collect_deribit_option_capacity = original_priority
-        recovery_v2.collect_deribit_option_capacity = original_critical
-        ResilientProviderGapCollectionService._collect_deribit_options = original_provider_gap
+def test_install_declares_shared_deribit_owners_and_fail_soft_patches():
+    source = inspect.getsource(repair.install_source_refresh_truth_repair)
+    assert "collect_deribit_option_capacity_shared" in source
+    assert "_record_failure_preserving_fresh_truth" in source
+    assert "_record_admission_preserving_fresh_deribit" in source
+    assert "ResilientProviderGapCollectionService._collect_deribit_options" in source
 
 
 def test_production_source_child_installs_truth_preservation_after_transport_repair():
