@@ -146,6 +146,11 @@ def lane_history_dashboard_html() -> str:
     """
 
     html = _original_dashboard_html()
+    html = html.replace(
+        "/v3/research/candidate-observatory/history?limit=50",
+        "/v3/research/candidate-observatory/history?limit=500",
+        1,
+    )
     html = html.replace("</head>", _LANE_HISTORY_STYLE + "</head>", 1)
     html = html.replace("</script>", _LANE_HISTORY_JS + "</script>", 1)
     return html
