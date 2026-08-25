@@ -16,5 +16,5 @@ def test_release_forces_new_local_project_build() -> None:
 
 
 def test_canonical_runtime_still_targets_v5_dashboard() -> None:
-    assert CANONICAL_API_APP == "inefficiency_engine.read_api_card_history_deploy:app"
+    assert CANONICAL_API_APP == "inefficiency_engine.read_api_liveness_deploy:app"
     assert DASHBOARD_UI_CONTRACT_VERSION == "v5_mechanism_truth"
