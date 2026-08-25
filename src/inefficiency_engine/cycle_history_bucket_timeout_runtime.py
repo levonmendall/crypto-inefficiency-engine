@@ -142,12 +142,11 @@ def _index_aligned_replace_bucket(
 ) -> int:
     """Replace one compact bucket with an index-aligned chronological top-N seek.
 
-    Production has a required ``market_quotes(venue, asset, observed_at, id)`` index.
-    The legacy bucket query filtered on the first three index columns but ranked only
-    by ``id DESC``. PostgreSQL could therefore fall back to a bounded sort/scan and hit
-    the deliberately short per-bucket statement timeout. Rank by ``observed_at DESC,
-    id DESC`` instead: this preserves the intended newest-observation semantics, uses
-    ``id`` only as a deterministic tie-breaker, and matches the existing index order.
+    Production may have the optional ``market_quotes(venue, asset, observed_at, id)``
+    runtime index. The query keeps exact filter-before-rank semantics whether PostgreSQL
+    can use that optimization or must fall back to its bounded statement budget. Rank
+    by ``observed_at DESC, id DESC`` so the newest observations are exact and ``id`` is
+    only a deterministic tie-breaker.
     """
 
     from inefficiency_engine import durable_control_cycle_history as legacy
@@ -212,7 +211,7 @@ def _index_aligned_replace_bucket(
 
 
 def install_index_aligned_cycle_history_bucket_runtime() -> None:
-    """Install the indexed bucket reader in both legacy and frozen-target runtimes."""
+    """Install the exact bucket reader in both legacy and frozen-target runtimes."""
 
     from inefficiency_engine import durable_control_cycle_history as legacy
     from inefficiency_engine import durable_control_cycle_history_target_runtime as target_runtime
@@ -258,7 +257,7 @@ def cycle_history_bucket_database_timeout(store: Any) -> Iterator[None]:
 # and every other worker keep the original module untouched.
 if os.getenv("CIE_CONTROL_EXECUTOR_CYCLE_ID"):
     from inefficiency_engine import durable_control_cycle_history as _legacy_cycle_history
-    from inefficiency_engine.durable_control_cycle_history_target_bridge_runtime import (
+    from inefficiency_engine.cycle_history_active_target_fallback_runtime import (
         advance_durable_control_cycle_history_cache as _advance_frozen_cycle_history,
         load_durable_control_cycle_history as _load_frozen_cycle_history,
     )
