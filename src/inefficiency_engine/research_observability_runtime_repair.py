@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from inefficiency_engine import disposable_heavy_job as heavy_job
 from inefficiency_engine import disposable_research_worker as research_worker
+from inefficiency_engine.alpha_funnel_projection import publish_alpha_funnel_projection
 from inefficiency_engine.candidate_observatory_runtime import (
     CandidateObservedAllLaneEvidenceFactoryService,
 )
@@ -96,6 +97,25 @@ def _without_mixed_microstructure_funnel(
     )
 
 
+def _publish_same_cycle_alpha_after_closure(store, alpha_factory) -> bool:
+    """Restore same-cycle alpha funnels after a structural closure append."""
+
+    if not hasattr(alpha_factory, "last_discovery_diagnostics"):
+        return False
+    diagnostics = alpha_factory.last_discovery_diagnostics()
+    if not isinstance(diagnostics, dict) or not diagnostics:
+        return False
+    snapshot = getattr(alpha_factory, "_last_discovery_snapshot", None)
+    observed_at = getattr(snapshot, "completed_at", None)
+    if not isinstance(observed_at, datetime):
+        return False
+    return publish_alpha_funnel_projection(
+        store,
+        diagnostics,
+        observed_at=observed_at,
+    )
+
+
 async def run_truthful_research_closure(*args, **kwargs):
     summary = await _ORIGINAL_RESEARCH_CLOSURE(*args, **kwargs)
     if summary is None:
@@ -105,12 +125,19 @@ async def run_truthful_research_closure(*args, **kwargs):
         return summary
 
     store = kwargs.get("store")
-    if store is None and len(args) >= 2:
-        store = args[1]
     if store is None:
         return corrected
 
     ResearchClosureSummaryLedger(store).record(corrected)
+    alpha_projection_republished = False
+    try:
+        alpha_projection_republished = _publish_same_cycle_alpha_after_closure(
+            store,
+            kwargs.get("alpha_factory"),
+        )
+    except Exception:
+        # Projection telemetry cannot make structural closure fail or create authority.
+        alpha_projection_republished = False
     try:
         store.record_worker_heartbeat(
             worker_id=RESEARCH_CLOSURE_WORKER_ID,
@@ -122,6 +149,7 @@ async def run_truthful_research_closure(*args, **kwargs):
                 "summary_observed_at": corrected.observed_at.isoformat(),
                 "summary_recorded": True,
                 "microstructure_funnel_source": "same_cycle_alpha_projection_only",
+                "same_cycle_alpha_projection_republished": alpha_projection_republished,
                 "cross_cycle_microstructure_join_allowed": False,
                 "paper_only": True,
                 "live_execution_authority": False,
@@ -132,15 +160,27 @@ async def run_truthful_research_closure(*args, **kwargs):
     return corrected
 
 
+async def _recover_stale_closure_before_research(service, store) -> None:
+    """Refresh structural closure independently before later alpha projection work."""
+
+    operating = SimpleNamespace(ledger=OperatingCertificationLedger(store))
+    await run_truthful_research_closure(
+        service=service,
+        store=store,
+        alpha_factory=object(),
+        operating_certification=operating,
+        total_capital_usd=float(service.settings.alpha_research_capital_usd),
+    )
+
+
 async def run_research_cycle_with_observability_repair(
     service,
     store,
     *,
     sequence: int,
 ):
-    """Run the normal research cycle, then independently recover stale closure truth."""
+    """Recover stale closure independently, then run the unchanged research cycle."""
 
-    result = await _ORIGINAL_RESEARCH_CYCLE(service, store, sequence=sequence)
     try:
         needs_recovery = closure_recovery_required(store)
     except Exception as exc:
@@ -160,39 +200,15 @@ async def run_research_cycle_with_observability_repair(
         except Exception:
             pass
 
-    if not needs_recovery:
-        return result
-
-    try:
-        operating = SimpleNamespace(ledger=OperatingCertificationLedger(store))
-        await run_truthful_research_closure(
-            service=service,
-            store=store,
-            alpha_factory=object(),
-            operating_certification=operating,
-            total_capital_usd=float(service.settings.alpha_research_capital_usd),
-        )
-        store.record_worker_heartbeat(
-            worker_id=RESEARCH_OBSERVABILITY_REPAIR_WORKER_ID,
-            state="success",
-            detail={
-                "stage": "closure_recovered",
-                "closure_stale_seconds": RESEARCH_CLOSURE_RECOVERY_STALE_SECONDS,
-                "certification_success_required_for_closure": False,
-                "qualification_thresholds_unchanged": True,
-                "allocation_authority": False,
-                "paper_only": True,
-                "live_execution_authority": False,
-            },
-        )
-    except Exception as exc:
+    if needs_recovery:
         try:
+            await _recover_stale_closure_before_research(service, store)
             store.record_worker_heartbeat(
                 worker_id=RESEARCH_OBSERVABILITY_REPAIR_WORKER_ID,
-                state="degraded",
-                error_type=type(exc).__name__,
+                state="success",
                 detail={
-                    "stage": "closure_recovery",
+                    "stage": "closure_recovered_before_research",
+                    "closure_stale_seconds": RESEARCH_CLOSURE_RECOVERY_STALE_SECONDS,
                     "certification_success_required_for_closure": False,
                     "qualification_thresholds_unchanged": True,
                     "allocation_authority": False,
@@ -200,9 +216,26 @@ async def run_research_cycle_with_observability_repair(
                     "live_execution_authority": False,
                 },
             )
-        except Exception:
-            pass
-    return result
+        except Exception as exc:
+            try:
+                store.record_worker_heartbeat(
+                    worker_id=RESEARCH_OBSERVABILITY_REPAIR_WORKER_ID,
+                    state="degraded",
+                    error_type=type(exc).__name__,
+                    detail={
+                        "stage": "closure_recovery_before_research",
+                        "certification_success_required_for_closure": False,
+                        "qualification_thresholds_unchanged": True,
+                        "allocation_authority": False,
+                        "paper_only": True,
+                        "live_execution_authority": False,
+                    },
+                )
+            except Exception:
+                pass
+
+    # Closure recovery is fail-soft and has no authority over the research cycle.
+    return await _ORIGINAL_RESEARCH_CYCLE(service, store, sequence=sequence)
 
 
 def install_research_observability_runtime_repair() -> None:
