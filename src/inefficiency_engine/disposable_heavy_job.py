@@ -5,6 +5,10 @@ import asyncio
 import os
 import uuid
 
+from inefficiency_engine.candidate_observatory_historical_replay import (
+    REPLAY_COMPLETE_EXIT_CODE,
+    run_historical_candidate_replay_batch,
+)
 from inefficiency_engine.config import Settings
 from inefficiency_engine.disposable_research_worker import (
     RESEARCH_WORKER_ID,
@@ -99,6 +103,7 @@ async def _run(job: str) -> int:
         )
         return TEMPORARY_ADMISSION_EXIT_CODE
 
+    replay_complete = False
     try:
         before = instance_memory_snapshot()
         memory_block = child_memory_admission_reason(before)
@@ -173,6 +178,25 @@ async def _run(job: str) -> int:
                 "complete_asset_count": payload.get("complete_asset_count", 0),
                 "overall_coverage_fraction": payload.get("overall_coverage_fraction", 0.0),
             }
+        elif job == "observatory_backfill":
+            payload = run_historical_candidate_replay_batch(store)
+            replay_complete = bool(payload.get("complete"))
+            result_detail = {
+                "replay_start": payload.get("replay_start"),
+                "replay_boundary": payload.get("replay_boundary"),
+                "live_observatory_started_at": payload.get("live_observatory_started_at"),
+                "complete": replay_complete,
+                "waiting_for_live_observatory_boundary": payload.get(
+                    "waiting_for_live_observatory_boundary", False
+                ),
+                "alpha_signals": payload.get("alpha_signals", {}),
+                "alpha_funnels": payload.get("alpha_funnels", {}),
+                "structural_funnels": payload.get("structural_funnels", {}),
+                "historical_counts_as_forward": False,
+                "qualification_authority": False,
+                "allocation_authority": False,
+                "live_execution_authority": False,
+            }
         else:
             raise ValueError(f"unknown disposable job: {job}")
 
@@ -197,6 +221,8 @@ async def _run(job: str) -> int:
         # A degraded research cycle is deliberately visible in durable telemetry but
         # is not process-fatal: the supervisor must keep scheduling independent
         # disposable cycles so transient providers can recover automatically.
+        if job == "observatory_backfill" and replay_complete:
+            return REPLAY_COMPLETE_EXIT_CODE
         return 0
     except Exception as exc:
         try:
@@ -222,7 +248,7 @@ async def _run(job: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="cie-heavy")
-    parser.add_argument("job", choices=["research", "history"])
+    parser.add_argument("job", choices=["research", "history", "observatory_backfill"])
     args = parser.parse_args()
     return asyncio.run(_run(args.job))
 

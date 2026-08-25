@@ -4,6 +4,9 @@ import sys
 import threading
 
 from inefficiency_engine import render_combined_postbind as base
+from inefficiency_engine.candidate_observatory_backfill_supervisor import (
+    run_candidate_observatory_backfill_supervisor,
+)
 from inefficiency_engine.cycle_history_background_supervisor import (
     run_cycle_history_background_supervisor,
 )
@@ -84,12 +87,20 @@ def main() -> int:
         name="cycle-history-background-supervisor",
         daemon=True,
     )
+    observatory_backfill_guard = threading.Thread(
+        target=run_candidate_observatory_backfill_supervisor,
+        args=(stop_event,),
+        name="candidate-observatory-backfill-supervisor",
+        daemon=True,
+    )
     cycle_history_guard.start()
+    observatory_backfill_guard.start()
     try:
         return base.main()
     finally:
         stop_event.set()
         cycle_history_guard.join(timeout=10.0)
+        observatory_backfill_guard.join(timeout=10.0)
 
 
 if __name__ == "__main__":

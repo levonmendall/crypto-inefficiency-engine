@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from inefficiency_engine.candidate_observatory import OBSERVATORY_WORKER_ID
+from inefficiency_engine.candidate_observatory_historical_replay import (
+    read_historical_candidate_replay,
+)
 from inefficiency_engine.dashboard_v5_router import build_v5_dashboard_router
 from inefficiency_engine.read_api import _latest_payload, _payload_history, _require_store
 from inefficiency_engine.read_api_fast import app
@@ -110,10 +113,11 @@ def research_closure_status():
 
 @app.get("/v3/research/candidate-observatory")
 def candidate_observatory_status(limit: int = 50):
-    """Expose raw signals, near misses, and diagnostic-only shadow learning.
+    """Expose live observatory truth plus separately labeled historical replay.
 
-    Priority scores, near-miss ranks, and diagnostic shadow outcomes are research
-    telemetry only; they cannot qualify a strategy or authorize allocation.
+    Historical replay is diagnostic-only and comes exclusively from evidence that was
+    already persisted before the live observatory existed. It never counts as forward
+    evidence and can never qualify a strategy or authorize allocation.
     """
 
     store = _require_store()
@@ -121,6 +125,7 @@ def candidate_observatory_status(limit: int = 50):
     latest = _latest_payload(store, "candidate_observatory_snapshots")
     recent_candidates = _payload_history(store, "candidate_observatory_events", limit=bounded)
     recent_shadow_events = _payload_history(store, "candidate_observatory_shadow_events", limit=bounded)
+    historical_replay = read_historical_candidate_replay(store, limit=bounded)
     heartbeat = None
     try:
         heartbeat = store.latest_worker_heartbeat(OBSERVATORY_WORKER_ID)
@@ -132,6 +137,8 @@ def candidate_observatory_status(limit: int = 50):
             "available": False,
             "recent_candidates": recent_candidates,
             "recent_diagnostic_shadow_events": recent_shadow_events,
+            "historical_replay": historical_replay,
+            "historical_replay_available": bool(historical_replay.get("available")),
             "runtime": runtime,
             "qualification_policy_version": RESEARCH_RESET_POLICY_VERSION,
             "qualification_thresholds_unchanged": True,
@@ -139,13 +146,19 @@ def candidate_observatory_status(limit: int = 50):
             "allocation_authority": False,
             "paper_only": True,
             "live_execution_authority": False,
-            "message": "no candidate observatory snapshot has been recorded yet",
+            "message": (
+                "no live candidate observatory snapshot has been recorded yet; historical replay is exposed separately"
+                if historical_replay.get("available")
+                else "no candidate observatory snapshot has been recorded yet"
+            ),
         }
     return {
         "available": True,
         **latest,
         "recent_candidates": recent_candidates,
         "recent_diagnostic_shadow_events": recent_shadow_events,
+        "historical_replay": historical_replay,
+        "historical_replay_available": bool(historical_replay.get("available")),
         "runtime": runtime,
         "qualification_policy_version": RESEARCH_RESET_POLICY_VERSION,
         "qualification_thresholds_unchanged": True,
@@ -154,6 +167,15 @@ def candidate_observatory_status(limit: int = 50):
         "paper_only": True,
         "live_execution_authority": False,
     }
+
+
+@app.get("/v3/research/candidate-observatory/history")
+def candidate_observatory_history(limit: int = 200):
+    """Return bounded pre-observatory history without mixing it into live evidence."""
+
+    store = _require_store()
+    bounded = max(1, min(500, int(limit)))
+    return read_historical_candidate_replay(store, limit=bounded)
 
 
 @app.get("/v3/research/qualification-reset")
