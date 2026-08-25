@@ -31,6 +31,11 @@ def test_refresh_failure_serves_prior_certified_target(monkeypatch):
         },
     }
     monkeypatch.setattr(runtime, "_load_checkpoint", lambda _factory: (checkpoint, True))
+    monkeypatch.setattr(
+        runtime,
+        "load_durable_control_cycle_history",
+        lambda _factory, _snapshot: {},
+    )
 
     def fail_refresh(*_args, **_kwargs):
         raise TimeoutError("canceling statement due to statement timeout")
@@ -91,6 +96,35 @@ def test_fallback_rejects_mismatched_certified_scan(monkeypatch):
         }
     }
     monkeypatch.setattr(runtime, "_load_checkpoint", lambda _factory: (checkpoint, True))
+    monkeypatch.setattr(
+        runtime,
+        "_advance_and_pin",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("refresh failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="refresh failed"):
+        runtime.advance_durable_control_cycle_history_cache(factory, incoming)
+
+
+def test_fallback_rejects_checkpoint_when_compact_history_is_unreadable(monkeypatch):
+    active_at = datetime(2026, 8, 24, 23, 30, tzinfo=timezone.utc)
+    active_snapshot = _snapshot("certified-scan", active_at)
+    incoming = _snapshot("newer-scan", datetime(2026, 8, 25, tzinfo=timezone.utc))
+    factory = SimpleNamespace(
+        store=SimpleNamespace(load_scan=lambda _scan_id: active_snapshot)
+    )
+    checkpoint = {
+        "active_target": {
+            "scan_id": "certified-scan",
+            "completed_at": active_at.isoformat(),
+        }
+    }
+    monkeypatch.setattr(runtime, "_load_checkpoint", lambda _factory: (checkpoint, True))
+    monkeypatch.setattr(
+        runtime,
+        "load_durable_control_cycle_history",
+        lambda _factory, _snapshot: None,
+    )
     monkeypatch.setattr(
         runtime,
         "_advance_and_pin",
