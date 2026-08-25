@@ -19,7 +19,10 @@ PORTFOLIO_BOUNDED_HEARTBEAT_COMMAND = [
     "-m",
     "inefficiency_engine.lightweight_portfolio_worker_bounded_heartbeat",
 ]
-BOUNDED_HEARTBEAT_API_APP = "inefficiency_engine.read_api_mobile_truth_deploy:app"
+# The outer ASGI liveness boundary guarantees Render's /health probe never enters
+# PostgreSQL-backed runtime diagnostics. /ready and every diagnostic route remain on
+# the full mobile-truth application behind that wrapper.
+BOUNDED_HEARTBEAT_API_APP = "inefficiency_engine.read_api_liveness_deploy:app"
 
 
 def install_source_repair_child_command() -> None:
