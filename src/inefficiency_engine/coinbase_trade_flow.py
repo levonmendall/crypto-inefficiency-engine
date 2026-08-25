@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 
 import httpx
 from sqlalchemy import insert, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from inefficiency_engine.priority_source_models import SourceProbeResult
 from inefficiency_engine.source_coverage import SourceCoveragePlane, SourceEventObservation
@@ -102,16 +104,52 @@ def _event_rows(observations: list[SourceEventObservation]) -> list[dict[str, ob
     ]
 
 
+def _conflict_safe_insert(table, batch: list[dict[str, object]], dialect_name: str):
+    if dialect_name == "postgresql":
+        return postgresql_insert(table).values(batch).on_conflict_do_nothing(
+            index_elements=[table.c.event_id]
+        )
+    if dialect_name == "sqlite":
+        return sqlite_insert(table).values(batch).on_conflict_do_nothing(
+            index_elements=[table.c.event_id]
+        )
+    return None
+
+
 def _persist_trade_events_bulk(
     coverage: SourceCoveragePlane,
     observations: list[SourceEventObservation],
 ) -> int:
-    """Persist a bounded event batch without one transaction per trade/lane row."""
+    """Persist a bounded event batch idempotently under concurrent refresh owners.
+
+    PostgreSQL and SQLite use an atomic ``ON CONFLICT DO NOTHING`` insert on the
+    durable ``event_id`` key. This removes the check-then-insert race that could
+    raise ``IntegrityError`` when the normal priority cycle and critical freshness
+    cycle observed the same Coinbase trades at the same time. Other SQL dialects
+    retain the previous bounded compatibility path.
+    """
 
     if not observations:
         return 0
     table = coverage.events.rows
     rows = _event_rows(observations)
+    dialect_name = str(coverage.store.engine.dialect.name or "").lower()
+
+    if dialect_name in {"postgresql", "sqlite"}:
+        inserted = 0
+        with coverage.store.engine.begin() as db:
+            for offset in range(0, len(rows), _BULK_EVENT_CHUNK_SIZE):
+                batch = rows[offset : offset + _BULK_EVENT_CHUNK_SIZE]
+                if not batch:
+                    continue
+                statement = _conflict_safe_insert(table, batch, dialect_name)
+                assert statement is not None
+                result = db.execute(statement)
+                rowcount = int(getattr(result, "rowcount", 0) or 0)
+                if rowcount > 0:
+                    inserted += rowcount
+        return inserted
+
     event_ids = [str(row["event_id"]) for row in rows]
     existing: set[str] = set()
     with coverage.store.engine.begin() as db:
@@ -224,6 +262,7 @@ async def collect_coinbase_trade_flow(
             "event_row_count": len(observations),
             "inserted_event_row_count": inserted_event_rows,
             "bulk_event_persistence": True,
+            "conflict_safe_event_persistence": True,
             "side_semantics": "coinbase_maker_side_inverted_to_aggressor",
             "maker_fill_assumed": False,
             "credential_required": False,
