@@ -13,11 +13,14 @@ from inefficiency_engine.runtime_index_maintenance import (
     BACKGROUND_INDEX_SPECS,
     CONTROL_GATE_INDEX_SPECS,
     CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
+    CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS,
     INDEX_SPECS,
     POSTGRES_INDEX_LOCK_TIMEOUT_MS,
     POSTGRES_INDEX_STATEMENT_TIMEOUT_MS,
     _create_index_sql,
     _ensure_postgres_index,
+    _next_replacement_index_name,
+    _statement_timeout_for_index,
     ensure_runtime_indexes_after_api_bind,
 )
 
@@ -69,7 +72,7 @@ class _RecordingDb:
         return None
 
 
-def test_postgres_invalid_runtime_index_uses_verified_versioned_replacement_without_drop(
+def test_postgres_invalid_runtime_index_uses_verified_dynamic_replacement_without_drop(
     monkeypatch,
 ):
     canonical_name = "ix_runtime_market_quotes_venue_asset_observed_at_id"
@@ -82,12 +85,15 @@ def test_postgres_invalid_runtime_index_uses_verified_versioned_replacement_with
             return {"valid": False, "ready": True}
         if index_name == replacement_name:
             replacement_reads += 1
-            if replacement_reads == 1:
-                return None
             return {"valid": True, "ready": True}
         return None
 
     monkeypatch.setattr(runtime_index_maintenance, "_postgres_index_state", fake_state)
+    monkeypatch.setattr(
+        runtime_index_maintenance,
+        "_postgres_replacement_index_states",
+        lambda _db, *, index_name: {},
+    )
     db = _RecordingDb()
 
     result = _ensure_postgres_index(
@@ -95,8 +101,10 @@ def test_postgres_invalid_runtime_index_uses_verified_versioned_replacement_with
         index_name=canonical_name,
         table_name="market_quotes",
         columns=("venue", "asset", "observed_at", "id"),
+        statement_timeout_ms=CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS,
     )
 
+    assert replacement_reads == 1
     assert result["postgres_index_valid"] is True
     assert result["postgres_index_ready"] is True
     assert result["repaired_invalid_index"] is True
@@ -107,10 +115,14 @@ def test_postgres_invalid_runtime_index_uses_verified_versioned_replacement_with
     assert result["effective_index_name"] == replacement_name
     assert result["invalid_index_cleanup_deferred"] is True
     assert result["deferred_invalid_index_name"] == canonical_name
-    assert result["postgres_statement_timeout_ms"] == POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
+    assert (
+        result["postgres_statement_timeout_ms"]
+        == CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
+    )
     assert result["postgres_lock_timeout_ms"] == POSTGRES_INDEX_LOCK_TIMEOUT_MS
     assert db.statements[0] == (
-        f"SET statement_timeout TO '{POSTGRES_INDEX_STATEMENT_TIMEOUT_MS}ms'"
+        "SET statement_timeout TO "
+        f"'{CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS}ms'"
     )
     assert db.statements[1] == f"SET lock_timeout TO '{POSTGRES_INDEX_LOCK_TIMEOUT_MS}ms'"
     assert db.statements[2].startswith(
@@ -120,19 +132,25 @@ def test_postgres_invalid_runtime_index_uses_verified_versioned_replacement_with
     assert not any(statement.startswith("DROP INDEX") for statement in db.statements)
 
 
-def test_postgres_invalid_replacement_is_skipped_for_next_verified_version(monkeypatch):
+def test_postgres_reuses_newest_valid_dynamic_replacement(monkeypatch):
     canonical_name = "ix_runtime_market_quotes_venue_asset_observed_at_id"
-
-    def fake_state(_db, *, index_name):
-        if index_name == canonical_name:
-            return {"valid": False, "ready": True}
-        if index_name == f"{canonical_name}_v2":
-            return {"valid": False, "ready": False}
-        if index_name == f"{canonical_name}_v3":
-            return {"valid": True, "ready": True}
-        return None
-
-    monkeypatch.setattr(runtime_index_maintenance, "_postgres_index_state", fake_state)
+    replacement_states = {
+        f"{canonical_name}_v2": {"valid": False, "ready": False},
+        f"{canonical_name}_v3": {"valid": True, "ready": True},
+        f"{canonical_name}_v4": {"valid": True, "ready": True},
+    }
+    monkeypatch.setattr(
+        runtime_index_maintenance,
+        "_postgres_index_state",
+        lambda _db, *, index_name: {"valid": False, "ready": True}
+        if index_name == canonical_name
+        else None,
+    )
+    monkeypatch.setattr(
+        runtime_index_maintenance,
+        "_postgres_replacement_index_states",
+        lambda _db, *, index_name: replacement_states,
+    )
     db = _RecordingDb()
 
     result = _ensure_postgres_index(
@@ -142,13 +160,94 @@ def test_postgres_invalid_replacement_is_skipped_for_next_verified_version(monke
         columns=("venue", "asset", "observed_at", "id"),
     )
 
-    assert result["effective_index_name"] == f"{canonical_name}_v3"
+    assert result["effective_index_name"] == f"{canonical_name}_v4"
     assert result["replacement_index_used"] is True
     assert result["existing_index_reused"] is True
     assert result["ddl_required"] is False
     assert result["invalid_index_cleanup_deferred"] is True
     assert not any(statement.startswith("DROP INDEX") for statement in db.statements)
     assert not any(statement.startswith("CREATE INDEX") for statement in db.statements)
+
+
+def test_postgres_dynamic_replacement_advances_beyond_exhausted_v2_v3_v4(monkeypatch):
+    canonical_name = "ix_runtime_market_quotes_venue_asset_observed_at_id"
+    replacement_states = {
+        f"{canonical_name}_v2": {"valid": False, "ready": False},
+        f"{canonical_name}_v3": {"valid": False, "ready": True},
+        f"{canonical_name}_v4": {"valid": False, "ready": False},
+    }
+
+    def fake_state(_db, *, index_name):
+        if index_name == canonical_name:
+            return {"valid": False, "ready": True}
+        if index_name == f"{canonical_name}_v5":
+            return {"valid": True, "ready": True}
+        return None
+
+    monkeypatch.setattr(runtime_index_maintenance, "_postgres_index_state", fake_state)
+    monkeypatch.setattr(
+        runtime_index_maintenance,
+        "_postgres_replacement_index_states",
+        lambda _db, *, index_name: replacement_states,
+    )
+    db = _RecordingDb()
+
+    result = _ensure_postgres_index(
+        db,
+        index_name=canonical_name,
+        table_name="market_quotes",
+        columns=("venue", "asset", "observed_at", "id"),
+        statement_timeout_ms=CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS,
+    )
+
+    assert result["effective_index_name"] == f"{canonical_name}_v5"
+    assert result["replacement_versions_observed"] == 3
+    assert any(
+        statement.startswith(
+            "CREATE INDEX CONCURRENTLY "
+            "ix_runtime_market_quotes_venue_asset_observed_at_id_v5"
+        )
+        for statement in db.statements
+    )
+    assert not any(statement.startswith("DROP INDEX") for statement in db.statements)
+
+
+def test_dynamic_replacement_name_tracks_highest_catalog_version():
+    canonical_name = "ix_runtime_market_quotes_venue_asset_observed_at_id"
+    states = {
+        f"{canonical_name}_v2": {"valid": False, "ready": False},
+        f"{canonical_name}_v4": {"valid": False, "ready": False},
+        f"{canonical_name}_v37": {"valid": False, "ready": False},
+    }
+
+    assert _next_replacement_index_name(
+        index_name=canonical_name,
+        existing_states=states,
+    ) == f"{canonical_name}_v38"
+
+
+def test_cycle_history_index_has_longer_but_finite_build_deadline():
+    cycle_columns = CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS["market_quotes"]
+
+    assert (
+        _statement_timeout_for_index(
+            table_name="market_quotes",
+            columns=cycle_columns,
+        )
+        == CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
+    )
+    assert (
+        CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
+        > POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
+    )
+    assert CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS == 120_000
+    assert (
+        _statement_timeout_for_index(
+            table_name="opportunities",
+            columns=("observed_at",),
+        )
+        == POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
+    )
 
 
 def test_postgres_valid_runtime_index_is_reused_without_ddl(monkeypatch):
