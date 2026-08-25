@@ -21,7 +21,7 @@ from inefficiency_engine.source_runtime_safety import (
 )
 
 
-CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"
+CANONICAL_API_APP = "inefficiency_engine.read_api_liveness_deploy:app"
 _runtime.API_APP = CANONICAL_API_APP
 
 # Preserve the public helper surface used by tests and operational tooling while
