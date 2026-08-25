@@ -108,16 +108,23 @@ class SourceCoverageLedger:
                 )
         return row.observation_id
 
-    def latest(self) -> dict[tuple[str, str], SourceCoverageObservation]:
+    def recent(self, *, limit: int = 3000) -> list[SourceCoverageObservation]:
+        """Return bounded append-only attempt history, newest first."""
+        bounded_limit = max(1, min(int(limit), 3000))
         with self.store.engine.connect() as db:
             payloads = list(
                 db.execute(
-                    select(self.rows.c.payload_json).order_by(self.rows.c.id.desc()).limit(3000)
+                    select(self.rows.c.payload_json)
+                    .order_by(self.rows.c.id.desc())
+                    .limit(bounded_limit)
                 ).scalars()
             )
+        return [SourceCoverageObservation.model_validate_json(payload) for payload in payloads]
+
+    def latest(self) -> dict[tuple[str, str], SourceCoverageObservation]:
+        """Compatibility view of the newest attempt per source/lane."""
         result: dict[tuple[str, str], SourceCoverageObservation] = {}
-        for payload in payloads:
-            row = SourceCoverageObservation.model_validate_json(payload)
+        for row in self.recent():
             result.setdefault((row.source_id, row.lane_id), row)
         return result
 
@@ -262,10 +269,7 @@ class SourceCoveragePlane:
                     )
                 ).mappings()
             )
-        latest: dict[str, dict[str, object]] = {}
-        for row in rows:
-            latest.setdefault(str(row["provider"]), dict(row))
-        return list(latest.values())
+        return [dict(row) for row in rows]
 
     def _admissions(self, available: set[str]) -> list[dict[str, object]]:
         if "provider_gap_admissions" not in available:
@@ -279,21 +283,15 @@ class SourceCoveragePlane:
                     )
                 ).scalars()
             )
-        latest: dict[tuple[str, str], dict[str, object]] = {}
+        rows: list[dict[str, object]] = []
         for raw in raws:
             try:
                 payload = json.loads(str(raw))
             except (TypeError, json.JSONDecodeError):
                 continue
             if isinstance(payload, dict):
-                latest.setdefault(
-                    (
-                        str(payload.get("mechanism_id") or ""),
-                        str(payload.get("provider") or ""),
-                    ),
-                    payload,
-                )
-        return list(latest.values())
+                rows.append(payload)
+        return rows
 
     def _table_candidate(
         self,
@@ -356,7 +354,7 @@ class SourceCoveragePlane:
         spec: dict[str, object],
         lane_id: str,
         now: datetime,
-        direct: dict[tuple[str, str], SourceCoverageObservation],
+        direct: list[SourceCoverageObservation],
         providers: list[dict[str, object]],
         admissions: list[dict[str, object]],
         available: set[str],
@@ -396,8 +394,10 @@ class SourceCoveragePlane:
             }
 
         candidates: list[dict[str, object]] = []
-        row = direct.get((str(spec["id"]), lane_id))
-        if row is not None:
+        source_id = str(spec["id"])
+        for row in direct:
+            if row.source_id != source_id or row.lane_id != lane_id:
+                continue
             candidates.append(
                 {
                     "healthy": row.healthy,
@@ -479,34 +479,102 @@ class SourceCoveragePlane:
             or datetime.min.replace(tzinfo=timezone.utc),
             reverse=True,
         )
-        latest = candidates[0]
-        observed = _time(latest.get("observed_at"))
-        age_seconds = max(0.0, (now - observed).total_seconds()) if observed else None
-        classes = [str(item) for item in list(latest.get("classes") or spec["classes"])]
-        freshness_seconds = self._freshness_seconds(classes)
-        fresh = bool(age_seconds is not None and age_seconds <= freshness_seconds)
-        admitted = bool(
-            latest.get("healthy")
-            and fresh
-            and latest.get("authoritative", True)
-            and latest.get("commercial", True)
-            and latest.get("point_in_time", True)
+        latest_attempt = candidates[0]
+
+        def _candidate_fresh(
+            candidate: dict[str, object],
+        ) -> tuple[datetime | None, float | None, list[str], float, bool]:
+            observed_at = _time(candidate.get("observed_at"))
+            age = max(0.0, (now - observed_at).total_seconds()) if observed_at else None
+            candidate_classes = [
+                str(item) for item in list(candidate.get("classes") or spec["classes"])
+            ]
+            ttl = self._freshness_seconds(candidate_classes)
+            is_fresh = bool(age is not None and age <= ttl)
+            return observed_at, age, candidate_classes, ttl, is_fresh
+
+        selected: dict[str, object] | None = None
+        selected_eval: tuple[
+            datetime | None, float | None, list[str], float, bool
+        ] | None = None
+        for candidate in candidates:
+            evaluated = _candidate_fresh(candidate)
+            if not (
+                candidate.get("healthy")
+                and evaluated[4]
+                and candidate.get("authoritative", True)
+                and candidate.get("commercial", True)
+                and candidate.get("point_in_time", True)
+            ):
+                continue
+            selected = candidate
+            selected_eval = evaluated
+            break
+
+        latest_observed, latest_age, _, latest_ttl, latest_fresh = _candidate_fresh(
+            latest_attempt
         )
-        state: Literal["healthy", "stale", "failed"] = (
+        latest_state: Literal["healthy", "stale", "failed"] = (
             "failed"
-            if not latest.get("healthy")
+            if not latest_attempt.get("healthy")
             else "healthy"
-            if fresh
+            if latest_fresh
             else "stale"
         )
+
+        if selected is None or selected_eval is None:
+            classes = [
+                str(item)
+                for item in list(latest_attempt.get("classes") or spec["classes"])
+            ]
+            return {
+                **base,
+                "state": latest_state,
+                "healthy": bool(latest_attempt.get("healthy")),
+                "fresh": latest_fresh,
+                "admitted": False,
+                "classes": classes,
+                "authoritative": bool(
+                    latest_attempt.get("authoritative", spec.get("authoritative", True))
+                ),
+                "observed_at": latest_observed.isoformat() if latest_observed else None,
+                "age_hours": latest_age / 3600.0 if latest_age is not None else None,
+                "age_seconds": latest_age,
+                "freshness_ttl_seconds": latest_ttl,
+                "freshness_policy": "evidence_class_specific"
+                if self.class_specific_freshness
+                else "explicit_uniform_override",
+                "item_count": int(latest_attempt.get("item_count") or 0),
+                "error_type": latest_attempt.get("error_type"),
+                "source_reference": latest_attempt.get("source_reference"),
+                "economic_fields_complete": bool(
+                    latest_attempt.get("economic_fields_complete")
+                ),
+                "forward_testable_evidence": bool(
+                    latest_attempt.get("forward_testable_evidence")
+                ),
+                "latest_attempt_state": latest_state,
+                "latest_attempt_observed_at": latest_observed.isoformat()
+                if latest_observed
+                else None,
+                "latest_attempt_error_type": latest_attempt.get("error_type"),
+                "latest_attempt_source_reference": latest_attempt.get("source_reference"),
+                "latest_attempt_item_count": int(latest_attempt.get("item_count") or 0),
+                "using_prior_fresh_evidence": False,
+            }
+
+        observed, age_seconds, classes, freshness_seconds, _ = selected_eval
+        using_prior_fresh_evidence = selected is not latest_attempt
         return {
             **base,
-            "state": state,
-            "healthy": bool(latest.get("healthy")),
-            "fresh": fresh,
-            "admitted": admitted,
+            "state": "healthy",
+            "healthy": True,
+            "fresh": True,
+            "admitted": True,
             "classes": classes,
-            "authoritative": bool(latest.get("authoritative", spec.get("authoritative", True))),
+            "authoritative": bool(
+                selected.get("authoritative", spec.get("authoritative", True))
+            ),
             "observed_at": observed.isoformat() if observed else None,
             "age_hours": age_seconds / 3600.0 if age_seconds is not None else None,
             "age_seconds": age_seconds,
@@ -514,17 +582,25 @@ class SourceCoveragePlane:
             "freshness_policy": "evidence_class_specific"
             if self.class_specific_freshness
             else "explicit_uniform_override",
-            "item_count": int(latest.get("item_count") or 0),
-            "error_type": latest.get("error_type"),
-            "source_reference": latest.get("source_reference"),
-            "economic_fields_complete": bool(latest.get("economic_fields_complete")),
-            "forward_testable_evidence": bool(latest.get("forward_testable_evidence")),
+            "item_count": int(selected.get("item_count") or 0),
+            "error_type": selected.get("error_type"),
+            "source_reference": selected.get("source_reference"),
+            "economic_fields_complete": bool(selected.get("economic_fields_complete")),
+            "forward_testable_evidence": bool(selected.get("forward_testable_evidence")),
+            "latest_attempt_state": latest_state,
+            "latest_attempt_observed_at": latest_observed.isoformat()
+            if latest_observed
+            else None,
+            "latest_attempt_error_type": latest_attempt.get("error_type"),
+            "latest_attempt_source_reference": latest_attempt.get("source_reference"),
+            "latest_attempt_item_count": int(latest_attempt.get("item_count") or 0),
+            "using_prior_fresh_evidence": using_prior_fresh_evidence,
         }
 
     def snapshot(self, *, now: datetime | None = None) -> SourceCoverageSnapshot:
         now = now or _now()
         available = set(inspect(self.store.engine).get_table_names())
-        direct = self.ledger.latest()
+        direct = self.ledger.recent()
         providers = self._provider_rows(available)
         admissions = self._admissions(available)
         rows: list[LaneSourceCoverage] = []
@@ -666,7 +742,9 @@ class SourceCoveragePlane:
             }
         )
         normalized_primary = {
-            str(item).strip().lower() for item in (primary_groups or set()) if str(item).strip()
+            str(item).strip().lower()
+            for item in (primary_groups or set())
+            if str(item).strip()
         }
         primary_ok = not normalized_primary or any(
             str(row.get("group") or "").strip().lower() in normalized_primary
