@@ -13,9 +13,6 @@ from inefficiency_engine.stablecoin_depth_shadow import (
 )
 
 
-NOW = datetime.now(timezone.utc)
-
-
 def book(asset: str, bid: float, ask: float) -> OrderBookSnapshot:
     return OrderBookSnapshot(
         venue="Coinbase",
@@ -26,7 +23,7 @@ def book(asset: str, bid: float, ask: float) -> OrderBookSnapshot:
         contract_key="spot",
         bids=[OrderBookLevel(price=bid, size=100000.0)],
         asks=[OrderBookLevel(price=ask, size=100000.0)],
-        observed_at=NOW,
+        observed_at=datetime.now(timezone.utc),
         source="test",
         request_latency_ms=5.0,
     )

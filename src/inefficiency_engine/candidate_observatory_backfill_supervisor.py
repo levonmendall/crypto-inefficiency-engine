@@ -25,7 +25,10 @@ BACKFILL_COVERAGE_COMMAND = [
     "inefficiency_engine.candidate_observatory_lane_coverage",
 ]
 BACKFILL_EXECUTOR_DEADLINE_SECONDS = 60.0
-BACKFILL_COVERAGE_DEADLINE_SECONDS = 30.0
+# Lane certification must aggregate the full replay window across several durable
+# ledgers. Keep the child strictly bounded, but give those database aggregates enough
+# time to publish the authoritative 13-lane coverage heartbeat before termination.
+BACKFILL_COVERAGE_DEADLINE_SECONDS = 90.0
 BACKFILL_SUCCESS_INTERVAL_SECONDS = 5.0
 BACKFILL_FAILURE_RETRY_SECONDS = 15.0
 BACKFILL_MEMORY_RETRY_SECONDS = 15.0

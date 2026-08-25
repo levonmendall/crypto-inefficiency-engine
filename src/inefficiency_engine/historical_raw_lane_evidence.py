@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any
 
 from sqlalchemy import MetaData, Table, and_, func, inspect, select
 
@@ -134,40 +133,101 @@ def _aggregate(
     return count, _parse_time(row[1]), _parse_time(row[2])
 
 
+def _aggregate_by_value(
+    store,
+    table: Table,
+    *,
+    column_name: str,
+    start_text: str,
+    boundary_text: str,
+) -> dict[str, tuple[int, datetime | None, datetime | None]]:
+    """Aggregate a full historical table window once, grouped by catalog key."""
+    observed = table.c.observed_at
+    group_column = table.c[column_name]
+    query = (
+        select(
+            group_column,
+            func.count(),
+            func.min(observed),
+            func.max(observed),
+        )
+        .where(observed >= start_text)
+        .where(observed < boundary_text)
+        .group_by(group_column)
+    )
+    with store.engine.connect() as db:
+        rows = list(db.execute(query))
+    result: dict[str, tuple[int, datetime | None, datetime | None]] = {}
+    for value, count_raw, earliest_raw, latest_raw in rows:
+        count = int(count_raw or 0)
+        if count <= 0:
+            continue
+        result[str(value)] = (
+            count,
+            _parse_time(earliest_raw),
+            _parse_time(latest_raw),
+        )
+    return result
+
+
 def _recover_catalog_table_sources(store, available: set[str], result, start_text: str, boundary_text: str) -> None:
-    """Recover source classes from canonical raw tables using bounded SQL aggregates."""
+    """Recover source classes with one range scan per durable table/grouping key."""
     reflected: dict[str, Table] = {}
+    aggregate_cache: dict[
+        tuple[str, str | None],
+        tuple[int, datetime | None, datetime | None]
+        | dict[str, tuple[int, datetime | None, datetime | None]],
+    ] = {}
+
     for spec in SOURCES:
         if spec.get("authoritative") is False:
             continue
         probe = spec.get("table")
         if not isinstance(probe, tuple) or len(probe) != 3:
             continue
-        table_name, column_name, value = probe
-        table_name = str(table_name)
+        table_name_raw, column_name_raw, value = probe
+        table_name = str(table_name_raw)
         if table_name not in available:
             continue
+
         table = reflected.get(table_name)
         if table is None:
             table = Table(table_name, MetaData(), autoload_with=store.engine)
             reflected[table_name] = table
         if "observed_at" not in table.c:
             continue
-        clause = None
-        if column_name is not None:
-            column_name = str(column_name)
-            if column_name not in table.c:
+
+        column_name = None if column_name_raw is None else str(column_name_raw)
+        if column_name is not None and column_name not in table.c:
+            continue
+        cache_key = (table_name, column_name)
+        if cache_key not in aggregate_cache:
+            if column_name is None:
+                aggregate_cache[cache_key] = _aggregate(
+                    store,
+                    table,
+                    start_text=start_text,
+                    boundary_text=boundary_text,
+                )
+            else:
+                aggregate_cache[cache_key] = _aggregate_by_value(
+                    store,
+                    table,
+                    column_name=column_name,
+                    start_text=start_text,
+                    boundary_text=boundary_text,
+                )
+
+        cached = aggregate_cache[cache_key]
+        if column_name is None:
+            count, earliest, latest = cached
+        else:
+            if not isinstance(cached, dict):
                 continue
-            clause = table.c[column_name] == value
-        count, earliest, latest = _aggregate(
-            store,
-            table,
-            start_text=start_text,
-            boundary_text=boundary_text,
-            extra_clause=clause,
-        )
+            count, earliest, latest = cached.get(str(value), (0, None, None))
         if not count:
             continue
+
         source_id = str(spec.get("id") or "")
         classes = {str(item) for item in list(spec.get("classes") or [])}
         for lane_id in list(spec.get("lanes") or []):
@@ -433,8 +493,8 @@ def recover_raw_lane_history(store, *, start: datetime, boundary: datetime) -> d
     """Recover historical source evidence from append-only raw ledgers.
 
     This is a diagnostic reconstruction only. It never creates candidate identities,
-    forward samples, qualification, allocation, or execution authority. SQL aggregate
-    reads keep large market tables bounded; provider-admission rows are streamed and
+    forward samples, qualification, allocation, or execution authority. Large catalog
+    tables are scanned once per grouping key; provider-admission rows are streamed and
     reduced to provider-level edge/count summaries.
     """
     result = _empty()
