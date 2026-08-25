@@ -130,11 +130,47 @@ def test_diagnostic_read_failure_serves_last_success_and_ages_it_fail_closed(mon
     assert expired["sources"][0]["cache_expired_during_read_failure"] is True
 
 
-def test_mobile_dashboard_retains_last_good_source_cards_on_read_failure():
+def test_mobile_dashboard_uses_permanent_keyed_source_cards():
+    from inefficiency_engine import read_api_mobile_truth_deploy as mobile
+
+    script = mobile._STABLE_SOURCE_CONNECTIVITY_JS
+    assert "const sourceCardNodes=new Map()" in script
+    assert "sourceCardNodes.has(sourceId)" in script
+    assert "host.appendChild(nodes.card)" in script
+    assert "for(const row of rows)patchSourceCard(row)" in script
+    assert "attention=rows.filter" not in script
+    assert "sourceProblems').innerHTML" not in script
+    assert "Latest refresh warning" in script
+    assert "prior evidence remains valid" in script
+
+
+def test_mobile_dashboard_retains_board_and_serializes_source_polling():
     from inefficiency_engine import read_api_mobile_truth_deploy as mobile
 
     script = mobile._STABLE_SOURCE_CONNECTIVITY_JS
     assert "lastGoodSourceConnectivity" in script
-    assert "served_last_successful_snapshot" in script
-    assert "diagnostic read unavailable" in script
-    assert "if(!$('sourceProblems').children.length)" in script
+    assert "retaining existing source board" in script
+    assert "if(sourceConnectivityInFlight)return sourceConnectivityInFlight" in script
+    assert "sourceConnectivityRequestSequence" in script
+    assert "sourceConnectivityAppliedSequence" in script
+
+
+def test_mobile_dashboard_staggers_reads_and_never_refetches_on_resize():
+    from inefficiency_engine import read_api_mobile_truth_deploy as mobile
+
+    boot = mobile._STAGGERED_BOOT_JS
+    assert "window.addEventListener('resize',()=>renderChart(window.__history||[]))" in boot
+    assert "window.addEventListener('resize',()=>refresh())" not in boot
+    assert "setTimeout(()=>refreshSourceConnectivity(),5000)" in boot
+    assert "document.visibilityState==='visible'" in boot
+    assert "refresh().finally(()=>refreshSourceConnectivity())" in boot
+
+
+def test_repaired_dashboard_embeds_stable_source_board_contract():
+    from inefficiency_engine import read_api_mobile_truth_deploy as mobile
+
+    html = mobile.repaired_dashboard_html()
+    assert "sourceCardNodes=new Map()" in html
+    assert "source-board" in html
+    assert "Latest refresh warning" in html
+    assert "setTimeout(()=>refreshSourceConnectivity(),5000)" in html
