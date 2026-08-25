@@ -1,22 +1,274 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from datetime import datetime, timezone
 
-from inefficiency_engine.candidate_observatory_lane_coverage import (
-    _read_persisted_lane_history,
-)
-from inefficiency_engine.source_coverage_catalog import LANES
+from sqlalchemy import inspect, text
+
+from inefficiency_engine.historical_raw_lane_evidence import recover_raw_lane_history
+from inefficiency_engine.source_coverage_catalog import LANES, SOURCES
 
 
 DEFAULT_CACHE_SECONDS = 300.0
+DEFAULT_SOURCE_ROW_LIMIT = 3000
+DEFAULT_OPERATING_ROW_LIMIT = 1000
+SOURCE_COVERAGE_TABLE = "source_coverage_observations"
+OPERATING_TABLE = "operating_certification_snapshots"
 _CACHE_LOCK = threading.Lock()
 _CACHE: dict[tuple[int, str], tuple[float, dict[str, object]]] = {}
 
 
 def _utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _parse_time(value: object | None) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return _utc(value)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return _utc(parsed)
+
+
+def _source_classes(source_id: str) -> set[str]:
+    for spec in SOURCES:
+        if str(spec.get("id") or "") == source_id:
+            return {str(value) for value in list(spec.get("classes") or [])}
+    return set()
+
+
+def _empty_state() -> dict[str, object]:
+    return {
+        "source_count": 0,
+        "source_earliest": None,
+        "source_latest": None,
+        "source_ids": set(),
+        "evidence_classes": set(),
+        "source_ledgers": set(),
+        "operating_count": 0,
+        "operating_earliest": None,
+        "operating_latest": None,
+        "latest_operating_at": None,
+        "latest_operating_state": None,
+        "max_authoritative_observation_count": 0,
+        "max_economic_candidate_count": 0,
+        "max_forward_signal_count": 0,
+        "max_independent_forward_outcome_count": 0,
+    }
+
+
+def _empty_history() -> dict[str, dict[str, object]]:
+    return {lane_id: _empty_state() for lane_id in LANES}
+
+
+def _merge_source_state(state: dict[str, object], recovered: dict[str, object]) -> None:
+    count = int(recovered.get("source_count") or 0)
+    if count <= 0:
+        return
+    state["source_count"] = int(state.get("source_count") or 0) + count
+    earliest = recovered.get("source_earliest")
+    latest = recovered.get("source_latest")
+    current_earliest = state.get("source_earliest")
+    current_latest = state.get("source_latest")
+    if isinstance(earliest, datetime):
+        state["source_earliest"] = (
+            earliest
+            if not isinstance(current_earliest, datetime) or earliest < current_earliest
+            else current_earliest
+        )
+    if isinstance(latest, datetime):
+        state["source_latest"] = (
+            latest
+            if not isinstance(current_latest, datetime) or latest > current_latest
+            else current_latest
+        )
+    state["source_ids"].update(
+        str(value) for value in recovered.get("source_ids", set())
+    )
+    state["evidence_classes"].update(
+        str(value) for value in recovered.get("evidence_classes", set())
+    )
+    state["source_ledgers"].update(
+        str(value) for value in recovered.get("source_ledgers", set())
+    )
+
+
+def _merge_operating_state(
+    state: dict[str, object],
+    *,
+    observed_at: datetime,
+    mechanism: dict[str, object],
+) -> None:
+    state["operating_count"] = int(state.get("operating_count") or 0) + 1
+    earliest = state.get("operating_earliest")
+    latest = state.get("operating_latest")
+    state["operating_earliest"] = (
+        observed_at if not isinstance(earliest, datetime) or observed_at < earliest else earliest
+    )
+    state["operating_latest"] = (
+        observed_at if not isinstance(latest, datetime) or observed_at > latest else latest
+    )
+    latest_operating_at = state.get("latest_operating_at")
+    if not isinstance(latest_operating_at, datetime) or observed_at >= latest_operating_at:
+        state["latest_operating_at"] = observed_at
+        state["latest_operating_state"] = mechanism.get("state")
+    for key in (
+        "authoritative_observation_count",
+        "economic_candidate_count",
+        "forward_signal_count",
+        "independent_forward_outcome_count",
+    ):
+        metric_key = f"max_{key}"
+        try:
+            value = max(0, int(mechanism.get(key) or 0))
+        except (TypeError, ValueError):
+            value = 0
+        state[metric_key] = max(int(state.get(metric_key) or 0), value)
+
+
+def _read_bounded_source_history(
+    store,
+    *,
+    start: datetime,
+    end: datetime,
+    limit: int,
+) -> dict[str, dict[str, object]]:
+    """Read only the newest bounded canonical source-coverage rows.
+
+    This supplements aggregate raw-ledger reconstruction with the canonical source
+    snapshots that are closest to the current boundary. It is intentionally bounded so
+    an HTTP request never walks the entire append-only source ledger.
+    """
+
+    result = _empty_history()
+    available = set(inspect(store.engine).get_table_names())
+    if SOURCE_COVERAGE_TABLE not in available:
+        return result
+    bounded = max(1, min(int(limit), 10000))
+    query = text(
+        "SELECT lane_id,source_id,observed_at,payload_json "
+        "FROM source_coverage_observations "
+        "WHERE observed_at>=:start AND observed_at<:end "
+        "ORDER BY id DESC LIMIT :limit"
+    )
+    with store.engine.connect() as db:
+        rows = list(
+            db.execute(
+                query,
+                {
+                    "start": _utc(start).isoformat(),
+                    "end": _utc(end).isoformat(),
+                    "limit": bounded,
+                },
+            ).mappings()
+        )
+    for row in rows:
+        lane_id = str(row.get("lane_id") or "")
+        if lane_id not in result:
+            continue
+        try:
+            payload = json.loads(str(row.get("payload_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if not bool(payload.get("healthy")):
+            continue
+        if payload.get("authoritative") is False:
+            continue
+        if payload.get("commercial_use_permitted") is False:
+            continue
+        if payload.get("point_in_time") is False:
+            continue
+        observed_at = _parse_time(row.get("observed_at") or payload.get("observed_at"))
+        if observed_at is None or observed_at < start or observed_at >= end:
+            continue
+        source_id = str(row.get("source_id") or payload.get("source_id") or "")
+        classes = {
+            str(value) for value in list(payload.get("evidence_classes") or [])
+        }
+        if not classes and source_id:
+            classes = _source_classes(source_id)
+        state = result[lane_id]
+        state["source_count"] = int(state.get("source_count") or 0) + 1
+        earliest = state.get("source_earliest")
+        latest = state.get("source_latest")
+        state["source_earliest"] = (
+            observed_at
+            if not isinstance(earliest, datetime) or observed_at < earliest
+            else earliest
+        )
+        state["source_latest"] = (
+            observed_at
+            if not isinstance(latest, datetime) or observed_at > latest
+            else latest
+        )
+        if source_id:
+            state["source_ids"].add(source_id)
+        state["evidence_classes"].update(classes)
+        state["source_ledgers"].add(SOURCE_COVERAGE_TABLE)
+    return result
+
+
+def _read_bounded_operating_history(
+    store,
+    *,
+    start: datetime,
+    end: datetime,
+    limit: int,
+) -> dict[str, dict[str, object]]:
+    """Read a bounded tail of operating snapshots for diagnostic context only."""
+
+    result = _empty_history()
+    available = set(inspect(store.engine).get_table_names())
+    if OPERATING_TABLE not in available:
+        return result
+    bounded = max(1, min(int(limit), 5000))
+    query = text(
+        "SELECT observed_at,payload_json FROM operating_certification_snapshots "
+        "WHERE observed_at>=:start AND observed_at<:end "
+        "ORDER BY id DESC LIMIT :limit"
+    )
+    with store.engine.connect() as db:
+        rows = list(
+            db.execute(
+                query,
+                {
+                    "start": _utc(start).isoformat(),
+                    "end": _utc(end).isoformat(),
+                    "limit": bounded,
+                },
+            ).mappings()
+        )
+    for row in rows:
+        observed_at = _parse_time(row.get("observed_at"))
+        if observed_at is None or observed_at < start or observed_at >= end:
+            continue
+        try:
+            payload = json.loads(str(row.get("payload_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        mechanisms = payload.get("mechanisms") if isinstance(payload, dict) else None
+        if not isinstance(mechanisms, list):
+            continue
+        for mechanism in mechanisms:
+            if not isinstance(mechanism, dict):
+                continue
+            lane_id = str(mechanism.get("mechanism_id") or "")
+            if lane_id not in result:
+                continue
+            _merge_operating_state(
+                result[lane_id],
+                observed_at=observed_at,
+                mechanism=mechanism,
+            )
+    return result
 
 
 def _lane_row(lane_id: str, state: dict[str, object]) -> dict[str, object]:
@@ -93,21 +345,73 @@ def build_durable_lane_history(
     *,
     start: datetime,
     end: datetime | None = None,
+    source_row_limit: int = DEFAULT_SOURCE_ROW_LIMIT,
+    operating_row_limit: int = DEFAULT_OPERATING_ROW_LIMIT,
 ) -> dict[str, object]:
-    """Summarize all trustworthy durable lane evidence since ``start``.
+    """Summarize durable lane evidence without putting an unbounded scan on HTTP.
 
-    This is deliberately distinct from pre-live historical certification. Evidence
-    collected after the first live observatory boundary is included here so a lane can
-    truthfully show accumulated history without retroactively claiming pre-live
-    coverage. No candidate identities, forward samples, qualification, allocation, or
-    execution authority are synthesized.
+    The canonical 13-lane shell is always returned, including every lane's required
+    evidence-class denominator. Raw append-only ledgers are recovered with aggregate
+    SQL where possible, while canonical source and operating snapshots are read only
+    from bounded recent tails. Any failed recovery stage is diagnostic and fail-soft:
+    missing data remains missing and can never create forward, qualification,
+    allocation, or execution authority.
     """
 
     start = _utc(start)
     end = _utc(end or datetime.now(timezone.utc))
-    persisted = _read_persisted_lane_history(store, start=start, boundary=end)
+    persisted = _empty_history()
+    read_errors: list[dict[str, str]] = []
+
+    try:
+        raw_history = recover_raw_lane_history(store, start=start, boundary=end)
+        for lane_id, recovered in raw_history.items():
+            if lane_id in persisted:
+                _merge_source_state(persisted[lane_id], recovered)
+    except Exception as exc:
+        read_errors.append({"stage": "raw_aggregate_history", "error_type": type(exc).__name__})
+
+    try:
+        bounded_sources = _read_bounded_source_history(
+            store,
+            start=start,
+            end=end,
+            limit=source_row_limit,
+        )
+        for lane_id, recovered in bounded_sources.items():
+            if lane_id in persisted:
+                _merge_source_state(persisted[lane_id], recovered)
+    except Exception as exc:
+        read_errors.append({"stage": "bounded_source_history", "error_type": type(exc).__name__})
+
+    try:
+        bounded_operating = _read_bounded_operating_history(
+            store,
+            start=start,
+            end=end,
+            limit=operating_row_limit,
+        )
+        for lane_id, recovered in bounded_operating.items():
+            if lane_id not in persisted:
+                continue
+            state = persisted[lane_id]
+            state["operating_count"] = int(recovered.get("operating_count") or 0)
+            state["operating_earliest"] = recovered.get("operating_earliest")
+            state["operating_latest"] = recovered.get("operating_latest")
+            state["latest_operating_at"] = recovered.get("latest_operating_at")
+            state["latest_operating_state"] = recovered.get("latest_operating_state")
+            for key in (
+                "max_authoritative_observation_count",
+                "max_economic_candidate_count",
+                "max_forward_signal_count",
+                "max_independent_forward_outcome_count",
+            ):
+                state[key] = int(recovered.get(key) or 0)
+    except Exception as exc:
+        read_errors.append({"stage": "bounded_operating_history", "error_type": type(exc).__name__})
+
     lanes = {
-        lane_id: _lane_row(lane_id, persisted.get(lane_id, {}))
+        lane_id: _lane_row(lane_id, persisted.get(lane_id, _empty_state()))
         for lane_id in LANES
     }
     available = sum(bool(row["history_available"]) for row in lanes.values())
@@ -122,8 +426,14 @@ def build_durable_lane_history(
         "lanes_without_durable_history": len(lanes) - available,
         "lanes_with_all_required_evidence_classes": full_classes,
         "lanes": lanes,
+        "read_degraded": bool(read_errors),
+        "read_errors": read_errors,
+        "read_model": "raw_aggregate_plus_bounded_recent_tails",
+        "bounded_source_row_limit": max(1, min(int(source_row_limit), 10000)),
+        "bounded_operating_row_limit": max(1, min(int(operating_row_limit), 5000)),
         "history_contract": (
-            "all trustworthy persisted source/operating evidence since history_start; "
+            "all trustworthy recoverable persisted evidence since history_start; "
+            "canonical source and operating tails are bounded for HTTP safety; "
             "post-live evidence does not certify the strict pre-live backfill"
         ),
         "candidate_level_history_synthesized": False,
@@ -159,6 +469,8 @@ def read_durable_lane_history(
 
 __all__ = [
     "DEFAULT_CACHE_SECONDS",
+    "DEFAULT_SOURCE_ROW_LIMIT",
+    "DEFAULT_OPERATING_ROW_LIMIT",
     "build_durable_lane_history",
     "read_durable_lane_history",
 ]
