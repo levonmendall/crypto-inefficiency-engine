@@ -72,6 +72,6 @@ def test_lane_repair_routes_api_and_portfolio_through_bounded_read_wrappers():
     assert 'commands["source"] = list(SOURCE_REPAIR_COMMAND)' in source
     assert 'commands["portfolio"] = list(PORTFOLIO_BOUNDED_HEARTBEAT_COMMAND)' in source
     assert 'BOUNDED_HEARTBEAT_API_APP' in source
-    assert "inefficiency_engine.read_api_bounded_heartbeat_deploy:app" == (
+    assert "inefficiency_engine.read_api_mobile_truth_deploy:app" == (
         render_combined_postbind_lane_repair.BOUNDED_HEARTBEAT_API_APP
     )
