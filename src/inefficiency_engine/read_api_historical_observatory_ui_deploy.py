@@ -107,13 +107,13 @@ function renderHistoricalReplay(p){
   $('historicalSelectedCandidates').innerHTML=selected.length?selected.slice(0,10).map(renderHistoricalCandidate).join(''):empty('No selected alpha candidate records have been recovered from the persisted signal ledger yet.');
   $('historicalFunnelRows').innerHTML=funnels.length?funnels.slice(0,14).map(renderHistoricalFunnel).join(''):empty('No historical rejection funnels have been recovered yet.');
   const unreconstructable=p?.candidate_level_rejections_reconstructable===false;
-  $('historicalOpportunityNote').textContent=unreconstructable?'Legacy rejected-candidate identities were not persisted. The app now reconstructs exact lane source/operating history where available and shows aggregate funnels separately; it never invents candidate-level history or changes forward qualification.':'Historical replay is diagnostic-only and has no qualification, allocation, or execution authority.';
+  $('historicalOpportunityNote').textContent=unreconstructable?'Legacy rejected-candidate identities were not persisted. The app reconstructs exact lane source/operating history where available and shows aggregate funnels separately; it never invents candidate-level history. Historical replay never changes forward samples, qualification, allocation, or execution.':'Historical replay never changes forward samples, qualification, allocation, or execution.';
 }
 async function refreshHistoricalReplay(){
   if(historicalReplayInFlight)return historicalReplayInFlight;
   const task=(async()=>{
     try{
-      const r=await fetch('/v3/research/candidate-observatory/history?limit=500',{cache:'no-store'});
+      const r=await fetch('/v3/research/candidate-observatory/history?limit=50',{cache:'no-store'});
       if(!r.ok)throw new Error(`HTTP ${r.status}`);
       renderHistoricalReplay(await r.json());
     }catch(e){
