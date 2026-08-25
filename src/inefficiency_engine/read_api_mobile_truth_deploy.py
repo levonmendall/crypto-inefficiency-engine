@@ -23,6 +23,34 @@ _OLD_FAMILY_LABEL = '<span class="muted">Opportunity families</span>'
 _NEW_FAMILY_LABEL = '<span class="muted">Allocation family gates</span>'
 _OLD_FAMILY_STATE = "$('familyStatus').textContent=failures.length?`${failures.length} degraded`:'Healthy';"
 _NEW_FAMILY_STATE = "$('familyStatus').textContent=failures.length?`${failures.length} degraded`:'No family-level failures';"
+_FORWARD_STAT_HELPER_MARKER = "function researchTimeline(c){"
+_FORWARD_STAT_HELPER = "function forwardStatPct(outcomes,value){return (+outcomes||0)>0?pct(value):'—'}\n"
+_FORWARD_STAT_REPLACEMENTS = (
+    (
+        "mean ${pct(s.mean_forward_net_return)}",
+        "mean ${forwardStatPct(s.forward_outcomes,s.mean_forward_net_return)}",
+    ),
+    (
+        "CI ${pct(s.mean_forward_net_return_ci_lower)}",
+        "CI ${forwardStatPct(s.forward_outcomes,s.mean_forward_net_return_ci_lower)}",
+    ),
+    (
+        "hit CI ${pct(s.forward_hit_rate_ci_lower)}",
+        "hit CI ${forwardStatPct(s.forward_outcomes,s.forward_hit_rate_ci_lower)}",
+    ),
+    (
+        "${metric('Forward mean',pct(c.mean_forward_net_return),'net return')}",
+        "${metric('Forward mean',forwardStatPct(c.forward_outcome_count,c.mean_forward_net_return),'net return')}",
+    ),
+    (
+        "${metric('CI lower',pct(c.mean_forward_net_return_ci_lower),'forward mean lower bound')}",
+        "${metric('CI lower',forwardStatPct(c.forward_outcome_count,c.mean_forward_net_return_ci_lower),'forward mean lower bound')}",
+    ),
+    (
+        "${metric('Hit rate',pct(c.forward_hit_rate),'forward outcomes')}",
+        "${metric('Hit rate',forwardStatPct(c.forward_outcome_count,c.forward_hit_rate),'forward outcomes')}",
+    ),
+)
 
 _original_dashboard_html = cards._dashboard_html
 
@@ -33,6 +61,13 @@ def repaired_dashboard_html() -> str:
     html = _original_dashboard_html()
     html = html.replace(_OLD_FAMILY_LABEL, _NEW_FAMILY_LABEL, 1)
     html = html.replace(_OLD_FAMILY_STATE, _NEW_FAMILY_STATE, 1)
+    html = html.replace(
+        _FORWARD_STAT_HELPER_MARKER,
+        _FORWARD_STAT_HELPER + _FORWARD_STAT_HELPER_MARKER,
+        1,
+    )
+    for old, new in _FORWARD_STAT_REPLACEMENTS:
+        html = html.replace(old, new, 1)
     html = html.replace("</head>", _MOBILE_TRUTH_STYLE + "</head>", 1)
     return html
 
