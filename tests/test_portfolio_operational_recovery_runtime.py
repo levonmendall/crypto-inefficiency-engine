@@ -7,6 +7,8 @@ from sqlalchemy.exc import OperationalError
 
 from inefficiency_engine.portfolio_operational_recovery_runtime import (
     install_portfolio_operational_recovery_runtime,
+    is_retryable_postgres_operational_error,
+    operational_recovery_delay_seconds,
     recycle_pool_after_operational_error,
 )
 
@@ -28,8 +30,22 @@ class _Store:
         self.heartbeats.append(kwargs)
 
 
-def _operational_error() -> OperationalError:
-    return OperationalError("SELECT 1", {}, RuntimeError("connection reset"))
+class _DriverError(RuntimeError):
+    def __init__(self, message: str, *, sqlstate: str | None = None):
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+def _operational_error(
+    message: str = "connection reset",
+    *,
+    sqlstate: str | None = None,
+) -> OperationalError:
+    return OperationalError(
+        "SELECT 1",
+        {},
+        _DriverError(message, sqlstate=sqlstate),
+    )
 
 
 def test_pool_recycle_is_limited_to_operational_errors():
@@ -40,6 +56,34 @@ def test_pool_recycle_is_limited_to_operational_errors():
 
     assert recycle_pool_after_operational_error(store, _operational_error()) is True
     assert store.engine.dispose_count == 1
+
+
+def test_retry_classifier_accepts_postgres_recovery_and_connection_states():
+    assert is_retryable_postgres_operational_error(
+        _operational_error("cannot connect now", sqlstate="57P03")
+    )
+    assert is_retryable_postgres_operational_error(
+        _operational_error("connection failure", sqlstate="08006")
+    )
+    assert is_retryable_postgres_operational_error(
+        _operational_error(
+            "FATAL: the database system is not yet accepting connections; "
+            "Consistent recovery state has not been yet reached."
+        )
+    )
+
+
+def test_retry_classifier_rejects_explicit_non_connection_sqlstate():
+    assert not is_retryable_postgres_operational_error(
+        _operational_error("password authentication failed", sqlstate="28P01")
+    )
+    assert not is_retryable_postgres_operational_error(RuntimeError("connection reset"))
+
+
+def test_recovery_backoff_is_exponential_jittered_and_capped():
+    assert operational_recovery_delay_seconds(0, random_value=0.0) == 1.0
+    assert operational_recovery_delay_seconds(1, random_value=1.0) == pytest.approx(2.4)
+    assert operational_recovery_delay_seconds(20, random_value=1.0) == 30.0
 
 
 def test_wrapped_portfolio_cycle_recycles_pool_without_replaying_cycle():
