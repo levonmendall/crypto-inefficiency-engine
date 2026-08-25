@@ -11,6 +11,7 @@ from inefficiency_engine.candidate_observatory_historical_replay import (
 )
 from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import build_evidence_store
+from inefficiency_engine.historical_raw_lane_evidence import recover_raw_lane_history
 from inefficiency_engine.source_coverage_catalog import LANES, SOURCES
 
 
@@ -80,6 +81,7 @@ def _empty_persisted_history() -> dict[str, dict[str, object]]:
             "source_latest": None,
             "source_ids": set(),
             "evidence_classes": set(),
+            "source_ledgers": set(),
             "operating_count": 0,
             "operating_earliest": None,
             "operating_latest": None,
@@ -94,17 +96,48 @@ def _empty_persisted_history() -> dict[str, dict[str, object]]:
     }
 
 
+def _merge_source_history(state: dict[str, object], recovered: dict[str, object]) -> None:
+    count = int(recovered.get("source_count") or 0)
+    if count <= 0:
+        return
+    state["source_count"] = int(state.get("source_count") or 0) + count
+    earliest = recovered.get("source_earliest")
+    latest = recovered.get("source_latest")
+    current_earliest = state.get("source_earliest")
+    current_latest = state.get("source_latest")
+    if isinstance(earliest, datetime):
+        state["source_earliest"] = (
+            earliest
+            if not isinstance(current_earliest, datetime) or earliest < current_earliest
+            else current_earliest
+        )
+    if isinstance(latest, datetime):
+        state["source_latest"] = (
+            latest
+            if not isinstance(current_latest, datetime) or latest > current_latest
+            else current_latest
+        )
+    state["source_ids"].update(str(value) for value in recovered.get("source_ids", set()))
+    state["evidence_classes"].update(
+        str(value) for value in recovered.get("evidence_classes", set())
+    )
+    state["source_ledgers"].update(
+        str(value) for value in recovered.get("source_ledgers", set())
+    )
+
+
 def _read_persisted_lane_history(
     store,
     *,
     start: datetime,
     boundary: datetime,
 ) -> dict[str, dict[str, object]]:
-    """Aggregate exact historical lane evidence without manufacturing candidates.
+    """Aggregate exact historical evidence from snapshots and older raw ledgers.
 
-    Source coverage observations prove what evidence classes were actually gathered.
-    Operating-certification snapshots preserve point-in-time lane progress, candidate,
-    signal, and outcome counts. Neither source is promoted into forward truth here.
+    Raw reconstruction exists specifically for the period before canonical per-lane
+    source snapshots were persisted. It only recovers evidence classes that are
+    provable from append-only source tables/events; it never manufactures candidates,
+    signals, outcomes, qualification, allocation, or execution authority.
     """
 
     result = _empty_persisted_history()
@@ -135,8 +168,6 @@ def _read_persisted_lane_history(
                     continue
                 if not isinstance(payload, dict):
                     continue
-                # Failed attempts are useful transport telemetry but not historical
-                # market evidence. Only admitted point-in-time observations count.
                 if not bool(payload.get("healthy")):
                     continue
                 if payload.get("authoritative") is False:
@@ -152,8 +183,12 @@ def _read_persisted_lane_history(
                 state["source_count"] = int(state["source_count"]) + 1
                 earliest = state.get("source_earliest")
                 latest = state.get("source_latest")
-                state["source_earliest"] = observed_at if earliest is None or observed_at < earliest else earliest
-                state["source_latest"] = observed_at if latest is None or observed_at > latest else latest
+                state["source_earliest"] = (
+                    observed_at if earliest is None or observed_at < earliest else earliest
+                )
+                state["source_latest"] = (
+                    observed_at if latest is None or observed_at > latest else latest
+                )
                 source_id = str(row.get("source_id") or payload.get("source_id") or "")
                 if source_id:
                     state["source_ids"].add(source_id)
@@ -161,6 +196,14 @@ def _read_persisted_lane_history(
                 if not classes and source_id:
                     classes = _source_classes(source_id)
                 state["evidence_classes"].update(classes)
+                state["source_ledgers"].add(SOURCE_COVERAGE_TABLE)
+
+    # Recover the pre-snapshot interval from the append-only raw evidence that the
+    # engine actually collected. Bounded aggregate SQL avoids loading large tables.
+    raw_history = recover_raw_lane_history(store, start=start, boundary=boundary)
+    for lane_id, recovered in raw_history.items():
+        if lane_id in result:
+            _merge_source_history(result[lane_id], recovered)
 
     if OPERATING_TABLE in available:
         table = Table(OPERATING_TABLE, MetaData(), autoload_with=store.engine)
@@ -192,8 +235,12 @@ def _read_persisted_lane_history(
                     state["operating_count"] = int(state["operating_count"]) + 1
                     earliest = state.get("operating_earliest")
                     latest = state.get("operating_latest")
-                    state["operating_earliest"] = observed_at if earliest is None or observed_at < earliest else earliest
-                    state["operating_latest"] = observed_at if latest is None or observed_at > latest else latest
+                    state["operating_earliest"] = (
+                        observed_at if earliest is None or observed_at < earliest else earliest
+                    )
+                    state["operating_latest"] = (
+                        observed_at if latest is None or observed_at > latest else latest
+                    )
                     if state.get("latest_operating_at") is None or observed_at >= state["latest_operating_at"]:
                         state["latest_operating_at"] = observed_at
                         state["latest_operating_state"] = mechanism.get("state")
@@ -218,13 +265,7 @@ def summarize_lane_coverage(
     edge_tolerance: timedelta = DEFAULT_EDGE_TOLERANCE,
     persisted_history: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    """Build a fail-closed historical evidence contract over all canonical lanes.
-
-    Funnel replay remains the strongest reconstruction when it exists. For lanes whose
-    legacy candidate identities/funnels were never persisted, exact source-coverage and
-    operating-certification ledgers can still prove that useful lane evidence was
-    gathered. This exposes real history without inventing rejected candidates.
-    """
+    """Build a fail-closed historical evidence contract over all canonical lanes."""
 
     start = _utc(start)
     boundary = _utc(boundary)
@@ -243,7 +284,11 @@ def summarize_lane_coverage(
             continue
         funnels = payload.get("funnels")
         if isinstance(funnels, dict):
-            source = str(record.get("source_table") or payload.get("reconstruction_method") or "unknown")
+            source = str(
+                record.get("source_table")
+                or payload.get("reconstruction_method")
+                or "unknown"
+            )
             for lane_id in funnels:
                 lane_id = str(lane_id)
                 if lane_id not in rows:
@@ -267,8 +312,12 @@ def summarize_lane_coverage(
         source_latest = lane_history.get("source_latest")
         operating_earliest = lane_history.get("operating_earliest")
         operating_latest = lane_history.get("operating_latest")
-        evidence_classes = {str(value) for value in lane_history.get("evidence_classes", set())}
-        required_classes = {str(value) for value in list(LANES[lane_id].get("required") or [])}
+        evidence_classes = {
+            str(value) for value in lane_history.get("evidence_classes", set())
+        }
+        required_classes = {
+            str(value) for value in list(LANES[lane_id].get("required") or [])
+        }
         missing_classes = sorted(required_classes - evidence_classes)
 
         row["omitted_untrusted_records"] = omitted[lane_id]
@@ -277,19 +326,30 @@ def summarize_lane_coverage(
         row["recovered_operating_snapshots"] = operating_count
         row["historical_evidence_classes"] = sorted(evidence_classes)
         row["missing_historical_evidence_classes"] = missing_classes
-        row["source_ids"] = sorted(str(value) for value in lane_history.get("source_ids", set()))
+        row["source_ids"] = sorted(
+            str(value) for value in lane_history.get("source_ids", set())
+        )
         row["max_authoritative_observation_count"] = int(
             lane_history.get("max_authoritative_observation_count") or 0
         )
-        row["max_economic_candidate_count"] = int(lane_history.get("max_economic_candidate_count") or 0)
-        row["max_forward_signal_count"] = int(lane_history.get("max_forward_signal_count") or 0)
+        row["max_economic_candidate_count"] = int(
+            lane_history.get("max_economic_candidate_count") or 0
+        )
+        row["max_forward_signal_count"] = int(
+            lane_history.get("max_forward_signal_count") or 0
+        )
         row["max_independent_forward_outcome_count"] = int(
             lane_history.get("max_independent_forward_outcome_count") or 0
         )
         row["latest_operating_state"] = lane_history.get("latest_operating_state")
 
         recovered_times = list(times)
-        for value in (source_earliest, source_latest, operating_earliest, operating_latest):
+        for value in (
+            source_earliest,
+            source_latest,
+            operating_earliest,
+            operating_latest,
+        ):
             if isinstance(value, datetime):
                 recovered_times.append(value)
         if recovered_times:
@@ -297,7 +357,10 @@ def summarize_lane_coverage(
             row["latest_recovered_at"] = max(recovered_times).isoformat()
 
         ledger_names = set(sources[lane_id])
-        if source_count:
+        ledger_names.update(
+            str(value) for value in lane_history.get("source_ledgers", set())
+        )
+        if source_count and not ledger_names:
             ledger_names.add(SOURCE_COVERAGE_TABLE)
         if operating_count:
             ledger_names.add(OPERATING_TABLE)
@@ -306,33 +369,45 @@ def summarize_lane_coverage(
         funnel_covers_start = bool(times and min(times) <= start + tolerance)
         funnel_covers_boundary = bool(times and max(times) >= boundary - tolerance)
         trusted_funnel = bool(times and omitted[lane_id] == 0)
-        funnel_complete = trusted_funnel and funnel_covers_start and funnel_covers_boundary
+        funnel_complete = (
+            trusted_funnel and funnel_covers_start and funnel_covers_boundary
+        )
 
-        source_covers_start = isinstance(source_earliest, datetime) and source_earliest <= start + tolerance
-        source_covers_boundary = isinstance(source_latest, datetime) and source_latest >= boundary - tolerance
-        source_classes_complete = not missing_classes
+        source_covers_start = (
+            isinstance(source_earliest, datetime)
+            and source_earliest <= start + tolerance
+        )
+        source_covers_boundary = (
+            isinstance(source_latest, datetime)
+            and source_latest >= boundary - tolerance
+        )
         source_complete = bool(
             source_count
             and source_covers_start
             and source_covers_boundary
-            and source_classes_complete
+            and not missing_classes
         )
 
         if funnel_complete:
             row["state"] = "complete"
             row["reconstruction_quality"] = "exact_aggregate_funnel"
-            row["reason"] = "trusted persisted aggregate funnel evidence covers both replay edges"
+            row["reason"] = (
+                "trusted persisted aggregate funnel evidence covers both replay edges"
+            )
             continue
         if source_complete:
             row["state"] = "complete"
             row["reconstruction_quality"] = "exact_source_evidence_history"
             row["reason"] = (
-                "trusted point-in-time source evidence covers every required evidence class and both replay edges; "
-                "candidate-level legacy rejections remain unreconstructable"
+                "trusted point-in-time source evidence covers every required evidence "
+                "class and both replay edges; candidate-level legacy rejections remain "
+                "unreconstructable"
             )
             continue
 
-        any_history = bool(times or source_count or operating_count or omitted[lane_id])
+        any_history = bool(
+            times or source_count or operating_count or omitted[lane_id]
+        )
         if not any_history:
             continue
 
@@ -348,22 +423,39 @@ def summarize_lane_coverage(
 
         reasons: list[str] = []
         if times and not funnel_covers_start:
-            reasons.append("recovered funnel history starts after the replay-start tolerance")
+            reasons.append(
+                "recovered funnel history starts after the replay-start tolerance"
+            )
         if times and not funnel_covers_boundary:
-            reasons.append("recovered funnel history stops before the live-boundary tolerance")
+            reasons.append(
+                "recovered funnel history stops before the live-boundary tolerance"
+            )
         if omitted[lane_id]:
             reasons.append("untrusted legacy funnel records were omitted")
         if source_count and not source_covers_start:
-            reasons.append("source evidence starts after the replay-start tolerance")
+            reasons.append(
+                "source evidence starts after the replay-start tolerance"
+            )
         if source_count and not source_covers_boundary:
-            reasons.append("source evidence stops before the live-boundary tolerance")
+            reasons.append(
+                "source evidence stops before the live-boundary tolerance"
+            )
         if source_count and missing_classes:
-            reasons.append("missing historical evidence classes: " + ", ".join(missing_classes))
+            reasons.append(
+                "missing historical evidence classes: " + ", ".join(missing_classes)
+            )
         if not source_count and operating_count:
-            reasons.append("operating snapshots exist but lane-tagged source history is unavailable")
-        row["reason"] = "; ".join(reasons) or "historical lane evidence is incomplete"
+            reasons.append(
+                "operating snapshots exist but lane-tagged source history is unavailable"
+            )
+        row["reason"] = (
+            "; ".join(reasons) or "historical lane evidence is incomplete"
+        )
 
-    state_counts = {state: 0 for state in ("complete", "partial", "unavailable", "not_applicable")}
+    state_counts = {
+        state: 0
+        for state in ("complete", "partial", "unavailable", "not_applicable")
+    }
     for row in rows.values():
         state = str(row["state"])
         state_counts[state] = state_counts.get(state, 0) + 1
@@ -399,7 +491,9 @@ def _read_replay_records(store) -> list[dict[str, object]]:
                     table.c.source_table,
                     table.c.observed_at,
                     table.c.payload_json,
-                ).where(table.c.record_type.in_(("alpha_funnel", "structural_funnel")))
+                ).where(
+                    table.c.record_type.in_(("alpha_funnel", "structural_funnel"))
+                )
             ).mappings()
         )
     records: list[dict[str, object]] = []
@@ -440,9 +534,13 @@ def certify_lane_coverage(store) -> dict[str, object]:
         boundary = live_start or datetime.now(timezone.utc)
 
     stream_complete = bool(
-        previous_detail.get("stream_replay_complete", previous_detail.get("complete"))
+        previous_detail.get(
+            "stream_replay_complete", previous_detail.get("complete")
+        )
     ) and live_start is not None
-    persisted_history = _read_persisted_lane_history(store, start=start, boundary=boundary)
+    persisted_history = _read_persisted_lane_history(
+        store, start=start, boundary=boundary
+    )
     lane_coverage = summarize_lane_coverage(
         _read_replay_records(store),
         start=start,
@@ -460,6 +558,7 @@ def certify_lane_coverage(store) -> dict[str, object]:
             "stream replay complete AND all 13 required lanes have trusted historical evidence coverage"
         ),
         "historical_source_reconstruction": True,
+        "historical_raw_source_reconstruction": True,
         "candidate_level_rejections_synthesized": False,
         "historical_counts_as_forward": False,
         "qualification_authority": False,
@@ -480,9 +579,15 @@ def main() -> int:
     settings = Settings.from_env()
     store = build_evidence_store(settings.evidence_db_path)
     if store is None:
-        raise RuntimeError("historical lane coverage certification requires durable evidence persistence")
+        raise RuntimeError(
+            "historical lane coverage certification requires durable evidence persistence"
+        )
     result = certify_lane_coverage(store)
-    return COVERAGE_COMPLETE_EXIT_CODE if bool(result.get("complete")) else COVERAGE_INCOMPLETE_EXIT_CODE
+    return (
+        COVERAGE_COMPLETE_EXIT_CODE
+        if bool(result.get("complete"))
+        else COVERAGE_INCOMPLETE_EXIT_CODE
+    )
 
 
 if __name__ == "__main__":
