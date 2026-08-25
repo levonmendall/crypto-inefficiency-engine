@@ -257,7 +257,8 @@ class SourceCoveragePlane:
     def record_event(self, row: SourceEventObservation) -> str:
         return self.events.record(row)
 
-    def _provider_rows(self, available: set[str]) -> list[dict[str, object]]:
+    def _provider_history_rows(self, available: set[str]) -> list[dict[str, object]]:
+        """Return bounded provider attempt history, newest first."""
         if "provider_statuses" not in available:
             return []
         with self.store.engine.connect() as db:
@@ -271,7 +272,12 @@ class SourceCoveragePlane:
             )
         return [dict(row) for row in rows]
 
-    def _admissions(self, available: set[str]) -> list[dict[str, object]]:
+    def _provider_rows(self, available: set[str]) -> list[dict[str, object]]:
+        """Compatibility hook for callers expecting the provider-row reader."""
+        return self._provider_history_rows(available)
+
+    def _admission_history_rows(self, available: set[str]) -> list[dict[str, object]]:
+        """Return bounded provider-gap admission history, newest first."""
         if "provider_gap_admissions" not in available:
             return []
         with self.store.engine.connect() as db:
@@ -292,6 +298,10 @@ class SourceCoveragePlane:
             if isinstance(payload, dict):
                 rows.append(payload)
         return rows
+
+    def _admissions(self, available: set[str]) -> list[dict[str, object]]:
+        """Compatibility hook for callers expecting the admission-row reader."""
+        return self._admission_history_rows(available)
 
     def _table_candidate(
         self,
@@ -601,8 +611,11 @@ class SourceCoveragePlane:
         now = now or _now()
         available = set(inspect(self.store.engine).get_table_names())
         direct = self.ledger.recent()
-        providers = self._provider_rows(available)
-        admissions = self._admissions(available)
+        # Reconciliation uses bounded histories directly. Runtime compatibility
+        # patches may still expose latest-only helper views, but they cannot erase
+        # still-fresh evidence used by the central source truth resolver.
+        providers = self._provider_history_rows(available)
+        admissions = self._admission_history_rows(available)
         rows: list[LaneSourceCoverage] = []
 
         for lane_id, definition in LANES.items():
