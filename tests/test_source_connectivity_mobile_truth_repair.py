@@ -64,6 +64,8 @@ def test_aave_runtime_repair_adds_independent_rpc_without_changing_query_policy(
         assert recovery_v1.AAVE_RPC_FALLBACK_URLS == (
             "https://eth.llamarpc.com",
             "https://cloudflare-eth.com/v1/mainnet",
+            "https://eth.drpc.org",
+            "https://public.1rpc.io/eth",
         )
         assert recovery_v1.AAVE_TRANSPORT_BUDGET_SECONDS == 4.0
         assert recovery_v2.AAVE_TRANSPORT_BUDGET_SECONDS == 4.0
