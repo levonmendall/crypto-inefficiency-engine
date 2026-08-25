@@ -22,7 +22,7 @@ BACKFILL_COMMAND = [
 BACKFILL_COVERAGE_COMMAND = [
     sys.executable,
     "-m",
-    "inefficiency_engine.candidate_observatory_lane_coverage",
+    "inefficiency_engine.candidate_observatory_lane_coverage_preflight",
 ]
 BACKFILL_EXECUTOR_DEADLINE_SECONDS = 60.0
 # Lane certification must aggregate the full replay window across several durable
@@ -35,6 +35,7 @@ BACKFILL_MEMORY_RETRY_SECONDS = 15.0
 API_BIND_POLL_SECONDS = 2.0
 API_BIND_TIMEOUT_SECONDS = 2.0
 TEMPORARY_ADMISSION_EXIT_CODE = 75
+COVERAGE_NOT_READY_EXIT_CODE = 2
 COVERAGE_COMPLETE_EXIT_CODE = 3
 COVERAGE_INCOMPLETE_EXIT_CODE = 4
 
@@ -83,13 +84,39 @@ def _run_bounded_child(
     return child.poll(), timed_out
 
 
+def _coverage_result(stop_event: threading.Event) -> tuple[int | None, bool]:
+    return _run_bounded_child(
+        BACKFILL_COVERAGE_COMMAND,
+        stop_event,
+        deadline_seconds=BACKFILL_COVERAGE_DEADLINE_SECONDS,
+    )
+
+
+def _coverage_terminal(code: int | None) -> bool:
+    return code in {COVERAGE_COMPLETE_EXIT_CODE, COVERAGE_INCOMPLETE_EXIT_CODE}
+
+
+def _log_terminal_coverage(code: int | None) -> None:
+    if code == COVERAGE_COMPLETE_EXIT_CODE:
+        print(
+            "candidate observatory historical replay is complete with all required lanes certified",
+            flush=True,
+        )
+    elif code == COVERAGE_INCOMPLETE_EXIT_CODE:
+        print(
+            "candidate observatory historical replay indexed but required lane coverage is incomplete",
+            flush=True,
+        )
+
+
 def run_candidate_observatory_backfill_supervisor(stop_event: threading.Event) -> None:
     """Backfill missing observatory truth in short-lived, leased children.
 
-    Stream exhaustion is only the indexing phase. A separate short-lived certifier
-    must then prove explicit coverage for every canonical profit lane before the
-    replay may be called complete. Missing or partial lane history remains fail-closed
-    and visible in the replay heartbeat rather than being interpreted as zero activity.
+    A short-lived coverage preflight runs before heavy-job memory admission. If durable
+    replay is already drained, this guarantees the authoritative 13-lane heartbeat can
+    be refreshed even when aggregate service memory is too high to admit another heavy
+    replay child. If replay is not ready, the preflight exits without certification and
+    the existing fail-closed, memory-gated replay path remains unchanged.
     """
 
     port = os.getenv("PORT", "10000")
@@ -99,6 +126,30 @@ def run_candidate_observatory_backfill_supervisor(stop_event: threading.Event) -
         return
 
     while not stop_event.is_set():
+        # Coverage certification is a finite database aggregation, not a heavy provider
+        # replay. Run it first so a previously drained replay cannot remain stuck behind
+        # the aggregate-memory start gate with an obsolete two-lane heartbeat.
+        coverage_code, coverage_timed_out = _coverage_result(stop_event)
+        if stop_event.is_set():
+            return
+        if coverage_timed_out:
+            print(
+                "candidate observatory lane coverage preflight timed out; retrying",
+                flush=True,
+            )
+            stop_event.wait(BACKFILL_FAILURE_RETRY_SECONDS)
+            continue
+        if _coverage_terminal(coverage_code):
+            _log_terminal_coverage(coverage_code)
+            return
+        if coverage_code not in (COVERAGE_NOT_READY_EXIT_CODE, None):
+            print(
+                f"candidate observatory lane coverage preflight exited code={coverage_code}; retrying",
+                flush=True,
+            )
+            stop_event.wait(BACKFILL_FAILURE_RETRY_SECONDS)
+            continue
+
         memory = instance_memory_snapshot()
         if bool(getattr(memory, "start_blocked", False)):
             stop_event.wait(BACKFILL_MEMORY_RETRY_SECONDS)
@@ -116,11 +167,7 @@ def run_candidate_observatory_backfill_supervisor(stop_event: threading.Event) -
             continue
 
         if return_code == REPLAY_COMPLETE_EXIT_CODE:
-            coverage_code, coverage_timed_out = _run_bounded_child(
-                BACKFILL_COVERAGE_COMMAND,
-                stop_event,
-                deadline_seconds=BACKFILL_COVERAGE_DEADLINE_SECONDS,
-            )
+            coverage_code, coverage_timed_out = _coverage_result(stop_event)
             if stop_event.is_set():
                 return
             if coverage_timed_out:
@@ -130,21 +177,8 @@ def run_candidate_observatory_backfill_supervisor(stop_event: threading.Event) -
                 )
                 stop_event.wait(BACKFILL_FAILURE_RETRY_SECONDS)
                 continue
-            if coverage_code == COVERAGE_COMPLETE_EXIT_CODE:
-                print(
-                    "candidate observatory historical replay is complete with all required lanes certified",
-                    flush=True,
-                )
-                return
-            if coverage_code == COVERAGE_INCOMPLETE_EXIT_CODE:
-                print(
-                    "candidate observatory historical replay indexed but required lane coverage is incomplete",
-                    flush=True,
-                )
-                # The historical source set is fixed at the live boundary. Re-running
-                # the same drained streams cannot manufacture missing legacy evidence;
-                # park truthfully as incomplete until a later release adds a valid
-                # reconstruction source and restarts this supervisor.
+            if _coverage_terminal(coverage_code):
+                _log_terminal_coverage(coverage_code)
                 return
             print(
                 f"candidate observatory lane coverage child exited code={coverage_code}; retrying",
@@ -171,5 +205,6 @@ __all__ = [
     "BACKFILL_COVERAGE_COMMAND",
     "BACKFILL_COVERAGE_DEADLINE_SECONDS",
     "BACKFILL_EXECUTOR_DEADLINE_SECONDS",
+    "COVERAGE_NOT_READY_EXIT_CODE",
     "run_candidate_observatory_backfill_supervisor",
 ]
