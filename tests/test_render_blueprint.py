@@ -18,7 +18,7 @@ def test_render_blueprint_defines_single_paid_combined_runtime():
     )
 
     canonical = Path("src/inefficiency_engine/render_combined.py").read_text()
-    assert 'CANONICAL_API_APP = "inefficiency_engine.read_api_card_history_deploy:app"' in canonical
+    assert 'CANONICAL_API_APP = "inefficiency_engine.read_api_liveness_deploy:app"' in canonical
     assert "render_combined_runtime" in canonical
 
     postbind = Path("src/inefficiency_engine/render_combined_postbind.py").read_text()
