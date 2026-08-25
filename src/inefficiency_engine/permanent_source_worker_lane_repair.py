@@ -4,6 +4,8 @@ import asyncio
 
 from inefficiency_engine import permanent_source_plane as source_plane
 from inefficiency_engine import permanent_source_worker as base
+from inefficiency_engine import production_source_recovery_runtime as recovery_v1
+from inefficiency_engine import production_source_recovery_v2_runtime as recovery_v2
 from inefficiency_engine.production_source_recovery_v2_runtime import (
     critical_source_refresh_loop,
     install_lido_provider_recovery,
@@ -18,6 +20,11 @@ from inefficiency_engine.source_lane_repair_runtime import (
 
 _ORIGINAL_RUN_PERMANENT_SOURCE_WORKER = base.run_permanent_source_worker
 _RUNTIME_PATCH_MARKER = "_critical_source_cadence_installed"
+AAVE_RPC_FALLBACK_URLS = (
+    "https://eth.llamarpc.com",
+    "https://cloudflare-eth.com/v1/mainnet",
+)
+AAVE_TRANSPORT_BUDGET_SECONDS = 4.0
 
 
 async def _collect_hyperliquid_distress_with_retries(
@@ -67,6 +74,14 @@ def install_remaining_source_lane_repairs() -> None:
         _collect_hyperliquid_distress_with_retries
     )
     install_lido_provider_recovery()
+
+    # Preserve the exact Aave V3 Ethereum Pool + LiquidationCall query while adding
+    # one independent documented Ethereum JSON-RPC transport. Keep the total fallback
+    # sequence inside the existing 15-second preflight boundary.
+    recovery_v1.AAVE_RPC_FALLBACK_URLS = AAVE_RPC_FALLBACK_URLS
+    recovery_v1.AAVE_TRANSPORT_BUDGET_SECONDS = AAVE_TRANSPORT_BUDGET_SECONDS
+    recovery_v2.AAVE_TRANSPORT_BUDGET_SECONDS = AAVE_TRANSPORT_BUDGET_SECONDS
+
     if not bool(getattr(base, _RUNTIME_PATCH_MARKER, False)):
         base.run_permanent_source_worker = _run_permanent_source_worker_with_critical_cadence
         setattr(base, _RUNTIME_PATCH_MARKER, True)
