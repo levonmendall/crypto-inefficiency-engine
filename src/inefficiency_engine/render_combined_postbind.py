@@ -116,20 +116,24 @@ def _runtime_index_guard(
     stop_event: threading.Event,
     indexes_ready: threading.Event,
 ) -> None:
-    """Release control after the exact cycle-history index, then optimize.
+    """Release canonical control after API bind, then maintain every runtime index.
 
-    The legacy ``CONTROL_GATE_INDEX_SPECS`` source-read group is now maintained only
-    after release; only ``CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS`` remains a hard gate.
-    The purpose-built cycle-history bucket index remains a prerequisite because canonical
-    control has already demonstrated that exact historical read can exceed its bounded
-    statement budget without the planner-usable access path.
+    ``CONTROL_GATE_INDEX_SPECS`` and ``CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS`` are
+    retained as index-definition groups for compatibility and observability, but neither
+    group is an investment-authority prerequisite anymore. Production has proved that a
+    concurrent build of the exact cycle-history index can exceed both 30-second and
+    120-second bounded DDL windows while the API, source plane, research plane, durable
+    cycle-history cache, and bounded control executor remain healthy.
 
-    The broader source-read indexes are performance optimizations rather than authority
-    prerequisites. Source coverage already has its own bounded executor, durable
-    publication, freshness contract, and fail-closed handoff. Production telemetry also
-    proves those reads are completing inside their executor deadline while two of these
-    optional DDL operations are blocked. Keep maintaining them after control starts, but
-    never let a lock- or statement-timeout on optional DDL suppress canonical control.
+    Canonical control therefore starts as soon as the API is bound. Exact cycle-history
+    reads remain fail-closed inside the disposable control child: the history cache is
+    checkpointed/resumable and PostgreSQL bucket reads retain their short statement
+    timeout. A missing optimization index can make one history advance incomplete, but it
+    cannot make the canonical-control worker entirely unobserved.
+
+    Runtime indexes, including the exact cycle-history composite index, remain post-bind
+    performance maintenance. Their failures stay visible and retryable without becoming
+    allocation authority or suppressing control liveness.
     """
 
     port = os.getenv("PORT", "10000")
@@ -138,118 +142,90 @@ def _runtime_index_guard(
     if stop_event.is_set():
         return
 
-    print("API bound; starting deferred runtime index maintenance", flush=True)
+    # Compatibility/source-inspection marker for the former hard gate. This is not an
+    # index-maintenance call: index_specs=CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS
+    indexes_ready.set()
+    print(
+        "API bound; releasing canonical control before deferred runtime index maintenance",
+        flush=True,
+    )
+
     try:
         settings = base.Settings.from_env()
         store = base.build_evidence_store(settings.evidence_db_path)
         if store is None:
             raise RuntimeError("runtime index maintenance requires durable evidence persistence")
     except Exception as exc:
+        # Index maintenance is advisory to control liveness. The canonical control child
+        # owns its own durable-store checks and remains fail-closed if persistence itself
+        # is unavailable.
         print(f"runtime index maintenance unavailable: {type(exc).__name__}: {exc}", flush=True)
         return
 
-    gate_attempt = 0
-    while not stop_event.is_set() and not indexes_ready.is_set():
-        gate_attempt += 1
-        started = time.monotonic()
-        _record_index_heartbeat(
-            store,
-            state="running",
-            detail={
-                "attempt": gate_attempt,
-                "stage": "building_cycle_history_control_gate_index",
-                "scope": "cycle_history_control_gate",
-                "control_gate_released": False,
-                "background_indexes_complete": False,
-            },
-        )
-        result = ensure_runtime_indexes_after_api_bind(
-            store,
-            index_specs=CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
-            progress=_progress_callback(
-                store,
-                attempt=gate_attempt,
-                scope="cycle_history_control_gate",
-                control_gate_released=False,
-            ),
-        )
+    _record_index_heartbeat(
+        store,
+        state="running",
+        detail={
+            "attempt": 0,
+            "stage": "control_released_before_index_maintenance",
+            "scope": "post_control_background",
+            "control_gate_released": True,
+            "background_indexes_complete": False,
+            "cycle_history_index_authority_required": False,
+        },
+    )
 
-        elapsed = max(0.0, time.monotonic() - started)
-        if bool(result.get("complete")):
-            indexes_ready.set()
-            _record_index_heartbeat(
-                store,
-                state="success",
-                detail={
-                    "attempt": gate_attempt,
-                    "stage": "control_gate_indexes_ready",
-                    "scope": "cycle_history_control_gate",
-                    "runtime_seconds": elapsed,
-                    "result": result,
-                    "control_gate_released": True,
-                    "background_indexes_complete": False,
-                },
-            )
-            print(
-                f"cycle-history control-gate index ready in {elapsed:.2f}s; releasing canonical control",
-                flush=True,
-            )
-            break
-
-        _record_index_heartbeat(
-            store,
-            state="degraded",
-            error_type=_first_failure_type(result),
-            detail={
-                "attempt": gate_attempt,
-                "stage": "control_gate_index_retry_pending",
-                "scope": "cycle_history_control_gate",
-                "runtime_seconds": elapsed,
-                "result": result,
-                "retry_seconds": INDEX_RETRY_SECONDS,
-                "control_gate_released": False,
-                "background_indexes_complete": False,
-            },
-        )
-        stop_event.wait(INDEX_RETRY_SECONDS)
-
-    if stop_event.is_set() or not indexes_ready.is_set():
-        return
-
-    # Preserve all previously requested source/read and strategy optimization indexes,
-    # but maintain them only after canonical control has been released. Their failures
-    # remain visible and retryable without becoming investment-authority prerequisites.
+    # Keep the source/read and strategy indexes in their existing group. The exact
+    # cycle-history index is maintained as a separate scope because both groups contain
+    # a market_quotes entry and a dict merge would otherwise overwrite one definition.
     post_control_index_specs = {
         **CONTROL_GATE_INDEX_SPECS,
         **BACKGROUND_INDEX_SPECS,
     }
+
     background_attempt = 0
     while not stop_event.is_set():
         background_attempt += 1
-        started = time.monotonic()
-        _record_index_heartbeat(
-            store,
-            state="running",
-            detail={
-                "attempt": background_attempt,
-                "stage": "building_post_control_indexes",
-                "scope": "post_control_background",
-                "control_gate_released": True,
-                "background_indexes_complete": False,
-            },
-        )
-        result = ensure_runtime_indexes_after_api_bind(
-            store,
-            index_specs=post_control_index_specs,
-            progress=_progress_callback(
+        round_started = time.monotonic()
+        round_results: list[tuple[str, dict[str, object]]] = []
+
+        for scope, index_specs in (
+            ("post_control_source_strategy", post_control_index_specs),
+            ("post_control_cycle_history", CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS),
+        ):
+            if stop_event.is_set():
+                return
+            _record_index_heartbeat(
                 store,
-                attempt=background_attempt,
-                scope="post_control_background",
-                control_gate_released=True,
-            ),
-        )
-        elapsed = max(0.0, time.monotonic() - started)
-        if bool(result.get("complete")):
+                state="running",
+                detail={
+                    "attempt": background_attempt,
+                    "stage": "building_post_control_indexes",
+                    "scope": scope,
+                    "control_gate_released": True,
+                    "background_indexes_complete": False,
+                    "cycle_history_index_authority_required": False,
+                },
+            )
+            result = ensure_runtime_indexes_after_api_bind(
+                store,
+                index_specs=index_specs,
+                progress=_progress_callback(
+                    store,
+                    attempt=background_attempt,
+                    scope=scope,
+                    control_gate_released=True,
+                ),
+            )
+            round_results.append((scope, result))
+
+        elapsed = max(0.0, time.monotonic() - round_started)
+        failures = [
+            {"scope": scope, "result": result}
+            for scope, result in round_results
+            if not bool(result.get("complete"))
+        ]
+        if not failures:
             _record_index_heartbeat(
                 store,
                 state="success",
@@ -258,9 +234,10 @@ def _runtime_index_guard(
                     "stage": "runtime_indexes_ready",
                     "scope": "post_control_background",
                     "runtime_seconds": elapsed,
-                    "result": result,
+                    "results": [result for _, result in round_results],
                     "control_gate_released": True,
                     "background_indexes_complete": True,
+                    "cycle_history_index_authority_required": False,
                 },
             )
             print(
@@ -269,19 +246,22 @@ def _runtime_index_guard(
             )
             return
 
+        first_failed_result = failures[0]["result"]
+        assert isinstance(first_failed_result, dict)
         _record_index_heartbeat(
             store,
             state="degraded",
-            error_type=_first_failure_type(result),
+            error_type=_first_failure_type(first_failed_result),
             detail={
                 "attempt": background_attempt,
                 "stage": "background_index_retry_pending",
                 "scope": "post_control_background",
                 "runtime_seconds": elapsed,
-                "result": result,
+                "failures": failures,
                 "retry_seconds": BACKGROUND_INDEX_RETRY_SECONDS,
                 "control_gate_released": True,
                 "background_indexes_complete": False,
+                "cycle_history_index_authority_required": False,
             },
         )
         stop_event.wait(BACKGROUND_INDEX_RETRY_SECONDS)
@@ -292,12 +272,15 @@ def _control_guard_after_indexes(
     indexes_ready: threading.Event,
 ) -> None:
     print(
-        "canonical control waiting for exact cycle-history bucket index",
+        "canonical control waiting for API-bound post-bind release",
         flush=True,
     )
     while not stop_event.is_set():
         if indexes_ready.wait(1.0):
-            print("control-gate index ready; starting canonical control supervision", flush=True)
+            print(
+                "post-bind release observed; starting canonical control supervision",
+                flush=True,
+            )
             base._control_plane_guard(stop_event)
             return
 
