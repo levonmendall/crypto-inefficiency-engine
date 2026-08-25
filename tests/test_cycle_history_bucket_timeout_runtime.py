@@ -62,6 +62,7 @@ def test_postgres_cycle_history_timeout_is_transaction_local_and_removed(monkeyp
         assert statements == [
             "SET LOCAL statement_timeout = 4000",
             "SET LOCAL lock_timeout = 1000",
+            "SET LOCAL enable_seqscan = off",
         ]
 
     assert removed == [(engine, "begin", installed["listener"])]
