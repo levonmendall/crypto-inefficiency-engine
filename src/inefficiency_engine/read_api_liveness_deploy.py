@@ -5,7 +5,7 @@ import os
 from typing import Any
 
 from inefficiency_engine import __version__
-from inefficiency_engine.read_api_executive_ui_deploy import app as _inner_app
+from inefficiency_engine.read_api_mobile_truth_deploy import app as _inner_app
 
 
 class DatabaseIndependentLivenessApp:
