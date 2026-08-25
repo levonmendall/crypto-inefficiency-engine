@@ -90,6 +90,29 @@ def test_mobile_dashboard_repairs_truth_label_and_narrow_cards():
     assert ".badge{white-space:normal" in html
 
 
+def test_all_cards_render_zero_sample_forward_statistics_as_unavailable():
+    from inefficiency_engine.read_api_mobile_truth_deploy import repaired_dashboard_html
+
+    html = repaired_dashboard_html()
+
+    # One shared formatter covers every mechanism card and strategy-detail card.
+    assert "function forwardStatPct(outcomes,value){return (+outcomes||0)>0?pct(value):'—'}" in html
+    assert "forwardStatPct(c.forward_outcome_count,c.mean_forward_net_return)" in html
+    assert "forwardStatPct(c.forward_outcome_count,c.mean_forward_net_return_ci_lower)" in html
+    assert "forwardStatPct(c.forward_outcome_count,c.forward_hit_rate)" in html
+    assert "forwardStatPct(s.forward_outcomes,s.mean_forward_net_return)" in html
+    assert "forwardStatPct(s.forward_outcomes,s.mean_forward_net_return_ci_lower)" in html
+    assert "forwardStatPct(s.forward_outcomes,s.forward_hit_rate_ci_lower)" in html
+
+    # Undefined zero-sample statistics no longer use the generic percentage formatter.
+    assert "metric('Forward mean',pct(c.mean_forward_net_return)" not in html
+    assert "metric('CI lower',pct(c.mean_forward_net_return_ci_lower)" not in html
+    assert "metric('Hit rate',pct(c.forward_hit_rate)" not in html
+
+    # Genuine zero P&L remains a real numeric value and is not gated by sample count.
+    assert "metric('Realized P&L',money(c.allocator_realized_profit_usd),'paper allocator')" in html
+
+
 def test_production_entrypoint_wraps_mobile_truth_with_database_independent_liveness():
     from inefficiency_engine import render_combined_postbind_lane_repair as runtime
     from inefficiency_engine import read_api_liveness_deploy as liveness
