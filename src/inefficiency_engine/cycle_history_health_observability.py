@@ -42,6 +42,9 @@ _PROGRESS_FIELDS = (
     "control_executor_slice_seconds",
     "control_executor_bucket_query_cap",
     "control_executor_supervisor_safe_slice",
+    "refresh_failure_served_prior_exact_target",
+    "refresh_error_type",
+    "refresh_error_message",
     "error_type",
     "message",
 )
@@ -61,21 +64,23 @@ def _control_detail(base: Any) -> dict[str, object]:
     return dict(detail) if isinstance(detail, dict) else {}
 
 
-def _bounded_cycle_history_progress(detail: dict[str, object]) -> dict[str, object]:
-    raw = detail.get("cycle_history_cache_progress")
+def _bounded_progress(raw: object) -> dict[str, object]:
     if not isinstance(raw, dict):
         return {}
     return {key: raw.get(key) for key in _PROGRESS_FIELDS if key in raw}
 
 
-def install_cycle_history_health_observability(base: Any) -> None:
-    """Expose already-persisted cycle-history failure detail through `/health`.
+def _bounded_cycle_history_progress(detail: dict[str, object]) -> dict[str, object]:
+    return _bounded_progress(detail.get("cycle_history_cache_progress"))
 
-    The disposable control executor stores the underlying cache exception type/message
-    plus bounded cache progress in its parent heartbeat. The existing health adapter
-    exposes only the generic ``CycleHistoryCacheError`` control state, which prevents a
-    production diagnosis of the exact failed DB/cache operation. This hook copies a
-    bounded diagnostic subset into the existing canonical-control health record.
+
+def install_cycle_history_health_observability(base: Any) -> None:
+    """Expose persisted cycle-history failure and refresh detail through `/health`.
+
+    A newer running parent heartbeat can legitimately contain less diagnostic detail
+    than the most recent terminal control record. Never replace already surfaced
+    terminal progress with an empty diagnostic lookup. This keeps the exact underlying
+    cache error visible while remaining diagnostic-only and non-authoritative.
     """
 
     if bool(getattr(base, _INSTALL_MARKER, False)):
@@ -95,15 +100,28 @@ def install_cycle_history_health_observability(base: Any) -> None:
             return payload
 
         detail = _control_detail(base)
-        progress = _bounded_cycle_history_progress(detail)
+        detail_progress = _bounded_cycle_history_progress(detail)
+        surfaced_progress = _bounded_progress(control.get("cycle_history_cache_progress"))
+        progress = detail_progress or surfaced_progress
+
+        complete = detail.get("cycle_history_cache_complete")
+        if complete is None:
+            complete = control.get("cycle_history_cache_complete")
+        if complete is None and "complete" in progress:
+            complete = progress.get("complete")
+
         control.update(
             {
-                "cycle_history_cache_complete": detail.get(
-                    "cycle_history_cache_complete"
-                ),
+                "cycle_history_cache_complete": complete,
                 "cycle_history_cache_progress": progress,
                 "cycle_history_cache_error_type": progress.get("error_type"),
                 "cycle_history_cache_error_message": progress.get("message"),
+                "cycle_history_cache_refresh_error_type": progress.get(
+                    "refresh_error_type"
+                ),
+                "cycle_history_cache_refresh_error_message": progress.get(
+                    "refresh_error_message"
+                ),
                 "cycle_history_cache_diagnostic_only": True,
             }
         )
