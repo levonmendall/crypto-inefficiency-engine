@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -59,6 +60,19 @@ def test_background_bucket_gets_longer_but_finite_database_budget_and_bounded_ba
     )
     assert backfill.BACKGROUND_BUCKET_QUERY_CAP == 32
     assert backfill.BACKGROUND_BUCKET_STATEMENT_TIMEOUT_SECONDS == 60.0
+    assert backfill.BACKGROUND_TARGET_TIME_BUDGET_SECONDS == 15.0
+
+
+def test_background_batch_temporarily_uses_maximum_target_runtime_budget(monkeypatch):
+    monkeypatch.setenv(backfill._BUCKET_QUERY_BUDGET_ENV, "7")
+    monkeypatch.setenv(backfill._TIME_BUDGET_ENV, "3")
+
+    with backfill._bounded_background_batch():
+        assert os.environ[backfill._BUCKET_QUERY_BUDGET_ENV] == "32"
+        assert os.environ[backfill._TIME_BUDGET_ENV] == "15.0"
+
+    assert os.environ[backfill._BUCKET_QUERY_BUDGET_ENV] == "7"
+    assert os.environ[backfill._TIME_BUDGET_ENV] == "3"
 
 
 def test_background_backfill_is_disposable_and_heavy_lease_serialized():
@@ -68,15 +82,23 @@ def test_background_backfill_is_disposable_and_heavy_lease_serialized():
     assert 'lease.next_sequence("cycle_history")' in source
     assert "advance_durable_control_cycle_history_cache" in source
     assert "_bounded_background_batch" in source
+    assert "INCOMPLETE_PROGRESS_EXIT_CODE" in source
+    assert 'progress.get("durable_checkpoint_persisted")' in source
     assert '"provider_requests_allowed": False' not in source
 
 
-def test_background_supervisor_has_external_deadline_and_fair_research_window():
+def test_background_supervisor_bootstraps_until_first_target_then_restores_fair_window():
     source = inspect.getsource(supervisor.run_cycle_history_background_supervisor)
 
     assert supervisor.BACKFILL_EXECUTOR_DEADLINE_SECONDS == 90.0
     assert supervisor.BACKFILL_SUCCESS_INTERVAL_SECONDS == 30.0
+    assert supervisor.BACKFILL_BOOTSTRAP_INTERVAL_SECONDS == 2.0
+    assert supervisor.INCOMPLETE_PROGRESS_EXIT_CODE == 76
     assert "instance_memory_snapshot" in source
+    assert 'getattr(memory, "terminate_required", False)' in source
+    assert 'getattr(memory, "start_blocked", False)' not in source
+    assert "return_code == INCOMPLETE_PROGRESS_EXIT_CODE" in source
+    assert "BACKFILL_BOOTSTRAP_INTERVAL_SECONDS" in source
     assert "subprocess.Popen(BACKFILL_COMMAND)" in source
     assert "_terminate(child)" in source
     assert supervisor.BACKFILL_COMMAND[-1] == (
