@@ -227,24 +227,23 @@ def test_e2e_truth_never_promotes_generic_history_to_cycle_history(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        api_truth.base.active,
-        "deployment_readiness",
+        api_truth,
+        "_raw_canonical_control_status",
         lambda: {
-            "runtime_heartbeats": {
-                "workers": {
-                    "canonical_control": {
-                        "cycle_history_cache_complete": False,
-                        "historical_cache_progress": {
-                            "strategy": {
-                                "cache_count": 0,
-                                "cache_initialized": False,
-                                "completion_state": "not_initialized_in_this_executor",
-                            }
-                        },
-                    }
+            "cycle_history_cache_complete": False,
+            "historical_cache_progress": {
+                "strategy": {
+                    "cache_count": 0,
+                    "cache_initialized": False,
+                    "completion_state": "not_initialized_in_this_executor",
                 }
-            }
+            },
         },
+    )
+    monkeypatch.setattr(
+        api_truth,
+        "_cycle_history_index_maintenance_status",
+        lambda: {"ready": False},
     )
 
     payload = api_truth.repaired_end_to_end_certification_payload()
@@ -262,6 +261,15 @@ def test_e2e_truth_never_promotes_generic_history_to_cycle_history(monkeypatch):
     assert payload["control"]["historical_cache_progress"]["strategy"][
         "cache_count"
     ] == 0
+    assert payload["duplicate_readiness_read_disabled"] is True
+
+
+def test_e2e_truth_wrapper_does_not_repeat_full_deployment_readiness():
+    source = inspect.getsource(api_truth.repaired_end_to_end_certification_payload)
+
+    assert "base.active.deployment_readiness" not in source
+    assert "_raw_canonical_control_status" in source
+    assert api_truth.CANONICAL_CONTROL_WORKER_ID == "canonical-control-operating-loop"
 
 
 def test_disposable_strategy_cache_reports_uninitialized_not_failed(monkeypatch):

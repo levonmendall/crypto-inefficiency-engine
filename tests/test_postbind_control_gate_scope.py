@@ -5,21 +5,20 @@ import inspect
 from inefficiency_engine import render_combined_postbind
 
 
-def test_only_cycle_history_index_blocks_canonical_control():
+def test_generic_postbind_never_blocks_control_on_exact_cycle_history_index():
     source = inspect.getsource(render_combined_postbind._runtime_index_guard)
 
-    cycle_gate_call = source.index(
-        "index_specs=CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS"
-    )
     release = source.index("indexes_ready.set()")
     post_control_group = source.index("post_control_index_specs = {")
     source_optimizations = source.index("**CONTROL_GATE_INDEX_SPECS", post_control_group)
     strategy_optimizations = source.index("**BACKGROUND_INDEX_SPECS", post_control_group)
 
-    assert cycle_gate_call < release
     assert release < post_control_group
     assert release < source_optimizations
     assert release < strategy_optimizations
+    assert "CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS" not in source
+    assert '"cycle_history_exact_index_owner": "cycle-history-index-maintenance"' in source
+    assert '"cycle_history_exact_index_maintained_here": False' in source
 
 
 def test_optional_post_control_index_failures_cannot_reclose_gate():

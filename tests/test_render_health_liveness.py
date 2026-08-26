@@ -71,6 +71,7 @@ def test_render_health_bypasses_composed_api_and_database_diagnostics(monkeypatc
     assert payload["runtime_diagnostics"] == "deferred_to_readiness"
     assert payload["readiness_endpoint"] == "/ready"
     assert payload["liveness_database_independent"] is True
+    assert payload["end_to_end_certification_deadline_seconds"] == 8.0
 
 
 def test_ready_and_diagnostics_remain_on_full_composed_application():
@@ -93,6 +94,48 @@ def test_head_health_is_also_database_independent():
     assert inner.calls == []
     assert messages[0]["status"] == 200
     assert messages[1]["body"] == b""
+
+
+def test_e2e_certification_returns_bounded_503_instead_of_hanging(monkeypatch):
+    inner = _InnerApp()
+    app = liveness.DatabaseIndependentLivenessApp(inner)
+
+    async def slow_to_thread(_func):
+        await asyncio.sleep(0.05)
+        return {"certified": False}
+
+    monkeypatch.setattr(liveness, "END_TO_END_CERTIFICATION_DEADLINE_SECONDS", 0.001)
+    monkeypatch.setattr(liveness.asyncio, "to_thread", slow_to_thread)
+
+    messages = _request(app, "/v3/operations/end-to-end-certification")
+
+    assert inner.calls == []
+    assert messages[0]["status"] == 503
+    payload = json.loads(messages[1]["body"])
+    detail = payload["detail"]
+    assert detail["error_type"] == "EndToEndCertificationDeadlineExceeded"
+    assert detail["deadline_seconds"] == 0.001
+    assert detail["retryable"] is True
+    assert detail["certification_authority"] is False
+    assert detail["paper_only"] is True
+
+
+def test_e2e_certification_still_returns_payload_when_read_finishes(monkeypatch):
+    inner = _InnerApp()
+    app = liveness.DatabaseIndependentLivenessApp(inner)
+
+    async def fast_to_thread(_func):
+        return {"certified": False, "status": "blocked", "paper_only": True}
+
+    monkeypatch.setattr(liveness.asyncio, "to_thread", fast_to_thread)
+
+    messages = _request(app, "/v3/operations/end-to-end-certification")
+
+    assert inner.calls == []
+    assert messages[0]["status"] == 200
+    payload = json.loads(messages[1]["body"])
+    assert payload["status"] == "blocked"
+    assert payload["paper_only"] is True
 
 
 def test_render_child_uses_database_independent_liveness_app():

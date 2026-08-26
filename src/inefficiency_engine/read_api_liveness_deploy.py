@@ -9,6 +9,9 @@ from inefficiency_engine import __version__
 from inefficiency_engine.read_api_durable_history_projection_deploy import app as _inner_app
 
 
+END_TO_END_CERTIFICATION_DEADLINE_SECONDS = 8.0
+
+
 async def _send_json(
     send: Any,
     *,
@@ -51,8 +54,9 @@ class DatabaseIndependentLivenessApp:
     """Answer Render liveness without touching PostgreSQL or worker diagnostics.
 
     `/health` remains a process-only branch with no database imports or reads. The
-    explicit E2E diagnostic is also intercepted at this outer boundary, but only after
-    path selection and in a worker thread; that lets us correct cycle-history telemetry
+    explicit E2E diagnostic is intercepted only after path selection and runs outside
+    the event loop behind a short client-facing deadline. A slow durable read therefore
+    returns explicit 503 diagnostic JSON instead of leaving browsers waiting forever,
     without changing the canonical production ASGI target or liveness contract.
     """
 
@@ -86,9 +90,22 @@ class DatabaseIndependentLivenessApp:
 
             status = 200
             try:
-                body_value: object = await asyncio.to_thread(
-                    repaired_end_to_end_certification_payload
+                body_value: object = await asyncio.wait_for(
+                    asyncio.to_thread(repaired_end_to_end_certification_payload),
+                    timeout=END_TO_END_CERTIFICATION_DEADLINE_SECONDS,
                 )
+            except asyncio.TimeoutError:
+                status = 503
+                body_value = {
+                    "detail": {
+                        "message": "end-to-end certification read exceeded its bounded deadline",
+                        "error_type": "EndToEndCertificationDeadlineExceeded",
+                        "deadline_seconds": END_TO_END_CERTIFICATION_DEADLINE_SECONDS,
+                        "retryable": True,
+                        "certification_authority": False,
+                        "paper_only": True,
+                    }
+                }
             except HTTPException as exc:
                 status = int(exc.status_code)
                 body_value = {"detail": exc.detail}
@@ -131,6 +148,7 @@ def liveness_payload() -> dict[str, object]:
         "runtime_diagnostics": "deferred_to_readiness",
         "readiness_endpoint": "/ready",
         "end_to_end_certification_endpoint": "/v3/operations/end-to-end-certification",
+        "end_to_end_certification_deadline_seconds": END_TO_END_CERTIFICATION_DEADLINE_SECONDS,
         "durable_history_endpoint": "/v3/dashboard/durable-lane-history",
         "durable_history_read_model": "persisted_background_projection",
         "liveness_database_independent": True,
@@ -140,4 +158,9 @@ def liveness_payload() -> dict[str, object]:
 app = DatabaseIndependentLivenessApp(_inner_app)
 
 
-__all__ = ["DatabaseIndependentLivenessApp", "app", "liveness_payload"]
+__all__ = [
+    "DatabaseIndependentLivenessApp",
+    "END_TO_END_CERTIFICATION_DEADLINE_SECONDS",
+    "app",
+    "liveness_payload",
+]

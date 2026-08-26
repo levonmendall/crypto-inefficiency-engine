@@ -406,22 +406,30 @@ def test_production_bootstrap_does_not_build_large_runtime_indexes():
     )
 
 
-def test_canonical_control_waits_for_source_and_cycle_history_indexes():
+def test_canonical_control_waits_for_api_bind_not_exact_cycle_history_index():
     control_source = inspect.getsource(render_combined_postbind._control_guard_after_indexes)
     maintenance_source = inspect.getsource(render_combined_postbind._runtime_index_guard)
 
     assert control_source.index("indexes_ready.wait") < control_source.index(
         "_control_plane_guard"
     )
-    assert maintenance_source.index("CONTROL_GATE_INDEX_SPECS") < maintenance_source.index(
-        "CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS"
+    release = maintenance_source.index("indexes_ready.set()")
+    post_control_group = maintenance_source.index("post_control_index_specs = {", release)
+    assert release < post_control_group
+    assert release < maintenance_source.index(
+        "CONTROL_GATE_INDEX_SPECS",
+        post_control_group,
     )
-    assert maintenance_source.index(
-        "CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS"
-    ) < maintenance_source.index("indexes_ready.set()")
-    assert maintenance_source.index("indexes_ready.set()") < maintenance_source.index(
-        "BACKGROUND_INDEX_SPECS"
+    assert release < maintenance_source.index(
+        "BACKGROUND_INDEX_SPECS",
+        post_control_group,
     )
+    assert "CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS" not in maintenance_source
+    assert (
+        '"cycle_history_exact_index_owner": "cycle-history-index-maintenance"'
+        in maintenance_source
+    )
+    assert '"cycle_history_exact_index_maintained_here": False' in maintenance_source
 
 
 def test_runtime_index_progress_is_published_before_each_long_build():

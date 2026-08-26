@@ -39,14 +39,15 @@ def test_postbind_builds_cycle_history_brin_before_large_runtime_indexes():
 
     release = source.index("indexes_ready.set()")
     brin_call = source.index("brin_result = ensure_cycle_history_brin_after_api_bind")
-    source_group = source.index(
-        '("post_control_source_strategy", post_control_index_specs)'
-    )
-    exact_btree = source.index(
-        '("post_control_cycle_history", CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS)'
+    source_scope = source.index('scope = "post_control_source_strategy"')
+    source_maintenance = source.index(
+        "result = ensure_runtime_indexes_after_api_bind",
+        source_scope,
     )
 
-    assert release < brin_call < source_group < exact_btree
+    assert release < brin_call < source_scope < source_maintenance
+    assert "CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS" not in source
+    assert '"cycle_history_exact_index_maintained_here": False' in source
     assert "indexes_ready.clear" not in source
 
 
