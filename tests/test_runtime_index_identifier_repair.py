@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from inefficiency_engine.runtime_index_health_observability import (
+    _index_maintenance_result,
+)
 from inefficiency_engine.runtime_index_maintenance import (
     POSTGRES_IDENTIFIER_MAX_BYTES,
     _next_replacement_index_name,
@@ -71,3 +74,40 @@ def test_next_replacement_uses_highest_hashed_long_name_version():
     assert replacement == _postgres_replacement_index_name(canonical, 10)
     assert replacement.endswith("_v10")
     assert len(replacement) <= POSTGRES_IDENTIFIER_MAX_BYTES
+
+
+def test_final_background_index_heartbeat_exposes_nested_failure_rows():
+    detail = {
+        "background_indexes_complete": False,
+        "failures": [
+            {
+                "scope": "post_control_source_strategy",
+                "result": {
+                    "complete": False,
+                    "dialect": "postgresql",
+                    "failures": [
+                        {
+                            "index": "ix_runtime_example",
+                            "table": "example",
+                            "error_type": "ProgrammingError",
+                            "message": "duplicate relation",
+                        }
+                    ],
+                },
+            }
+        ],
+    }
+
+    result = _index_maintenance_result(detail)
+
+    assert result["complete"] is False
+    assert result["dialect"] == "postgresql"
+    assert result["failures"] == [
+        {
+            "scope": "post_control_source_strategy",
+            "index": "ix_runtime_example",
+            "table": "example",
+            "error_type": "ProgrammingError",
+            "message": "duplicate relation",
+        }
+    ]
