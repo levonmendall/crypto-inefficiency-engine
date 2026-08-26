@@ -8,30 +8,62 @@ from inefficiency_engine import read_api_end_to_end_certification_deploy as base
 END_TO_END_PATH = "/v3/operations/end-to-end-certification"
 CYCLE_HISTORY_INDEX_WORKER_ID = "cycle-history-index-maintenance"
 CYCLE_HISTORY_INDEX_STALE_SECONDS = 180.0
+CANONICAL_CONTROL_WORKER_ID = "canonical-control-operating-loop"
+
+
+def _store_or_none():
+    try:
+        return base.active._store()  # noqa: SLF001 - production diagnostic composition
+    except Exception:
+        return None
+
+
+def _raw_canonical_control_status() -> dict[str, object]:
+    """Read only the one durable control heartbeat needed by the truth repair.
+
+    The legacy repair re-ran the entire deployment-readiness composition after the base
+    certification payload had already done so. That duplicated table/heartbeat reads on
+    every request. Read the canonical-control heartbeat directly instead and keep this
+    diagnostic fail-soft; absence can never promote certification.
+    """
+
+    store = _store_or_none()
+    if store is None:
+        return {}
+    try:
+        heartbeat = store.latest_worker_heartbeat(CANONICAL_CONTROL_WORKER_ID)
+    except Exception:
+        return {}
+    if heartbeat is None:
+        return {}
+
+    detail = dict(getattr(heartbeat, "detail", {}) or {})
+    return {
+        "available": True,
+        "state": getattr(heartbeat, "state", None),
+        "error_type": getattr(heartbeat, "error_type", None),
+        "cycle_history_cache_complete": detail.get("cycle_history_cache_complete"),
+        "cycle_history_cache_progress": detail.get("cycle_history_cache_progress"),
+        "historical_cache_progress": detail.get("historical_cache_progress"),
+        "operating_reconciliation_complete": detail.get(
+            "operating_reconciliation_complete"
+        ),
+        "qualified_bridge_publication_complete": detail.get(
+            "qualified_bridge_publication_complete"
+        ),
+    }
 
 
 def _cycle_history_index_maintenance_status() -> dict[str, object]:
     """Expose the dedicated exact-index owner without granting certification authority."""
 
-    try:
-        store = base.active._store()  # noqa: SLF001 - production diagnostic composition
-    except Exception as exc:
-        return {
-            "available": False,
-            "stale": True,
-            "ready": False,
-            "error_type": type(exc).__name__,
-            "reason": "index_heartbeat_store_unavailable",
-            "worker_id": CYCLE_HISTORY_INDEX_WORKER_ID,
-            "single_owner": True,
-            "certification_authority": False,
-        }
+    store = _store_or_none()
     if store is None:
         return {
             "available": False,
             "stale": True,
             "ready": False,
-            "reason": "index_heartbeat_store_unconfigured",
+            "reason": "index_heartbeat_store_unavailable",
             "worker_id": CYCLE_HISTORY_INDEX_WORKER_ID,
             "single_owner": True,
             "certification_authority": False,
@@ -115,6 +147,15 @@ def _cycle_history_index_maintenance_status() -> dict[str, object]:
         "current_index_ok": detail.get("current_index_ok"),
         "current_index_concurrent": detail.get("current_index_concurrent"),
         "message": detail.get("message"),
+        "attempt_number": detail.get("attempt_number"),
+        "statement_timeout_ms": detail.get("statement_timeout_ms"),
+        "previous_attempt_number": detail.get("previous_attempt_number"),
+        "previous_stage": detail.get("previous_stage"),
+        "previous_error_type": detail.get("previous_error_type"),
+        "previous_message": detail.get("previous_message"),
+        "previous_effective_index_name": detail.get(
+            "previous_effective_index_name"
+        ),
         "single_owner": True,
         "generic_runtime_exact_index_maintenance_disabled": True,
         "certification_authority": False,
@@ -132,20 +173,14 @@ def repaired_end_to_end_certification_payload() -> dict[str, object]:
     allowed generic historical-cache completion to satisfy the cycle-history serving
     target check. This repair recomputes that check from the raw control heartbeat's
     explicit cycle-history field plus the certified background target only.
+
+    The base certification composition already performs the full readiness read. This
+    wrapper deliberately does not call ``deployment_readiness`` a second time; it reads
+    only the one canonical-control heartbeat needed to correct cycle-history semantics.
     """
 
     payload = dict(base.end_to_end_certification_payload())
-
-    raw_control: dict[str, object] = {}
-    try:
-        ready = dict(base.active.deployment_readiness())
-        runtime = ready.get("runtime_heartbeats")
-        workers = runtime.get("workers") if isinstance(runtime, dict) else {}
-        raw_control = base._worker(workers, "canonical_control")
-    except Exception:
-        # The base endpoint already failed closed on readiness. A second diagnostic read
-        # is advisory; if unavailable, never promote generic history into cycle history.
-        raw_control = {}
+    raw_control = _raw_canonical_control_status()
 
     background = payload.get("cycle_history_backfill")
     background = dict(background) if isinstance(background, dict) else {}
@@ -238,15 +273,18 @@ def repaired_end_to_end_certification_payload() -> dict[str, object]:
                 else "none"
             ),
             "cycle_history_generic_cache_fallback_disabled": True,
+            "duplicate_readiness_read_disabled": True,
         }
     )
     return payload
 
 
 __all__ = [
+    "CANONICAL_CONTROL_WORKER_ID",
     "CYCLE_HISTORY_INDEX_STALE_SECONDS",
     "CYCLE_HISTORY_INDEX_WORKER_ID",
     "END_TO_END_PATH",
     "_cycle_history_index_maintenance_status",
+    "_raw_canonical_control_status",
     "repaired_end_to_end_certification_payload",
 ]
