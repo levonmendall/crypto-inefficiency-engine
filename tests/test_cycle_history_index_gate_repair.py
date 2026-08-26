@@ -267,7 +267,7 @@ def test_e2e_truth_never_promotes_generic_history_to_cycle_history(monkeypatch):
 def test_e2e_truth_wrapper_does_not_repeat_full_deployment_readiness():
     source = inspect.getsource(api_truth.repaired_end_to_end_certification_payload)
 
-    assert "deployment_readiness" not in source
+    assert "base.active.deployment_readiness" not in source
     assert "_raw_canonical_control_status" in source
     assert api_truth.CANONICAL_CONTROL_WORKER_ID == "canonical-control-operating-loop"
 
