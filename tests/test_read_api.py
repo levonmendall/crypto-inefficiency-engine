@@ -107,7 +107,7 @@ def test_render_combined_service_uses_restored_command_center_with_v5_mechanism_
     assert runtime["type"] == "web"
     assert runtime["plan"] == "standard"
     assert runtime["startCommand"] == (
-        "PYTHONPATH=src python -m inefficiency_engine.render_combined_postbind_lane_repair"
+        "PYTHONPATH=src python -m inefficiency_engine.render_combined_postbind_history_projection"
     )
 
     canonical = Path("src/inefficiency_engine/render_combined.py").read_text()
@@ -125,6 +125,13 @@ def test_render_combined_service_uses_restored_command_center_with_v5_mechanism_
     assert 'commands["source"] = list(SOURCE_REPAIR_COMMAND)' in repair_bootstrap
     assert "return base.main()" in repair_bootstrap
 
+    projection_bootstrap = Path(
+        "src/inefficiency_engine/render_combined_postbind_history_projection.py"
+    ).read_text()
+    assert "run_durable_lane_history_projection_supervisor" in projection_bootstrap
+    assert "from inefficiency_engine import render_combined_postbind_lane_repair as base" in projection_bootstrap
+    assert "return base.main()" in projection_bootstrap
+
     deploy = Path("src/inefficiency_engine/read_api_card_history_deploy.py").read_text()
     assert "dashboard_cards_v5" in deploy
     assert "dashboard_command_center_v6" in deploy
@@ -134,6 +141,13 @@ def test_render_combined_service_uses_restored_command_center_with_v5_mechanism_
     assert "dashboard_card_history" not in deploy
     assert '"dashboard_inherited_card_overlay_chain_active": False' in deploy
     assert '"dashboard_contract_active": True' in deploy
+
+    history_projection = Path(
+        "src/inefficiency_engine/read_api_durable_history_projection_deploy.py"
+    ).read_text()
+    assert 'DURABLE_HISTORY_PATH = "/v3/dashboard/durable-lane-history"' in history_projection
+    assert "durable_history_projection_payload" in history_projection
+    assert "history is not being reported as zero" in history_projection
 
     v5 = Path("src/inefficiency_engine/dashboard_cards_v5.py").read_text()
     assert 'DASHBOARD_UI_CONTRACT_VERSION = "v5_mechanism_truth"' in v5
