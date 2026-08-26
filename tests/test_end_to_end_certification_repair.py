@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import inefficiency_engine.read_api_end_to_end_certification_deploy as certification
@@ -17,6 +18,43 @@ def _worker(state="success", *, stale=False, **extra):
     }
 
 
+def _alpha_research_worker(*, stale=False):
+    observed_at = (
+        "2026-01-01T00:00:00+00:00"
+        if stale
+        else datetime.now(timezone.utc).isoformat()
+    )
+    return _worker(
+        "running",
+        observed_at=observed_at,
+        critical_evidence_recovery={
+            "workers": {
+                "alpha_forward": {
+                    "worker_id": "shadow-research-auxiliary",
+                    "signal": "alpha_forward_evidence_cycle_id",
+                    "available": True,
+                    "observed_at": observed_at,
+                    "state": "running",
+                    "cycle_id": "alpha-test",
+                    "recovery_after_seconds": 1200.0,
+                }
+            }
+        },
+    )
+
+
+def _source_history_worker(*, complete=True):
+    return _worker(
+        "success" if complete else "running",
+        stage="canonical_history_ready" if complete else "canonical_history_archive_migrating",
+        complete=complete,
+        compact_certification_summary=complete,
+        checkpoint_heartbeat_id=100 if complete else 50,
+        lane_count=13 if complete else 0,
+        snapshot_count=1300 if complete else 0,
+    )
+
+
 def _ready_payload(*, sufficient_lane_count=6):
     workers = {
         "canonical_control": _worker(
@@ -28,6 +66,7 @@ def _ready_payload(*, sufficient_lane_count=6):
         "portfolio": _worker("running"),
         "permanent_source": _worker("running"),
         "mechanism_forward": _worker("success"),
+        "research": _alpha_research_worker(),
         "source_coverage_snapshot": _worker(
             persisted_complete_snapshot=True,
             lane_count=13,
@@ -43,6 +82,7 @@ def _ready_payload(*, sufficient_lane_count=6):
             control_gate_released=True,
             background_indexes_complete=False,
         ),
+        "source_history_migration": _source_history_worker(),
     }
     return {
         "status": "ready",
@@ -54,34 +94,8 @@ def _ready_payload(*, sufficient_lane_count=6):
     }
 
 
-def _patch_current_alpha_and_history(monkeypatch):
-    monkeypatch.setattr(
-        certification,
-        "_alpha_forward_status",
-        lambda store, now, stale_after_seconds: {
-            "available": True,
-            "recovery_required": False,
-            "reason": "alpha_forward_marker_current",
-        },
-    )
-    monkeypatch.setattr(
-        certification,
-        "_source_history_status",
-        lambda store: {
-            "available": True,
-            "migration_complete": True,
-            "checkpoint_heartbeat_id": 100,
-            "lane_count": 13,
-            "snapshot_count": 1300,
-            "reason": "complete",
-        },
-    )
-
-
 def test_certification_allows_economic_rejection_without_trade(monkeypatch):
     monkeypatch.setattr(certification.active, "deployment_readiness", _ready_payload)
-    monkeypatch.setattr(certification.active, "_store", lambda: object())
-    _patch_current_alpha_and_history(monkeypatch)
 
     payload = certification.end_to_end_certification_payload()
 
@@ -98,6 +112,7 @@ def test_certification_allows_economic_rejection_without_trade(monkeypatch):
     assert payload["runtime_index_maintenance"]["certification_authority"] is False
     assert payload["qualification_thresholds_unchanged"] is True
     assert payload["live_execution_authority"] is False
+    assert payload["certification_post_readiness_database_reads"] == 0
 
 
 def test_all_lane_scope_is_reported_separately_from_pipeline_operation(monkeypatch):
@@ -106,8 +121,6 @@ def test_all_lane_scope_is_reported_separately_from_pipeline_operation(monkeypat
         "deployment_readiness",
         lambda: _ready_payload(sufficient_lane_count=13),
     )
-    monkeypatch.setattr(certification.active, "_store", lambda: object())
-    _patch_current_alpha_and_history(monkeypatch)
 
     payload = certification.end_to_end_certification_payload()
 
@@ -118,7 +131,8 @@ def test_all_lane_scope_is_reported_separately_from_pipeline_operation(monkeypat
 
 def test_certification_fails_closed_on_stale_alpha_and_incomplete_control(monkeypatch):
     ready = _ready_payload()
-    control = ready["runtime_heartbeats"]["workers"]["canonical_control"]
+    workers = ready["runtime_heartbeats"]["workers"]
+    control = workers["canonical_control"]
     control.update(
         {
             "state": "degraded",
@@ -128,28 +142,9 @@ def test_certification_fails_closed_on_stale_alpha_and_incomplete_control(monkey
             "qualified_bridge_publication_complete": False,
         }
     )
+    workers["research"] = _alpha_research_worker(stale=True)
+    workers["source_history_migration"] = _source_history_worker(complete=False)
     monkeypatch.setattr(certification.active, "deployment_readiness", lambda: ready)
-    monkeypatch.setattr(certification.active, "_store", lambda: object())
-    monkeypatch.setattr(
-        certification,
-        "_alpha_forward_status",
-        lambda store, now, stale_after_seconds: {
-            "available": True,
-            "recovery_required": True,
-            "reason": "alpha_forward_marker_stale",
-        },
-    )
-    monkeypatch.setattr(
-        certification,
-        "_source_history_status",
-        lambda store: {
-            "available": True,
-            "migration_complete": False,
-            "checkpoint_heartbeat_id": 50,
-            "lane_count": 13,
-            "reason": "migration_in_progress",
-        },
-    )
 
     payload = certification.end_to_end_certification_payload()
 
