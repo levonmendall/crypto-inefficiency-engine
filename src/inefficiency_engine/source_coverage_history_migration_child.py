@@ -3,10 +3,13 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from sqlalchemy import text
+
 from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import build_evidence_store
 from inefficiency_engine.source_coverage_history import (
     DEFAULT_MIGRATION_HEARTBEAT_BATCH,
+    SOURCE_COVERAGE_HISTORY_TABLE,
     backfill_source_coverage_history_from_heartbeats,
 )
 
@@ -52,6 +55,30 @@ def _record(store: Any, *, state: str, detail: dict[str, object], error_type: st
         pass
 
 
+def _completed_history_summary(store: Any) -> dict[str, int]:
+    """Publish final archive counts once, off the HTTP request path."""
+
+    with store.engine.connect() as db:
+        lane_count = int(
+            db.execute(
+                text(
+                    f"SELECT COUNT(DISTINCT lane_id) FROM {SOURCE_COVERAGE_HISTORY_TABLE}"
+                )
+            ).scalar_one()
+            or 0
+        )
+        snapshot_count = int(
+            db.execute(
+                text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_HISTORY_TABLE}")
+            ).scalar_one()
+            or 0
+        )
+    return {
+        "lane_count": lane_count,
+        "snapshot_count": snapshot_count,
+    }
+
+
 def advance_one_history_migration_batch(store: Any, *, max_heartbeats: int | None = None) -> dict[str, object]:
     """Advance one small transactional archive batch and publish exact progress."""
 
@@ -63,12 +90,18 @@ def advance_one_history_migration_batch(store: Any, *, max_heartbeats: int | Non
         )
     )
     complete = bool(result.get("complete"))
+    if complete:
+        # The migration child owns this one-time aggregate read. Certification later
+        # consumes the published counts from the worker heartbeat and never recounts
+        # the append-only archive on a browser request.
+        result.update(_completed_history_summary(store))
     _record(
         store,
         state="success" if complete else "running",
         detail={
             "stage": "canonical_history_ready" if complete else "canonical_history_archive_migrating",
             "batch_limit": batch,
+            "compact_certification_summary": complete,
             **result,
         },
     )
@@ -107,6 +140,7 @@ __all__ = [
     "DEFAULT_CHILD_MIGRATION_BATCH",
     "MIGRATION_INCOMPLETE_EXIT_CODE",
     "SOURCE_COVERAGE_HISTORY_MIGRATION_WORKER_ID",
+    "_completed_history_summary",
     "advance_one_history_migration_batch",
     "migration_batch_size",
 ]

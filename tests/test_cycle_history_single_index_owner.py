@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 from datetime import datetime, timezone
-from types import SimpleNamespace
 
 from inefficiency_engine import read_api_cycle_history_truth_repair as api_truth
 from inefficiency_engine import render_combined_postbind as postbind
@@ -20,13 +19,17 @@ def test_generic_postbind_maintainer_does_not_own_exact_cycle_history_btree():
     assert "cycle_history_exact_index_maintained_here" in guard_source
 
 
-def test_dedicated_index_heartbeat_is_exposed_as_single_owner(monkeypatch):
+def test_dedicated_index_heartbeat_is_exposed_as_single_owner_from_compact_row():
     now = datetime.now(timezone.utc)
-    heartbeat = SimpleNamespace(
-        observed_at=now,
-        state="success",
-        error_type=None,
-        detail={
+    status = api_truth._cycle_history_index_maintenance_status(
+        {
+            "worker_id": api_truth.CYCLE_HISTORY_INDEX_WORKER_ID,
+            "available": True,
+            "observed_at": now.isoformat(),
+            "age_seconds": 0.0,
+            "stale": False,
+            "state": "success",
+            "error_type": None,
             "stage": "cycle_history_index_ready",
             "index_status": {
                 "ready": True,
@@ -36,18 +39,8 @@ def test_dedicated_index_heartbeat_is_exposed_as_single_owner(monkeypatch):
                 "reason": "replacement_index_ready",
             },
             "maintenance_result": {"complete": True},
-        },
+        }
     )
-    store = SimpleNamespace(
-        latest_worker_heartbeat=lambda worker_id: (
-            heartbeat
-            if worker_id == api_truth.CYCLE_HISTORY_INDEX_WORKER_ID
-            else None
-        )
-    )
-    monkeypatch.setattr(api_truth.base.active, "_store", lambda: store)
-
-    status = api_truth._cycle_history_index_maintenance_status()
 
     assert status["available"] is True
     assert status["ready"] is True
@@ -58,12 +51,22 @@ def test_dedicated_index_heartbeat_is_exposed_as_single_owner(monkeypatch):
     assert status["certification_authority"] is False
 
 
-def test_e2e_payload_surfaces_dedicated_index_owner(monkeypatch):
-    heartbeat = SimpleNamespace(
-        observed_at=datetime.now(timezone.utc),
-        state="running",
-        error_type=None,
-        detail={
+def test_e2e_payload_surfaces_dedicated_index_owner_without_extra_db_read(monkeypatch):
+    worker_truth = {
+        "canonical_control": {
+            "available": True,
+            "cycle_history_cache_complete": False,
+            "cycle_history_cache_progress": {},
+            "historical_cache_progress": {},
+        },
+        "cycle_history_index_maintenance": {
+            "worker_id": api_truth.CYCLE_HISTORY_INDEX_WORKER_ID,
+            "available": True,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "age_seconds": 0.0,
+            "stale": False,
+            "state": "running",
+            "error_type": None,
             "stage": "cycle_history_index_maintenance_starting",
             "index_status": {
                 "ready": False,
@@ -73,18 +76,10 @@ def test_e2e_payload_surfaces_dedicated_index_owner(monkeypatch):
                 "reason": "planner_usable_index_unavailable",
             },
         },
-    )
-    store = SimpleNamespace(latest_worker_heartbeat=lambda _worker_id: heartbeat)
-    monkeypatch.setattr(api_truth.base.active, "_store", lambda: store)
-    monkeypatch.setattr(
-        api_truth.base.active,
-        "deployment_readiness",
-        lambda: {"runtime_heartbeats": {"workers": {"canonical_control": {}}}},
-    )
-    monkeypatch.setattr(
-        api_truth.base,
-        "end_to_end_certification_payload",
-        lambda: {
+    }
+
+    def fake_base(*, include_worker_truth: bool = False):
+        payload = {
             "certified": False,
             "operationally_certified": False,
             "status": "blocked",
@@ -99,8 +94,12 @@ def test_e2e_payload_surfaces_dedicated_index_owner(monkeypatch):
                 "progress": {},
             },
             "control": {},
-        },
-    )
+        }
+        if include_worker_truth:
+            payload["_certification_workers"] = worker_truth
+        return payload
+
+    monkeypatch.setattr(api_truth.base, "end_to_end_certification_payload", fake_base)
 
     payload = api_truth.repaired_end_to_end_certification_payload()
 
@@ -114,3 +113,5 @@ def test_e2e_payload_surfaces_dedicated_index_owner(monkeypatch):
     assert payload["cycle_history_backfill"]["exact_index_worker_id"] == (
         "cycle-history-index-maintenance"
     )
+    assert payload["truth_repair_additional_database_reads"] == 0
+    assert "_certification_workers" not in payload

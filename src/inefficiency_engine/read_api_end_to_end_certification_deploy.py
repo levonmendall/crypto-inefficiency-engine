@@ -3,24 +3,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
-from sqlalchemy import inspect, text
 
 from inefficiency_engine import read_api_certification_fast_readiness as active
 from inefficiency_engine import read_api_lane_history_ui_deploy as inner
 from inefficiency_engine.critical_evidence_recovery import (
     DEFAULT_ALPHA_FORWARD_RECOVERY_STALE_SECONDS,
-    _alpha_forward_status,
-)
-from inefficiency_engine.source_coverage_history import (
-    MIGRATION_NAME,
-    SOURCE_COVERAGE_HISTORY_MIGRATION_TABLE,
-    SOURCE_COVERAGE_HISTORY_TABLE,
 )
 
 
 app = inner.app
 _CYCLE_HISTORY_BACKFILL_WORKER_ID = "cycle-history-background-backfill"
 _CYCLE_HISTORY_BACKFILL_STALE_SECONDS = 180.0
+_ALPHA_RESEARCH_WORKER_ID = "shadow-research-auxiliary"
 
 
 def _worker(workers: object, name: str) -> dict[str, object]:
@@ -38,124 +32,165 @@ def _fresh_worker(row: dict[str, object], *, allowed_states: set[str]) -> bool:
     )
 
 
-def _source_history_status(store) -> dict[str, object]:
-    """Read canonical source-history migration truth without creating schema."""
-
-    try:
-        available = set(inspect(store.engine).get_table_names())
-        if SOURCE_COVERAGE_HISTORY_MIGRATION_TABLE not in available:
-            return {
-                "available": False,
-                "migration_complete": False,
-                "checkpoint_heartbeat_id": 0,
-                "lane_count": 0,
-                "reason": "migration_table_unavailable",
-            }
-        with store.engine.connect() as db:
-            row = db.execute(
-                text(
-                    "SELECT checkpoint_heartbeat_id, complete, updated_at "
-                    f"FROM {SOURCE_COVERAGE_HISTORY_MIGRATION_TABLE} "
-                    "WHERE migration_name=:migration_name LIMIT 1"
-                ),
-                {"migration_name": MIGRATION_NAME},
-            ).mappings().first()
-            lane_count = 0
-            snapshot_count = 0
-            if SOURCE_COVERAGE_HISTORY_TABLE in available:
-                lane_count = int(
-                    db.execute(
-                        text(
-                            f"SELECT COUNT(DISTINCT lane_id) FROM {SOURCE_COVERAGE_HISTORY_TABLE}"
-                        )
-                    ).scalar_one()
-                    or 0
-                )
-                snapshot_count = int(
-                    db.execute(
-                        text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_HISTORY_TABLE}")
-                    ).scalar_one()
-                    or 0
-                )
-        if row is None:
-            return {
-                "available": True,
-                "migration_complete": False,
-                "checkpoint_heartbeat_id": 0,
-                "lane_count": lane_count,
-                "snapshot_count": snapshot_count,
-                "reason": "migration_checkpoint_unobserved",
-            }
-        return {
-            "available": True,
-            "migration_complete": bool(row.get("complete")),
-            "checkpoint_heartbeat_id": int(row.get("checkpoint_heartbeat_id") or 0),
-            "updated_at": row.get("updated_at"),
-            "lane_count": lane_count,
-            "snapshot_count": snapshot_count,
-            "reason": "complete" if bool(row.get("complete")) else "migration_in_progress",
-        }
-    except Exception as exc:
-        return {
-            "available": False,
-            "migration_complete": False,
-            "checkpoint_heartbeat_id": 0,
-            "lane_count": 0,
-            "error_type": type(exc).__name__,
-            "reason": "source_history_read_unavailable",
-        }
+def _parse_time(value: object | None) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
-def _cycle_history_backfill_status(store) -> dict[str, object]:
-    """Expose the bounded background bootstrap heartbeat without granting authority.
+def _alpha_forward_status_from_research_worker(
+    research: dict[str, object],
+    *,
+    now: datetime,
+) -> dict[str, object]:
+    """Re-age the research worker's already-published alpha recovery truth.
 
-    The background worker is the process that creates the first exact active target.
-    Canonical control remains an independent required certification gate, so reporting a
-    completed background target cannot falsely certify reconciliation or bridge output.
+    The disposable research process performs the expensive durable alpha-marker lookup
+    as part of its normal background cycle and carries the resulting recovery snapshot
+    in its heartbeat. Certification consumes that compact publication instead of doing
+    a request-time JSON LIKE scan over the append-only heartbeat ledger.
     """
 
-    try:
-        heartbeat = store.latest_worker_heartbeat(_CYCLE_HISTORY_BACKFILL_WORKER_ID)
-    except Exception as exc:
-        return {
-            "available": False,
-            "stale": True,
-            "cache_complete": False,
-            "progress": {},
-            "error_type": type(exc).__name__,
-            "certification_authority": False,
+    recovery = research.get("critical_evidence_recovery")
+    recovery = dict(recovery) if isinstance(recovery, dict) else {}
+    recovery_workers = recovery.get("workers")
+    recovery_workers = dict(recovery_workers) if isinstance(recovery_workers, dict) else {}
+    raw = recovery_workers.get("alpha_forward")
+    raw = dict(raw) if isinstance(raw, dict) else {}
+
+    # A research heartbeat may also carry the successful alpha marker directly after
+    # the evidence phase. Use that compact marker only when the cycle-start recovery
+    # snapshot is absent; either source remains durable worker-published truth.
+    if not raw and research.get("alpha_forward_evidence_cycle_id"):
+        raw = {
+            "worker_id": _ALPHA_RESEARCH_WORKER_ID,
+            "signal": "alpha_forward_evidence_cycle_id",
+            "available": True,
+            "observed_at": research.get("observed_at"),
+            "state": research.get("state"),
+            "cycle_id": research.get("alpha_forward_evidence_cycle_id"),
+            "recovery_after_seconds": DEFAULT_ALPHA_FORWARD_RECOVERY_STALE_SECONDS,
         }
-    if heartbeat is None:
+
+    if not raw or not bool(raw.get("available")):
+        return {
+            "worker_id": _ALPHA_RESEARCH_WORKER_ID,
+            "signal": "alpha_forward_evidence_cycle_id",
+            "available": False,
+            "recovery_required": True,
+            "reason": "compact_alpha_forward_status_unavailable",
+            "error_type": raw.get("error_type") if raw else None,
+        }
+
+    observed_at = _parse_time(raw.get("observed_at"))
+    if observed_at is None:
+        return {
+            "worker_id": _ALPHA_RESEARCH_WORKER_ID,
+            "signal": "alpha_forward_evidence_cycle_id",
+            "available": False,
+            "recovery_required": True,
+            "reason": "compact_alpha_forward_timestamp_unavailable",
+        }
+
+    try:
+        recovery_after_seconds = max(
+            60.0,
+            float(
+                raw.get("recovery_after_seconds")
+                or DEFAULT_ALPHA_FORWARD_RECOVERY_STALE_SECONDS
+            ),
+        )
+    except (TypeError, ValueError):
+        recovery_after_seconds = float(DEFAULT_ALPHA_FORWARD_RECOVERY_STALE_SECONDS)
+    age_seconds = max(
+        0.0,
+        (now.astimezone(timezone.utc) - observed_at.astimezone(timezone.utc)).total_seconds(),
+    )
+    stale = age_seconds > recovery_after_seconds
+    return {
+        "worker_id": str(raw.get("worker_id") or _ALPHA_RESEARCH_WORKER_ID),
+        "signal": str(raw.get("signal") or "alpha_forward_evidence_cycle_id"),
+        "available": True,
+        "recovery_required": stale,
+        "reason": "alpha_forward_marker_stale" if stale else "alpha_forward_marker_current",
+        "age_seconds": age_seconds,
+        "observed_at": observed_at.isoformat(),
+        "state": raw.get("state"),
+        "cycle_id": raw.get("cycle_id"),
+        "error_type": raw.get("error_type"),
+        "recovery_after_seconds": recovery_after_seconds,
+        "source": "research_worker_compact_recovery_snapshot",
+    }
+
+
+def _source_history_status_from_worker(worker: dict[str, object]) -> dict[str, object]:
+    """Consume the migration child's final archive summary without recounting tables."""
+
+    available = bool(worker.get("available"))
+    complete = bool(
+        available
+        and str(worker.get("state") or "") == "success"
+        and str(worker.get("stage") or "") == "canonical_history_ready"
+        and worker.get("complete") is True
+        and worker.get("compact_certification_summary") is True
+    )
+    lane_count = int(worker.get("lane_count") or 0) if available else 0
+    snapshot_count = int(worker.get("snapshot_count") or 0) if available else 0
+    return {
+        "available": available,
+        "migration_complete": complete,
+        "checkpoint_heartbeat_id": int(worker.get("checkpoint_heartbeat_id") or 0),
+        "updated_at": worker.get("observed_at"),
+        "lane_count": lane_count,
+        "snapshot_count": snapshot_count,
+        "reason": (
+            "complete"
+            if complete
+            else "compact_history_summary_pending"
+            if available
+            else "migration_heartbeat_unavailable"
+        ),
+        "error_type": worker.get("error_type"),
+        "request_time_archive_count_queries": 0,
+    }
+
+
+def _cycle_history_backfill_status_from_worker(worker: dict[str, object]) -> dict[str, object]:
+    """Expose the already-batched background bootstrap heartbeat without another read."""
+
+    if not bool(worker.get("available")):
         return {
             "available": False,
             "stale": True,
             "cache_complete": False,
             "progress": {},
+            "error_type": worker.get("error_type"),
             "certification_authority": False,
         }
 
-    detail = dict(getattr(heartbeat, "detail", {}) or {})
-    raw_progress = detail.get("progress")
+    raw_progress = worker.get("progress")
     progress = dict(raw_progress) if isinstance(raw_progress, dict) else {}
-    observed_at = getattr(heartbeat, "observed_at", None)
-    age_seconds = None
-    if isinstance(observed_at, datetime):
-        observed = observed_at if observed_at.tzinfo else observed_at.replace(tzinfo=timezone.utc)
-        age_seconds = max(0.0, (datetime.now(timezone.utc) - observed).total_seconds())
-    stale = age_seconds is None or age_seconds > _CYCLE_HISTORY_BACKFILL_STALE_SECONDS
-    cache_complete = bool(detail.get("cache_complete") or progress.get("complete"))
-    serving_scan_id = progress.get("serving_scan_id")
+    stale = bool(worker.get("stale", True))
+    cache_complete = bool(worker.get("cache_complete") or progress.get("complete"))
+    serving_scan_id = progress.get("serving_scan_id") or worker.get("serving_scan_id")
     return {
         "available": True,
-        "state": getattr(heartbeat, "state", None),
-        "error_type": getattr(heartbeat, "error_type", None),
-        "observed_at": observed_at,
-        "age_seconds": age_seconds,
+        "state": worker.get("state"),
+        "error_type": worker.get("error_type"),
+        "observed_at": worker.get("observed_at"),
+        "age_seconds": worker.get("age_seconds"),
         "stale": stale,
-        "stage": detail.get("stage"),
+        "stage": worker.get("stage"),
         "cache_complete": cache_complete,
         "first_certified_target_pending": bool(
-            detail.get("first_certified_target_pending", not cache_complete)
+            worker.get("first_certified_target_pending", not cache_complete)
         ),
         "serving_scan_id": serving_scan_id,
         "progress": progress,
@@ -163,17 +198,16 @@ def _cycle_history_backfill_status(store) -> dict[str, object]:
     }
 
 
-def end_to_end_certification_payload() -> dict[str, object]:
-    """Return a fail-closed production certification from durable runtime truth.
+def end_to_end_certification_payload(
+    *,
+    include_worker_truth: bool = False,
+) -> dict[str, object]:
+    """Return fail-closed certification from one compact durable worker snapshot.
 
-    Certification proves that the paper pipeline can move truthful evidence through
-    every authority boundary. It deliberately does *not* require a profitable candidate,
-    allocation, position or trade: correct economic/statistical rejection is a healthy
-    end-to-end result. Historical or presentation data can never create qualification.
-
-    Operational certification and full 13-lane evidence completeness are reported
-    separately. A fail-closed evidence gap does not make the runtime dishonest, but the
-    endpoint never labels a partially source-sufficient universe as fully complete.
+    The request performs readiness/ping plus one batched latest-heartbeat query. Alpha
+    freshness, source-history migration, cycle-history backfill, and downstream truth
+    are then derived in memory from that same snapshot. No request-time archive recount,
+    JSON heartbeat scan, provider work, qualification, allocation, or execution occurs.
     """
 
     try:
@@ -191,24 +225,24 @@ def end_to_end_certification_payload() -> dict[str, object]:
 
     runtime = ready.get("runtime_heartbeats")
     workers = runtime.get("workers") if isinstance(runtime, dict) else {}
+    workers = dict(workers) if isinstance(workers, dict) else {}
     control = _worker(workers, "canonical_control")
     portfolio = _worker(workers, "portfolio")
     source = _worker(workers, "permanent_source")
     mechanism = _worker(workers, "mechanism_forward")
+    research = _worker(workers, "research")
     source_snapshot = _worker(workers, "source_coverage_snapshot")
     research_projection = _worker(workers, "research_projection")
     index_maintenance = _worker(workers, "runtime_index_maintenance")
+    source_history_worker = _worker(workers, "source_history_migration")
+    cycle_history_worker = _worker(workers, "cycle_history_backfill")
 
-    store = active._store()  # noqa: SLF001 - production read-plane composition
-    if store is None:
-        raise HTTPException(status_code=503, detail="evidence persistence is not configured")
-    alpha_forward = _alpha_forward_status(
-        store,
-        now=datetime.now(timezone.utc),
-        stale_after_seconds=DEFAULT_ALPHA_FORWARD_RECOVERY_STALE_SECONDS,
+    now = datetime.now(timezone.utc)
+    alpha_forward = _alpha_forward_status_from_research_worker(research, now=now)
+    source_history = _source_history_status_from_worker(source_history_worker)
+    cycle_history_backfill = _cycle_history_backfill_status_from_worker(
+        cycle_history_worker
     )
-    source_history = _source_history_status(store)
-    cycle_history_backfill = _cycle_history_backfill_status(store)
     control_cycle_complete = bool(
         control.get("cycle_history_cache_complete")
         or control.get("historical_cache_complete")
@@ -294,12 +328,12 @@ def end_to_end_certification_payload() -> dict[str, object]:
     if not isinstance(control_progress, dict):
         control_progress = {}
 
-    return {
+    payload: dict[str, object] = {
         "certified": operationally_certified,
         "operationally_certified": operationally_certified,
         "status": "certified" if operationally_certified else "blocked",
         "release_commit": ready.get("release_commit"),
-        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "observed_at": now.isoformat(),
         "checks": checks,
         "blockers": blockers,
         "alpha_forward": alpha_forward,
@@ -332,6 +366,8 @@ def end_to_end_certification_payload() -> dict[str, object]:
             ),
         },
         "runtime_index_maintenance": index_advisory,
+        "certification_read_model": "single_batched_worker_snapshot",
+        "certification_post_readiness_database_reads": 0,
         "trade_required_for_certification": False,
         "positive_candidate_required_for_certification": False,
         "economic_rejection_is_valid": True,
@@ -340,6 +376,9 @@ def end_to_end_certification_payload() -> dict[str, object]:
         "live_execution_authority": False,
         "paper_only": True,
     }
+    if include_worker_truth:
+        payload["_certification_workers"] = workers
+    return payload
 
 
 @app.get("/v3/operations/end-to-end-certification")
@@ -347,4 +386,11 @@ def end_to_end_certification():
     return end_to_end_certification_payload()
 
 
-__all__ = ["app", "end_to_end_certification", "end_to_end_certification_payload"]
+__all__ = [
+    "app",
+    "end_to_end_certification",
+    "end_to_end_certification_payload",
+    "_alpha_forward_status_from_research_worker",
+    "_cycle_history_backfill_status_from_worker",
+    "_source_history_status_from_worker",
+]
