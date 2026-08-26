@@ -15,7 +15,6 @@ from inefficiency_engine.durable_control_cache import (
 from inefficiency_engine.runtime_index_maintenance import (
     BACKGROUND_INDEX_SPECS,
     CONTROL_GATE_INDEX_SPECS,
-    CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
     ensure_runtime_indexes_after_api_bind,
 )
 
@@ -121,25 +120,18 @@ def _runtime_index_guard(
     stop_event: threading.Event,
     indexes_ready: threading.Event,
 ) -> None:
-    """Release canonical control after API bind, then maintain every runtime index.
+    """Release control after API bind, then maintain non-cycle-history indexes.
 
-    ``CONTROL_GATE_INDEX_SPECS`` and ``CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS`` are
-    retained as index-definition groups for compatibility and observability, but neither
-    group is an investment-authority prerequisite anymore. Production has proved that a
-    concurrent build of the exact cycle-history btree can exceed bounded DDL windows
-    while the API, source plane, research plane, durable cycle-history cache, and bounded
-    control executor remain healthy.
+    The generic post-bind maintainer owns the compact cycle-history BRIN plus ordinary
+    source/read and strategy indexes. It intentionally does *not* own the exact
+    ``market_quotes(venue, asset, observed_at, id)`` btree used by the 180-day
+    cycle-history backfill. That exact btree has one owner only:
+    ``cycle-history-index-maintenance``. Keeping one DDL owner prevents competing
+    ``CREATE INDEX CONCURRENTLY`` attempts and catalog/lock contention.
 
-    Canonical control therefore starts as soon as the API is bound. Exact cycle-history
-    reads remain fail-closed inside the disposable control child. Immediately after
-    release, maintenance first installs a compact BRIN over append-only ``observed_at``.
-    That gives the exact day-range query a cheap planner path without waiting for the
-    much larger four-column btree. Source/strategy indexes and the exact btree continue
-    afterward as optional performance maintenance.
-
-    None of these indexes grant evidence, qualification, allocation, or execution
-    authority. Their failures stay visible and retryable without suppressing control
-    liveness.
+    Canonical control still starts as soon as the API is bound. None of these indexes
+    grant evidence, qualification, allocation, or execution authority. Failures remain
+    visible and retryable without suppressing process liveness.
     """
 
     port = os.getenv("PORT", "10000")
@@ -148,8 +140,6 @@ def _runtime_index_guard(
     if stop_event.is_set():
         return
 
-    # Compatibility/source-inspection marker for the former hard gate. This is not an
-    # index-maintenance call: index_specs=CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS
     indexes_ready.set()
     print(
         "API bound; releasing canonical control before deferred runtime index maintenance",
@@ -162,9 +152,6 @@ def _runtime_index_guard(
         if store is None:
             raise RuntimeError("runtime index maintenance requires durable evidence persistence")
     except Exception as exc:
-        # Index maintenance is advisory to control liveness. The canonical control child
-        # owns its own durable-store checks and remains fail-closed if persistence itself
-        # is unavailable.
         print(f"runtime index maintenance unavailable: {type(exc).__name__}: {exc}", flush=True)
         return
 
@@ -177,13 +164,12 @@ def _runtime_index_guard(
             "scope": "post_control_background",
             "control_gate_released": True,
             "background_indexes_complete": False,
+            "cycle_history_exact_index_owner": "cycle-history-index-maintenance",
+            "cycle_history_exact_index_maintained_here": False,
             "cycle_history_index_authority_required": False,
         },
     )
 
-    # Keep the source/read and strategy indexes in their existing group. The exact
-    # cycle-history btree is maintained as a separate scope because both groups contain
-    # a market_quotes entry and a dict merge would otherwise overwrite one definition.
     post_control_index_specs = {
         **CONTROL_GATE_INDEX_SPECS,
         **BACKGROUND_INDEX_SPECS,
@@ -195,9 +181,8 @@ def _runtime_index_guard(
         round_started = time.monotonic()
         round_results: list[tuple[str, dict[str, object]]] = []
 
-        # Repair the actual production failure first. BRIN summarizes the append-only
-        # observed-at ranges with a tiny index and lets the exact venue/asset/day query
-        # avoid a full market_quotes scan while the larger btree is still unavailable.
+        # BRIN remains a small independent range-read optimization. It is not the exact
+        # btree gate and therefore does not compete with the dedicated exact-index owner.
         brin_scope = "post_control_cycle_history_brin"
         _record_index_heartbeat(
             store,
@@ -208,6 +193,8 @@ def _runtime_index_guard(
                 "scope": brin_scope,
                 "control_gate_released": True,
                 "background_indexes_complete": False,
+                "cycle_history_exact_index_owner": "cycle-history-index-maintenance",
+                "cycle_history_exact_index_maintained_here": False,
                 "cycle_history_index_authority_required": False,
             },
         )
@@ -222,41 +209,40 @@ def _runtime_index_guard(
         )
         round_results.append((brin_scope, brin_result))
 
-        for scope, index_specs in (
-            ("post_control_source_strategy", post_control_index_specs),
-            ("post_control_cycle_history", CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS),
-        ):
-            if stop_event.is_set():
-                return
-            _record_index_heartbeat(
+        if stop_event.is_set():
+            return
+        scope = "post_control_source_strategy"
+        _record_index_heartbeat(
+            store,
+            state="running",
+            detail={
+                "attempt": background_attempt,
+                "stage": "building_post_control_indexes",
+                "scope": scope,
+                "control_gate_released": True,
+                "background_indexes_complete": False,
+                "cycle_history_exact_index_owner": "cycle-history-index-maintenance",
+                "cycle_history_exact_index_maintained_here": False,
+                "cycle_history_index_authority_required": False,
+            },
+        )
+        result = ensure_runtime_indexes_after_api_bind(
+            store,
+            index_specs=post_control_index_specs,
+            progress=_progress_callback(
                 store,
-                state="running",
-                detail={
-                    "attempt": background_attempt,
-                    "stage": "building_post_control_indexes",
-                    "scope": scope,
-                    "control_gate_released": True,
-                    "background_indexes_complete": False,
-                    "cycle_history_index_authority_required": False,
-                },
-            )
-            result = ensure_runtime_indexes_after_api_bind(
-                store,
-                index_specs=index_specs,
-                progress=_progress_callback(
-                    store,
-                    attempt=background_attempt,
-                    scope=scope,
-                    control_gate_released=True,
-                ),
-            )
-            round_results.append((scope, result))
+                attempt=background_attempt,
+                scope=scope,
+                control_gate_released=True,
+            ),
+        )
+        round_results.append((scope, result))
 
         elapsed = max(0.0, time.monotonic() - round_started)
         failures = [
-            {"scope": scope, "result": result}
-            for scope, result in round_results
-            if not bool(result.get("complete"))
+            {"scope": scope_name, "result": scope_result}
+            for scope_name, scope_result in round_results
+            if not bool(scope_result.get("complete"))
         ]
         if not failures:
             _record_index_heartbeat(
@@ -267,9 +253,11 @@ def _runtime_index_guard(
                     "stage": "runtime_indexes_ready",
                     "scope": "post_control_background",
                     "runtime_seconds": elapsed,
-                    "results": [result for _, result in round_results],
+                    "results": [scope_result for _, scope_result in round_results],
                     "control_gate_released": True,
                     "background_indexes_complete": True,
+                    "cycle_history_exact_index_owner": "cycle-history-index-maintenance",
+                    "cycle_history_exact_index_maintained_here": False,
                     "cycle_history_index_authority_required": False,
                 },
             )
@@ -294,6 +282,8 @@ def _runtime_index_guard(
                 "retry_seconds": BACKGROUND_INDEX_RETRY_SECONDS,
                 "control_gate_released": True,
                 "background_indexes_complete": False,
+                "cycle_history_exact_index_owner": "cycle-history-index-maintenance",
+                "cycle_history_exact_index_maintained_here": False,
                 "cycle_history_index_authority_required": False,
             },
         )
