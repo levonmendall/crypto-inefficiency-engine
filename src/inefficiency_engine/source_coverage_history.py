@@ -5,13 +5,15 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Boolean, Column, Index, Integer, MetaData, String, Table, Text, func, insert, select
+from sqlalchemy import Boolean, Column, Index, Integer, MetaData, String, Table, Text, func, insert, select, update
 
 from inefficiency_engine.source_coverage import SourceCoverageSnapshot
 
 
 SOURCE_COVERAGE_HISTORY_TABLE = "source_coverage_history"
+SOURCE_COVERAGE_HISTORY_MIGRATION_TABLE = "source_coverage_history_migrations"
 SOURCE_COVERAGE_SNAPSHOT_WORKER_ID = "canonical-source-coverage-snapshot"
+MIGRATION_NAME = "worker_heartbeat_snapshot_archive"
 DEFAULT_MIGRATION_HEARTBEAT_BATCH = 250
 
 
@@ -63,6 +65,13 @@ class SourceCoverageHistoryLedger:
             Column("admitted_source_ids_json", Text, nullable=False),
             Column("payload_json", Text, nullable=False),
             Column("lineage_hash", String(64), nullable=False),
+        )
+        self.migrations = Table(
+            SOURCE_COVERAGE_HISTORY_MIGRATION_TABLE,
+            metadata,
+            Column("migration_name", String(96), primary_key=True),
+            Column("checkpoint_heartbeat_id", Integer, nullable=False),
+            Column("updated_at", Text, nullable=False),
         )
         Index(
             "ix_source_coverage_history_lane_time",
@@ -118,6 +127,25 @@ class SourceCoverageHistoryLedger:
             )
         return rows
 
+    def _insert_missing_rows(self, db: Any, rows: list[dict[str, object]]) -> int:
+        if not rows:
+            return 0
+        keys = [str(row["snapshot_key"]) for row in rows]
+        existing: set[str] = set()
+        for offset in range(0, len(keys), 500):
+            existing.update(
+                str(value)
+                for value in db.execute(
+                    select(self.rows.c.snapshot_key).where(
+                        self.rows.c.snapshot_key.in_(keys[offset : offset + 500])
+                    )
+                ).scalars()
+            )
+        pending = [row for row in rows if str(row["snapshot_key"]) not in existing]
+        if pending:
+            db.execute(insert(self.rows), pending)
+        return len(pending)
+
     def record_snapshot(
         self,
         snapshot: SourceCoverageSnapshot,
@@ -130,25 +158,16 @@ class SourceCoverageHistoryLedger:
             published_at=published_at or datetime.now(timezone.utc),
             heartbeat_id=heartbeat_id,
         )
-        if not rows:
-            return 0
-        keys = [str(row["snapshot_key"]) for row in rows]
         with self.store.engine.begin() as db:
-            existing = set(
-                db.execute(
-                    select(self.rows.c.snapshot_key).where(
-                        self.rows.c.snapshot_key.in_(keys)
-                    )
-                ).scalars()
-            )
-            pending = [row for row in rows if row["snapshot_key"] not in existing]
-            if pending:
-                db.execute(insert(self.rows), pending)
-        return len(pending)
+            return self._insert_missing_rows(db, rows)
 
-    def latest_migrated_heartbeat_id(self) -> int:
+    def migration_checkpoint(self) -> int:
         with self.store.engine.connect() as db:
-            value = db.execute(select(func.max(self.rows.c.heartbeat_id))).scalar_one_or_none()
+            value = db.execute(
+                select(self.migrations.c.checkpoint_heartbeat_id).where(
+                    self.migrations.c.migration_name == MIGRATION_NAME
+                )
+            ).scalar_one_or_none()
         return int(value or 0)
 
     def first_snapshot_at(self) -> datetime | None:
@@ -240,10 +259,10 @@ def backfill_source_coverage_history_from_heartbeats(
     start: datetime | None = None,
     max_heartbeats: int = DEFAULT_MIGRATION_HEARTBEAT_BATCH,
 ) -> dict[str, object]:
-    """Migrate a bounded checkpointed batch from the append-only heartbeat archive."""
+    """Migrate one bounded archive batch with the checkpoint in the same transaction."""
 
     ledger = SourceCoverageHistoryLedger(store)
-    checkpoint = ledger.latest_migrated_heartbeat_id()
+    checkpoint = ledger.migration_checkpoint()
     bounded = max(1, min(int(max_heartbeats), 2000))
     query = (
         select(
@@ -259,15 +278,15 @@ def backfill_source_coverage_history_from_heartbeats(
     if start is not None:
         query = query.where(store.worker_heartbeats.c.observed_at >= _utc(start).isoformat())
     with store.engine.connect() as db:
-        rows = list(db.execute(query).mappings())
+        archive_rows = list(db.execute(query).mappings())
 
-    has_more = len(rows) > bounded
-    rows = rows[:bounded]
+    has_more = len(archive_rows) > bounded
+    archive_rows = archive_rows[:bounded]
+    lane_rows: list[dict[str, object]] = []
     migrated_heartbeats = 0
-    inserted_lane_snapshots = 0
     invalid_heartbeats = 0
     latest_heartbeat_id = checkpoint
-    for row in rows:
+    for row in archive_rows:
         latest_heartbeat_id = max(latest_heartbeat_id, int(row["id"]))
         try:
             heartbeat_payload = json.loads(str(row["payload_json"]))
@@ -280,12 +299,43 @@ def backfill_source_coverage_history_from_heartbeats(
             invalid_heartbeats += 1
             continue
         published_at = _parse_time(row["observed_at"]) or snapshot.observed_at
-        inserted_lane_snapshots += ledger.record_snapshot(
-            snapshot,
-            published_at=published_at,
-            heartbeat_id=int(row["id"]),
+        lane_rows.extend(
+            ledger._snapshot_rows(
+                snapshot,
+                published_at=published_at,
+                heartbeat_id=int(row["id"]),
+            )
         )
         migrated_heartbeats += 1
+
+    inserted_lane_snapshots = 0
+    if archive_rows:
+        now_text = datetime.now(timezone.utc).isoformat()
+        with store.engine.begin() as db:
+            inserted_lane_snapshots = ledger._insert_missing_rows(db, lane_rows)
+            existing = db.execute(
+                select(ledger.migrations.c.migration_name).where(
+                    ledger.migrations.c.migration_name == MIGRATION_NAME
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                db.execute(
+                    insert(ledger.migrations),
+                    {
+                        "migration_name": MIGRATION_NAME,
+                        "checkpoint_heartbeat_id": latest_heartbeat_id,
+                        "updated_at": now_text,
+                    },
+                )
+            else:
+                db.execute(
+                    update(ledger.migrations)
+                    .where(ledger.migrations.c.migration_name == MIGRATION_NAME)
+                    .values(
+                        checkpoint_heartbeat_id=latest_heartbeat_id,
+                        updated_at=now_text,
+                    )
+                )
 
     return {
         "complete": not has_more,
@@ -304,6 +354,7 @@ def backfill_source_coverage_history_from_heartbeats(
 __all__ = [
     "DEFAULT_MIGRATION_HEARTBEAT_BATCH",
     "SOURCE_COVERAGE_HISTORY_TABLE",
+    "SOURCE_COVERAGE_HISTORY_MIGRATION_TABLE",
     "SourceCoverageHistoryLedger",
     "backfill_source_coverage_history_from_heartbeats",
     "persist_source_coverage_history_snapshot",
