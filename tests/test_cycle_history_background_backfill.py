@@ -52,12 +52,12 @@ def test_non_control_call_still_owns_normal_double_buffer_refresh(monkeypatch):
     assert result == expected
 
 
-def test_background_bucket_gets_longer_but_finite_database_budget():
+def test_background_bucket_gets_longer_but_finite_database_budget_and_bounded_batch():
     assert backfill._postgres_background_timeout_statements() == (
         "SET LOCAL statement_timeout = 60000",
         "SET LOCAL lock_timeout = 5000",
     )
-    assert backfill.BACKGROUND_BUCKET_QUERY_CAP == 1
+    assert backfill.BACKGROUND_BUCKET_QUERY_CAP == 32
     assert backfill.BACKGROUND_BUCKET_STATEMENT_TIMEOUT_SECONDS == 60.0
 
 
@@ -67,14 +67,15 @@ def test_background_backfill_is_disposable_and_heavy_lease_serialized():
     assert "HeavyWorkLeaseLedger" in source
     assert 'lease.next_sequence("cycle_history")' in source
     assert "advance_durable_control_cycle_history_cache" in source
-    assert "BACKGROUND_BUCKET_QUERY_CAP" not in source
+    assert "_bounded_background_batch" in source
     assert '"provider_requests_allowed": False' not in source
 
 
-def test_background_supervisor_has_external_deadline_and_reclaimed_process_boundary():
+def test_background_supervisor_has_external_deadline_and_fair_research_window():
     source = inspect.getsource(supervisor.run_cycle_history_background_supervisor)
 
     assert supervisor.BACKFILL_EXECUTOR_DEADLINE_SECONDS == 90.0
+    assert supervisor.BACKFILL_SUCCESS_INTERVAL_SECONDS == 30.0
     assert "instance_memory_snapshot" in source
     assert "subprocess.Popen(BACKFILL_COMMAND)" in source
     assert "_terminate(child)" in source
@@ -83,13 +84,17 @@ def test_background_supervisor_has_external_deadline_and_reclaimed_process_bound
     )
 
 
-def test_production_entrypoint_starts_cycle_history_background_supervisor():
+def test_production_entrypoint_starts_history_and_projection_supervisors():
     source = inspect.getsource(entrypoint.main)
 
     assert "run_cycle_history_background_supervisor" in source
     assert 'name="cycle-history-background-supervisor"' in source
     assert "cycle_history_guard.start()" in source
     assert "cycle_history_guard.join" in source
+    assert "run_research_projection_supervisor" in source
+    assert 'name="research-projection-refresh-supervisor"' in source
+    assert "research_projection_guard.start()" in source
+    assert "research_projection_guard.join" in source
 
 
 def test_health_exposes_cycle_history_background_worker():

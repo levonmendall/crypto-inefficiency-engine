@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from collections.abc import Callable, Mapping
@@ -55,12 +56,13 @@ ProgressCallback = Callable[[dict[str, object]], None]
 POSTGRES_INDEX_STATEMENT_TIMEOUT_MS = 30_000
 CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS = 120_000
 POSTGRES_INDEX_LOCK_TIMEOUT_MS = 5_000
+POSTGRES_IDENTIFIER_MAX_BYTES = 63
 
 # Interrupted CREATE INDEX CONCURRENTLY statements can leave invalid catalog entries.
 # Replacement names are intentionally dynamic rather than a fixed _v2/_v3/_v4 set:
 # every retry discovers already-used versions from pg_catalog and advances to a fresh
 # deterministic suffix. Invalid predecessors are never dropped on the authority path.
-_REPLACEMENT_VERSION_RE = re.compile(r"_v(?P<version>[2-9][0-9]*)$")
+_REPLACEMENT_VERSION_RE = re.compile(r"_v(?P<version>(?:[2-9]|[1-9][0-9]+))$")
 
 
 class RuntimeIndexVerificationError(RuntimeError):
@@ -69,6 +71,37 @@ class RuntimeIndexVerificationError(RuntimeError):
 
 def _index_name(table_name: str, columns: tuple[str, ...]) -> str:
     return f"ix_runtime_{table_name}_{'_'.join(columns)}"
+
+
+def _postgres_canonical_index_name(index_name: str) -> str:
+    """Return the physical canonical name PostgreSQL already uses.
+
+    PostgreSQL truncates unquoted identifiers to 63 bytes. Runtime index names are
+    ASCII, so matching that truncation explicitly lets catalog verification address the
+    same physical relation that older releases may already have created.
+    """
+
+    return index_name[:POSTGRES_IDENTIFIER_MAX_BYTES]
+
+
+def _postgres_replacement_index_name(index_name: str, version: int) -> str:
+    """Build a deterministic versioned name whose suffix survives PostgreSQL truncation.
+
+    Older code appended ``_vN`` to names that were already near 63 bytes. PostgreSQL
+    silently truncated the suffix, so every retry could target the same relation and
+    surface a repeated ``ProgrammingError``. Preserve short historical names exactly;
+    for long names reserve room for a compact hash plus the version suffix.
+    """
+
+    canonical = _postgres_canonical_index_name(index_name)
+    suffix = f"_v{int(version)}"
+    direct = f"{canonical}{suffix}"
+    if len(direct) <= POSTGRES_IDENTIFIER_MAX_BYTES:
+        return direct
+    digest = hashlib.sha1(canonical.encode("ascii")).hexdigest()[:8]
+    reserved = len(digest) + len(suffix) + 1
+    prefix_length = max(1, POSTGRES_IDENTIFIER_MAX_BYTES - reserved)
+    return f"{canonical[:prefix_length]}_{digest}{suffix}"
 
 
 def _create_index_sql(
@@ -116,6 +149,18 @@ def _postgres_index_is_usable(state: dict[str, bool] | None) -> bool:
     return bool(state is not None and state.get("valid") and state.get("ready"))
 
 
+def _replacement_version(index_name: str, replacement_name: str) -> int | None:
+    match = _REPLACEMENT_VERSION_RE.search(replacement_name)
+    if match is None:
+        return None
+    version = int(match.group("version"))
+    return (
+        version
+        if replacement_name == _postgres_replacement_index_name(index_name, version)
+        else None
+    )
+
+
 def _postgres_replacement_index_states(
     db: Any,
     *,
@@ -123,12 +168,14 @@ def _postgres_replacement_index_states(
 ) -> dict[str, dict[str, bool]]:
     """Return existing versioned replacements for one canonical runtime index.
 
-    Query pg_catalog by a literal prefix so underscores in the canonical index name are
-    not treated as LIKE wildcards. Unknown similarly-prefixed names are ignored unless
-    their suffix is exactly ``_vN`` with N >= 2.
+    Long replacements may contain a compact hash before ``_vN`` so the version suffix
+    survives PostgreSQL's 63-byte identifier limit. Query by a conservative literal
+    canonical prefix, then accept only names that exactly match the deterministic naming
+    function for their parsed version.
     """
 
-    prefix = f"{index_name}_v"
+    canonical = _postgres_canonical_index_name(index_name)
+    prefix = canonical[: min(len(canonical), 40)]
     rows = (
         db.execute(
             text(
@@ -147,23 +194,13 @@ def _postgres_replacement_index_states(
     states: dict[str, dict[str, bool]] = {}
     for row in rows:
         name = str(row.get("name") or "")
-        suffix = name[len(index_name) :]
-        if not _REPLACEMENT_VERSION_RE.fullmatch(suffix):
+        if _replacement_version(canonical, name) is None:
             continue
         states[name] = {
             "valid": bool(row.get("valid")),
             "ready": bool(row.get("ready")),
         }
     return states
-
-
-def _replacement_version(index_name: str, replacement_name: str) -> int | None:
-    if not replacement_name.startswith(index_name):
-        return None
-    match = _REPLACEMENT_VERSION_RE.fullmatch(replacement_name[len(index_name) :])
-    if match is None:
-        return None
-    return int(match.group("version"))
 
 
 def _next_replacement_index_name(
@@ -177,7 +214,7 @@ def _next_replacement_index_name(
         if (version := _replacement_version(index_name, name)) is not None
     ]
     next_version = max(versions, default=1) + 1
-    return f"{index_name}_v{next_version}"
+    return _postgres_replacement_index_name(index_name, next_version)
 
 
 def _usable_replacement_index_name(
@@ -264,14 +301,16 @@ def _ensure_postgres_index(
     Missing indexes are built under finite statement/lock deadlines. If an interrupted
     concurrent build left the canonical name invalid, do not DROP it on the control-gate
     path. Discover every existing ``_vN`` replacement in pg_catalog, reuse the newest
-    planner-usable one, or create the next unused version. This means repeated cancelled
-    builds cannot permanently exhaust a fixed replacement-name set.
+    planner-usable one, or create the next unused version. Replacement names explicitly
+    reserve room for the version suffix so PostgreSQL identifier truncation cannot turn
+    repeated repairs into duplicate-relation ProgrammingErrors.
 
     A valid replacement has identical columns and therefore satisfies the required access
     path. Obsolete invalid catalog objects remain explicitly deferred for later fail-soft
     reclamation after canonical control is operating.
     """
 
+    index_name = _postgres_canonical_index_name(index_name)
     state = _postgres_index_state(db, index_name=index_name)
     if _postgres_index_is_usable(state):
         return _verified_index_result(
@@ -430,7 +469,12 @@ def ensure_runtime_indexes_after_api_bind(
     for table_name, columns in requested.items():
         if table_name not in available:
             continue
-        index_name = _index_name(table_name, columns)
+        logical_index_name = _index_name(table_name, columns)
+        index_name = (
+            _postgres_canonical_index_name(logical_index_name)
+            if dialect_name == "postgresql"
+            else logical_index_name
+        )
         started = time.monotonic()
         actual_columns = {
             str(row.get("name"))
@@ -441,6 +485,7 @@ def ensure_runtime_indexes_after_api_bind(
         if missing_columns:
             row = {
                 "index": index_name,
+                "logical_index": logical_index_name,
                 "table": table_name,
                 "runtime_seconds": max(0.0, time.monotonic() - started),
                 "concurrent": dialect_name == "postgresql",
@@ -476,6 +521,7 @@ def ensure_runtime_indexes_after_api_bind(
                 {
                     "phase": "starting",
                     "index": index_name,
+                    "logical_index": logical_index_name,
                     "table": table_name,
                     "concurrent": dialect_name == "postgresql",
                     "schema_compatible": True,
@@ -502,6 +548,7 @@ def ensure_runtime_indexes_after_api_bind(
                     db.execute(text(statement))
             row = {
                 "index": index_name,
+                "logical_index": logical_index_name,
                 "table": table_name,
                 "runtime_seconds": max(0.0, time.monotonic() - started),
                 "concurrent": dialect_name == "postgresql",
@@ -515,6 +562,7 @@ def ensure_runtime_indexes_after_api_bind(
         except Exception as exc:
             failure = {
                 "index": index_name,
+                "logical_index": logical_index_name,
                 "table": table_name,
                 "runtime_seconds": max(0.0, time.monotonic() - started),
                 "concurrent": dialect_name == "postgresql",
@@ -538,4 +586,7 @@ def ensure_runtime_indexes_after_api_bind(
         "startup_critical_path": False,
         "api_bound_before_maintenance": True,
         "postgres_index_validity_verified": dialect_name == "postgresql",
+        "postgres_identifier_limit_bytes": (
+            POSTGRES_IDENTIFIER_MAX_BYTES if dialect_name == "postgresql" else None
+        ),
     }

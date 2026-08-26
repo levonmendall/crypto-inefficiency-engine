@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import inefficiency_engine.critical_evidence_recovery as recovery_module
 from inefficiency_engine.critical_evidence_recovery import (
     ALPHA_L2_WORKER_ID,
+    DEFAULT_ALPHA_FORWARD_RECOVERY_STALE_SECONDS,
     DEFAULT_CRITICAL_EVIDENCE_RECOVERY_STALE_SECONDS,
     DEFAULT_SOURCE_TRUTH_RETRY_COOLDOWN_SECONDS,
     MECHANISM_FORWARD_WORKER_ID,
@@ -58,6 +59,7 @@ def _stale_truth():
 
 def test_default_recovery_windows_match_production_freshness_contract():
     assert DEFAULT_CRITICAL_EVIDENCE_RECOVERY_STALE_SECONDS == 180.0
+    assert DEFAULT_ALPHA_FORWARD_RECOVERY_STALE_SECONDS == 1200.0
     assert DEFAULT_SOURCE_TRUTH_RETRY_COOLDOWN_SECONDS == 60.0
 
 
@@ -92,6 +94,37 @@ def test_stale_source_worker_forces_source_recovery_at_dashboard_sla():
     assert status["alpha_forward_required"] is False
     assert status["workers"]["source_refresh"]["reason"] == "grossly_stale"
     assert status["workers"]["source_refresh"]["recovery_after_seconds"] == 180.0
+
+
+def test_fresh_l2_cannot_mask_stale_alpha_forward_completion(monkeypatch):
+    monkeypatch.setattr(
+        recovery_module,
+        "_alpha_forward_status",
+        lambda store, now, stale_after_seconds: {
+            "worker_id": "shadow-research-auxiliary",
+            "signal": "alpha_forward_evidence_cycle_id",
+            "available": True,
+            "recovery_required": True,
+            "reason": "alpha_forward_marker_stale",
+            "age_seconds": 6 * 24 * 60 * 60,
+            "recovery_after_seconds": stale_after_seconds,
+        },
+    )
+    store = FakeStore(
+        {
+            SOURCE_REFRESH_WORKER_ID: _heartbeat(age_seconds=30),
+            ALPHA_L2_WORKER_ID: _heartbeat(age_seconds=5),
+            MECHANISM_FORWARD_WORKER_ID: _heartbeat(age_seconds=30),
+        }
+    )
+
+    status = critical_evidence_recovery_status(store, now=NOW)
+
+    assert status["workers"]["alpha_l2_sampling"]["recovery_required"] is False
+    assert status["workers"]["alpha_forward"]["reason"] == "alpha_forward_marker_stale"
+    assert status["alpha_forward_required"] is True
+    assert status["alpha_forward_completion_signal"].endswith("alpha_forward_evidence_cycle_id")
+    assert status["qualification_thresholds_unchanged"] is True
 
 
 def test_stale_mechanism_worker_does_not_force_disposable_alpha_recovery():

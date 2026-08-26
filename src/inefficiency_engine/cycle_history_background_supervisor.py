@@ -16,7 +16,10 @@ BACKFILL_COMMAND = [
     "inefficiency_engine.cycle_history_background_backfill",
 ]
 BACKFILL_EXECUTOR_DEADLINE_SECONDS = 90.0
-BACKFILL_SUCCESS_INTERVAL_SECONDS = 5.0
+# The backfill child now advances a bounded batch rather than one bucket. Leave an
+# explicit window after each successful batch so scheduled research/alpha work can win
+# the shared heavy-work lease instead of being repeatedly raced by a five-second loop.
+BACKFILL_SUCCESS_INTERVAL_SECONDS = 30.0
 BACKFILL_FAILURE_RETRY_SECONDS = 15.0
 BACKFILL_MEMORY_RETRY_SECONDS = 15.0
 API_BIND_POLL_SECONDS = 2.0
@@ -51,11 +54,11 @@ def _terminate(child: subprocess.Popen[bytes], *, grace_seconds: float = 5.0) ->
 def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None:
     """Run exact history maintenance in short-lived, memory-reclaiming children.
 
-    The coordinator stays lightweight.  Each child acquires the existing heavy-work
-    lease, advances one durable history bucket with a longer bounded DB timeout, then
-    exits completely.  This keeps raw historical reconstruction out of the 25-second
-    canonical-control executor and prevents it from competing with research/history
-    heavy jobs for memory at the same instant.
+    The coordinator stays lightweight. Each child acquires the existing heavy-work
+    lease, advances a bounded durable history batch, checkpoints each completed bucket,
+    and exits completely. The post-success yield gives disposable research a fair lease
+    window while still advancing the 180-day frozen target much faster than the former
+    one-bucket-per-process design.
     """
 
     port = os.getenv("PORT", "10000")
@@ -118,5 +121,6 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
 __all__ = [
     "BACKFILL_COMMAND",
     "BACKFILL_EXECUTOR_DEADLINE_SECONDS",
+    "BACKFILL_SUCCESS_INTERVAL_SECONDS",
     "run_cycle_history_background_supervisor",
 ]

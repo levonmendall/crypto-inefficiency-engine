@@ -10,6 +10,9 @@ from inefficiency_engine.candidate_observatory_backfill_supervisor import (
 from inefficiency_engine.cycle_history_background_supervisor import (
     run_cycle_history_background_supervisor,
 )
+from inefficiency_engine.research_projection_supervisor import (
+    run_research_projection_supervisor,
+)
 
 
 SOURCE_REPAIR_COMMAND = [
@@ -93,14 +96,22 @@ def main() -> int:
         name="candidate-observatory-backfill-supervisor",
         daemon=True,
     )
+    research_projection_guard = threading.Thread(
+        target=run_research_projection_supervisor,
+        args=(stop_event,),
+        name="research-projection-refresh-supervisor",
+        daemon=True,
+    )
     cycle_history_guard.start()
     observatory_backfill_guard.start()
+    research_projection_guard.start()
     try:
         return base.main()
     finally:
         stop_event.set()
         cycle_history_guard.join(timeout=10.0)
         observatory_backfill_guard.join(timeout=10.0)
+        research_projection_guard.join(timeout=10.0)
 
 
 if __name__ == "__main__":
