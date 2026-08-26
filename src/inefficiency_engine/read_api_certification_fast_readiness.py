@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import select, union_all
 
 from inefficiency_engine import read_api_active_volume_deploy as active
 from inefficiency_engine.evidence import WorkerHeartbeat
 
 
 BATCHED_HEARTBEAT_READ = True
+LATEST_HEARTBEAT_QUERY_STRATEGY = "targeted_latest_per_worker_union"
 
 # Certification consumes only durable worker publications. Keep every worker needed by
 # the E2E truth composition in the same latest-heartbeat query so the HTTP request does
@@ -34,26 +35,32 @@ def _certification_heartbeat_mapping() -> dict[str, str]:
 
 
 def _latest_heartbeats(store, worker_ids: list[str]) -> dict[str, WorkerHeartbeat]:
-    """Read the latest durable heartbeat for all requested workers in one query."""
+    """Read newest requested worker rows in one round trip using targeted index seeks.
+
+    A grouped ``MAX(id)`` over the append-only heartbeat ledger can scan a large portion
+    of the table before PostgreSQL applies the request's short read deadline. Build one
+    bounded newest-row subquery per requested worker instead. The outer ``UNION ALL`` is
+    still one database statement/round trip, while ``worker_heartbeats(worker_id, id)``
+    gives the planner a direct access path for each ``ORDER BY id DESC LIMIT 1`` lookup.
+    """
 
     ordered_ids = list(dict.fromkeys(str(worker_id) for worker_id in worker_ids if worker_id))
     if not ordered_ids:
         return {}
 
     rows = store.worker_heartbeats
-    latest_ids = (
-        select(
-            rows.c.worker_id.label("worker_id"),
-            func.max(rows.c.id).label("id"),
+    targeted = []
+    for worker_id in ordered_ids:
+        latest = (
+            select(rows.c.worker_id, rows.c.payload_json)
+            .where(rows.c.worker_id == worker_id)
+            .order_by(rows.c.id.desc())
+            .limit(1)
+            .subquery()
         )
-        .where(rows.c.worker_id.in_(ordered_ids))
-        .group_by(rows.c.worker_id)
-        .subquery()
-    )
-    query = (
-        select(rows.c.worker_id, rows.c.payload_json)
-        .join(latest_ids, rows.c.id == latest_ids.c.id)
-    )
+        targeted.append(select(latest.c.worker_id, latest.c.payload_json))
+    query = targeted[0] if len(targeted) == 1 else union_all(*targeted)
+
     with store.engine.connect() as db:
         payload_rows = list(db.execute(query).mappings())
 
@@ -80,6 +87,7 @@ def _runtime_heartbeats() -> dict[str, object]:
             "workers": {},
             "reason": "evidence persistence is not configured",
             "batched_latest_heartbeat_read": True,
+            "heartbeat_query_strategy": LATEST_HEARTBEAT_QUERY_STRATEGY,
         }
 
     now = datetime.now(timezone.utc)
@@ -94,12 +102,18 @@ def _runtime_heartbeats() -> dict[str, object]:
         ),
     )
     mapping = _certification_heartbeat_mapping()
+    batch_error: dict[str, object] | None = None
     try:
         latest = _latest_heartbeats(store, list(mapping.values()))
-        batch_error_type = None
     except Exception as exc:
         latest = {}
-        batch_error_type = type(exc).__name__
+        batch_error = {
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:1000],
+            "query_strategy": LATEST_HEARTBEAT_QUERY_STRATEGY,
+            "retryable": True,
+            "certification_authority": False,
+        }
 
     workers: dict[str, object] = {}
     for label, worker_id in mapping.items():
@@ -112,8 +126,10 @@ def _runtime_heartbeats() -> dict[str, object]:
             workers[label] = {
                 "worker_id": worker_id,
                 "available": False,
-                "state": "unavailable" if batch_error_type else "unobserved",
-                "error_type": batch_error_type,
+                "state": "unavailable" if batch_error else "unobserved",
+                "error_type": batch_error.get("error_type") if batch_error else None,
+                "error_message": batch_error.get("message") if batch_error else None,
+                "heartbeat_query_strategy": LATEST_HEARTBEAT_QUERY_STRATEGY,
                 "stale_after_seconds": worker_stale_seconds,
             }
             continue
@@ -228,6 +244,9 @@ def _runtime_heartbeats() -> dict[str, object]:
         "diagnostic_only": True,
         "batched_latest_heartbeat_read": True,
         "heartbeat_query_count": 1,
+        "heartbeat_query_strategy": LATEST_HEARTBEAT_QUERY_STRATEGY,
+        "heartbeat_query_failed": batch_error is not None,
+        "batch_error": batch_error,
         "certification_worker_count": len(mapping),
     }
 
@@ -254,6 +273,7 @@ def deployment_readiness() -> dict[str, object]:
 
 __all__ = [
     "BATCHED_HEARTBEAT_READ",
+    "LATEST_HEARTBEAT_QUERY_STRATEGY",
     "_certification_heartbeat_mapping",
     "_latest_heartbeats",
     "_runtime_heartbeats",

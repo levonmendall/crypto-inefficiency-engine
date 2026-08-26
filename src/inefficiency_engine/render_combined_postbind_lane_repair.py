@@ -81,14 +81,14 @@ def install_control_truth_command() -> None:
 
 
 def install_worker_heartbeat_read_index() -> None:
-    """Add the latest-worker read index to deferred generic index maintenance.
+    """Keep the latest-worker index in the dedicated priority post-bind scope.
 
-    Certification reads the append-only heartbeat ledger by worker id and newest row id.
-    This composite index is a read optimization only: it is post-bind, non-authoritative,
-    and independent of the dedicated exact cycle-history index owner.
+    The index is no longer appended to the generic background queue. It remains
+    non-authoritative and post-bind, but is attempted before unrelated BRIN/source/
+    strategy DDL so certification can use targeted newest-row seeks promptly.
     """
 
-    base.BACKGROUND_INDEX_SPECS.update(WORKER_HEARTBEAT_READ_INDEX_SPEC)
+    base.PRIORITY_READ_INDEX_SPECS.update(WORKER_HEARTBEAT_READ_INDEX_SPEC)
 
 
 def install_research_observability_heavy_command() -> None:
