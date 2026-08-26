@@ -9,6 +9,7 @@ from sqlalchemy import inspect, text
 
 from inefficiency_engine.historical_raw_lane_evidence import recover_raw_lane_history
 from inefficiency_engine.source_coverage_catalog import LANES, SOURCES
+from inefficiency_engine.source_coverage_history import SourceCoverageHistoryLedger
 
 
 DEFAULT_CACHE_SECONDS = 300.0
@@ -51,6 +52,7 @@ def _empty_state() -> dict[str, object]:
         "source_ids": set(),
         "evidence_classes": set(),
         "source_ledgers": set(),
+        "canonical_snapshot_count": 0,
         "operating_count": 0,
         "operating_earliest": None,
         "operating_latest": None,
@@ -69,9 +71,11 @@ def _empty_history() -> dict[str, dict[str, object]]:
 
 def _merge_source_state(state: dict[str, object], recovered: dict[str, object]) -> None:
     count = int(recovered.get("source_count") or 0)
-    if count <= 0:
-        return
+    snapshot_count = int(recovered.get("canonical_snapshot_count") or 0)
     state["source_count"] = int(state.get("source_count") or 0) + count
+    state["canonical_snapshot_count"] = int(
+        state.get("canonical_snapshot_count") or 0
+    ) + snapshot_count
     earliest = recovered.get("source_earliest")
     latest = recovered.get("source_latest")
     current_earliest = state.get("source_earliest")
@@ -139,12 +143,7 @@ def _read_bounded_source_history(
     end: datetime,
     limit: int,
 ) -> dict[str, dict[str, object]]:
-    """Read only the newest bounded canonical source-coverage rows.
-
-    This supplements aggregate raw-ledger reconstruction with the canonical source
-    snapshots that are closest to the current boundary. It is intentionally bounded so
-    an HTTP request never walks the entire append-only source ledger.
-    """
+    """Legacy pre-canonical source observations, bounded and fail-closed."""
 
     result = _empty_history()
     available = set(inspect(store.engine).get_table_names())
@@ -293,8 +292,15 @@ def _lane_row(lane_id: str, state: dict[str, object]) -> dict[str, object]:
         if isinstance(value, datetime)
     ]
     source_count = int(state.get("source_count") or 0)
+    snapshot_count = int(state.get("canonical_snapshot_count") or 0)
     operating_count = int(state.get("operating_count") or 0)
-    has_history = bool(source_count or operating_count or earliest_candidates or latest_candidates)
+    has_history = bool(
+        source_count
+        or snapshot_count
+        or operating_count
+        or earliest_candidates
+        or latest_candidates
+    )
     recovered_count = len(required & recovered)
     required_count = len(required)
     return {
@@ -307,6 +313,7 @@ def _lane_row(lane_id: str, state: dict[str, object]) -> dict[str, object]:
         "evidence_class_fill_ratio": (
             float(recovered_count) / float(required_count) if required_count else 1.0
         ),
+        "canonical_source_snapshot_count": snapshot_count,
         "recovered_source_observations": source_count,
         "recovered_operating_snapshots": operating_count,
         "earliest_recovered_at": (
@@ -348,41 +355,59 @@ def build_durable_lane_history(
     source_row_limit: int = DEFAULT_SOURCE_ROW_LIMIT,
     operating_row_limit: int = DEFAULT_OPERATING_ROW_LIMIT,
 ) -> dict[str, object]:
-    """Summarize durable lane evidence without putting an unbounded scan on HTTP.
-
-    The canonical 13-lane shell is always returned, including every lane's required
-    evidence-class denominator. Raw append-only ledgers are recovered with aggregate
-    SQL where possible, while canonical source and operating snapshots are read only
-    from bounded recent tails. Any failed recovery stage is diagnostic and fail-soft:
-    missing data remains missing and can never create forward, qualification,
-    allocation, or execution authority.
-    """
+    """Read canonical lane history first; reconstruct only the pre-canonical gap."""
 
     start = _utc(start)
     end = _utc(end or datetime.now(timezone.utc))
     persisted = _empty_history()
     read_errors: list[dict[str, str]] = []
+    first_canonical_snapshot: datetime | None = None
 
     try:
-        raw_history = recover_raw_lane_history(store, start=start, boundary=end)
-        for lane_id, recovered in raw_history.items():
+        ledger = SourceCoverageHistoryLedger(store)
+        first_canonical_snapshot = ledger.first_snapshot_at()
+        canonical_history = ledger.summary(start=start, end=end)
+        for lane_id, recovered in canonical_history.items():
             if lane_id in persisted:
                 _merge_source_state(persisted[lane_id], recovered)
     except Exception as exc:
-        read_errors.append({"stage": "raw_aggregate_history", "error_type": type(exc).__name__})
-
-    try:
-        bounded_sources = _read_bounded_source_history(
-            store,
-            start=start,
-            end=end,
-            limit=source_row_limit,
+        read_errors.append(
+            {"stage": "canonical_source_coverage_history", "error_type": type(exc).__name__}
         )
-        for lane_id, recovered in bounded_sources.items():
-            if lane_id in persisted:
-                _merge_source_state(persisted[lane_id], recovered)
-    except Exception as exc:
-        read_errors.append({"stage": "bounded_source_history", "error_type": type(exc).__name__})
+
+    prehistory_end = end
+    if first_canonical_snapshot is not None:
+        prehistory_end = min(end, max(start, first_canonical_snapshot))
+
+    if prehistory_end > start:
+        try:
+            raw_history = recover_raw_lane_history(
+                store,
+                start=start,
+                boundary=prehistory_end,
+            )
+            for lane_id, recovered in raw_history.items():
+                if lane_id in persisted:
+                    _merge_source_state(persisted[lane_id], recovered)
+        except Exception as exc:
+            read_errors.append(
+                {"stage": "raw_precanonical_history", "error_type": type(exc).__name__}
+            )
+
+        try:
+            legacy_sources = _read_bounded_source_history(
+                store,
+                start=start,
+                end=prehistory_end,
+                limit=source_row_limit,
+            )
+            for lane_id, recovered in legacy_sources.items():
+                if lane_id in persisted:
+                    _merge_source_state(persisted[lane_id], recovered)
+        except Exception as exc:
+            read_errors.append(
+                {"stage": "legacy_source_prehistory", "error_type": type(exc).__name__}
+            )
 
     try:
         bounded_operating = _read_bounded_operating_history(
@@ -408,7 +433,9 @@ def build_durable_lane_history(
             ):
                 state[key] = int(recovered.get(key) or 0)
     except Exception as exc:
-        read_errors.append({"stage": "bounded_operating_history", "error_type": type(exc).__name__})
+        read_errors.append(
+            {"stage": "bounded_operating_history", "error_type": type(exc).__name__}
+        )
 
     lanes = {
         lane_id: _lane_row(lane_id, persisted.get(lane_id, _empty_state()))
@@ -421,6 +448,11 @@ def build_durable_lane_history(
     return {
         "history_start": start.isoformat(),
         "history_end": end.isoformat(),
+        "canonical_history_started_at": (
+            first_canonical_snapshot.isoformat()
+            if first_canonical_snapshot is not None
+            else None
+        ),
         "lane_count": len(lanes),
         "lanes_with_durable_history": available,
         "lanes_without_durable_history": len(lanes) - available,
@@ -428,12 +460,12 @@ def build_durable_lane_history(
         "lanes": lanes,
         "read_degraded": bool(read_errors),
         "read_errors": read_errors,
-        "read_model": "raw_aggregate_plus_bounded_recent_tails",
+        "read_model": "canonical_source_coverage_history_plus_precanonical_recovery",
         "bounded_source_row_limit": max(1, min(int(source_row_limit), 10000)),
         "bounded_operating_row_limit": max(1, min(int(operating_row_limit), 5000)),
         "history_contract": (
-            "all trustworthy recoverable persisted evidence since history_start; "
-            "canonical source and operating tails are bounded for HTTP safety; "
+            "canonical append-only source-coverage history is authoritative after its "
+            "first snapshot; raw/provider reconstruction is used only before that point; "
             "post-live evidence does not certify the strict pre-live backfill"
         ),
         "candidate_level_history_synthesized": False,
