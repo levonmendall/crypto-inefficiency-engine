@@ -71,6 +71,7 @@ class SourceCoverageHistoryLedger:
             metadata,
             Column("migration_name", String(96), primary_key=True),
             Column("checkpoint_heartbeat_id", Integer, nullable=False),
+            Column("complete", Boolean, nullable=False),
             Column("updated_at", Text, nullable=False),
         )
         Index(
@@ -161,14 +162,26 @@ class SourceCoverageHistoryLedger:
         with self.store.engine.begin() as db:
             return self._insert_missing_rows(db, rows)
 
-    def migration_checkpoint(self) -> int:
+    def migration_status(self) -> dict[str, object]:
         with self.store.engine.connect() as db:
-            value = db.execute(
-                select(self.migrations.c.checkpoint_heartbeat_id).where(
-                    self.migrations.c.migration_name == MIGRATION_NAME
-                )
-            ).scalar_one_or_none()
-        return int(value or 0)
+            row = db.execute(
+                select(
+                    self.migrations.c.checkpoint_heartbeat_id,
+                    self.migrations.c.complete,
+                    self.migrations.c.updated_at,
+                ).where(self.migrations.c.migration_name == MIGRATION_NAME)
+            ).mappings().first()
+        if row is None:
+            return {
+                "checkpoint_heartbeat_id": 0,
+                "complete": False,
+                "updated_at": None,
+            }
+        return {
+            "checkpoint_heartbeat_id": int(row["checkpoint_heartbeat_id"] or 0),
+            "complete": bool(row["complete"]),
+            "updated_at": row["updated_at"],
+        }
 
     def first_snapshot_at(self) -> datetime | None:
         with self.store.engine.connect() as db:
@@ -262,7 +275,8 @@ def backfill_source_coverage_history_from_heartbeats(
     """Migrate one bounded archive batch with the checkpoint in the same transaction."""
 
     ledger = SourceCoverageHistoryLedger(store)
-    checkpoint = ledger.migration_checkpoint()
+    status = ledger.migration_status()
+    checkpoint = int(status["checkpoint_heartbeat_id"] or 0)
     bounded = max(1, min(int(max_heartbeats), 2000))
     query = (
         select(
@@ -308,37 +322,34 @@ def backfill_source_coverage_history_from_heartbeats(
         )
         migrated_heartbeats += 1
 
-    inserted_lane_snapshots = 0
-    if archive_rows:
-        now_text = datetime.now(timezone.utc).isoformat()
-        with store.engine.begin() as db:
-            inserted_lane_snapshots = ledger._insert_missing_rows(db, lane_rows)
-            existing = db.execute(
-                select(ledger.migrations.c.migration_name).where(
-                    ledger.migrations.c.migration_name == MIGRATION_NAME
-                )
-            ).scalar_one_or_none()
-            if existing is None:
-                db.execute(
-                    insert(ledger.migrations),
-                    {
-                        "migration_name": MIGRATION_NAME,
-                        "checkpoint_heartbeat_id": latest_heartbeat_id,
-                        "updated_at": now_text,
-                    },
-                )
-            else:
-                db.execute(
-                    update(ledger.migrations)
-                    .where(ledger.migrations.c.migration_name == MIGRATION_NAME)
-                    .values(
-                        checkpoint_heartbeat_id=latest_heartbeat_id,
-                        updated_at=now_text,
-                    )
-                )
+    migration_complete = not has_more
+    now_text = datetime.now(timezone.utc).isoformat()
+    with store.engine.begin() as db:
+        inserted_lane_snapshots = ledger._insert_missing_rows(db, lane_rows)
+        existing = db.execute(
+            select(ledger.migrations.c.migration_name).where(
+                ledger.migrations.c.migration_name == MIGRATION_NAME
+            )
+        ).scalar_one_or_none()
+        values = {
+            "checkpoint_heartbeat_id": latest_heartbeat_id,
+            "complete": migration_complete,
+            "updated_at": now_text,
+        }
+        if existing is None:
+            db.execute(
+                insert(ledger.migrations),
+                {"migration_name": MIGRATION_NAME, **values},
+            )
+        else:
+            db.execute(
+                update(ledger.migrations)
+                .where(ledger.migrations.c.migration_name == MIGRATION_NAME)
+                .values(**values)
+            )
 
     return {
-        "complete": not has_more,
+        "complete": migration_complete,
         "checkpoint_heartbeat_id": latest_heartbeat_id,
         "migrated_heartbeats": migrated_heartbeats,
         "inserted_lane_snapshots": inserted_lane_snapshots,
