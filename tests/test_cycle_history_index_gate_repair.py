@@ -191,9 +191,9 @@ def test_disposable_strategy_cache_reports_uninitialized_not_failed(monkeypatch)
     assert status["strategy"]["uninitialized_is_not_durable_cache_failure"] is True
 
 
-def test_production_entrypoint_wires_repaired_history_api_and_control_executor():
+def test_production_entrypoint_wires_repaired_history_and_control_executor():
     assert entrypoint.BOUNDED_HEARTBEAT_API_APP == (
-        "inefficiency_engine.read_api_cycle_history_truth_repair:app"
+        "inefficiency_engine.read_api_liveness_deploy:app"
     )
     assert entrypoint.CONTROL_TRUTH_COMMAND[-1] == (
         "inefficiency_engine.permanent_control_worker_truth_repair"
