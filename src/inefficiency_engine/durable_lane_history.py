@@ -5,18 +5,23 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 
-from inefficiency_engine.historical_raw_lane_evidence import recover_raw_lane_history
+from inefficiency_engine.candidate_observatory_historical_replay import REPLAY_WORKER_ID
+from inefficiency_engine.historical_raw_lane_evidence import recover_raw_lane_history  # compatibility only; never called on the HTTP path
 from inefficiency_engine.source_coverage_catalog import LANES, SOURCES
 from inefficiency_engine.source_coverage_history import SourceCoverageHistoryLedger
 
 
-DEFAULT_CACHE_SECONDS = 300.0
+# Keep the dashboard fresh enough to reveal a completed migration/materialization on the
+# next normal browser refresh. The old five-minute cache hid successful repairs.
+DEFAULT_CACHE_SECONDS = 30.0
 DEFAULT_SOURCE_ROW_LIMIT = 3000
 DEFAULT_OPERATING_ROW_LIMIT = 1000
+MATERIALIZED_PREHISTORY_HEARTBEAT_LIMIT = 32
 SOURCE_COVERAGE_TABLE = "source_coverage_observations"
 OPERATING_TABLE = "operating_certification_snapshots"
+MATERIALIZED_PREHISTORY_LEDGER = "candidate_observatory_lane_coverage_heartbeat"
 _CACHE_LOCK = threading.Lock()
 _CACHE: dict[tuple[int, str], tuple[float, dict[str, object]]] = {}
 
@@ -70,12 +75,12 @@ def _empty_history() -> dict[str, dict[str, object]]:
 
 
 def _merge_source_state(state: dict[str, object], recovered: dict[str, object]) -> None:
-    count = int(recovered.get("source_count") or 0)
-    snapshot_count = int(recovered.get("canonical_snapshot_count") or 0)
-    state["source_count"] = int(state.get("source_count") or 0) + count
+    state["source_count"] = int(state.get("source_count") or 0) + int(
+        recovered.get("source_count") or 0
+    )
     state["canonical_snapshot_count"] = int(
         state.get("canonical_snapshot_count") or 0
-    ) + snapshot_count
+    ) + int(recovered.get("canonical_snapshot_count") or 0)
     earliest = recovered.get("source_earliest")
     latest = recovered.get("source_latest")
     current_earliest = state.get("source_earliest")
@@ -136,6 +141,120 @@ def _merge_operating_state(
         state[metric_key] = max(int(state.get(metric_key) or 0), value)
 
 
+def _read_materialized_prehistory(
+    store,
+    *,
+    requested_start: datetime,
+    first_canonical_snapshot: datetime | None,
+) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
+    """Read the latest persisted all-lane certifier aggregate without rescanning history.
+
+    The historical lane certifier already performs the expensive raw/provider database
+    aggregation in a bounded disposable child and persists its exact 13-lane result in
+    the replay worker heartbeat. Reusing that materialized result keeps raw reconstruction
+    completely off the HTTP request path.
+
+    We only merge a certifier aggregate when its complete time window is contained in the
+    dashboard request and ends no later than the first canonical source snapshot. That
+    prevents an unsplittable aggregate from overlapping canonical source-history rows.
+    """
+
+    result = _empty_history()
+    meta: dict[str, object] = {
+        "available": False,
+        "heartbeat_observed_at": None,
+        "replay_start": None,
+        "replay_boundary": None,
+        "overlap_rejected": False,
+    }
+    query = (
+        select(
+            store.worker_heartbeats.c.observed_at,
+            store.worker_heartbeats.c.payload_json,
+        )
+        .where(store.worker_heartbeats.c.worker_id == REPLAY_WORKER_ID)
+        .order_by(store.worker_heartbeats.c.id.desc())
+        .limit(MATERIALIZED_PREHISTORY_HEARTBEAT_LIMIT)
+    )
+    with store.engine.connect() as db:
+        heartbeat_rows = list(db.execute(query).mappings())
+
+    for heartbeat_row in heartbeat_rows:
+        try:
+            payload = json.loads(str(heartbeat_row.get("payload_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        detail = payload.get("detail") if isinstance(payload, dict) else None
+        if not isinstance(detail, dict):
+            continue
+        coverage = detail.get("lane_coverage")
+        lanes = coverage.get("lanes") if isinstance(coverage, dict) else None
+        if not isinstance(lanes, dict):
+            continue
+
+        replay_start = _parse_time(detail.get("replay_start"))
+        replay_boundary = _parse_time(
+            detail.get("replay_boundary") or detail.get("live_observatory_started_at")
+        )
+        if replay_start is None or replay_boundary is None:
+            continue
+        meta.update(
+            {
+                "heartbeat_observed_at": (
+                    _parse_time(heartbeat_row.get("observed_at")).isoformat()
+                    if _parse_time(heartbeat_row.get("observed_at")) is not None
+                    else None
+                ),
+                "replay_start": replay_start.isoformat(),
+                "replay_boundary": replay_boundary.isoformat(),
+            }
+        )
+
+        # The materialized aggregate cannot be sliced. Never over-include a period that
+        # starts before the requested window or overlaps canonical source-history rows.
+        if requested_start > replay_start:
+            continue
+        if (
+            first_canonical_snapshot is not None
+            and replay_boundary > first_canonical_snapshot
+        ):
+            meta["overlap_rejected"] = True
+            continue
+
+        for lane_id, row in lanes.items():
+            lane_id = str(lane_id)
+            if lane_id not in result or not isinstance(row, dict):
+                continue
+            state = result[lane_id]
+            try:
+                state["source_count"] = max(
+                    0, int(row.get("recovered_source_observations") or 0)
+                )
+            except (TypeError, ValueError):
+                state["source_count"] = 0
+            state["source_earliest"] = _parse_time(row.get("earliest_recovered_at"))
+            state["source_latest"] = _parse_time(row.get("latest_recovered_at"))
+            state["source_ids"].update(
+                str(value) for value in list(row.get("source_ids") or []) if str(value)
+            )
+            state["evidence_classes"].update(
+                str(value)
+                for value in list(row.get("historical_evidence_classes") or [])
+                if str(value)
+            )
+            state["source_ledgers"].update(
+                str(value)
+                for value in list(row.get("source_ledgers") or [])
+                if str(value)
+            )
+            if state["source_count"] or state["evidence_classes"] or state["source_ids"]:
+                state["source_ledgers"].add(MATERIALIZED_PREHISTORY_LEDGER)
+        meta["available"] = True
+        return result, meta
+
+    return result, meta
+
+
 def _read_bounded_source_history(
     store,
     *,
@@ -143,7 +262,7 @@ def _read_bounded_source_history(
     end: datetime,
     limit: int,
 ) -> dict[str, dict[str, object]]:
-    """Legacy pre-canonical source observations, bounded and fail-closed."""
+    """Legacy helper retained for offline diagnostics; not used by dashboard HTTP reads."""
 
     result = _empty_history()
     available = set(inspect(store.engine).get_table_names())
@@ -300,6 +419,8 @@ def _lane_row(lane_id: str, state: dict[str, object]) -> dict[str, object]:
         or operating_count
         or earliest_candidates
         or latest_candidates
+        or state.get("evidence_classes")
+        or state.get("source_ids")
     )
     recovered_count = len(required & recovered)
     required_count = len(required)
@@ -355,7 +476,7 @@ def build_durable_lane_history(
     source_row_limit: int = DEFAULT_SOURCE_ROW_LIMIT,
     operating_row_limit: int = DEFAULT_OPERATING_ROW_LIMIT,
 ) -> dict[str, object]:
-    """Read canonical lane history first; reconstruct only a certified prehistory gap."""
+    """Read canonical history plus already-materialized prehistory; never rescan raw HTTP."""
 
     start = _utc(start)
     end = _utc(end or datetime.now(timezone.utc))
@@ -381,43 +502,29 @@ def build_durable_lane_history(
             {"stage": "canonical_source_coverage_history", "error_type": type(exc).__name__}
         )
 
-    migration_complete = bool(migration_status.get("complete"))
-    prehistory_end = start
-    if migration_complete:
-        prehistory_end = end
-        if first_canonical_snapshot is not None:
-            prehistory_end = min(end, max(start, first_canonical_snapshot))
+    materialized_meta: dict[str, object] = {
+        "available": False,
+        "heartbeat_observed_at": None,
+        "replay_start": None,
+        "replay_boundary": None,
+        "overlap_rejected": False,
+    }
+    try:
+        prehistory, materialized_meta = _read_materialized_prehistory(
+            store,
+            requested_start=start,
+            first_canonical_snapshot=first_canonical_snapshot,
+        )
+        for lane_id, recovered in prehistory.items():
+            if lane_id in persisted:
+                _merge_source_state(persisted[lane_id], recovered)
+    except Exception as exc:
+        read_errors.append(
+            {"stage": "materialized_prehistory", "error_type": type(exc).__name__}
+        )
 
-    if prehistory_end > start:
-        try:
-            raw_history = recover_raw_lane_history(
-                store,
-                start=start,
-                boundary=prehistory_end,
-            )
-            for lane_id, recovered in raw_history.items():
-                if lane_id in persisted:
-                    _merge_source_state(persisted[lane_id], recovered)
-        except Exception as exc:
-            read_errors.append(
-                {"stage": "raw_precanonical_history", "error_type": type(exc).__name__}
-            )
-
-        try:
-            legacy_sources = _read_bounded_source_history(
-                store,
-                start=start,
-                end=prehistory_end,
-                limit=source_row_limit,
-            )
-            for lane_id, recovered in legacy_sources.items():
-                if lane_id in persisted:
-                    _merge_source_state(persisted[lane_id], recovered)
-        except Exception as exc:
-            read_errors.append(
-                {"stage": "legacy_source_prehistory", "error_type": type(exc).__name__}
-            )
-
+    # Operating snapshots are already bounded and diagnostic. They remain safe to read
+    # directly because this query has a hard row limit and never triggers raw recovery.
     try:
         bounded_operating = _read_bounded_operating_history(
             store,
@@ -462,11 +569,22 @@ def build_durable_lane_history(
             if first_canonical_snapshot is not None
             else None
         ),
-        "canonical_history_migration_complete": migration_complete,
+        "canonical_history_migration_complete": bool(migration_status.get("complete")),
         "canonical_history_migration_checkpoint": int(
             migration_status.get("checkpoint_heartbeat_id") or 0
         ),
         "canonical_history_migration_updated_at": migration_status.get("updated_at"),
+        "materialized_prehistory_available": bool(materialized_meta.get("available")),
+        "materialized_prehistory_heartbeat_observed_at": materialized_meta.get(
+            "heartbeat_observed_at"
+        ),
+        "materialized_prehistory_replay_start": materialized_meta.get("replay_start"),
+        "materialized_prehistory_replay_boundary": materialized_meta.get(
+            "replay_boundary"
+        ),
+        "materialized_prehistory_overlap_rejected": bool(
+            materialized_meta.get("overlap_rejected")
+        ),
         "lane_count": len(lanes),
         "lanes_with_durable_history": available,
         "lanes_without_durable_history": len(lanes) - available,
@@ -474,15 +592,16 @@ def build_durable_lane_history(
         "lanes": lanes,
         "read_degraded": bool(read_errors),
         "read_errors": read_errors,
-        "read_model": "canonical_source_coverage_history_plus_precanonical_recovery",
+        "read_model": "canonical_source_coverage_history_plus_materialized_prehistory",
         "bounded_source_row_limit": max(1, min(int(source_row_limit), 10000)),
         "bounded_operating_row_limit": max(1, min(int(operating_row_limit), 5000)),
+        "raw_history_reconstruction_on_http": False,
         "history_contract": (
             "canonical append-only source-coverage history is authoritative after its "
-            "first snapshot; archive migration is checkpointed and raw/provider "
-            "reconstruction is disabled until migration completes, then used only "
-            "before the first canonical snapshot; post-live evidence does not certify "
-            "the strict pre-live backfill"
+            "first snapshot; pre-canonical source/evidence history is read from the "
+            "persisted all-lane certifier aggregate produced by a bounded child; raw "
+            "provider reconstruction never runs on the dashboard request path; post-live "
+            "evidence does not certify the strict pre-live backfill"
         ),
         "candidate_level_history_synthesized": False,
         "historical_counts_as_forward": False,
@@ -499,7 +618,7 @@ def read_durable_lane_history(
     start: datetime,
     cache_seconds: float = DEFAULT_CACHE_SECONDS,
 ) -> dict[str, object]:
-    """Return a bounded-cache read model for the dashboard read plane."""
+    """Return a short bounded-cache read model for the dashboard read plane."""
 
     start = _utc(start)
     key = (id(store), start.isoformat())
@@ -519,6 +638,7 @@ __all__ = [
     "DEFAULT_CACHE_SECONDS",
     "DEFAULT_SOURCE_ROW_LIMIT",
     "DEFAULT_OPERATING_ROW_LIMIT",
+    "MATERIALIZED_PREHISTORY_LEDGER",
     "build_durable_lane_history",
     "read_durable_lane_history",
 ]
