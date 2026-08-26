@@ -355,16 +355,22 @@ def build_durable_lane_history(
     source_row_limit: int = DEFAULT_SOURCE_ROW_LIMIT,
     operating_row_limit: int = DEFAULT_OPERATING_ROW_LIMIT,
 ) -> dict[str, object]:
-    """Read canonical lane history first; reconstruct only the pre-canonical gap."""
+    """Read canonical lane history first; reconstruct only a certified prehistory gap."""
 
     start = _utc(start)
     end = _utc(end or datetime.now(timezone.utc))
     persisted = _empty_history()
     read_errors: list[dict[str, str]] = []
     first_canonical_snapshot: datetime | None = None
+    migration_status: dict[str, object] = {
+        "checkpoint_heartbeat_id": 0,
+        "complete": False,
+        "updated_at": None,
+    }
 
     try:
         ledger = SourceCoverageHistoryLedger(store)
+        migration_status = ledger.migration_status()
         first_canonical_snapshot = ledger.first_snapshot_at()
         canonical_history = ledger.summary(start=start, end=end)
         for lane_id, recovered in canonical_history.items():
@@ -375,9 +381,12 @@ def build_durable_lane_history(
             {"stage": "canonical_source_coverage_history", "error_type": type(exc).__name__}
         )
 
-    prehistory_end = end
-    if first_canonical_snapshot is not None:
-        prehistory_end = min(end, max(start, first_canonical_snapshot))
+    migration_complete = bool(migration_status.get("complete"))
+    prehistory_end = start
+    if migration_complete:
+        prehistory_end = end
+        if first_canonical_snapshot is not None:
+            prehistory_end = min(end, max(start, first_canonical_snapshot))
 
     if prehistory_end > start:
         try:
@@ -453,6 +462,11 @@ def build_durable_lane_history(
             if first_canonical_snapshot is not None
             else None
         ),
+        "canonical_history_migration_complete": migration_complete,
+        "canonical_history_migration_checkpoint": int(
+            migration_status.get("checkpoint_heartbeat_id") or 0
+        ),
+        "canonical_history_migration_updated_at": migration_status.get("updated_at"),
         "lane_count": len(lanes),
         "lanes_with_durable_history": available,
         "lanes_without_durable_history": len(lanes) - available,
@@ -465,8 +479,10 @@ def build_durable_lane_history(
         "bounded_operating_row_limit": max(1, min(int(operating_row_limit), 5000)),
         "history_contract": (
             "canonical append-only source-coverage history is authoritative after its "
-            "first snapshot; raw/provider reconstruction is used only before that point; "
-            "post-live evidence does not certify the strict pre-live backfill"
+            "first snapshot; archive migration is checkpointed and raw/provider "
+            "reconstruction is disabled until migration completes, then used only "
+            "before the first canonical snapshot; post-live evidence does not certify "
+            "the strict pre-live backfill"
         ),
         "candidate_level_history_synthesized": False,
         "historical_counts_as_forward": False,
