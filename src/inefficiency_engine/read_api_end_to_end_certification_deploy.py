@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 from sqlalchemy import inspect, text
 
-from inefficiency_engine import read_api_active_volume_deploy as active
+from inefficiency_engine import read_api_certification_fast_readiness as active
 from inefficiency_engine import read_api_lane_history_ui_deploy as inner
 from inefficiency_engine.critical_evidence_recovery import (
     DEFAULT_ALPHA_FORWARD_RECOVERY_STALE_SECONDS,

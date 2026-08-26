@@ -38,6 +38,9 @@ CONTROL_TRUTH_COMMAND = [
     "-m",
     "inefficiency_engine.permanent_control_worker_truth_repair",
 ]
+WORKER_HEARTBEAT_READ_INDEX_SPEC = {
+    "worker_heartbeats": ("worker_id", "id"),
+}
 # Keep the canonical database-independent liveness app as the production ASGI target.
 # That app now intercepts only the explicit E2E diagnostic after path selection, while
 # /health remains a zero-database process-liveness branch.
@@ -77,6 +80,17 @@ def install_control_truth_command() -> None:
     base.base.CONTROL_COMMAND = list(CONTROL_TRUTH_COMMAND)
 
 
+def install_worker_heartbeat_read_index() -> None:
+    """Add the latest-worker read index to deferred generic index maintenance.
+
+    Certification reads the append-only heartbeat ledger by worker id and newest row id.
+    This composite index is a read optimization only: it is post-bind, non-authoritative,
+    and independent of the dedicated exact cycle-history index owner.
+    """
+
+    base.BACKGROUND_INDEX_SPECS.update(WORKER_HEARTBEAT_READ_INDEX_SPEC)
+
+
 def install_research_observability_heavy_command() -> None:
     """Route only disposable research through the observability/closure repair."""
 
@@ -97,6 +111,7 @@ def install_research_observability_heavy_command() -> None:
 def main() -> int:
     install_source_repair_child_command()
     install_control_truth_command()
+    install_worker_heartbeat_read_index()
     install_research_observability_heavy_command()
     stop_event = threading.Event()
     cycle_history_guard = threading.Thread(
