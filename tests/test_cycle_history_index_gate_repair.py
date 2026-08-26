@@ -199,10 +199,24 @@ def test_dedicated_index_child_restores_shared_timeout_and_preserves_attempt_con
 
 
 def test_e2e_truth_never_promotes_generic_history_to_cycle_history(monkeypatch):
-    monkeypatch.setattr(
-        api_truth.base,
-        "end_to_end_certification_payload",
-        lambda: {
+    historical_progress = {
+        "strategy": {
+            "cache_count": 0,
+            "cache_initialized": False,
+            "completion_state": "not_initialized_in_this_executor",
+        }
+    }
+    workers = {
+        "canonical_control": {
+            "available": True,
+            "cycle_history_cache_complete": False,
+            "cycle_history_cache_progress": {},
+            "historical_cache_progress": historical_progress,
+        }
+    }
+
+    def fake_base(*, include_worker_truth=False):
+        payload = {
             "certified": True,
             "operationally_certified": True,
             "status": "certified",
@@ -224,26 +238,15 @@ def test_e2e_truth_never_promotes_generic_history_to_cycle_history(monkeypatch):
                     "strategy": {"cache_count": 0}
                 },
             },
-        },
-    )
+        }
+        if include_worker_truth:
+            payload["_certification_workers"] = workers
+        return payload
+
     monkeypatch.setattr(
-        api_truth,
-        "_raw_canonical_control_status",
-        lambda: {
-            "cycle_history_cache_complete": False,
-            "historical_cache_progress": {
-                "strategy": {
-                    "cache_count": 0,
-                    "cache_initialized": False,
-                    "completion_state": "not_initialized_in_this_executor",
-                }
-            },
-        },
-    )
-    monkeypatch.setattr(
-        api_truth,
-        "_cycle_history_index_maintenance_status",
-        lambda: {"ready": False},
+        api_truth.base,
+        "end_to_end_certification_payload",
+        fake_base,
     )
 
     payload = api_truth.repaired_end_to_end_certification_payload()
@@ -262,6 +265,7 @@ def test_e2e_truth_never_promotes_generic_history_to_cycle_history(monkeypatch):
         "cache_count"
     ] == 0
     assert payload["duplicate_readiness_read_disabled"] is True
+    assert payload["truth_repair_additional_database_reads"] == 0
 
 
 def test_e2e_truth_wrapper_does_not_repeat_full_deployment_readiness():
