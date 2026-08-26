@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any
@@ -8,15 +9,51 @@ from inefficiency_engine import __version__
 from inefficiency_engine.read_api_durable_history_projection_deploy import app as _inner_app
 
 
+async def _send_json(
+    send: Any,
+    *,
+    status: int,
+    value: object,
+    head_only: bool,
+    jsonable: bool = False,
+) -> None:
+    if jsonable:
+        from fastapi.encoders import jsonable_encoder
+
+        value = jsonable_encoder(value)
+    encoded = json.dumps(
+        value,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"cache-control", b"no-store"),
+        (b"content-length", str(len(encoded)).encode("ascii")),
+    ]
+    await send(
+        {
+            "type": "http.response.start",
+            "status": int(status),
+            "headers": headers,
+        }
+    )
+    await send(
+        {
+            "type": "http.response.body",
+            "body": b"" if head_only else encoded,
+            "more_body": False,
+        }
+    )
+
+
 class DatabaseIndependentLivenessApp:
     """Answer Render liveness without touching PostgreSQL or worker diagnostics.
 
-    The composed read API deliberately keeps `/ready` and diagnostic endpoints on the
-    full application, where durable database/runtime truth remains fail-closed. Render's
-    `/health` probe has a different contract: prove only that the web process is alive
-    and able to serve HTTP. Intercepting that one route at the outer ASGI boundary makes
-    it impossible for future diagnostic composition to put synchronous database reads
-    back onto the liveness critical path.
+    `/health` remains a process-only branch with no database imports or reads. The
+    explicit E2E diagnostic is also intercepted at this outer boundary, but only after
+    path selection and in a worker thread; that lets us correct cycle-history telemetry
+    without changing the canonical production ASGI target or liveness contract.
     """
 
     def __init__(self, inner: Any) -> None:
@@ -29,29 +66,46 @@ class DatabaseIndependentLivenessApp:
             and scope.get("path") == "/health"
             and method in {"GET", "HEAD"}
         ):
-            encoded = json.dumps(
-                liveness_payload(),
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-            headers = [
-                (b"content-type", b"application/json"),
-                (b"cache-control", b"no-store"),
-                (b"content-length", str(len(encoded)).encode("ascii")),
-            ]
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 200,
-                    "headers": headers,
-                }
+            await _send_json(
+                send,
+                status=200,
+                value=liveness_payload(),
+                head_only=method == "HEAD",
             )
-            await send(
-                {
-                    "type": "http.response.body",
-                    "body": b"" if method == "HEAD" else encoded,
-                    "more_body": False,
+            return
+
+        if (
+            scope.get("type") == "http"
+            and scope.get("path") == "/v3/operations/end-to-end-certification"
+            and method in {"GET", "HEAD"}
+        ):
+            from fastapi import HTTPException
+            from inefficiency_engine.read_api_cycle_history_truth_repair import (
+                repaired_end_to_end_certification_payload,
+            )
+
+            status = 200
+            try:
+                body_value: object = await asyncio.to_thread(
+                    repaired_end_to_end_certification_payload
+                )
+            except HTTPException as exc:
+                status = int(exc.status_code)
+                body_value = {"detail": exc.detail}
+            except Exception as exc:
+                status = 503
+                body_value = {
+                    "detail": {
+                        "message": "end-to-end certification truth repair unavailable",
+                        "error_type": type(exc).__name__,
+                    }
                 }
+            await _send_json(
+                send,
+                status=status,
+                value=body_value,
+                head_only=method == "HEAD",
+                jsonable=True,
             )
             return
 
