@@ -75,7 +75,13 @@ def _record_history_stage(
 
 
 def main() -> int:
-    """Compute one canonical source snapshot and advance its append-only history."""
+    """Compute one canonical source snapshot and persist its current history row.
+
+    The old heartbeat archive is deliberately *not* migrated in this child. The source
+    snapshot executor has a hard external deadline and must spend that budget on current
+    source truth. Historical archive migration is owned by an independent bounded
+    supervisor so a slow current snapshot can never strand the historical checkpoint.
+    """
 
     from inefficiency_engine.disposable_executor_memory_guard import (
         MEMORY_PRESSURE_EXIT_CODE,
@@ -106,8 +112,7 @@ def main() -> int:
     )
     from inefficiency_engine.source_coverage import SourceCoveragePlane
     from inefficiency_engine.source_coverage_history import (
-        DEFAULT_MIGRATION_HEARTBEAT_BATCH,
-        backfill_source_coverage_history_from_heartbeats,
+        SourceCoverageHistoryLedger,
         persist_source_coverage_history_snapshot,
     )
     from inefficiency_engine.source_coverage_snapshot_stage_runtime import (
@@ -194,40 +199,28 @@ def main() -> int:
         )
         raise RuntimeError(message)
 
-    # History persistence is diagnostic and fail-soft with respect to current source
-    # publication. The current canonical snapshot is written first so every new source
-    # state becomes durable immediately; the old heartbeat archive is then migrated in
-    # bounded, transactionally checkpointed batches.
+    # Every new canonical snapshot is still dual-written immediately. Only migration of
+    # *older* heartbeat rows moved out of this deadline-constrained process.
     try:
         inserted_current = persist_source_coverage_history_snapshot(
             store,
             snapshot,
             published_at=heartbeat.observed_at,
         )
-        try:
-            migration_batch = int(
-                os.getenv(
-                    "CIE_SOURCE_COVERAGE_HISTORY_MIGRATION_BATCH",
-                    str(DEFAULT_MIGRATION_HEARTBEAT_BATCH),
-                )
-            )
-        except ValueError:
-            migration_batch = DEFAULT_MIGRATION_HEARTBEAT_BATCH
-        migration = backfill_source_coverage_history_from_heartbeats(
-            store,
-            max_heartbeats=migration_batch,
-        )
+        migration = SourceCoverageHistoryLedger(store).migration_status()
+        migration_complete = bool(migration.get("complete"))
         _record_history_stage(
             store,
-            state="success" if bool(migration.get("complete")) else "running",
+            state="success" if migration_complete else "running",
             detail={
                 "stage": (
                     "canonical_history_ready"
-                    if bool(migration.get("complete"))
-                    else "canonical_history_archive_migrating"
+                    if migration_complete
+                    else "live_snapshot_persisted_archive_migration_pending"
                 ),
                 "snapshot_observed_at": snapshot.observed_at.isoformat(),
                 "inserted_current_lane_snapshots": inserted_current,
+                "archive_migration_owner": "source-coverage-history-migration-supervisor",
                 **migration,
             },
         )
@@ -237,10 +230,11 @@ def main() -> int:
             state="degraded",
             error_type=type(exc).__name__,
             detail={
-                "stage": "canonical_history_persistence_failed",
+                "stage": "canonical_history_current_snapshot_persistence_failed",
                 "snapshot_observed_at": snapshot.observed_at.isoformat(),
                 "message": str(exc)[:1000],
                 "retrying": True,
+                "archive_migration_owner": "source-coverage-history-migration-supervisor",
             },
         )
 
