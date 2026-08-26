@@ -134,6 +134,44 @@ def _stage_fields(heartbeat: WorkerHeartbeat | None) -> dict[str, object]:
     }
 
 
+def _index_maintenance_result(detail: dict[str, object]) -> dict[str, object]:
+    """Normalize in-progress, legacy nested, and final round index heartbeat shapes."""
+
+    nested = detail.get("result")
+    if isinstance(nested, dict):
+        failures = nested.get("failures")
+        return {
+            "complete": nested.get("complete"),
+            "dialect": nested.get("dialect"),
+            "failures": list(failures) if isinstance(failures, list) else [],
+        }
+
+    scoped = detail.get("failures")
+    flattened: list[dict[str, object]] = []
+    dialect: object | None = None
+    if isinstance(scoped, list):
+        for item in scoped:
+            if not isinstance(item, dict):
+                continue
+            scope = item.get("scope")
+            result = item.get("result")
+            if not isinstance(result, dict):
+                continue
+            if dialect is None:
+                dialect = result.get("dialect")
+            failures = result.get("failures")
+            if not isinstance(failures, list):
+                continue
+            for failure in failures:
+                if isinstance(failure, dict):
+                    flattened.append({"scope": scope, **failure})
+    return {
+        "complete": detail.get("background_indexes_complete"),
+        "dialect": dialect,
+        "failures": flattened,
+    }
+
+
 def install_runtime_index_health_observability(base: Any) -> None:
     """Expose post-bind index and durable source-coverage state through public health.
 
@@ -167,8 +205,8 @@ def install_runtime_index_health_observability(base: Any) -> None:
         index_worker = workers.get(RUNTIME_INDEX_LABEL)
         if isinstance(index_worker, dict) and bool(index_worker.get("available")):
             detail = _detail_payload(base, RUNTIME_INDEX_WORKER_ID)
-            result = detail.get("result") if isinstance(detail.get("result"), dict) else {}
-            failures = result.get("failures") if isinstance(result, dict) else None
+            result = _index_maintenance_result(detail)
+            failures = result.get("failures")
             index_worker.update(
                 {
                     "attempt": detail.get("attempt"),
@@ -186,12 +224,8 @@ def install_runtime_index_health_observability(base: Any) -> None:
                         "background_indexes_complete"
                     ),
                     "maintenance_runtime_seconds": detail.get("runtime_seconds"),
-                    "maintenance_result_complete": (
-                        result.get("complete") if isinstance(result, dict) else None
-                    ),
-                    "maintenance_dialect": (
-                        result.get("dialect") if isinstance(result, dict) else None
-                    ),
+                    "maintenance_result_complete": result.get("complete"),
+                    "maintenance_dialect": result.get("dialect"),
                     "maintenance_failures": (
                         failures if isinstance(failures, list) else []
                     ),
