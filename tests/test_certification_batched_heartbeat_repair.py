@@ -106,6 +106,8 @@ def test_priority_heartbeat_index_restores_shared_runtime_timeout(monkeypatch):
     assert captured["index_specs"] == {"worker_heartbeats": ("worker_id", "id")}
     assert captured["timeout_ms"] == 180_000
     assert captured["progress"] is progress
+    helper_source = inspect.getsource(entrypoint.base._ensure_priority_worker_heartbeat_index)
+    assert "finally:" in helper_source
     assert (
         entrypoint.base.runtime_indexes.POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
         == original_timeout
