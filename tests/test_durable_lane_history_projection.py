@@ -114,6 +114,7 @@ def test_dashboard_never_converts_missing_projection_to_zero_history():
     assert "durableEvidenceLabel" in html
     assert "durableSourceLabel" in html
     assert "'UNAVAILABLE'" in html
-    assert "laneDurableHistory=null" not in html
+    assert "}catch(_e){laneDurableHistory=null}" not in html
+    assert "catch(e){if(laneDurableHistory)laneDurableHistory.last_fetch_error=String(e)}" in html
     assert "setInterval(refreshLaneDurableHistory,30000);" in html
     assert "setInterval(refreshLaneDurableHistory,300000);" not in html
