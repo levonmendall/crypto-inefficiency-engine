@@ -35,7 +35,14 @@ WORKER_ID = "cycle-history-background-backfill"
 TEMPORARY_ADMISSION_EXIT_CODE = 75
 BACKGROUND_BUCKET_STATEMENT_TIMEOUT_SECONDS = 60.0
 BACKGROUND_BUCKET_LOCK_TIMEOUT_SECONDS = 5.0
-BACKGROUND_BUCKET_QUERY_CAP = 1
+# The previous production worker intentionally advanced only one day bucket per child.
+# A frozen 180-day target across many venue/asset pairs therefore required thousands of
+# process launches even when every indexed bucket query completed quickly. The durable
+# cache already checkpoints after every bucket and the target runtime has its own 15s
+# wall-clock slice, so allow a bounded batch inside one lease/process instead. This
+# changes throughput only; rows/day, history length, target exactness and authority are
+# unchanged.
+BACKGROUND_BUCKET_QUERY_CAP = 32
 _BUCKET_QUERY_BUDGET_ENV = "CIE_CONTROL_CYCLE_HISTORY_BUCKET_QUERY_BUDGET"
 
 
@@ -86,12 +93,12 @@ def _postgres_background_timeout_statements() -> tuple[str, str]:
 
 @contextmanager
 def background_cycle_history_database_timeout(store: Any) -> Iterator[None]:
-    """Give one background history bucket a long but finite PostgreSQL budget.
+    """Give each background history query a long but finite PostgreSQL budget.
 
-    This scope is intentionally separate from canonical control's four-second bucket
-    budget.  The backfill child has no allocation or execution authority and is
-    disposable, so it can spend longer proving one exact historical bucket while the
-    25-second canonical-control child remains free of raw-ledger reconstruction.
+    This scope is intentionally separate from canonical control's short query budget.
+    The backfill child has no allocation or execution authority and is disposable, so
+    it may spend longer proving exact historical buckets while canonical control stays
+    free of raw-ledger reconstruction.
     """
 
     engine = store.engine
@@ -113,7 +120,7 @@ def background_cycle_history_database_timeout(store: Any) -> Iterator[None]:
 
 
 @contextmanager
-def _single_background_bucket() -> Iterator[None]:
+def _bounded_background_batch() -> Iterator[None]:
     previous = os.environ.get(_BUCKET_QUERY_BUDGET_ENV)
     os.environ[_BUCKET_QUERY_BUDGET_ENV] = str(BACKGROUND_BUCKET_QUERY_CAP)
     try:
@@ -156,7 +163,7 @@ def _bounded_progress(progress: dict[str, object]) -> dict[str, object]:
 
 
 def run_backfill_slice() -> int:
-    """Advance one exact frozen cycle-history bucket outside canonical control."""
+    """Advance one bounded batch of an exact frozen cycle-history target."""
 
     settings = Settings.from_env()
     store = build_evidence_store(settings.evidence_db_path)
@@ -198,14 +205,14 @@ def run_backfill_slice() -> int:
         _record_heartbeat(
             store,
             state="running",
-            stage="backfill_slice_starting",
+            stage="backfill_batch_starting",
             sequence=sequence,
             detail={"owner": owner, "memory_before": memory.as_dict()},
         )
 
         # Match canonical control's source-view semantics without performing provider
-        # requests.  The background worker consumes the already-persisted complete
-        # source snapshot and only maintains the compact historical projection.
+        # requests. The background worker consumes the already-persisted complete source
+        # snapshot and only maintains the compact historical projection.
         install_source_coverage_reconciliation_runtime()
         install_control_source_coverage_snapshot_reader_runtime()
         ensure_durable_control_cache_schema(store)
@@ -241,7 +248,7 @@ def run_backfill_slice() -> int:
             return 1
 
         started = time.monotonic()
-        with background_cycle_history_database_timeout(store), _single_background_bucket():
+        with background_cycle_history_database_timeout(store), _bounded_background_batch():
             progress = dict(
                 advance_durable_control_cycle_history_cache(
                     alpha_factory,
@@ -257,7 +264,7 @@ def run_backfill_slice() -> int:
             stage=(
                 "certified_target_available"
                 if complete
-                else "backfill_slice_checkpointed"
+                else "backfill_batch_checkpointed"
             ),
             sequence=sequence,
             detail={
@@ -266,6 +273,7 @@ def run_backfill_slice() -> int:
                 "slice_runtime_seconds": elapsed,
                 "cache_complete": complete,
                 "progress": bounded,
+                "batched_bucket_queries": True,
                 "process_exit_reclaims_heap": True,
             },
         )
@@ -274,7 +282,7 @@ def run_backfill_slice() -> int:
         _record_heartbeat(
             store,
             state="degraded",
-            stage="backfill_slice_failed",
+            stage="backfill_batch_failed",
             error_type=type(exc).__name__,
             detail={
                 "owner": owner,
