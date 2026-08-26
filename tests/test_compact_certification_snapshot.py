@@ -114,3 +114,30 @@ def test_truth_repair_reuses_worker_snapshot_without_database_lookup():
     assert "latest_worker_heartbeat" not in source
     assert "deployment_readiness" not in source
     assert '"truth_repair_additional_database_reads": 0' in source
+
+
+def test_truth_repair_surfaces_shared_snapshot_database_error():
+    error = truth_repair._worker_snapshot_error(
+        {
+            "canonical_control": {
+                "available": False,
+                "error_type": "OperationalError",
+                "error_message": "canceling statement due to statement timeout",
+                "heartbeat_query_strategy": "targeted_latest_per_worker_union",
+            },
+            "portfolio": {
+                "available": False,
+                "error_type": "OperationalError",
+                "error_message": "canceling statement due to statement timeout",
+                "heartbeat_query_strategy": "targeted_latest_per_worker_union",
+            },
+        }
+    )
+
+    assert error == {
+        "error_type": "OperationalError",
+        "message": "canceling statement due to statement timeout",
+        "query_strategy": "targeted_latest_per_worker_union",
+        "retryable": True,
+        "certification_authority": False,
+    }
