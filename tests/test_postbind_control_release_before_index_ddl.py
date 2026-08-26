@@ -5,13 +5,13 @@ import inspect
 from inefficiency_engine import render_combined_postbind
 
 
-def test_canonical_control_release_precedes_all_runtime_index_ddl():
+def test_canonical_control_release_precedes_all_generic_runtime_index_ddl():
     source = inspect.getsource(render_combined_postbind._runtime_index_guard)
 
     release = source.index("indexes_ready.set()")
     post_control_group = source.index("post_control_index_specs = {", release)
     source_strategy_maintenance = source.index(
-        "index_specs=index_specs",
+        "index_specs=post_control_index_specs",
         post_control_group,
     )
 
@@ -21,15 +21,15 @@ def test_canonical_control_release_precedes_all_runtime_index_ddl():
     assert '"cycle_history_index_authority_required": False' in source[release:]
 
 
-def test_cycle_history_index_is_only_post_control_background_maintenance():
+def test_exact_cycle_history_index_is_absent_from_generic_post_control_maintenance():
     source = inspect.getsource(render_combined_postbind._runtime_index_guard)
     release = source.index("indexes_ready.set()")
+    brin_scope = source.index('"post_control_cycle_history_brin"', release)
 
-    cycle_scope = source.index('"post_control_cycle_history"', release)
-    cycle_spec = source.index("CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS", cycle_scope)
-    maintenance_call = source.index("ensure_runtime_indexes_after_api_bind", cycle_scope)
-
-    assert release < cycle_scope < cycle_spec < maintenance_call
+    assert release < brin_scope
+    assert "CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS" not in source
+    assert '"cycle_history_exact_index_owner": "cycle-history-index-maintenance"' in source
+    assert '"cycle_history_exact_index_maintained_here": False' in source
     assert "control_gate_index_retry_pending" not in source
     assert "building_cycle_history_control_gate_index" not in source
     assert "indexes_ready.clear" not in source
