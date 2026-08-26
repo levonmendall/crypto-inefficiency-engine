@@ -6,6 +6,7 @@ import time
 from urllib.request import urlopen
 
 from inefficiency_engine import render_combined as base
+from inefficiency_engine import runtime_index_maintenance as runtime_indexes
 from inefficiency_engine.cycle_history_brin_runtime import (
     ensure_cycle_history_brin_after_api_bind,
 )
@@ -24,6 +25,10 @@ INDEX_RETRY_SECONDS = 30.0
 BACKGROUND_INDEX_RETRY_SECONDS = 300.0
 API_BIND_POLL_SECONDS = 2.0
 API_BIND_READ_TIMEOUT_SECONDS = 2.0
+PRIORITY_READ_INDEX_SPECS: dict[str, tuple[str, ...]] = {
+    "worker_heartbeats": ("worker_id", "id"),
+}
+WORKER_HEARTBEAT_PRIORITY_INDEX_STATEMENT_TIMEOUT_MS = 180_000
 
 
 def bootstrap_permanent_runtime_schema() -> None:
@@ -116,22 +121,49 @@ def _first_failure_type(result: dict[str, object]) -> str:
     return "RuntimeIndexMaintenanceFailed"
 
 
+def _ensure_priority_worker_heartbeat_index(
+    store,
+    *,
+    progress,
+) -> dict[str, object]:
+    """Build the certification heartbeat read index before generic background DDL.
+
+    The helper temporarily widens only the ordinary runtime-index deadline in this
+    process while the single ``worker_heartbeats(worker_id, id)`` index is maintained.
+    The shared default is restored before BRIN/source/strategy maintenance begins. The
+    exact cycle-history index keeps its independent owner and timeout in another process.
+    """
+
+    previous_timeout_ms = runtime_indexes.POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
+    try:
+        runtime_indexes.POSTGRES_INDEX_STATEMENT_TIMEOUT_MS = (
+            WORKER_HEARTBEAT_PRIORITY_INDEX_STATEMENT_TIMEOUT_MS
+        )
+        return ensure_runtime_indexes_after_api_bind(
+            store,
+            index_specs=PRIORITY_READ_INDEX_SPECS,
+            progress=progress,
+        )
+    finally:
+        runtime_indexes.POSTGRES_INDEX_STATEMENT_TIMEOUT_MS = previous_timeout_ms
+
+
 def _runtime_index_guard(
     stop_event: threading.Event,
     indexes_ready: threading.Event,
 ) -> None:
-    """Release control after API bind, then maintain non-cycle-history indexes.
+    """Release control after API bind, then maintain prioritized and background indexes.
 
-    The generic post-bind maintainer owns the compact cycle-history BRIN plus ordinary
-    source/read and strategy indexes. It intentionally does *not* own the exact
-    ``market_quotes(venue, asset, observed_at, id)`` btree used by the 180-day
-    cycle-history backfill. That exact btree has one owner only:
-    ``cycle-history-index-maintenance``. Keeping one DDL owner prevents competing
-    ``CREATE INDEX CONCURRENTLY`` attempts and catalog/lock contention.
+    The generic post-bind maintainer owns the priority worker-heartbeat read index, the
+    compact cycle-history BRIN, plus ordinary source/read and strategy indexes. It
+    intentionally does *not* own the exact ``market_quotes(venue, asset, observed_at,
+    id)`` btree used by the 180-day cycle-history backfill. That exact btree has one owner
+    only: ``cycle-history-index-maintenance``.
 
-    Canonical control still starts as soon as the API is bound. None of these indexes
-    grant evidence, qualification, allocation, or execution authority. Failures remain
-    visible and retryable without suppressing process liveness.
+    Canonical control starts as soon as the API is bound. None of these indexes grant
+    evidence, qualification, allocation, or execution authority. The heartbeat index is
+    attempted first on each maintenance round so certification does not remain dependent
+    on a large unindexed append-only ledger while unrelated background indexes build.
     """
 
     port = os.getenv("PORT", "10000")
@@ -164,6 +196,7 @@ def _runtime_index_guard(
             "scope": "post_control_background",
             "control_gate_released": True,
             "background_indexes_complete": False,
+            "priority_worker_heartbeat_index_complete": False,
             "cycle_history_exact_index_owner": "cycle-history-index-maintenance",
             "cycle_history_exact_index_maintained_here": False,
             "cycle_history_index_authority_required": False,
@@ -181,6 +214,39 @@ def _runtime_index_guard(
         round_started = time.monotonic()
         round_results: list[tuple[str, dict[str, object]]] = []
 
+        priority_scope = "post_control_priority_worker_heartbeat_read"
+        _record_index_heartbeat(
+            store,
+            state="running",
+            detail={
+                "attempt": background_attempt,
+                "stage": "building_priority_worker_heartbeat_index",
+                "scope": priority_scope,
+                "control_gate_released": True,
+                "background_indexes_complete": False,
+                "priority_worker_heartbeat_index_complete": False,
+                "priority_statement_timeout_ms": (
+                    WORKER_HEARTBEAT_PRIORITY_INDEX_STATEMENT_TIMEOUT_MS
+                ),
+                "cycle_history_exact_index_owner": "cycle-history-index-maintenance",
+                "cycle_history_exact_index_maintained_here": False,
+                "cycle_history_index_authority_required": False,
+            },
+        )
+        priority_result = _ensure_priority_worker_heartbeat_index(
+            store,
+            progress=_progress_callback(
+                store,
+                attempt=background_attempt,
+                scope=priority_scope,
+                control_gate_released=True,
+            ),
+        )
+        round_results.append((priority_scope, priority_result))
+
+        if stop_event.is_set():
+            return
+
         # BRIN remains a small independent range-read optimization. It is not the exact
         # btree gate and therefore does not compete with the dedicated exact-index owner.
         brin_scope = "post_control_cycle_history_brin"
@@ -193,6 +259,9 @@ def _runtime_index_guard(
                 "scope": brin_scope,
                 "control_gate_released": True,
                 "background_indexes_complete": False,
+                "priority_worker_heartbeat_index_complete": bool(
+                    priority_result.get("complete")
+                ),
                 "cycle_history_exact_index_owner": "cycle-history-index-maintenance",
                 "cycle_history_exact_index_maintained_here": False,
                 "cycle_history_index_authority_required": False,
@@ -221,6 +290,9 @@ def _runtime_index_guard(
                 "scope": scope,
                 "control_gate_released": True,
                 "background_indexes_complete": False,
+                "priority_worker_heartbeat_index_complete": bool(
+                    priority_result.get("complete")
+                ),
                 "cycle_history_exact_index_owner": "cycle-history-index-maintenance",
                 "cycle_history_exact_index_maintained_here": False,
                 "cycle_history_index_authority_required": False,
@@ -256,6 +328,7 @@ def _runtime_index_guard(
                     "results": [scope_result for _, scope_result in round_results],
                     "control_gate_released": True,
                     "background_indexes_complete": True,
+                    "priority_worker_heartbeat_index_complete": True,
                     "cycle_history_exact_index_owner": "cycle-history-index-maintenance",
                     "cycle_history_exact_index_maintained_here": False,
                     "cycle_history_index_authority_required": False,
@@ -282,6 +355,9 @@ def _runtime_index_guard(
                 "retry_seconds": BACKGROUND_INDEX_RETRY_SECONDS,
                 "control_gate_released": True,
                 "background_indexes_complete": False,
+                "priority_worker_heartbeat_index_complete": bool(
+                    priority_result.get("complete")
+                ),
                 "cycle_history_exact_index_owner": "cycle-history-index-maintenance",
                 "cycle_history_exact_index_maintained_here": False,
                 "cycle_history_index_authority_required": False,
