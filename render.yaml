@@ -19,7 +19,9 @@ services:
     # Large production read indexes are intentionally maintained only after the API
     # has bound its Render port. This keeps multimillion-row DDL out of the deploy
     # startup deadline while preserving serial table bootstrap before child startup.
-    startCommand: PYTHONPATH=src python -m inefficiency_engine.render_combined_postbind_lane_repair
+    # Durable lane history is also materialized post-bind in an independent bounded
+    # child so dashboard requests never reconstruct historical ledgers themselves.
+    startCommand: PYTHONPATH=src python -m inefficiency_engine.render_combined_postbind_history_projection
     healthCheckPath: /health
     maxShutdownDelaySeconds: 90
     envVars:
