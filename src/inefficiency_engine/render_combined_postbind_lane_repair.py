@@ -7,7 +7,7 @@ from inefficiency_engine import render_combined_postbind as base
 from inefficiency_engine.candidate_observatory_backfill_supervisor import (
     run_candidate_observatory_backfill_supervisor,
 )
-from inefficiency_engine.cycle_history_background_supervisor import (
+from inefficiency_engine.cycle_history_background_supervisor_repair import (
     run_cycle_history_background_supervisor,
 )
 from inefficiency_engine.research_projection_supervisor import (
@@ -33,10 +33,17 @@ RESEARCH_OBSERVABILITY_COMMAND = [
     "-m",
     "inefficiency_engine.disposable_heavy_job_research_observability",
 ]
-# The outer ASGI liveness boundary guarantees Render's /health probe never enters
-# PostgreSQL-backed runtime diagnostics. /ready and every diagnostic route remain on
-# the full mobile-truth application behind that wrapper.
-BOUNDED_HEARTBEAT_API_APP = "inefficiency_engine.read_api_liveness_deploy:app"
+CONTROL_TRUTH_COMMAND = [
+    sys.executable,
+    "-m",
+    "inefficiency_engine.permanent_control_worker_truth_repair",
+]
+# The outer ASGI liveness boundary still guarantees Render's /health probe never enters
+# PostgreSQL-backed diagnostics. The truth-repair wrapper intercepts only the explicit
+# end-to-end certification route and delegates every other route to the liveness app.
+BOUNDED_HEARTBEAT_API_APP = (
+    "inefficiency_engine.read_api_cycle_history_truth_repair:app"
+)
 
 
 def install_source_repair_child_command() -> None:
@@ -66,6 +73,12 @@ def install_source_repair_child_command() -> None:
     base.base._remaining_source_lane_repair_installed = True
 
 
+def install_control_truth_command() -> None:
+    """Route only canonical control through truthful disposable diagnostics."""
+
+    base.base.CONTROL_COMMAND = list(CONTROL_TRUTH_COMMAND)
+
+
 def install_research_observability_heavy_command() -> None:
     """Route only disposable research through the observability/closure repair."""
 
@@ -85,6 +98,7 @@ def install_research_observability_heavy_command() -> None:
 
 def main() -> int:
     install_source_repair_child_command()
+    install_control_truth_command()
     install_research_observability_heavy_command()
     stop_event = threading.Event()
     cycle_history_guard = threading.Thread(
