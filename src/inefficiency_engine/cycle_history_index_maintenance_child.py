@@ -51,6 +51,16 @@ def _record_heartbeat(
         pass
 
 
+def _latest_attempt_detail(store: Any) -> tuple[Any | None, dict[str, object]]:
+    try:
+        heartbeat = store.latest_worker_heartbeat(WORKER_ID)
+    except Exception:
+        return None, {}
+    if heartbeat is None:
+        return None, {}
+    return heartbeat, dict(getattr(heartbeat, "detail", None) or {})
+
+
 def _previous_attempt_context(store: Any) -> tuple[int, dict[str, object]]:
     """Carry the last exact-index outcome into the next disposable attempt.
 
@@ -60,14 +70,10 @@ def _previous_attempt_context(store: Any) -> tuple[int, dict[str, object]]:
     This is diagnostic only and has no certification authority.
     """
 
-    try:
-        heartbeat = store.latest_worker_heartbeat(WORKER_ID)
-    except Exception:
-        heartbeat = None
+    heartbeat, detail = _latest_attempt_detail(store)
     if heartbeat is None:
         return 1, {}
 
-    detail = dict(getattr(heartbeat, "detail", None) or {})
     try:
         previous_attempt = max(0, int(detail.get("attempt_number") or 0))
     except (TypeError, ValueError):
@@ -90,6 +96,28 @@ def _previous_attempt_context(store: Any) -> tuple[int, dict[str, object]]:
         context["previous_effective_index_name"] = str(previous_index)
 
     return previous_attempt + 1, context
+
+
+def _current_attempt_context(store: Any) -> tuple[int, dict[str, object]]:
+    """Return the attempt already in progress without incrementing it again."""
+
+    _heartbeat, detail = _latest_attempt_detail(store)
+    try:
+        attempt_number = max(1, int(detail.get("attempt_number") or 1))
+    except (TypeError, ValueError):
+        attempt_number = 1
+    context = {
+        key: detail[key]
+        for key in (
+            "previous_attempt_number",
+            "previous_stage",
+            "previous_error_type",
+            "previous_message",
+            "previous_effective_index_name",
+        )
+        if detail.get(key) is not None
+    }
+    return attempt_number, context
 
 
 def run_index_maintenance() -> int:
@@ -201,7 +229,7 @@ def main() -> int:
             settings = Settings.from_env()
             store = build_evidence_store(settings.evidence_db_path)
             if store is not None:
-                attempt_number, previous_context = _previous_attempt_context(store)
+                attempt_number, previous_context = _current_attempt_context(store)
                 _record_heartbeat(
                     store,
                     state="degraded",
