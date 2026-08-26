@@ -8,8 +8,10 @@ from inefficiency_engine import control_cycle_executor_truth_repair as control_t
 from inefficiency_engine import cycle_history_background_backfill_repair as backfill_repair
 from inefficiency_engine import cycle_history_background_supervisor_repair as supervisor_repair
 from inefficiency_engine import cycle_history_index_gate as index_gate
+from inefficiency_engine import cycle_history_index_maintenance_child as index_child
 from inefficiency_engine import read_api_cycle_history_truth_repair as api_truth
 from inefficiency_engine import render_combined_postbind_lane_repair as entrypoint
+from inefficiency_engine import runtime_index_maintenance
 
 
 def test_non_postgres_cycle_history_index_gate_is_not_a_production_ddl_requirement():
@@ -82,12 +84,13 @@ def test_backfill_start_heartbeat_preserves_last_durable_progress(monkeypatch):
     assert detail["previous_backfill_stage"] == "backfill_batch_checkpointed"
 
 
-def test_supervisor_verifies_index_before_launching_raw_backfill():
+def test_supervisor_gives_dedicated_exact_index_a_realistic_bounded_window():
     source = inspect.getsource(
         supervisor_repair.run_cycle_history_background_supervisor
     )
 
-    assert supervisor_repair.INDEX_EXECUTOR_DEADLINE_SECONDS == 135.0
+    assert index_child.DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS == 600_000
+    assert supervisor_repair.INDEX_EXECUTOR_DEADLINE_SECONDS == 630.0
     assert supervisor_repair.INDEX_COMMAND[-1] == (
         "inefficiency_engine.cycle_history_index_maintenance_child"
     )
@@ -97,6 +100,102 @@ def test_supervisor_verifies_index_before_launching_raw_backfill():
     assert source.index("INDEX_COMMAND") < source.index("BACKFILL_COMMAND")
     assert "exact_index_ready = False" in source
     assert "return_code == INDEX_NOT_READY_EXIT_CODE" in source
+
+
+def test_dedicated_index_child_restores_shared_timeout_and_preserves_attempt_context(
+    monkeypatch,
+):
+    previous = SimpleNamespace(
+        detail={
+            "stage": "cycle_history_index_failed",
+            "attempt_number": 4,
+            "message": "canceling statement due to statement timeout",
+            "current_index": "ix_runtime_market_quotes_venue_asset_observed_at_id_v4",
+        },
+        error_type="OperationalError",
+    )
+    recorded: list[dict[str, object]] = []
+    store = SimpleNamespace(
+        latest_worker_heartbeat=lambda _worker_id: previous,
+        record_worker_heartbeat=lambda **kwargs: recorded.append(kwargs),
+    )
+    statuses = iter(
+        [
+            {"ready": False, "effective_index_name": None},
+            {
+                "ready": True,
+                "effective_index_name": (
+                    "ix_runtime_market_quotes_venue_asset_observed_at_id_v5"
+                ),
+            },
+        ]
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        index_child,
+        "Settings",
+        SimpleNamespace(
+            from_env=lambda: SimpleNamespace(evidence_db_path="test-durable-store")
+        ),
+    )
+    monkeypatch.setattr(index_child, "build_evidence_store", lambda _path: store)
+    monkeypatch.setattr(
+        index_child,
+        "cycle_history_exact_index_status",
+        lambda _store: next(statuses),
+    )
+
+    def fake_ensure(_store, *, index_specs, progress):
+        captured["timeout_ms"] = (
+            runtime_index_maintenance.CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
+        )
+        captured["index_specs"] = index_specs
+        progress(
+            {
+                "phase": "complete",
+                "index": "ix_runtime_market_quotes_venue_asset_observed_at_id_v5",
+                "effective_index_name": (
+                    "ix_runtime_market_quotes_venue_asset_observed_at_id_v5"
+                ),
+                "table": "market_quotes",
+                "runtime_seconds": 420.0,
+                "ok": True,
+                "concurrent": True,
+            }
+        )
+        return {"complete": True}
+
+    monkeypatch.setattr(
+        runtime_index_maintenance,
+        "ensure_runtime_indexes_after_api_bind",
+        fake_ensure,
+    )
+    original_timeout = (
+        runtime_index_maintenance.CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
+    )
+
+    assert index_child.run_index_maintenance() == 0
+
+    assert captured["timeout_ms"] == 600_000
+    assert captured["index_specs"] == (
+        runtime_index_maintenance.CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS
+    )
+    assert (
+        runtime_index_maintenance.CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
+        == original_timeout
+    )
+    assert recorded
+    first_detail = recorded[0]["detail"]
+    assert first_detail["attempt_number"] == 5
+    assert first_detail["previous_attempt_number"] == 4
+    assert first_detail["previous_stage"] == "cycle_history_index_failed"
+    assert first_detail["previous_error_type"] == "OperationalError"
+    assert first_detail["previous_message"] == (
+        "canceling statement due to statement timeout"
+    )
+    assert first_detail["previous_effective_index_name"].endswith("_v4")
+    assert first_detail["statement_timeout_ms"] == 600_000
 
 
 def test_e2e_truth_never_promotes_generic_history_to_cycle_history(monkeypatch):
