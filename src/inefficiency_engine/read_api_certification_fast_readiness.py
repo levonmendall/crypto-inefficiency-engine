@@ -10,9 +10,27 @@ from inefficiency_engine.evidence import WorkerHeartbeat
 
 BATCHED_HEARTBEAT_READ = True
 
+# Certification consumes only durable worker publications. Keep every worker needed by
+# the E2E truth composition in the same latest-heartbeat query so the HTTP request does
+# not serially revisit the append-only heartbeat ledger after readiness is assembled.
+_CERTIFICATION_EXTRA_HEARTBEATS = {
+    "source_coverage_snapshot": "canonical-source-coverage-snapshot",
+    "research_projection": "dashboard-research-projection-publisher",
+    "runtime_index_maintenance": "source-coverage-runtime-index-maintenance",
+    "source_history_migration": "canonical-source-coverage-history-migration",
+    "cycle_history_backfill": "cycle-history-background-backfill",
+    "cycle_history_index_maintenance": "cycle-history-index-maintenance",
+}
+
 
 def _store():
     return active._store()  # noqa: SLF001 - deploy-layer composition
+
+
+def _certification_heartbeat_mapping() -> dict[str, str]:
+    mapping = dict(active._RUNTIME_HEARTBEATS)  # noqa: SLF001 - deploy composition
+    mapping.update(_CERTIFICATION_EXTRA_HEARTBEATS)
+    return mapping
 
 
 def _latest_heartbeats(store, worker_ids: list[str]) -> dict[str, WorkerHeartbeat]:
@@ -75,7 +93,7 @@ def _runtime_heartbeats() -> dict[str, object]:
             )
         ),
     )
-    mapping = dict(active._RUNTIME_HEARTBEATS)  # noqa: SLF001 - deploy composition
+    mapping = _certification_heartbeat_mapping()
     try:
         latest = _latest_heartbeats(store, list(mapping.values()))
         batch_error_type = None
@@ -192,8 +210,12 @@ def _runtime_heartbeats() -> dict[str, object]:
                 }
             )
         else:
-            # Preserve worker-specific durable details used by certification checks.
+            # Preserve compact worker-specific durable details used by certification.
+            # The source snapshot's full lane payload is intentionally omitted: the E2E
+            # endpoint needs only its already-published aggregate counts and handoff truth.
             for key, value in detail.items():
+                if label == "source_coverage_snapshot" and key == "snapshot":
+                    continue
                 worker.setdefault(str(key), value)
         workers[label] = worker
 
@@ -206,6 +228,7 @@ def _runtime_heartbeats() -> dict[str, object]:
         "diagnostic_only": True,
         "batched_latest_heartbeat_read": True,
         "heartbeat_query_count": 1,
+        "certification_worker_count": len(mapping),
     }
 
 
@@ -223,6 +246,7 @@ def deployment_readiness() -> dict[str, object]:
             "runtime_heartbeats": _runtime_heartbeats(),
             "dashboard_critical_path_persisted_only": True,
             "certification_batched_heartbeat_read": True,
+            "certification_post_readiness_database_reads": 0,
         }
     )
     return payload
@@ -230,6 +254,7 @@ def deployment_readiness() -> dict[str, object]:
 
 __all__ = [
     "BATCHED_HEARTBEAT_READ",
+    "_certification_heartbeat_mapping",
     "_latest_heartbeats",
     "_runtime_heartbeats",
     "_store",
