@@ -16,15 +16,18 @@ BACKFILL_COMMAND = [
     "inefficiency_engine.cycle_history_background_backfill",
 ]
 BACKFILL_EXECUTOR_DEADLINE_SECONDS = 90.0
-# The backfill child now advances a bounded batch rather than one bucket. Leave an
-# explicit window after each successful batch so scheduled research/alpha work can win
-# the shared heavy-work lease instead of being repeatedly raced by a five-second loop.
+# Once an exact active target exists, preserve the fair-share window for research and
+# alpha refresh. Before the first active target exists, however, a successful bounded
+# checkpoint should be followed quickly by another disposable slice; otherwise an exact
+# 180-day bootstrap can remain the control-plane blocker for hours.
 BACKFILL_SUCCESS_INTERVAL_SECONDS = 30.0
+BACKFILL_BOOTSTRAP_INTERVAL_SECONDS = 2.0
 BACKFILL_FAILURE_RETRY_SECONDS = 15.0
 BACKFILL_MEMORY_RETRY_SECONDS = 15.0
 API_BIND_POLL_SECONDS = 2.0
 API_BIND_TIMEOUT_SECONDS = 2.0
 TEMPORARY_ADMISSION_EXIT_CODE = 75
+INCOMPLETE_PROGRESS_EXIT_CODE = 76
 
 
 def _api_is_bound(port: str | int) -> bool:
@@ -54,11 +57,11 @@ def _terminate(child: subprocess.Popen[bytes], *, grace_seconds: float = 5.0) ->
 def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None:
     """Run exact history maintenance in short-lived, memory-reclaiming children.
 
-    The coordinator stays lightweight. Each child acquires the existing heavy-work
-    lease, advances a bounded durable history batch, checkpoints each completed bucket,
-    and exits completely. The post-success yield gives disposable research a fair lease
-    window while still advancing the 180-day frozen target much faster than the former
-    one-bucket-per-process design.
+    Each child still owns the existing heavy-work lease and emergency memory gate. The
+    lightweight parent no longer applies the broader ``start_blocked`` admission flag,
+    because that flag is appropriate for optional heavy work but can starve the first
+    control serving target indefinitely. Emergency ``terminate_required`` remains a
+    hard fail-closed boundary in both parent and child.
     """
 
     port = os.getenv("PORT", "10000")
@@ -69,9 +72,9 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
 
     while not stop_event.is_set():
         memory = instance_memory_snapshot()
-        if bool(getattr(memory, "start_blocked", False)):
+        if bool(getattr(memory, "terminate_required", False)):
             print(
-                "cycle-history background backfill deferred by aggregate memory admission",
+                "cycle-history background backfill deferred by emergency memory admission",
                 flush=True,
             )
             stop_event.wait(BACKFILL_MEMORY_RETRY_SECONDS)
@@ -107,6 +110,12 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
         if return_code == TEMPORARY_ADMISSION_EXIT_CODE:
             stop_event.wait(BACKFILL_MEMORY_RETRY_SECONDS)
             continue
+        if return_code == INCOMPLETE_PROGRESS_EXIT_CODE:
+            # A durable checkpoint advanced but no first certified serving target exists
+            # yet. Keep bootstrapping promptly; every child still exits and releases the
+            # heavy-work lease before this short delay.
+            stop_event.wait(BACKFILL_BOOTSTRAP_INTERVAL_SECONDS)
+            continue
         if return_code not in (0, None):
             print(
                 f"cycle-history background backfill child exited code={return_code}; retrying",
@@ -122,5 +131,7 @@ __all__ = [
     "BACKFILL_COMMAND",
     "BACKFILL_EXECUTOR_DEADLINE_SECONDS",
     "BACKFILL_SUCCESS_INTERVAL_SECONDS",
+    "BACKFILL_BOOTSTRAP_INTERVAL_SECONDS",
+    "INCOMPLETE_PROGRESS_EXIT_CODE",
     "run_cycle_history_background_supervisor",
 ]
