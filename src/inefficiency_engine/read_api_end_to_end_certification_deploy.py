@@ -3,12 +3,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
+from sqlalchemy import inspect, text
 
 from inefficiency_engine import read_api_active_volume_deploy as active
 from inefficiency_engine import read_api_lane_history_ui_deploy as inner
 from inefficiency_engine.critical_evidence_recovery import (
     DEFAULT_ALPHA_FORWARD_RECOVERY_STALE_SECONDS,
     _alpha_forward_status,
+)
+from inefficiency_engine.source_coverage_history import (
+    MIGRATION_NAME,
+    SOURCE_COVERAGE_HISTORY_MIGRATION_TABLE,
+    SOURCE_COVERAGE_HISTORY_TABLE,
 )
 
 
@@ -30,6 +36,74 @@ def _fresh_worker(row: dict[str, object], *, allowed_states: set[str]) -> bool:
     )
 
 
+def _source_history_status(store) -> dict[str, object]:
+    """Read canonical source-history migration truth without creating schema."""
+
+    try:
+        available = set(inspect(store.engine).get_table_names())
+        if SOURCE_COVERAGE_HISTORY_MIGRATION_TABLE not in available:
+            return {
+                "available": False,
+                "migration_complete": False,
+                "checkpoint_heartbeat_id": 0,
+                "lane_count": 0,
+                "reason": "migration_table_unavailable",
+            }
+        with store.engine.connect() as db:
+            row = db.execute(
+                text(
+                    "SELECT checkpoint_heartbeat_id, complete, updated_at "
+                    f"FROM {SOURCE_COVERAGE_HISTORY_MIGRATION_TABLE} "
+                    "WHERE migration_name=:migration_name LIMIT 1"
+                ),
+                {"migration_name": MIGRATION_NAME},
+            ).mappings().first()
+            lane_count = 0
+            snapshot_count = 0
+            if SOURCE_COVERAGE_HISTORY_TABLE in available:
+                lane_count = int(
+                    db.execute(
+                        text(
+                            f"SELECT COUNT(DISTINCT lane_id) FROM {SOURCE_COVERAGE_HISTORY_TABLE}"
+                        )
+                    ).scalar_one()
+                    or 0
+                )
+                snapshot_count = int(
+                    db.execute(
+                        text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_HISTORY_TABLE}")
+                    ).scalar_one()
+                    or 0
+                )
+        if row is None:
+            return {
+                "available": True,
+                "migration_complete": False,
+                "checkpoint_heartbeat_id": 0,
+                "lane_count": lane_count,
+                "snapshot_count": snapshot_count,
+                "reason": "migration_checkpoint_unobserved",
+            }
+        return {
+            "available": True,
+            "migration_complete": bool(row.get("complete")),
+            "checkpoint_heartbeat_id": int(row.get("checkpoint_heartbeat_id") or 0),
+            "updated_at": row.get("updated_at"),
+            "lane_count": lane_count,
+            "snapshot_count": snapshot_count,
+            "reason": "complete" if bool(row.get("complete")) else "migration_in_progress",
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "migration_complete": False,
+            "checkpoint_heartbeat_id": 0,
+            "lane_count": 0,
+            "error_type": type(exc).__name__,
+            "reason": "source_history_read_unavailable",
+        }
+
+
 def end_to_end_certification_payload() -> dict[str, object]:
     """Return a fail-closed production certification from durable runtime truth.
 
@@ -37,6 +111,10 @@ def end_to_end_certification_payload() -> dict[str, object]:
     every authority boundary. It deliberately does *not* require a profitable candidate,
     allocation, position or trade: correct economic/statistical rejection is a healthy
     end-to-end result. Historical or presentation data can never create qualification.
+
+    Operational certification and full 13-lane evidence completeness are reported
+    separately. A fail-closed evidence gap does not make the runtime dishonest, but the
+    endpoint never labels a partially source-sufficient universe as fully complete.
     """
 
     try:
@@ -70,6 +148,7 @@ def end_to_end_certification_payload() -> dict[str, object]:
         now=datetime.now(timezone.utc),
         stale_after_seconds=DEFAULT_ALPHA_FORWARD_RECOVERY_STALE_SECONDS,
     )
+    source_history = _source_history_status(store)
 
     checks = {
         "database_ready": bool(ready.get("database_ok")),
@@ -85,6 +164,10 @@ def end_to_end_certification_payload() -> dict[str, object]:
             and not source_snapshot.get("stale")
             and source_snapshot.get("persisted_complete_snapshot") is True
             and int(source_snapshot.get("lane_count") or 0) == 13
+        ),
+        "canonical_source_history_migrated": bool(
+            source_history.get("migration_complete")
+            and int(source_history.get("lane_count") or 0) == 13
         ),
         "structural_forward_worker_current": _fresh_worker(
             mechanism,
@@ -118,7 +201,12 @@ def end_to_end_certification_payload() -> dict[str, object]:
         ),
     }
     blockers = [name for name, passed in checks.items() if not passed]
-    certified = not blockers
+    operationally_certified = not blockers
+    lane_count = int(source_snapshot.get("lane_count") or 0)
+    sufficient_lane_count = int(source_snapshot.get("sufficient_lane_count") or 0)
+    full_13_lane_evidence_scope_complete = bool(
+        lane_count == 13 and sufficient_lane_count == 13
+    )
 
     index_advisory = {
         "available": bool(index_maintenance.get("available")),
@@ -130,26 +218,29 @@ def end_to_end_certification_payload() -> dict[str, object]:
     }
 
     return {
-        "certified": certified,
-        "status": "certified" if certified else "blocked",
+        "certified": operationally_certified,
+        "operationally_certified": operationally_certified,
+        "status": "certified" if operationally_certified else "blocked",
         "release_commit": ready.get("release_commit"),
         "observed_at": datetime.now(timezone.utc).isoformat(),
         "checks": checks,
         "blockers": blockers,
         "alpha_forward": alpha_forward,
+        "canonical_source_history": source_history,
         "source_coverage": {
-            "lane_count": source_snapshot.get("lane_count"),
-            "sufficient_lane_count": source_snapshot.get("sufficient_lane_count"),
+            "lane_count": lane_count,
+            "sufficient_lane_count": sufficient_lane_count,
             "forward_test_eligible_lane_count": source_snapshot.get(
                 "forward_test_eligible_lane_count"
             ),
             "allocation_source_qualified_lane_count": source_snapshot.get(
                 "allocation_source_qualified_lane_count"
             ),
+            "full_13_lane_evidence_scope_complete": full_13_lane_evidence_scope_complete,
             "all_lanes_required_to_be_profitable": False,
-            "all_lanes_required_to_be_source_sufficient": False,
-            "fail_closed_lane_gaps_allowed": True,
+            "fail_closed_lane_gaps_allowed_for_operational_certification": True,
         },
+        "full_13_lane_evidence_scope_complete": full_13_lane_evidence_scope_complete,
         "control": {
             "state": control.get("state"),
             "error_type": control.get("error_type"),
