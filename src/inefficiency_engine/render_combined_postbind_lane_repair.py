@@ -38,12 +38,10 @@ CONTROL_TRUTH_COMMAND = [
     "-m",
     "inefficiency_engine.permanent_control_worker_truth_repair",
 ]
-# The outer ASGI liveness boundary still guarantees Render's /health probe never enters
-# PostgreSQL-backed diagnostics. The truth-repair wrapper intercepts only the explicit
-# end-to-end certification route and delegates every other route to the liveness app.
-BOUNDED_HEARTBEAT_API_APP = (
-    "inefficiency_engine.read_api_cycle_history_truth_repair:app"
-)
+# Keep the canonical database-independent liveness app as the production ASGI target.
+# That app now intercepts only the explicit E2E diagnostic after path selection, while
+# /health remains a zero-database process-liveness branch.
+BOUNDED_HEARTBEAT_API_APP = "inefficiency_engine.read_api_liveness_deploy:app"
 
 
 def install_source_repair_child_command() -> None:
