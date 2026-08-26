@@ -47,13 +47,11 @@ class ReadOnlyEvidenceStore(EvidenceStore):
             timeout = max(1, int(connect_timeout_seconds))
             statement_ms = max(250, int(statement_timeout_ms))
             lock_ms = max(100, min(int(lock_timeout_ms), statement_ms))
-            kwargs["connect_args"] = {
-                "connect_timeout": timeout,
-                "options": (
-                    f"-c statement_timeout={statement_ms} "
-                    f"-c lock_timeout={lock_ms}"
-                ),
-            }
+            kwargs["connect_args"] = {"connect_timeout": timeout}
+            kwargs["connect_args"]["options"] = (
+                f"-c statement_timeout={statement_ms} "
+                f"-c lock_timeout={lock_ms}"
+            )
             kwargs["pool_timeout"] = timeout
 
         self.engine: Engine = create_engine(url, **kwargs)
