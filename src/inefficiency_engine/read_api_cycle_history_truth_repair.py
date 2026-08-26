@@ -21,6 +21,7 @@ def _raw_canonical_control_status(
         "available": bool(row.get("available")),
         "state": row.get("state"),
         "error_type": row.get("error_type"),
+        "error_message": row.get("error_message"),
         "cycle_history_cache_complete": row.get("cycle_history_cache_complete"),
         "cycle_history_cache_progress": row.get("cycle_history_cache_progress"),
         "historical_cache_progress": row.get("historical_cache_progress"),
@@ -31,6 +32,26 @@ def _raw_canonical_control_status(
             "qualified_bridge_publication_complete"
         ),
     }
+
+
+def _worker_snapshot_error(workers: dict[str, object]) -> dict[str, object] | None:
+    """Surface the shared batched-read failure without another durable lookup."""
+
+    for raw in workers.values():
+        if not isinstance(raw, dict) or raw.get("available"):
+            continue
+        error_type = raw.get("error_type")
+        message = raw.get("error_message")
+        if not error_type and not message:
+            continue
+        return {
+            "error_type": error_type,
+            "message": message,
+            "query_strategy": raw.get("heartbeat_query_strategy"),
+            "retryable": True,
+            "certification_authority": False,
+        }
+    return None
 
 
 def _cycle_history_index_maintenance_status(
@@ -44,6 +65,8 @@ def _cycle_history_index_maintenance_status(
             "available": False,
             "stale": True,
             "ready": False,
+            "error_type": row.get("error_type") if row else None,
+            "error_message": row.get("error_message") if row else None,
             "reason": "index_heartbeat_unavailable_in_compact_snapshot",
             "worker_id": CYCLE_HISTORY_INDEX_WORKER_ID,
             "single_owner": True,
@@ -119,6 +142,7 @@ def repaired_end_to_end_certification_payload() -> dict[str, object]:
     payload = dict(base.end_to_end_certification_payload(include_worker_truth=True))
     workers = payload.pop("_certification_workers", {})
     workers = dict(workers) if isinstance(workers, dict) else {}
+    snapshot_error = _worker_snapshot_error(workers)
     raw_control = _raw_canonical_control_status(
         workers.get("canonical_control")
         if isinstance(workers.get("canonical_control"), dict)
@@ -177,6 +201,8 @@ def repaired_end_to_end_certification_payload() -> dict[str, object]:
             "cycle_history_generic_cache_fallback_disabled": True,
         }
     )
+    if raw_control.get("error_message"):
+        control["error_message"] = raw_control.get("error_message")
 
     strategy = historical_progress.get("strategy")
     if isinstance(strategy, dict):
@@ -218,6 +244,7 @@ def repaired_end_to_end_certification_payload() -> dict[str, object]:
                 if background_cycle_complete
                 else "none"
             ),
+            "worker_snapshot_error": snapshot_error,
             "cycle_history_generic_cache_fallback_disabled": True,
             "duplicate_readiness_read_disabled": True,
             "truth_repair_additional_database_reads": 0,
@@ -233,5 +260,6 @@ __all__ = [
     "END_TO_END_PATH",
     "_cycle_history_index_maintenance_status",
     "_raw_canonical_control_status",
+    "_worker_snapshot_error",
     "repaired_end_to_end_certification_payload",
 ]
