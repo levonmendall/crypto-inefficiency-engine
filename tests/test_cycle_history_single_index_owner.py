@@ -13,6 +13,7 @@ def test_generic_postbind_maintainer_does_not_own_exact_cycle_history_btree():
     guard_source = inspect.getsource(postbind._runtime_index_guard)
 
     assert "CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS" not in module_source
+    assert '"post_control_cycle_history"' not in guard_source
     assert "post_control_source_strategy" in guard_source
     assert "ensure_cycle_history_brin_after_api_bind" in guard_source
     assert "cycle-history-index-maintenance" in guard_source
