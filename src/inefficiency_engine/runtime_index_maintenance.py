@@ -62,7 +62,7 @@ POSTGRES_IDENTIFIER_MAX_BYTES = 63
 # Replacement names are intentionally dynamic rather than a fixed _v2/_v3/_v4 set:
 # every retry discovers already-used versions from pg_catalog and advances to a fresh
 # deterministic suffix. Invalid predecessors are never dropped on the authority path.
-_REPLACEMENT_VERSION_RE = re.compile(r"_v(?P<version>[2-9][0-9]*)$")
+_REPLACEMENT_VERSION_RE = re.compile(r"_v(?P<version>(?:[2-9]|[1-9][0-9]+))$")
 
 
 class RuntimeIndexVerificationError(RuntimeError):
