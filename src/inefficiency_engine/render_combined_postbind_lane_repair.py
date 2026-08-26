@@ -13,6 +13,9 @@ from inefficiency_engine.cycle_history_background_supervisor import (
 from inefficiency_engine.research_projection_supervisor import (
     run_research_projection_supervisor,
 )
+from inefficiency_engine.source_coverage_history_migration_supervisor import (
+    run_source_coverage_history_migration_supervisor,
+)
 
 
 SOURCE_REPAIR_COMMAND = [
@@ -96,6 +99,12 @@ def main() -> int:
         name="candidate-observatory-backfill-supervisor",
         daemon=True,
     )
+    source_history_guard = threading.Thread(
+        target=run_source_coverage_history_migration_supervisor,
+        args=(stop_event,),
+        name="source-coverage-history-migration-supervisor",
+        daemon=True,
+    )
     research_projection_guard = threading.Thread(
         target=run_research_projection_supervisor,
         args=(stop_event,),
@@ -104,6 +113,7 @@ def main() -> int:
     )
     cycle_history_guard.start()
     observatory_backfill_guard.start()
+    source_history_guard.start()
     research_projection_guard.start()
     try:
         return base.main()
@@ -111,6 +121,7 @@ def main() -> int:
         stop_event.set()
         cycle_history_guard.join(timeout=10.0)
         observatory_backfill_guard.join(timeout=10.0)
+        source_history_guard.join(timeout=10.0)
         research_projection_guard.join(timeout=10.0)
 
 
