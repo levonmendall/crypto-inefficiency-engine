@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
 from inefficiency_engine import read_api_end_to_end_certification_deploy as base
 
 
@@ -11,111 +9,59 @@ CYCLE_HISTORY_INDEX_STALE_SECONDS = 180.0
 CANONICAL_CONTROL_WORKER_ID = "canonical-control-operating-loop"
 
 
-def _store_or_none():
-    try:
-        return base.active._store()  # noqa: SLF001 - production diagnostic composition
-    except Exception:
-        return None
+def _raw_canonical_control_status(
+    worker: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Extract explicit cycle-history truth from the already-batched control row."""
 
-
-def _raw_canonical_control_status() -> dict[str, object]:
-    """Read only the one durable control heartbeat needed by the truth repair.
-
-    The legacy repair re-ran the entire deployment-readiness composition after the base
-    certification payload had already done so. That duplicated table/heartbeat reads on
-    every request. Read the canonical-control heartbeat directly instead and keep this
-    diagnostic fail-soft; absence can never promote certification.
-    """
-
-    store = _store_or_none()
-    if store is None:
+    row = dict(worker) if isinstance(worker, dict) else {}
+    if not row:
         return {}
-    try:
-        heartbeat = store.latest_worker_heartbeat(CANONICAL_CONTROL_WORKER_ID)
-    except Exception:
-        return {}
-    if heartbeat is None:
-        return {}
-
-    detail = dict(getattr(heartbeat, "detail", {}) or {})
     return {
-        "available": True,
-        "state": getattr(heartbeat, "state", None),
-        "error_type": getattr(heartbeat, "error_type", None),
-        "cycle_history_cache_complete": detail.get("cycle_history_cache_complete"),
-        "cycle_history_cache_progress": detail.get("cycle_history_cache_progress"),
-        "historical_cache_progress": detail.get("historical_cache_progress"),
-        "operating_reconciliation_complete": detail.get(
+        "available": bool(row.get("available")),
+        "state": row.get("state"),
+        "error_type": row.get("error_type"),
+        "cycle_history_cache_complete": row.get("cycle_history_cache_complete"),
+        "cycle_history_cache_progress": row.get("cycle_history_cache_progress"),
+        "historical_cache_progress": row.get("historical_cache_progress"),
+        "operating_reconciliation_complete": row.get(
             "operating_reconciliation_complete"
         ),
-        "qualified_bridge_publication_complete": detail.get(
+        "qualified_bridge_publication_complete": row.get(
             "qualified_bridge_publication_complete"
         ),
     }
 
 
-def _cycle_history_index_maintenance_status() -> dict[str, object]:
-    """Expose the dedicated exact-index owner without granting certification authority."""
+def _cycle_history_index_maintenance_status(
+    worker: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Expose the dedicated exact-index owner from the same batched worker snapshot."""
 
-    store = _store_or_none()
-    if store is None:
+    row = dict(worker) if isinstance(worker, dict) else {}
+    if not row or not bool(row.get("available")):
         return {
             "available": False,
             "stale": True,
             "ready": False,
-            "reason": "index_heartbeat_store_unavailable",
+            "reason": "index_heartbeat_unavailable_in_compact_snapshot",
             "worker_id": CYCLE_HISTORY_INDEX_WORKER_ID,
             "single_owner": True,
             "certification_authority": False,
+            "allocation_authority": False,
+            "live_execution_authority": False,
+            "paper_only": True,
         }
 
-    try:
-        heartbeat = store.latest_worker_heartbeat(CYCLE_HISTORY_INDEX_WORKER_ID)
-    except Exception as exc:
-        return {
-            "available": False,
-            "stale": True,
-            "ready": False,
-            "error_type": type(exc).__name__,
-            "reason": "index_heartbeat_read_failed",
-            "worker_id": CYCLE_HISTORY_INDEX_WORKER_ID,
-            "single_owner": True,
-            "certification_authority": False,
-        }
-    if heartbeat is None:
-        return {
-            "available": False,
-            "stale": True,
-            "ready": False,
-            "reason": "index_heartbeat_unobserved",
-            "worker_id": CYCLE_HISTORY_INDEX_WORKER_ID,
-            "single_owner": True,
-            "certification_authority": False,
-        }
-
-    detail = dict(getattr(heartbeat, "detail", {}) or {})
-    raw_status = detail.get("index_status")
+    raw_status = row.get("index_status")
     index_status = dict(raw_status) if isinstance(raw_status, dict) else {}
-    raw_maintenance = detail.get("maintenance_result")
+    raw_maintenance = row.get("maintenance_result")
     maintenance_result = (
         dict(raw_maintenance) if isinstance(raw_maintenance, dict) else {}
     )
-
-    observed_at = getattr(heartbeat, "observed_at", None)
-    age_seconds = None
-    if isinstance(observed_at, datetime):
-        observed = (
-            observed_at
-            if observed_at.tzinfo is not None
-            else observed_at.replace(tzinfo=timezone.utc)
-        )
-        age_seconds = max(
-            0.0,
-            (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds(),
-        )
-    stale = age_seconds is None or age_seconds > CYCLE_HISTORY_INDEX_STALE_SECONDS
-    state = str(getattr(heartbeat, "state", None) or "unknown")
-    stage = str(detail.get("stage") or "") or None
+    stale = bool(row.get("stale", True))
+    state = str(row.get("state") or "unknown")
+    stage = str(row.get("stage") or "") or None
     ready = bool(
         not stale
         and state == "success"
@@ -128,9 +74,9 @@ def _cycle_history_index_maintenance_status() -> dict[str, object]:
         "worker_id": CYCLE_HISTORY_INDEX_WORKER_ID,
         "state": state,
         "stage": stage,
-        "error_type": getattr(heartbeat, "error_type", None),
-        "observed_at": observed_at,
-        "age_seconds": age_seconds,
+        "error_type": row.get("error_type"),
+        "observed_at": row.get("observed_at"),
+        "age_seconds": row.get("age_seconds"),
         "stale": stale,
         "ready": ready,
         "index_status": index_status,
@@ -139,23 +85,19 @@ def _cycle_history_index_maintenance_status() -> dict[str, object]:
         "effective_index_name": index_status.get("effective_index_name"),
         "planner_usable_verified": index_status.get("planner_usable_verified"),
         "reason": index_status.get("reason"),
-        "current_index": detail.get("current_index"),
-        "current_table": detail.get("current_table"),
-        "current_index_runtime_seconds": detail.get(
-            "current_index_runtime_seconds"
-        ),
-        "current_index_ok": detail.get("current_index_ok"),
-        "current_index_concurrent": detail.get("current_index_concurrent"),
-        "message": detail.get("message"),
-        "attempt_number": detail.get("attempt_number"),
-        "statement_timeout_ms": detail.get("statement_timeout_ms"),
-        "previous_attempt_number": detail.get("previous_attempt_number"),
-        "previous_stage": detail.get("previous_stage"),
-        "previous_error_type": detail.get("previous_error_type"),
-        "previous_message": detail.get("previous_message"),
-        "previous_effective_index_name": detail.get(
-            "previous_effective_index_name"
-        ),
+        "current_index": row.get("current_index"),
+        "current_table": row.get("current_table"),
+        "current_index_runtime_seconds": row.get("current_index_runtime_seconds"),
+        "current_index_ok": row.get("current_index_ok"),
+        "current_index_concurrent": row.get("current_index_concurrent"),
+        "message": row.get("message"),
+        "attempt_number": row.get("attempt_number"),
+        "statement_timeout_ms": row.get("statement_timeout_ms"),
+        "previous_attempt_number": row.get("previous_attempt_number"),
+        "previous_stage": row.get("previous_stage"),
+        "previous_error_type": row.get("previous_error_type"),
+        "previous_message": row.get("previous_message"),
+        "previous_effective_index_name": row.get("previous_effective_index_name"),
         "single_owner": True,
         "generic_runtime_exact_index_maintenance_disabled": True,
         "certification_authority": False,
@@ -166,21 +108,22 @@ def _cycle_history_index_maintenance_status() -> dict[str, object]:
 
 
 def repaired_end_to_end_certification_payload() -> dict[str, object]:
-    """Separate exact cycle-history truth from generic historical-cache telemetry.
+    """Apply cycle-history truth semantics without any additional database reads.
 
-    The legacy endpoint fell back from a missing ``cycle_history_cache_progress`` field
-    to the unrelated strategy/outcome ``historical_cache_progress`` object, and also
-    allowed generic historical-cache completion to satisfy the cycle-history serving
-    target check. This repair recomputes that check from the raw control heartbeat's
-    explicit cycle-history field plus the certified background target only.
-
-    The base certification composition already performs the full readiness read. This
-    wrapper deliberately does not call ``deployment_readiness`` a second time; it reads
-    only the one canonical-control heartbeat needed to correct cycle-history semantics.
+    Base certification requests one compact latest-worker snapshot. This wrapper reuses
+    those exact rows to keep generic historical caches from masquerading as cycle-history
+    completion and to expose the dedicated exact-index owner. No second readiness call,
+    heartbeat lookup, archive count, or provider work is allowed here.
     """
 
-    payload = dict(base.end_to_end_certification_payload())
-    raw_control = _raw_canonical_control_status()
+    payload = dict(base.end_to_end_certification_payload(include_worker_truth=True))
+    workers = payload.pop("_certification_workers", {})
+    workers = dict(workers) if isinstance(workers, dict) else {}
+    raw_control = _raw_canonical_control_status(
+        workers.get("canonical_control")
+        if isinstance(workers.get("canonical_control"), dict)
+        else None
+    )
 
     background = payload.get("cycle_history_backfill")
     background = dict(background) if isinstance(background, dict) else {}
@@ -245,7 +188,10 @@ def repaired_end_to_end_certification_payload() -> dict[str, object]:
             "completion_state"
         )
 
-    exact_index = _cycle_history_index_maintenance_status()
+    exact_row = workers.get("cycle_history_index_maintenance")
+    exact_index = _cycle_history_index_maintenance_status(
+        exact_row if isinstance(exact_row, dict) else None
+    )
     if (
         background.get("first_certified_target_pending")
         and not exact_index.get("ready")
@@ -274,6 +220,7 @@ def repaired_end_to_end_certification_payload() -> dict[str, object]:
             ),
             "cycle_history_generic_cache_fallback_disabled": True,
             "duplicate_readiness_read_disabled": True,
+            "truth_repair_additional_database_reads": 0,
         }
     )
     return payload
