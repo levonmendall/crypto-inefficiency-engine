@@ -10,6 +10,7 @@ from inefficiency_engine import read_api_cycle_history_truth_repair as truth_rep
 from inefficiency_engine import read_api_end_to_end_certification_deploy as certification
 from inefficiency_engine import source_coverage_history_migration_child as history_child
 from inefficiency_engine.evidence import EvidenceStore
+from inefficiency_engine.source_coverage_history import SOURCE_COVERAGE_HISTORY_TABLE
 
 
 def test_certification_batch_includes_every_post_readiness_truth_worker():
@@ -80,13 +81,13 @@ def test_migration_child_publishes_final_counts_off_request_path(tmp_path):
     with store.engine.begin() as db:
         db.execute(
             text(
-                "CREATE TABLE canonical_source_coverage_history ("
+                f"CREATE TABLE {SOURCE_COVERAGE_HISTORY_TABLE} ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, lane_id TEXT NOT NULL)"
             )
         )
         db.execute(
             text(
-                "INSERT INTO canonical_source_coverage_history(lane_id) "
+                f"INSERT INTO {SOURCE_COVERAGE_HISTORY_TABLE}(lane_id) "
                 "VALUES ('price_discrepancy'),('carry'),('carry')"
             )
         )
