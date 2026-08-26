@@ -1,14 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-import json
-from typing import Any
-
-from fastapi import HTTPException
-from fastapi.encoders import jsonable_encoder
-
 from inefficiency_engine import read_api_end_to_end_certification_deploy as base
-from inefficiency_engine.read_api_liveness_deploy import app as _inner_app
 
 
 END_TO_END_PATH = "/v3/operations/end-to-end-certification"
@@ -20,10 +12,8 @@ def repaired_end_to_end_certification_payload() -> dict[str, object]:
     The legacy endpoint fell back from a missing ``cycle_history_cache_progress`` field
     to the unrelated strategy/outcome ``historical_cache_progress`` object, and also
     allowed generic historical-cache completion to satisfy the cycle-history serving
-    target check. That could make an empty disposable strategy cache appear to be
-    cycle-history progress. This read-plane repair recomputes the one check from the raw
-    control heartbeat's explicit cycle-history field plus the certified background
-    target only. It grants no authority and never changes evidence.
+    target check. This repair recomputes that check from the raw control heartbeat's
+    explicit cycle-history field plus the certified background target only.
     """
 
     payload = dict(base.end_to_end_certification_payload())
@@ -123,70 +113,7 @@ def repaired_end_to_end_certification_payload() -> dict[str, object]:
     return payload
 
 
-class CycleHistoryTruthApp:
-    """Intercept only the E2E diagnostic; delegate all other routes unchanged."""
-
-    def __init__(self, inner: Any) -> None:
-        self.inner = inner
-
-    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        method = str(scope.get("method") or "").upper()
-        if (
-            scope.get("type") == "http"
-            and scope.get("path") == END_TO_END_PATH
-            and method in {"GET", "HEAD"}
-        ):
-            status = 200
-            try:
-                body_value: object = await asyncio.to_thread(
-                    repaired_end_to_end_certification_payload
-                )
-            except HTTPException as exc:
-                status = int(exc.status_code)
-                body_value = {"detail": exc.detail}
-            except Exception as exc:
-                status = 503
-                body_value = {
-                    "detail": {
-                        "message": "end-to-end certification truth repair unavailable",
-                        "error_type": type(exc).__name__,
-                    }
-                }
-
-            encoded = json.dumps(
-                jsonable_encoder(body_value),
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-            headers = [
-                (b"content-type", b"application/json"),
-                (b"cache-control", b"no-store"),
-                (b"content-length", str(len(encoded)).encode("ascii")),
-            ]
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": status,
-                    "headers": headers,
-                }
-            )
-            await send(
-                {
-                    "type": "http.response.body",
-                    "body": b"" if method == "HEAD" else encoded,
-                    "more_body": False,
-                }
-            )
-            return
-
-        await self.inner(scope, receive, send)
-
-
-app = CycleHistoryTruthApp(_inner_app)
-
-
 __all__ = [
-    "CycleHistoryTruthApp",
-    "app",
+    "END_TO_END_PATH",
     "repaired_end_to_end_certification_payload",
 ]
