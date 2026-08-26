@@ -5,7 +5,7 @@ import os
 from typing import Any
 
 from inefficiency_engine import __version__
-from inefficiency_engine.read_api_lane_history_ui_deploy import app as _inner_app
+from inefficiency_engine.read_api_end_to_end_certification_deploy import app as _inner_app
 
 
 class DatabaseIndependentLivenessApp:
@@ -76,6 +76,7 @@ def liveness_payload() -> dict[str, object]:
         "database_check": "deferred_to_readiness",
         "runtime_diagnostics": "deferred_to_readiness",
         "readiness_endpoint": "/ready",
+        "end_to_end_certification_endpoint": "/v3/operations/end-to-end-certification",
         "liveness_database_independent": True,
     }
 
