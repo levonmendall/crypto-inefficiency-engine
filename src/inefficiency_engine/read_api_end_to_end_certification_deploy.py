@@ -19,6 +19,8 @@ from inefficiency_engine.source_coverage_history import (
 
 
 app = inner.app
+_CYCLE_HISTORY_BACKFILL_WORKER_ID = "cycle-history-background-backfill"
+_CYCLE_HISTORY_BACKFILL_STALE_SECONDS = 180.0
 
 
 def _worker(workers: object, name: str) -> dict[str, object]:
@@ -104,6 +106,63 @@ def _source_history_status(store) -> dict[str, object]:
         }
 
 
+def _cycle_history_backfill_status(store) -> dict[str, object]:
+    """Expose the bounded background bootstrap heartbeat without granting authority.
+
+    The background worker is the process that creates the first exact active target.
+    Canonical control remains an independent required certification gate, so reporting a
+    completed background target cannot falsely certify reconciliation or bridge output.
+    """
+
+    try:
+        heartbeat = store.latest_worker_heartbeat(_CYCLE_HISTORY_BACKFILL_WORKER_ID)
+    except Exception as exc:
+        return {
+            "available": False,
+            "stale": True,
+            "cache_complete": False,
+            "progress": {},
+            "error_type": type(exc).__name__,
+            "certification_authority": False,
+        }
+    if heartbeat is None:
+        return {
+            "available": False,
+            "stale": True,
+            "cache_complete": False,
+            "progress": {},
+            "certification_authority": False,
+        }
+
+    detail = dict(getattr(heartbeat, "detail", {}) or {})
+    raw_progress = detail.get("progress")
+    progress = dict(raw_progress) if isinstance(raw_progress, dict) else {}
+    observed_at = getattr(heartbeat, "observed_at", None)
+    age_seconds = None
+    if isinstance(observed_at, datetime):
+        observed = observed_at if observed_at.tzinfo else observed_at.replace(tzinfo=timezone.utc)
+        age_seconds = max(0.0, (datetime.now(timezone.utc) - observed).total_seconds())
+    stale = age_seconds is None or age_seconds > _CYCLE_HISTORY_BACKFILL_STALE_SECONDS
+    cache_complete = bool(detail.get("cache_complete") or progress.get("complete"))
+    serving_scan_id = progress.get("serving_scan_id")
+    return {
+        "available": True,
+        "state": getattr(heartbeat, "state", None),
+        "error_type": getattr(heartbeat, "error_type", None),
+        "observed_at": observed_at,
+        "age_seconds": age_seconds,
+        "stale": stale,
+        "stage": detail.get("stage"),
+        "cache_complete": cache_complete,
+        "first_certified_target_pending": bool(
+            detail.get("first_certified_target_pending", not cache_complete)
+        ),
+        "serving_scan_id": serving_scan_id,
+        "progress": progress,
+        "certification_authority": False,
+    }
+
+
 def end_to_end_certification_payload() -> dict[str, object]:
     """Return a fail-closed production certification from durable runtime truth.
 
@@ -149,6 +208,20 @@ def end_to_end_certification_payload() -> dict[str, object]:
         stale_after_seconds=DEFAULT_ALPHA_FORWARD_RECOVERY_STALE_SECONDS,
     )
     source_history = _source_history_status(store)
+    cycle_history_backfill = _cycle_history_backfill_status(store)
+    control_cycle_complete = bool(
+        control.get("cycle_history_cache_complete")
+        or control.get("historical_cache_complete")
+    )
+    background_cycle_complete = bool(
+        cycle_history_backfill.get("available")
+        and not cycle_history_backfill.get("stale")
+        and cycle_history_backfill.get("cache_complete")
+        and cycle_history_backfill.get("serving_scan_id")
+    )
+    cycle_history_serving_target_certified = bool(
+        control_cycle_complete or background_cycle_complete
+    )
 
     checks = {
         "database_ready": bool(ready.get("database_ok")),
@@ -177,10 +250,7 @@ def end_to_end_certification_payload() -> dict[str, object]:
             alpha_forward.get("available")
             and not alpha_forward.get("recovery_required")
         ),
-        "cycle_history_serving_target_certified": bool(
-            control.get("cycle_history_cache_complete")
-            or control.get("historical_cache_complete")
-        ),
+        "cycle_history_serving_target_certified": cycle_history_serving_target_certified,
         "canonical_control_current": _fresh_worker(
             control,
             allowed_states={"success"},
@@ -216,6 +286,13 @@ def end_to_end_certification_payload() -> dict[str, object]:
         "control_gate_released": index_maintenance.get("control_gate_released"),
         "certification_authority": False,
     }
+    control_progress = control.get("cycle_history_cache_progress")
+    if not isinstance(control_progress, dict) or not control_progress:
+        control_progress = control.get("historical_cache_progress")
+    if not isinstance(control_progress, dict) or not control_progress:
+        control_progress = cycle_history_backfill.get("progress")
+    if not isinstance(control_progress, dict):
+        control_progress = {}
 
     return {
         "certified": operationally_certified,
@@ -227,6 +304,7 @@ def end_to_end_certification_payload() -> dict[str, object]:
         "blockers": blockers,
         "alpha_forward": alpha_forward,
         "canonical_source_history": source_history,
+        "cycle_history_backfill": cycle_history_backfill,
         "source_coverage": {
             "lane_count": lane_count,
             "sufficient_lane_count": sufficient_lane_count,
@@ -244,8 +322,8 @@ def end_to_end_certification_payload() -> dict[str, object]:
         "control": {
             "state": control.get("state"),
             "error_type": control.get("error_type"),
-            "cycle_history_cache_complete": control.get("cycle_history_cache_complete"),
-            "cycle_history_cache_progress": control.get("cycle_history_cache_progress"),
+            "cycle_history_cache_complete": control_cycle_complete,
+            "cycle_history_cache_progress": control_progress,
             "operating_reconciliation_complete": control.get(
                 "operating_reconciliation_complete"
             ),
