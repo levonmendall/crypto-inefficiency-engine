@@ -17,7 +17,7 @@ def _worker(state="success", *, stale=False, **extra):
     }
 
 
-def _ready_payload():
+def _ready_payload(*, sufficient_lane_count=6):
     workers = {
         "canonical_control": _worker(
             cycle_history_cache_complete=True,
@@ -32,7 +32,7 @@ def _ready_payload():
             persisted_complete_snapshot=True,
             lane_count=13,
             handoff_stale=False,
-            sufficient_lane_count=6,
+            sufficient_lane_count=sufficient_lane_count,
             forward_test_eligible_lane_count=7,
             allocation_source_qualified_lane_count=6,
         ),
@@ -54,9 +54,7 @@ def _ready_payload():
     }
 
 
-def test_certification_allows_economic_rejection_without_trade(monkeypatch):
-    monkeypatch.setattr(certification.active, "deployment_readiness", _ready_payload)
-    monkeypatch.setattr(certification.active, "_store", lambda: object())
+def _patch_current_alpha_and_history(monkeypatch):
     monkeypatch.setattr(
         certification,
         "_alpha_forward_status",
@@ -66,19 +64,56 @@ def test_certification_allows_economic_rejection_without_trade(monkeypatch):
             "reason": "alpha_forward_marker_current",
         },
     )
+    monkeypatch.setattr(
+        certification,
+        "_source_history_status",
+        lambda store: {
+            "available": True,
+            "migration_complete": True,
+            "checkpoint_heartbeat_id": 100,
+            "lane_count": 13,
+            "snapshot_count": 1300,
+            "reason": "complete",
+        },
+    )
+
+
+def test_certification_allows_economic_rejection_without_trade(monkeypatch):
+    monkeypatch.setattr(certification.active, "deployment_readiness", _ready_payload)
+    monkeypatch.setattr(certification.active, "_store", lambda: object())
+    _patch_current_alpha_and_history(monkeypatch)
 
     payload = certification.end_to_end_certification_payload()
 
     assert payload["certified"] is True
+    assert payload["operationally_certified"] is True
     assert payload["blockers"] == []
     assert payload["trade_required_for_certification"] is False
     assert payload["positive_candidate_required_for_certification"] is False
     assert payload["economic_rejection_is_valid"] is True
+    assert payload["canonical_source_history"]["migration_complete"] is True
     assert payload["source_coverage"]["sufficient_lane_count"] == 6
-    assert payload["source_coverage"]["all_lanes_required_to_be_source_sufficient"] is False
+    assert payload["full_13_lane_evidence_scope_complete"] is False
+    assert payload["source_coverage"]["fail_closed_lane_gaps_allowed_for_operational_certification"] is True
     assert payload["runtime_index_maintenance"]["certification_authority"] is False
     assert payload["qualification_thresholds_unchanged"] is True
     assert payload["live_execution_authority"] is False
+
+
+def test_all_lane_scope_is_reported_separately_from_pipeline_operation(monkeypatch):
+    monkeypatch.setattr(
+        certification.active,
+        "deployment_readiness",
+        lambda: _ready_payload(sufficient_lane_count=13),
+    )
+    monkeypatch.setattr(certification.active, "_store", lambda: object())
+    _patch_current_alpha_and_history(monkeypatch)
+
+    payload = certification.end_to_end_certification_payload()
+
+    assert payload["certified"] is True
+    assert payload["full_13_lane_evidence_scope_complete"] is True
+    assert payload["source_coverage"]["sufficient_lane_count"] == 13
 
 
 def test_certification_fails_closed_on_stale_alpha_and_incomplete_control(monkeypatch):
@@ -104,10 +139,22 @@ def test_certification_fails_closed_on_stale_alpha_and_incomplete_control(monkey
             "reason": "alpha_forward_marker_stale",
         },
     )
+    monkeypatch.setattr(
+        certification,
+        "_source_history_status",
+        lambda store: {
+            "available": True,
+            "migration_complete": False,
+            "checkpoint_heartbeat_id": 50,
+            "lane_count": 13,
+            "reason": "migration_in_progress",
+        },
+    )
 
     payload = certification.end_to_end_certification_payload()
 
     assert payload["certified"] is False
+    assert "canonical_source_history_migrated" in payload["blockers"]
     assert "alpha_forward_cycle_current" in payload["blockers"]
     assert "cycle_history_serving_target_certified" in payload["blockers"]
     assert "canonical_control_current" in payload["blockers"]
