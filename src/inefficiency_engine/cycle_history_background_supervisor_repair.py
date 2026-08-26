@@ -22,10 +22,12 @@ BACKFILL_COMMAND = [
     "-m",
     "inefficiency_engine.cycle_history_background_backfill_repair",
 ]
-# Runtime index maintenance already applies a 120-second PostgreSQL statement timeout
-# for this exact four-column index. Give the disposable process a small bounded margin
-# for catalog verification and clean shutdown without extending any backfill deadline.
-INDEX_EXECUTOR_DEADLINE_SECONDS = 135.0
+# Production proved the former 120-second PostgreSQL statement timeout could restart
+# CREATE INDEX CONCURRENTLY indefinitely before the exact four-column index finished.
+# The dedicated child now gives that one build a ten-minute SQL deadline. Keep a small
+# bounded process margin for verification and clean shutdown without changing any
+# history/backfill deadline.
+INDEX_EXECUTOR_DEADLINE_SECONDS = 630.0
 INDEX_RETRY_SECONDS = 30.0
 
 
