@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Boolean, Column, Index, Integer, MetaData, String, Table, Text, func, insert, select, update
+from sqlalchemy import Boolean, Column, Index, Integer, MetaData, String, Table, Text, func, insert, inspect, select, update
 
 from inefficiency_engine.source_coverage import SourceCoverageSnapshot
 
@@ -83,7 +83,20 @@ class SourceCoverageHistoryLedger:
             "ix_source_coverage_history_heartbeat",
             self.rows.c.heartbeat_id,
         )
-        metadata.create_all(store.engine)
+        try:
+            metadata.create_all(store.engine)
+        except Exception:
+            # API reads and the short-lived source executor can be the first process
+            # to touch this release at the same time. SQLAlchemy's check-first DDL is
+            # not a cross-process lock, so tolerate the race only when both canonical
+            # tables now exist; any genuine schema failure remains fatal to this reader.
+            available = set(inspect(store.engine).get_table_names())
+            required = {
+                SOURCE_COVERAGE_HISTORY_TABLE,
+                SOURCE_COVERAGE_HISTORY_MIGRATION_TABLE,
+            }
+            if not required <= available:
+                raise
 
     def _snapshot_rows(
         self,
