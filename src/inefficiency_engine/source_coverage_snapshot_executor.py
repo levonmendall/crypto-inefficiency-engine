@@ -5,6 +5,7 @@ from typing import Any
 
 
 SOURCE_COVERAGE_EXECUTOR_WORKER_ID = "canonical-source-coverage-executor"
+SOURCE_COVERAGE_HISTORY_WORKER_ID = "canonical-source-coverage-history"
 
 
 def _record_executor_stage(
@@ -46,8 +47,35 @@ def _record_executor_stage(
         pass
 
 
+def _record_history_stage(
+    store: Any,
+    *,
+    state: str,
+    detail: dict[str, object],
+    error_type: str | None = None,
+) -> None:
+    try:
+        store.record_worker_heartbeat(
+            worker_id=SOURCE_COVERAGE_HISTORY_WORKER_ID,
+            state=state,
+            error_type=error_type,
+            detail={
+                **detail,
+                "canonical_history_authority": "source_coverage_snapshot_archive",
+                "candidate_level_history_synthesized": False,
+                "historical_counts_as_forward": False,
+                "qualification_authority": False,
+                "allocation_authority": False,
+                "live_execution_authority": False,
+                "paper_only": True,
+            },
+        )
+    except Exception:
+        pass
+
+
 def main() -> int:
-    """Compute and persist exactly one source-coverage snapshot without provider calls."""
+    """Compute one canonical source snapshot and advance its append-only history."""
 
     from inefficiency_engine.disposable_executor_memory_guard import (
         MEMORY_PRESSURE_EXIT_CODE,
@@ -77,6 +105,11 @@ def main() -> int:
         install_current_source_scan_probe_runtime,
     )
     from inefficiency_engine.source_coverage import SourceCoveragePlane
+    from inefficiency_engine.source_coverage_history import (
+        DEFAULT_MIGRATION_HEARTBEAT_BATCH,
+        backfill_source_coverage_history_from_heartbeats,
+        persist_source_coverage_history_snapshot,
+    )
     from inefficiency_engine.source_coverage_snapshot_stage_runtime import (
         SourceCoverageSnapshotStageProfiler,
         profile_source_coverage_snapshot,
@@ -160,6 +193,56 @@ def main() -> int:
             stage_timings_seconds=timings,
         )
         raise RuntimeError(message)
+
+    # History persistence is diagnostic and fail-soft with respect to current source
+    # publication. The current canonical snapshot is written first so every new source
+    # state becomes durable immediately; the old heartbeat archive is then migrated in
+    # bounded, transactionally checkpointed batches.
+    try:
+        inserted_current = persist_source_coverage_history_snapshot(
+            store,
+            snapshot,
+            published_at=heartbeat.observed_at,
+        )
+        try:
+            migration_batch = int(
+                os.getenv(
+                    "CIE_SOURCE_COVERAGE_HISTORY_MIGRATION_BATCH",
+                    str(DEFAULT_MIGRATION_HEARTBEAT_BATCH),
+                )
+            )
+        except ValueError:
+            migration_batch = DEFAULT_MIGRATION_HEARTBEAT_BATCH
+        migration = backfill_source_coverage_history_from_heartbeats(
+            store,
+            max_heartbeats=migration_batch,
+        )
+        _record_history_stage(
+            store,
+            state="success" if bool(migration.get("complete")) else "running",
+            detail={
+                "stage": (
+                    "canonical_history_ready"
+                    if bool(migration.get("complete"))
+                    else "canonical_history_archive_migrating"
+                ),
+                "snapshot_observed_at": snapshot.observed_at.isoformat(),
+                "inserted_current_lane_snapshots": inserted_current,
+                **migration,
+            },
+        )
+    except Exception as exc:
+        _record_history_stage(
+            store,
+            state="degraded",
+            error_type=type(exc).__name__,
+            detail={
+                "stage": "canonical_history_persistence_failed",
+                "snapshot_observed_at": snapshot.observed_at.isoformat(),
+                "message": str(exc)[:1000],
+                "retrying": True,
+            },
+        )
 
     _record_executor_stage(
         store,

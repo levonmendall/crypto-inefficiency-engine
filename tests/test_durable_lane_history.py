@@ -14,6 +14,7 @@ def _empty_state() -> dict[str, object]:
         "source_ids": set(),
         "evidence_classes": set(),
         "source_ledgers": set(),
+        "canonical_snapshot_count": 0,
         "operating_count": 0,
         "operating_earliest": None,
         "operating_latest": None,
@@ -28,6 +29,33 @@ def _empty_state() -> dict[str, object]:
 
 def _empty_history() -> dict[str, dict[str, object]]:
     return {lane_id: _empty_state() for lane_id in LANES}
+
+
+def _install_canonical(
+    monkeypatch,
+    *,
+    summary: dict[str, dict[str, object]] | None = None,
+    first: datetime | None = None,
+    complete: bool = True,
+) -> None:
+    class FakeLedger:
+        def __init__(self, _store):
+            pass
+
+        def migration_status(self):
+            return {
+                "checkpoint_heartbeat_id": 123,
+                "complete": complete,
+                "updated_at": "2026-08-25T00:00:00+00:00",
+            }
+
+        def first_snapshot_at(self):
+            return first
+
+        def summary(self, *, start, end):
+            return summary or {}
+
+    monkeypatch.setattr(history, "SourceCoverageHistoryLedger", FakeLedger)
 
 
 def _disable_secondary_reads(monkeypatch) -> None:
@@ -57,6 +85,7 @@ def test_durable_history_reports_all_lanes_without_claiming_prelive_completion(m
         "evidence_classes": {"market_history", "execution_costs"},
         "source_ledgers": {"market_quotes"},
     }
+    _install_canonical(monkeypatch, complete=True)
     monkeypatch.setattr(
         history,
         "recover_raw_lane_history",
@@ -74,7 +103,6 @@ def test_durable_history_reports_all_lanes_without_claiming_prelive_completion(m
     assert row["evidence_class_history_complete"] is True
     assert row["recovered_evidence_class_count"] == 2
     assert row["required_evidence_class_count"] == 2
-    assert row["earliest_recovered_at"] == "2026-08-22T00:00:00+00:00"
     assert row["candidate_level_history_synthesized"] is False
     assert payload["historical_counts_as_forward"] is False
     assert payload["qualification_authority"] is False
@@ -96,6 +124,7 @@ def test_durable_history_keeps_missing_evidence_classes_visible(monkeypatch):
         "evidence_classes": {"order_book"},
         "source_ledgers": {"order_books"},
     }
+    _install_canonical(monkeypatch, complete=True)
     monkeypatch.setattr(
         history,
         "recover_raw_lane_history",
@@ -127,6 +156,7 @@ def test_durable_history_never_turns_source_records_into_candidate_counts(monkey
         "evidence_classes": {"timestamped_events", "event_identity"},
         "source_ledgers": {"source_event_observations"},
     }
+    _install_canonical(monkeypatch, complete=True)
     monkeypatch.setattr(
         history,
         "recover_raw_lane_history",
@@ -146,20 +176,29 @@ def test_durable_history_fail_soft_keeps_canonical_denominators(monkeypatch):
     start = datetime(2026, 8, 21, tzinfo=timezone.utc)
     end = datetime(2026, 8, 25, tzinfo=timezone.utc)
 
-    def fail(*_args, **_kwargs):
-        raise RuntimeError("simulated production read failure")
+    class FailingLedger:
+        def __init__(self, _store):
+            raise RuntimeError("simulated canonical history failure")
 
-    monkeypatch.setattr(history, "recover_raw_lane_history", fail)
-    monkeypatch.setattr(history, "_read_bounded_source_history", fail)
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("simulated operating read failure")
+
+    monkeypatch.setattr(history, "SourceCoverageHistoryLedger", FailingLedger)
     monkeypatch.setattr(history, "_read_bounded_operating_history", fail)
+    monkeypatch.setattr(
+        history,
+        "recover_raw_lane_history",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("raw reconstruction must remain disabled without a completed migration")
+        ),
+    )
 
     payload = history.build_durable_lane_history(object(), start=start, end=end)
 
     assert payload["lane_count"] == 13
     assert payload["read_degraded"] is True
     assert {item["stage"] for item in payload["read_errors"]} == {
-        "raw_aggregate_history",
-        "bounded_source_history",
+        "canonical_source_coverage_history",
         "bounded_operating_history",
     }
     for lane_id, definition in LANES.items():
@@ -167,45 +206,46 @@ def test_durable_history_fail_soft_keeps_canonical_denominators(monkeypatch):
         assert row["required_evidence_class_count"] == len(definition["required"])
         assert row["required_evidence_class_count"] > 0
         assert row["recovered_evidence_class_count"] == 0
-        assert row["history_available"] is False
     assert payload["historical_counts_as_forward"] is False
     assert payload["qualification_authority"] is False
     assert payload["allocation_authority"] is False
     assert payload["live_execution_authority"] is False
 
 
-def test_bounded_source_tail_merges_with_raw_history(monkeypatch):
+def test_incomplete_canonical_migration_skips_raw_http_reconstruction(monkeypatch):
     start = datetime(2026, 8, 21, tzinfo=timezone.utc)
     end = datetime(2026, 8, 25, tzinfo=timezone.utc)
-    raw = _empty_history()
-    recent = _empty_history()
-    raw["yield"] = {
-        **_empty_state(),
-        "source_count": 4,
-        "source_earliest": datetime(2026, 8, 22, tzinfo=timezone.utc),
-        "source_latest": datetime(2026, 8, 23, tzinfo=timezone.utc),
-        "source_ids": {"lido-yield"},
-        "evidence_classes": {"yield_rate"},
-        "source_ledgers": {"mechanism_research_observations"},
+    canonical = {
+        "yield": {
+            **_empty_state(),
+            "canonical_snapshot_count": 4,
+            "source_count": 4,
+            "source_earliest": datetime(2026, 8, 25, 1, tzinfo=timezone.utc),
+            "source_latest": datetime(2026, 8, 25, 2, tzinfo=timezone.utc),
+            "source_ids": {"morpho-markets"},
+            "evidence_classes": {"yield_rate", "capacity", "exit_liquidity"},
+            "source_ledgers": {"source_coverage_history"},
+        }
     }
-    recent["yield"] = {
-        **_empty_state(),
-        "source_count": 2,
-        "source_earliest": datetime(2026, 8, 24, tzinfo=timezone.utc),
-        "source_latest": datetime(2026, 8, 25, tzinfo=timezone.utc),
-        "source_ids": {"morpho-markets"},
-        "evidence_classes": {"yield_rate", "capacity", "exit_liquidity"},
-        "source_ledgers": {"source_coverage_observations"},
-    }
+    _install_canonical(
+        monkeypatch,
+        summary=canonical,
+        first=datetime(2026, 8, 25, 1, tzinfo=timezone.utc),
+        complete=False,
+    )
     monkeypatch.setattr(
         history,
         "recover_raw_lane_history",
-        lambda _store, *, start, boundary: raw,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("raw reconstruction must not run during archive migration")
+        ),
     )
     monkeypatch.setattr(
         history,
         "_read_bounded_source_history",
-        lambda *_args, **_kwargs: recent,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy source reconstruction must not run during migration")
+        ),
     )
     monkeypatch.setattr(
         history,
@@ -216,9 +256,29 @@ def test_bounded_source_tail_merges_with_raw_history(monkeypatch):
     payload = history.build_durable_lane_history(object(), start=start, end=end)
     row = payload["lanes"]["yield"]
 
+    assert payload["canonical_history_migration_complete"] is False
+    assert row["canonical_source_snapshot_count"] == 4
     assert row["recovered_evidence_class_count"] == 3
-    assert row["required_evidence_class_count"] == 3
-    assert row["evidence_class_history_complete"] is True
-    assert row["recovered_source_observations"] == 6
-    assert row["earliest_recovered_at"] == "2026-08-22T00:00:00+00:00"
-    assert row["latest_recovered_at"] == "2026-08-25T00:00:00+00:00"
+    assert row["history_available"] is True
+
+
+def test_completed_migration_limits_raw_recovery_to_precanonical_boundary(monkeypatch):
+    start = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    first = datetime(2026, 8, 22, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 25, tzinfo=timezone.utc)
+    calls: list[datetime] = []
+
+    _install_canonical(monkeypatch, summary={}, first=first, complete=True)
+
+    def raw(_store, *, start, boundary):
+        calls.append(boundary)
+        return _empty_history()
+
+    monkeypatch.setattr(history, "recover_raw_lane_history", raw)
+    _disable_secondary_reads(monkeypatch)
+
+    payload = history.build_durable_lane_history(object(), start=start, end=end)
+
+    assert calls == [first]
+    assert payload["canonical_history_migration_complete"] is True
+    assert payload["canonical_history_started_at"] == first.isoformat()
