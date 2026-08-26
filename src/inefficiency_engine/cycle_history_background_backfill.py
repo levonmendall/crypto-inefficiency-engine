@@ -33,17 +33,18 @@ from inefficiency_engine.source_runtime_safety import (
 
 WORKER_ID = "cycle-history-background-backfill"
 TEMPORARY_ADMISSION_EXIT_CODE = 75
+INCOMPLETE_PROGRESS_EXIT_CODE = 76
 BACKGROUND_BUCKET_STATEMENT_TIMEOUT_SECONDS = 60.0
 BACKGROUND_BUCKET_LOCK_TIMEOUT_SECONDS = 5.0
-# The previous production worker intentionally advanced only one day bucket per child.
-# A frozen 180-day target across many venue/asset pairs therefore required thousands of
-# process launches even when every indexed bucket query completed quickly. The durable
-# cache already checkpoints after every bucket and the target runtime has its own 15s
-# wall-clock slice, so allow a bounded batch inside one lease/process instead. This
-# changes throughput only; rows/day, history length, target exactness and authority are
+# The child is already externally bounded at 90 seconds and exits after every slice.
+# Use the target runtime's maximum finite work window during first-target bootstrap so
+# the exact 180-day target cannot take hours merely because each process defaults to an
+# eight-second slice. History length, rows/day, filters, qualification and authority are
 # unchanged.
+BACKGROUND_TARGET_TIME_BUDGET_SECONDS = 15.0
 BACKGROUND_BUCKET_QUERY_CAP = 32
 _BUCKET_QUERY_BUDGET_ENV = "CIE_CONTROL_CYCLE_HISTORY_BUCKET_QUERY_BUDGET"
+_TIME_BUDGET_ENV = "CIE_CONTROL_CYCLE_HISTORY_TIME_BUDGET_SECONDS"
 
 
 def _record_heartbeat(
@@ -69,6 +70,7 @@ def _record_heartbeat(
                 "statement_timeout_seconds": BACKGROUND_BUCKET_STATEMENT_TIMEOUT_SECONDS,
                 "lock_timeout_seconds": BACKGROUND_BUCKET_LOCK_TIMEOUT_SECONDS,
                 "bucket_query_cap": BACKGROUND_BUCKET_QUERY_CAP,
+                "target_time_budget_seconds": BACKGROUND_TARGET_TIME_BUDGET_SECONDS,
                 "provider_requests_allowed": False,
                 "provider_requests_used": 0,
                 "qualification_thresholds_unchanged": True,
@@ -121,15 +123,21 @@ def background_cycle_history_database_timeout(store: Any) -> Iterator[None]:
 
 @contextmanager
 def _bounded_background_batch() -> Iterator[None]:
-    previous = os.environ.get(_BUCKET_QUERY_BUDGET_ENV)
+    previous_query_budget = os.environ.get(_BUCKET_QUERY_BUDGET_ENV)
+    previous_time_budget = os.environ.get(_TIME_BUDGET_ENV)
     os.environ[_BUCKET_QUERY_BUDGET_ENV] = str(BACKGROUND_BUCKET_QUERY_CAP)
+    os.environ[_TIME_BUDGET_ENV] = str(BACKGROUND_TARGET_TIME_BUDGET_SECONDS)
     try:
         yield
     finally:
-        if previous is None:
+        if previous_query_budget is None:
             os.environ.pop(_BUCKET_QUERY_BUDGET_ENV, None)
         else:
-            os.environ[_BUCKET_QUERY_BUDGET_ENV] = previous
+            os.environ[_BUCKET_QUERY_BUDGET_ENV] = previous_query_budget
+        if previous_time_budget is None:
+            os.environ.pop(_TIME_BUDGET_ENV, None)
+        else:
+            os.environ[_TIME_BUDGET_ENV] = previous_time_budget
 
 
 def _bounded_progress(progress: dict[str, object]) -> dict[str, object]:
@@ -163,7 +171,13 @@ def _bounded_progress(progress: dict[str, object]) -> dict[str, object]:
 
 
 def run_backfill_slice() -> int:
-    """Advance one bounded batch of an exact frozen cycle-history target."""
+    """Advance one bounded batch of an exact frozen cycle-history target.
+
+    Exit 76 means the durable checkpoint advanced but no certified serving target exists
+    yet. The lightweight supervisor treats that as healthy bootstrap progress and starts
+    another bounded child promptly. Exit 0 means a certified active target is available,
+    after which the normal fair-share refresh cadence resumes.
+    """
 
     settings = Settings.from_env()
     store = build_evidence_store(settings.evidence_db_path)
@@ -258,6 +272,7 @@ def run_backfill_slice() -> int:
         elapsed = max(0.0, time.monotonic() - started)
         bounded = _bounded_progress(progress)
         complete = bool(progress.get("complete"))
+        checkpointed = bool(progress.get("durable_checkpoint_persisted"))
         _record_heartbeat(
             store,
             state="success",
@@ -272,12 +287,19 @@ def run_backfill_slice() -> int:
                 "source_scan_id": str(source_snapshot.scan_id),
                 "slice_runtime_seconds": elapsed,
                 "cache_complete": complete,
+                "first_certified_target_pending": not complete,
+                "durable_progress_checkpointed": checkpointed,
                 "progress": bounded,
                 "batched_bucket_queries": True,
+                "bootstrap_retry_without_fair_share_delay": not complete,
                 "process_exit_reclaims_heap": True,
             },
         )
-        return 0
+        if complete:
+            return 0
+        if checkpointed:
+            return INCOMPLETE_PROGRESS_EXIT_CODE
+        return 1
     except Exception as exc:
         _record_heartbeat(
             store,
