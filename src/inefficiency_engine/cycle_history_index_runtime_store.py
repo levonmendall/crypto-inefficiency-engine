@@ -20,6 +20,15 @@ from inefficiency_engine.evidence import (
 EXACT_INDEX_CONNECT_TIMEOUT_SECONDS = 8
 EXACT_INDEX_HEARTBEAT_STATEMENT_TIMEOUT_MS = 8_000
 EXACT_INDEX_HEARTBEAT_LOCK_TIMEOUT_MS = 3_000
+# The exact CREATE INDEX CONCURRENTLY call can remain quiet on one SSL/TCP connection
+# for many minutes. Production proved that connection can otherwise disappear mid-DDL
+# with ``SSL error: unexpected eof while reading``. Keep these libpq TCP keepalives
+# isolated to the dedicated exact-index runtime store; no general evidence-store or
+# provider connection settings are changed.
+EXACT_INDEX_TCP_KEEPALIVES_ENABLED = 1
+EXACT_INDEX_TCP_KEEPALIVES_IDLE_SECONDS = 30
+EXACT_INDEX_TCP_KEEPALIVES_INTERVAL_SECONDS = 10
+EXACT_INDEX_TCP_KEEPALIVES_COUNT = 3
 
 
 def _payload(heartbeat: WorkerHeartbeat) -> str:
@@ -46,13 +55,34 @@ def _configure_bounded_heartbeat_session(db: Any) -> None:
     )
 
 
+def _postgres_connection_resilience_detail() -> dict[str, object]:
+    return {
+        "exact_index_tcp_keepalives_enabled": True,
+        "exact_index_tcp_keepalives_idle_seconds": EXACT_INDEX_TCP_KEEPALIVES_IDLE_SECONDS,
+        "exact_index_tcp_keepalives_interval_seconds": EXACT_INDEX_TCP_KEEPALIVES_INTERVAL_SECONDS,
+        "exact_index_tcp_keepalives_count": EXACT_INDEX_TCP_KEEPALIVES_COUNT,
+        "exact_index_connection_resilience_scope": "dedicated_exact_index_only",
+    }
+
+
 class CycleHistoryIndexRuntimeStore:
     """Schema-free store for the dedicated exact-index process and its probes."""
 
     schema_free_exact_index_runtime_store = True
 
-    def __init__(self, engine: Engine):
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        connection_resilience: dict[str, object] | None = None,
+    ):
         self.engine = engine
+        self._connection_resilience = dict(connection_resilience or {})
+
+    def connection_resilience_detail(self) -> dict[str, object]:
+        """Return non-secret connection settings suitable for runtime telemetry."""
+
+        return dict(self._connection_resilience)
 
     def latest_worker_heartbeat(self, worker_id: str | None = None) -> WorkerHeartbeat | None:
         where = "WHERE worker_id = :worker_id" if worker_id else ""
@@ -128,20 +158,33 @@ def build_cycle_history_index_runtime_store(
         "pool_pre_ping": True,
         "poolclass": NullPool,
     }
+    connection_resilience: dict[str, object] = {
+        "exact_index_tcp_keepalives_enabled": False,
+        "exact_index_connection_resilience_scope": "dedicated_exact_index_only",
+    }
     if url.startswith("postgresql"):
         # Connect acquisition and every session start with a short catalog/query bound.
         # The direct exact-index maintainer explicitly raises statement_timeout to the
-        # dedicated one-hour value immediately before CREATE INDEX CONCURRENTLY.
+        # dedicated one-hour value immediately before CREATE INDEX CONCURRENTLY. libpq
+        # keepalives protect that otherwise-quiet long-lived SSL/TCP DDL connection.
         kwargs["connect_args"] = {
             "connect_timeout": EXACT_INDEX_CONNECT_TIMEOUT_SECONDS,
+            "keepalives": EXACT_INDEX_TCP_KEEPALIVES_ENABLED,
+            "keepalives_idle": EXACT_INDEX_TCP_KEEPALIVES_IDLE_SECONDS,
+            "keepalives_interval": EXACT_INDEX_TCP_KEEPALIVES_INTERVAL_SECONDS,
+            "keepalives_count": EXACT_INDEX_TCP_KEEPALIVES_COUNT,
             "options": (
                 f"-c statement_timeout={EXACT_INDEX_HEARTBEAT_STATEMENT_TIMEOUT_MS} "
                 f"-c lock_timeout={EXACT_INDEX_HEARTBEAT_LOCK_TIMEOUT_MS}"
             ),
         }
+        connection_resilience = _postgres_connection_resilience_detail()
     elif url.startswith("sqlite:"):
         kwargs["connect_args"] = {"check_same_thread": False}
-    return CycleHistoryIndexRuntimeStore(create_engine(url, **kwargs))
+    return CycleHistoryIndexRuntimeStore(
+        create_engine(url, **kwargs),
+        connection_resilience=connection_resilience,
+    )
 
 
 __all__ = [
@@ -149,5 +192,9 @@ __all__ = [
     "EXACT_INDEX_CONNECT_TIMEOUT_SECONDS",
     "EXACT_INDEX_HEARTBEAT_LOCK_TIMEOUT_MS",
     "EXACT_INDEX_HEARTBEAT_STATEMENT_TIMEOUT_MS",
+    "EXACT_INDEX_TCP_KEEPALIVES_COUNT",
+    "EXACT_INDEX_TCP_KEEPALIVES_ENABLED",
+    "EXACT_INDEX_TCP_KEEPALIVES_IDLE_SECONDS",
+    "EXACT_INDEX_TCP_KEEPALIVES_INTERVAL_SECONDS",
     "build_cycle_history_index_runtime_store",
 ]
