@@ -20,6 +20,18 @@ INDEX_NOT_READY_EXIT_CODE = 77
 # deadlines.
 DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS = 3_600_000
 
+_PREVIOUS_CHILD_TERMINAL_FIELDS = {
+    "child_terminal_stage": "previous_child_terminal_stage",
+    "child_sql_error_type": "previous_child_sql_error_type",
+    "child_sql_error_message": "previous_child_sql_error_message",
+    "child_return_code": "previous_child_return_code",
+    "child_timed_out": "previous_child_timed_out",
+    "termination_signal": "previous_termination_signal",
+    "termination_signal_number": "previous_termination_signal_number",
+    "possible_oom_or_external_kill": "previous_possible_oom_or_external_kill",
+    "oom_kill_proven": "previous_oom_kill_proven",
+}
+
 
 def _record_heartbeat(
     store: Any,
@@ -63,13 +75,24 @@ def _latest_attempt_detail(store: Any) -> tuple[Any | None, dict[str, object]]:
     return heartbeat, dict(getattr(heartbeat, "detail", None) or {})
 
 
+def _previous_child_terminal_context(detail: dict[str, object]) -> dict[str, object]:
+    """Rename the terminal child fields so they remain clearly prior-attempt evidence."""
+
+    return {
+        target: detail[source]
+        for source, target in _PREVIOUS_CHILD_TERMINAL_FIELDS.items()
+        if detail.get(source) is not None
+    }
+
+
 def _previous_attempt_context(store: Any) -> tuple[int, dict[str, object]]:
     """Carry the last exact-index outcome into the next disposable attempt.
 
-    A new `starting` heartbeat must not erase the only useful evidence from the prior
+    A new `starting` heartbeat must not erase the useful evidence from the prior
     failed/timed-out build. Persist a monotonic attempt number plus the prior stage,
-    error, message and effective/current index name into every new attempt's heartbeat.
-    This is diagnostic only and has no certification authority.
+    error, message, SQL failure, return code, termination classification and index name
+    into every new attempt's heartbeat. This is diagnostic only and has no certification
+    authority.
     """
 
     heartbeat, detail = _latest_attempt_detail(store)
@@ -81,7 +104,7 @@ def _previous_attempt_context(store: Any) -> tuple[int, dict[str, object]]:
     except (TypeError, ValueError):
         previous_attempt = 0
 
-    context: dict[str, object] = {}
+    context: dict[str, object] = _previous_child_terminal_context(detail)
     if previous_attempt:
         context["previous_attempt_number"] = previous_attempt
     previous_stage = detail.get("stage")
@@ -108,15 +131,17 @@ def _current_attempt_context(store: Any) -> tuple[int, dict[str, object]]:
         attempt_number = max(1, int(detail.get("attempt_number") or 1))
     except (TypeError, ValueError):
         attempt_number = 1
+    keys = (
+        "previous_attempt_number",
+        "previous_stage",
+        "previous_error_type",
+        "previous_message",
+        "previous_effective_index_name",
+        *_PREVIOUS_CHILD_TERMINAL_FIELDS.values(),
+    )
     context = {
         key: detail[key]
-        for key in (
-            "previous_attempt_number",
-            "previous_stage",
-            "previous_error_type",
-            "previous_message",
-            "previous_effective_index_name",
-        )
+        for key in keys
         if detail.get(key) is not None
     }
     return attempt_number, context
