@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 from types import SimpleNamespace
 from typing import Awaitable, Callable, Mapping, Sequence
@@ -14,6 +15,11 @@ from inefficiency_engine.cex_dex_promotion import CexDexPaperPromotionService
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.expanded_alpha_factory import ExpandedAlphaFactoryService
 from inefficiency_engine.operating_certification import OperatingCertificationService
+from inefficiency_engine.process_tree import (
+    process_tree_alive,
+    signal_process_tree,
+    subprocess_group_kwargs,
+)
 from inefficiency_engine.service import OpportunityService
 from inefficiency_engine.unified_allocation import UnifiedPaperAllocationPlan, UnifiedPaperAllocatorService
 from inefficiency_engine.universal_service import UniversalOpportunityService
@@ -84,13 +90,16 @@ def default_stage_command(stage_command: str) -> list[str]:
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is not None:
+    if not process_tree_alive(process):
         return
-    process.terminate()
-    try:
-        await asyncio.wait_for(process.wait(), timeout=5.0)
-    except TimeoutError:
-        process.kill()
+    signal_process_tree(process, signal.SIGTERM)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5.0
+    while process_tree_alive(process) and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+    if process_tree_alive(process):
+        signal_process_tree(process, signal.SIGKILL)
+    if process.returncode is None:
         await process.wait()
 
 
@@ -125,6 +134,7 @@ async def run_stage_subprocess(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=merged_env,
+        **subprocess_group_kwargs(),
     )
     try:
         try:
@@ -141,7 +151,7 @@ async def run_stage_subprocess(
             await _terminate_process(process)
             raise
     finally:
-        if process.returncode is None:
+        if process_tree_alive(process):
             await _terminate_process(process)
 
     if process.returncode != 0:
