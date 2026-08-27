@@ -104,7 +104,7 @@ services:
 
 databases:
   - name: cie-evidence
-    plan: basic-256mb
+    plan: basic-1gb
     region: oregon
     databaseName: cie_evidence
     user: cie
