@@ -65,7 +65,7 @@ def test_public_health_contract_remains_database_independent():
 
     assert payload["liveness_database_independent"] is True
     assert payload["database_check"] == "deferred_to_readiness"
-    assert payload["runtime_diagnostics"] == "deferred_to_bounded_internal_snapshot"
+    assert payload["runtime_diagnostics"] == "deferred_to_readiness"
     assert payload["readiness_endpoint"] == "/ready"
     assert payload["internal_runtime_heartbeat_endpoint"] == (
         "/v3/internal/runtime-heartbeats"
