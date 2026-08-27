@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import threading
@@ -51,6 +52,7 @@ RUNTIME_PARENT_HEARTBEAT_COMMAND = [
     "-m",
     "inefficiency_engine.combined_runtime_parent_heartbeat",
 ]
+RUNTIME_PARENT_TERMINAL_DEADLINE_SECONDS = 5.0
 WORKER_HEARTBEAT_READ_INDEX_SPEC = {
     "worker_heartbeats": ("worker_id", "id"),
 }
@@ -132,6 +134,25 @@ def _stop_diagnostic_child(child: subprocess.Popen[bytes] | None) -> None:
         child.wait(timeout=5.0)
 
 
+def _record_parent_terminal(payload: dict[str, object]) -> None:
+    """Best-effort terminal truth in a disposable process; never delay shutdown long."""
+
+    try:
+        subprocess.run(
+            [
+                *RUNTIME_PARENT_HEARTBEAT_COMMAND,
+                "--terminal",
+                json.dumps(payload, separators=(",", ":")),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=RUNTIME_PARENT_TERMINAL_DEADLINE_SECONDS,
+        )
+    except Exception:
+        pass
+
+
 def main() -> int:
     install_source_repair_child_command()
     install_control_truth_command()
@@ -169,7 +190,27 @@ def main() -> int:
     source_history_guard.start()
     research_projection_guard.start()
     try:
-        return base.main()
+        try:
+            return_code = base.main()
+        except BaseException as exc:
+            _record_parent_terminal(
+                {
+                    "exit_reason": "combined_runtime_base_raised",
+                    "return_code": None,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:500],
+                }
+            )
+            raise
+        _record_parent_terminal(
+            {
+                "exit_reason": "combined_runtime_base_returned",
+                "return_code": return_code,
+                "error_type": None,
+                "message": None,
+            }
+        )
+        return return_code
     finally:
         stop_event.set()
         _stop_diagnostic_child(runtime_parent_heartbeat)
