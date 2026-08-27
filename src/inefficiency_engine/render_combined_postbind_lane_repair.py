@@ -13,6 +13,9 @@ from inefficiency_engine.cycle_history_background_supervisor_repair import (
 from inefficiency_engine.research_projection_supervisor import (
     run_research_projection_supervisor,
 )
+from inefficiency_engine.runtime_watchdog_readiness_repair import (
+    install_runtime_watchdog_readiness_repair,
+)
 from inefficiency_engine.source_coverage_history_migration_supervisor import (
     run_source_coverage_history_migration_supervisor,
 )
@@ -113,6 +116,7 @@ def main() -> int:
     install_control_truth_command()
     install_worker_heartbeat_read_index()
     install_research_observability_heavy_command()
+    install_runtime_watchdog_readiness_repair()
     stop_event = threading.Event()
     cycle_history_guard = threading.Thread(
         target=run_cycle_history_background_supervisor,
