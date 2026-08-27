@@ -80,31 +80,75 @@ def _read_json(path: Path) -> dict[str, object]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _process_group_exists(pgid: int) -> bool:
+    """Return whether a POSIX process group still has any members."""
+
+    if os.name != "posix" or not hasattr(os, "killpg"):
+        return False
+    try:
+        os.killpg(int(pgid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _executor_tree_alive(process: subprocess.Popen[bytes]) -> bool:
+    parent_alive = process.poll() is None
+    if os.name == "posix" and hasattr(os, "killpg") and getattr(process, "pid", None):
+        return _process_group_exists(int(process.pid))
+    return parent_alive
+
+
+def _signal_executor_tree(
+    process: subprocess.Popen[bytes],
+    sig: signal.Signals,
+) -> bool:
+    """Signal the isolated executor process group, falling back to the direct child."""
+
+    if os.name == "posix" and hasattr(os, "killpg") and getattr(process, "pid", None):
+        try:
+            os.killpg(int(process.pid), sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except OSError:
+            # Preserve the existing portable direct-child cleanup as a fallback.
+            pass
+    if process.poll() is not None:
+        return False
+    if sig == signal.SIGTERM:
+        process.terminate()
+    else:
+        process.kill()
+    return True
+
+
 def _terminate_executor(
     process: subprocess.Popen[bytes],
     *,
     grace_seconds: float,
 ) -> tuple[bool, bool]:
-    """Terminate one executor and escalate to SIGKILL without touching its parent."""
+    """Terminate the disposable executor tree without touching its supervising parent."""
 
-    if process.poll() is not None:
+    if not _executor_tree_alive(process):
         return False, False
-    terminated = True
+    terminated = _signal_executor_tree(process, signal.SIGTERM)
     killed = False
-    process.terminate()
     deadline = time.monotonic() + max(0.0, float(grace_seconds))
-    while process.poll() is None and time.monotonic() < deadline:
+    while _executor_tree_alive(process) and time.monotonic() < deadline:
         time.sleep(0.01)
-    if process.poll() is None:
-        killed = True
-        process.kill()
+    if _executor_tree_alive(process):
+        killed = _signal_executor_tree(process, signal.SIGKILL)
     try:
         process.wait(timeout=max(0.1, float(grace_seconds) + 0.1))
     except subprocess.TimeoutExpired:
-        if process.poll() is None:
-            killed = True
-            process.kill()
-            process.wait(timeout=1.0)
+        if _executor_tree_alive(process):
+            killed = _signal_executor_tree(process, signal.SIGKILL) or killed
+        process.wait(timeout=1.0)
     return terminated, killed
 
 
