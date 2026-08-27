@@ -20,6 +20,7 @@ CONTROL_CACHE_CHECKPOINTS = Table(
     Column("payload_json", Text, nullable=False),
 )
 _SCHEMA_VERSION = 1
+_CHECKPOINT_IDENTITY_FIELD = "_checkpoint_structure_identity"
 
 
 def durable_control_cache_namespace() -> str | None:
@@ -34,21 +35,30 @@ def control_cache_structure_identity(*parts: object) -> str:
     return "sha256:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
-def control_cache_store_identity(store: Any) -> str:
-    """Identify one durable store without depending on process-local object ids."""
+def control_cache_checkpoint_identity(cache_key: str) -> str:
+    """Identify the serialized contract behind one durable control checkpoint.
 
-    safe = str(getattr(store, "safe_database_url", "") or "").strip()
-    if safe:
-        return safe
-    engine = getattr(store, "engine", None)
-    url = getattr(engine, "url", None)
-    render = getattr(url, "render_as_string", None)
-    if callable(render):
-        try:
-            return str(render(hide_password=True))
-        except TypeError:
-            return str(render())
-    return f"{type(engine).__module__}.{type(engine).__qualname__}:{id(engine)}"
+    The physical checkpoint key remains unchanged so already accumulated production
+    progress is not discarded. Legacy payloads without an identity are accepted once
+    and stamped on their next save. A payload carrying a conflicting identity is not
+    trusted, which forces the existing fail-closed bounded rebuild path.
+    """
+
+    if cache_key == "strategy-evidence":
+        contract = (
+            "strategy-evidence-v1|"
+            "alpha_forward_events:id,strategy_id,family,event_type,payload_json|"
+            "allocation_forward_trials:id,strategy,settlement_supported|"
+            "allocation_forward_outcomes:id,strategy,payload_json|"
+            "signals,raw_outcomes,observed_identity,allocator_by_strategy,supported_trials"
+        )
+    elif cache_key.startswith("outcome-history:"):
+        contract = f"outcome-history-json-model-v1|{cache_key}"
+    elif cache_key == "cycle-history-live-compact-v3":
+        contract = "cycle-history-live-compact-v3|daily-bucket-checkpoint-v3"
+    else:
+        contract = f"generic-control-checkpoint-v1|{cache_key}"
+    return control_cache_structure_identity("durable-control-checkpoint", contract)
 
 
 def ensure_durable_control_cache_schema(store: Any) -> None:
@@ -84,7 +94,13 @@ def load_control_cache_checkpoint(
         payload = json.loads(str(row.payload_json))
     except (TypeError, json.JSONDecodeError):
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    observed_identity = payload.get(_CHECKPOINT_IDENTITY_FIELD)
+    expected_identity = control_cache_checkpoint_identity(cache_key)
+    if observed_identity is not None and str(observed_identity) != expected_identity:
+        return None
+    return payload
 
 
 def save_control_cache_checkpoint(
@@ -100,11 +116,13 @@ def save_control_cache_checkpoint(
     if qualified is None:
         return False
     ensure_durable_control_cache_schema(store)
+    stamped_payload = dict(payload)
+    stamped_payload[_CHECKPOINT_IDENTITY_FIELD] = control_cache_checkpoint_identity(cache_key)
     values = {
         "schema_version": _SCHEMA_VERSION,
         "complete": bool(complete),
         "updated_at": datetime.now(timezone.utc).isoformat(),
-        "payload_json": json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        "payload_json": json.dumps(stamped_payload, sort_keys=True, separators=(",", ":")),
     }
     with store.engine.begin() as db:
         exists = db.execute(
