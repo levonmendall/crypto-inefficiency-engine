@@ -64,27 +64,20 @@ def ensure_exact_cycle_history_index_direct(
     statement_timeout_ms: int,
     progress: ProgressCallback | None = None,
 ) -> dict[str, object]:
-    """Maintain the one known exact index without generic schema inspection.
+    """Maintain the known exact index without generic PostgreSQL schema inspection."""
 
-    The permanent startup bootstrap already owns schema creation. This path therefore
-    performs only bounded, direct catalog checks for the known ``market_quotes`` table
-    and columns, then preserves the existing invalid-index replacement semantics before
-    entering the dedicated long ``CREATE INDEX CONCURRENTLY`` window.
-    """
-
-    dialect_name = str(getattr(store.engine.dialect, "name", ""))
-    logical_index_name = rim._index_name(EXACT_INDEX_TABLE, EXACT_INDEX_COLUMNS)
+    engine = getattr(store, "engine", None)
+    dialect_name = str(getattr(getattr(engine, "dialect", None), "name", ""))
     if dialect_name != "postgresql":
-        return {
-            "complete": True,
-            "dialect": dialect_name,
-            "attempted": [],
-            "failures": [],
-            "requested_tables": [EXACT_INDEX_TABLE],
-            "postgres_index_validity_verified": False,
-            "postgres_runtime_index_not_required": True,
-        }
+        # Production exact-index ownership is PostgreSQL-only. Preserve the existing
+        # generic behavior for SQLite/tests and other non-production dialects.
+        return rim.ensure_runtime_indexes_after_api_bind(
+            store,
+            index_specs=rim.CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
+            progress=progress,
+        )
 
+    logical_index_name = rim._index_name(EXACT_INDEX_TABLE, EXACT_INDEX_COLUMNS)
     index_name = rim._postgres_canonical_index_name(logical_index_name)
     started = time.monotonic()
     pre_ddl_complete = False
@@ -249,7 +242,6 @@ def ensure_exact_cycle_history_index_direct(
             db.execute(text(create_statement))
             ddl_runtime_seconds = max(0.0, time.monotonic() - ddl_started)
 
-            # Re-verification is catalog work, not part of the long DDL allowance.
             rim._configure_postgres_index_deadlines(
                 db,
                 statement_timeout_ms=EXACT_INDEX_PRE_DDL_STATEMENT_TIMEOUT_MS,
