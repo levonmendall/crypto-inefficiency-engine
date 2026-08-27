@@ -43,15 +43,58 @@ def _store() -> Any:
     return store
 
 
-def _latest_detail(store: Any) -> dict[str, object]:
+def _latest_heartbeat(store: Any) -> tuple[Any | None, dict[str, object]]:
     try:
         heartbeat = store.latest_worker_heartbeat(WORKER_ID)
     except Exception:
-        return {}
+        return None, {}
     if heartbeat is None:
-        return {}
+        return None, {}
     detail = getattr(heartbeat, "detail", None)
-    return dict(detail) if isinstance(detail, dict) else {}
+    return heartbeat, dict(detail) if isinstance(detail, dict) else {}
+
+
+def _attempt_number(detail: dict[str, object]) -> int:
+    try:
+        return max(0, int(detail.get("attempt_number") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_child_terminal(heartbeat: Any, detail: dict[str, object]) -> bool:
+    stage = str(detail.get("stage") or "")
+    state = str(getattr(heartbeat, "state", "") or "")
+    return (
+        stage.startswith("cycle_history_index_")
+        and stage != "cycle_history_index_supervisor_observing"
+        and (
+            state in {"success", "degraded", "failed"}
+            or stage.endswith(("_failed", "_retry_pending", "_ready"))
+        )
+    )
+
+
+def _sql_error_fields(value: object) -> tuple[str | None, str | None]:
+    """Find concrete SQL failure fields retained inside maintenance results."""
+
+    if isinstance(value, dict):
+        error_type = value.get("error_type")
+        message = value.get("message") or value.get("error")
+        if error_type or message:
+            return (
+                str(error_type) if error_type else None,
+                str(message)[:500] if message else None,
+            )
+        for nested in value.values():
+            found = _sql_error_fields(nested)
+            if any(found):
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _sql_error_fields(nested)
+            if any(found):
+                return found
+    return None, None
 
 
 def _carry(previous: dict[str, object]) -> dict[str, object]:
@@ -91,7 +134,6 @@ def _status(store: Any) -> dict[str, object]:
 
 
 def _record(store: Any, payload: dict[str, object]) -> None:
-    previous = _latest_detail(store)
     detail = payload.get("detail")
     detail = dict(detail) if isinstance(detail, dict) else {}
     if bool(payload.get("include_status_progress")):
@@ -105,6 +147,35 @@ def _record(store: Any, payload: dict[str, object]) -> None:
                 "postgres_index_progress": progress,
             }
         )
+
+    # Status/progress queries can take several seconds. Re-read durable truth only
+    # after those queries finish so a child terminal heartbeat written while this
+    # disposable probe was in flight cannot be replaced by stale observing data.
+    heartbeat, previous = _latest_heartbeat(store)
+    if str(payload.get("stage") or "") == "cycle_history_index_supervisor_observing":
+        expected_attempt = _attempt_number(detail)
+        latest_attempt = _attempt_number(previous)
+        if heartbeat is not None and _is_child_terminal(heartbeat, previous) and (
+            not expected_attempt or latest_attempt >= expected_attempt
+        ):
+            return
+
+    if bool(payload.get("preserve_child_terminal")) and heartbeat is not None:
+        child_error = getattr(heartbeat, "error_type", None) or previous.get(
+            "error_type"
+        )
+        child_message = previous.get("message")
+        sql_error, sql_message = _sql_error_fields(previous.get("maintenance_result"))
+        detail.update(
+            {
+                "attempt_number": previous.get("attempt_number"),
+                "child_terminal_stage": previous.get("stage"),
+                "child_sql_error_type": sql_error or child_error,
+                "child_sql_error_message": sql_message or child_message,
+                "child_maintenance_result": previous.get("maintenance_result"),
+            }
+        )
+        detail = {key: value for key, value in detail.items() if value is not None}
     store.record_worker_heartbeat(
         worker_id=WORKER_ID,
         state=str(payload.get("state") or "running"),

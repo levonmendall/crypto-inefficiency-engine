@@ -151,6 +151,95 @@ def test_index_supervisor_publishes_terminal_truth_through_bounded_probe(monkeyp
     assert payload["include_status_progress"] is False
 
 
+def test_observing_probe_cannot_overwrite_child_terminal_heartbeat_in_flight(
+    monkeypatch,
+):
+    running = SimpleNamespace(
+        state="running",
+        error_type=None,
+        detail={"stage": "cycle_history_index_building", "attempt_number": 12},
+    )
+    terminal = SimpleNamespace(
+        state="degraded",
+        error_type="OperationalError",
+        detail={
+            "stage": "cycle_history_index_retry_pending",
+            "attempt_number": 12,
+            "message": "canceling statement due to statement timeout",
+        },
+    )
+    current = {"heartbeat": running}
+    recorded: list[dict[str, object]] = []
+    store = SimpleNamespace(
+        latest_worker_heartbeat=lambda _worker_id: current["heartbeat"],
+        record_worker_heartbeat=lambda **kwargs: recorded.append(kwargs),
+        engine=SimpleNamespace(dialect=SimpleNamespace(name="sqlite")),
+    )
+
+    def status_while_child_exits(_store):
+        current["heartbeat"] = terminal
+        return {"ready": False}
+
+    monkeypatch.setattr(supervisor_probe, "_status", status_while_child_exits)
+
+    supervisor_probe._record(
+        store,
+        {
+            "state": "running",
+            "stage": "cycle_history_index_supervisor_observing",
+            "detail": {"attempt_number": 12},
+            "include_status_progress": True,
+        },
+    )
+
+    assert recorded == []
+    assert current["heartbeat"] is terminal
+
+
+def test_supervisor_terminal_row_preserves_child_sql_failure_and_attempt():
+    child = SimpleNamespace(
+        state="degraded",
+        error_type="CycleHistoryExactIndexUnavailable",
+        detail={
+            "stage": "cycle_history_index_retry_pending",
+            "attempt_number": 19,
+            "maintenance_result": {
+                "indexes": [
+                    {
+                        "error_type": "OperationalError",
+                        "message": "canceling statement due to lock timeout",
+                    }
+                ]
+            },
+        },
+    )
+    recorded: list[dict[str, object]] = []
+    store = SimpleNamespace(
+        latest_worker_heartbeat=lambda _worker_id: child,
+        record_worker_heartbeat=lambda **kwargs: recorded.append(kwargs),
+    )
+
+    supervisor_probe._record(
+        store,
+        {
+            "state": "degraded",
+            "stage": "cycle_history_index_child_retry_pending",
+            "error_type": "IndexChildExitedNonZero",
+            "detail": {"child_return_code": 77},
+            "preserve_child_terminal": True,
+        },
+    )
+
+    detail = recorded[0]["detail"]
+    assert detail["attempt_number"] == 19
+    assert detail["child_terminal_stage"] == "cycle_history_index_retry_pending"
+    assert detail["child_sql_error_type"] == "OperationalError"
+    assert detail["child_sql_error_message"] == (
+        "canceling statement due to lock timeout"
+    )
+    assert detail["child_return_code"] == 77
+
+
 def test_index_supervisor_observes_blocking_ddl_with_disposable_probe():
     supervisor_source = inspect.getsource(supervisor_repair)
     probe_source = inspect.getsource(supervisor_probe)

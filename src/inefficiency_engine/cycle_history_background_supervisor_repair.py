@@ -116,6 +116,7 @@ def _record_index_supervisor_heartbeat(
     error_type: str | None = None,
     detail: dict[str, object] | None = None,
     include_status_progress: bool = False,
+    preserve_child_terminal: bool = False,
 ) -> None:
     """Publish supervisor truth through an eight-second disposable DB process."""
 
@@ -127,6 +128,7 @@ def _record_index_supervisor_heartbeat(
             "error_type": error_type,
             "detail": dict(detail or {}),
             "include_status_progress": bool(include_status_progress),
+            "preserve_child_terminal": bool(preserve_child_terminal),
         }
     )
 
@@ -187,6 +189,11 @@ def _run_index_child(
             base._terminate(child)
             break
         if now >= next_progress:
+            # The bounded diagnostic may start near the exact instant the DDL owner
+            # exits. Re-check immediately before launching it; the probe also performs
+            # a durable compare-after-diagnostics guard before any observing write.
+            if child.poll() is not None:
+                break
             _record_index_supervisor_heartbeat(
                 state="running",
                 stage="cycle_history_index_supervisor_observing",
@@ -271,8 +278,23 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
                         },
                     )
                 elif return_code == INDEX_NOT_READY_EXIT_CODE and not timed_out:
-                    # The child completed normally and already published concrete SQL
-                    # failure/retry detail. Preserve that terminal heartbeat verbatim.
+                    error_type, exit_detail = _index_child_exit_diagnostics(
+                        return_code,
+                        timed_out=timed_out,
+                    )
+                    consecutive_terminal_failures += 1
+                    _record_index_supervisor_heartbeat(
+                        state="degraded",
+                        stage="cycle_history_index_child_retry_pending",
+                        error_type=error_type,
+                        detail={
+                            **exit_detail,
+                            "index_status": after,
+                            "consecutive_terminal_failures": consecutive_terminal_failures,
+                            "retry_seconds": INDEX_RETRY_SECONDS,
+                        },
+                        preserve_child_terminal=True,
+                    )
                     stop_event.wait(INDEX_RETRY_SECONDS)
                     continue
                 elif timed_out or return_code not in (0, None):
@@ -299,6 +321,7 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
                             "retry_backoff_escalated": retry_seconds
                             > INDEX_RETRY_SECONDS,
                         },
+                        preserve_child_terminal=True,
                     )
                     print(
                         "cycle-history exact-index child terminated "
@@ -320,13 +343,30 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
                             "consecutive_terminal_failures": consecutive_terminal_failures,
                             "retry_seconds": INDEX_RETRY_SECONDS,
                         },
+                        preserve_child_terminal=True,
                     )
                     stop_event.wait(INDEX_RETRY_SECONDS)
                     continue
                 else:
-                    # If bounded verification itself is unavailable, preserve legacy
-                    # behavior only for a clean child exit; nonzero exits are handled above.
-                    exact_index_ready = return_code in (0, None) and not timed_out
+                    error_type, exit_detail = _index_child_exit_diagnostics(
+                        return_code,
+                        timed_out=timed_out,
+                    )
+                    consecutive_terminal_failures += 1
+                    _record_index_supervisor_heartbeat(
+                        state="degraded",
+                        stage="cycle_history_index_child_exit_unverified",
+                        error_type=(error_type or "IndexChildExitVerificationUnavailable"),
+                        detail={
+                            **exit_detail,
+                            "index_status": None,
+                            "consecutive_terminal_failures": consecutive_terminal_failures,
+                            "retry_seconds": INDEX_RETRY_SECONDS,
+                        },
+                        preserve_child_terminal=True,
+                    )
+                    stop_event.wait(INDEX_RETRY_SECONDS)
+                    continue
 
             if exact_index_ready:
                 print(
