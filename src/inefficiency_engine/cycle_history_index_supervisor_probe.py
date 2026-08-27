@@ -12,6 +12,7 @@ from inefficiency_engine.cycle_history_index_maintenance_child import WORKER_ID
 from inefficiency_engine.cycle_history_index_runtime_store import (
     build_cycle_history_index_runtime_store,
 )
+from inefficiency_engine.evidence import WorkerHeartbeat
 
 
 _PROGRESS_QUERY = text(
@@ -29,12 +30,13 @@ _PROGRESS_QUERY = text(
         idx.relname AS index_name
     FROM pg_stat_progress_create_index AS p
     JOIN pg_class AS tbl ON tbl.oid = p.relid
-    LEFT JOIN pg_class AS idx ON idx.oid = p.index_relid
+    LEFT JOIN pg_class AS idx ON idx.oid = p.indexrelid
     WHERE tbl.relname = 'market_quotes'
     ORDER BY p.pid
     LIMIT 1
     """
 )
+_RECENT_TERMINAL_SCAN_LIMIT = 64
 
 
 def _store() -> Any:
@@ -67,7 +69,8 @@ def _is_child_terminal(heartbeat: Any, detail: dict[str, object]) -> bool:
     stage = str(detail.get("stage") or "")
     state = str(getattr(heartbeat, "state", "") or "")
     return (
-        stage.startswith("cycle_history_index_")
+        not bool(detail.get("supervisor_observation"))
+        and stage.startswith("cycle_history_index_")
         and stage != "cycle_history_index_supervisor_observing"
         and (
             state in {"success", "degraded", "failed"}
@@ -147,6 +150,182 @@ def _status(store: Any) -> dict[str, object]:
     return dict(cycle_history_exact_index_status(store))
 
 
+def _recent_heartbeats(store: Any) -> list[tuple[WorkerHeartbeat, dict[str, object]]]:
+    """Read a tiny newest-first slice through the existing worker_id/id access path."""
+
+    with store.engine.connect() as db:
+        payloads = list(
+            db.execute(
+                text(
+                    "SELECT payload_json FROM worker_heartbeats "
+                    "WHERE worker_id = :worker_id ORDER BY id DESC LIMIT :limit"
+                ),
+                {"worker_id": WORKER_ID, "limit": _RECENT_TERMINAL_SCAN_LIMIT},
+            ).scalars()
+        )
+    rows: list[tuple[WorkerHeartbeat, dict[str, object]]] = []
+    for payload in payloads:
+        try:
+            heartbeat = WorkerHeartbeat.model_validate_json(payload)
+        except Exception:
+            continue
+        detail = dict(heartbeat.detail or {})
+        rows.append((heartbeat, detail))
+    return rows
+
+
+def _find_child_terminal(
+    store: Any,
+    *,
+    expected_attempt_number: int,
+) -> tuple[WorkerHeartbeat | None, dict[str, object]]:
+    for heartbeat, detail in _recent_heartbeats(store):
+        if _attempt_number(detail) != expected_attempt_number:
+            continue
+        if _is_child_terminal(heartbeat, detail):
+            return heartbeat, detail
+    return None, {}
+
+
+def _find_durable_supervisor_terminal(
+    store: Any,
+    *,
+    expected_attempt_number: int,
+    stage: str,
+) -> tuple[WorkerHeartbeat | None, dict[str, object]]:
+    for heartbeat, detail in _recent_heartbeats(store):
+        if _attempt_number(detail) != expected_attempt_number:
+            continue
+        if not bool(detail.get("supervisor_observation")):
+            continue
+        if str(detail.get("stage") or "") != stage:
+            continue
+        if detail.get("terminal_truth_durable") is True:
+            return heartbeat, detail
+    return None, {}
+
+
+def _capture_terminal(store: Any, payload: dict[str, object]) -> dict[str, object]:
+    """Durably copy one exited child's terminal evidence before any DDL retry.
+
+    Observing heartbeats may be newer than the child's terminal row, so search only a
+    bounded recent slice for the exact attempt instead of trusting the latest row. For
+    normal child exits, absence of a child terminal row is fail-closed: the supervisor
+    must retry this diagnostic action and may not launch another DDL child. Signal or
+    supervisor-timeout exits can be certified from the parent's process evidence alone.
+    """
+
+    expected_attempt_number = max(1, int(payload.get("expected_attempt_number") or 1))
+    stage = str(payload.get("stage") or "cycle_history_index_child_retry_pending")
+    existing, existing_detail = _find_durable_supervisor_terminal(
+        store,
+        expected_attempt_number=expected_attempt_number,
+        stage=stage,
+    )
+    if existing is not None:
+        return {
+            "ok": True,
+            "terminal_truth_durable": True,
+            "attempt_number": expected_attempt_number,
+            "stage": stage,
+            "child_terminal_stage": existing_detail.get("child_terminal_stage"),
+            "child_sql_error_type": existing_detail.get("child_sql_error_type"),
+            "child_sql_error_message": existing_detail.get("child_sql_error_message"),
+            "reason": "terminal_truth_already_durable",
+        }
+
+    child_heartbeat, child_detail = _find_child_terminal(
+        store,
+        expected_attempt_number=expected_attempt_number,
+    )
+    allow_supervisor_only = bool(payload.get("allow_supervisor_only_terminal"))
+    if child_heartbeat is None and not allow_supervisor_only:
+        return {
+            "ok": True,
+            "terminal_truth_durable": False,
+            "attempt_number": expected_attempt_number,
+            "stage": stage,
+            "reason": "child_terminal_heartbeat_not_durable",
+        }
+
+    detail = payload.get("detail")
+    detail = dict(detail) if isinstance(detail, dict) else {}
+    if child_heartbeat is not None:
+        child_error = child_heartbeat.error_type or child_detail.get("error_type")
+        child_message = child_detail.get("message")
+        sql_error, sql_message = _sql_error_fields(child_detail.get("maintenance_result"))
+        detail.update(
+            {
+                "child_terminal_stage": child_detail.get("stage"),
+                "child_error_type": child_error,
+                "child_sql_error_type": sql_error or child_error,
+                "child_sql_error_message": sql_message or child_message,
+                "child_maintenance_result": child_detail.get("maintenance_result"),
+                "child_effective_index_name": child_detail.get("effective_index_name")
+                or child_detail.get("current_index"),
+                "terminal_capture_source": "bounded_recent_child_terminal_scan",
+            }
+        )
+    else:
+        detail.update(
+            {
+                "child_terminal_heartbeat_unavailable": True,
+                "terminal_capture_source": "supervisor_process_exit_evidence",
+            }
+        )
+
+    detail.update(
+        {
+            "attempt_number": expected_attempt_number,
+            "terminal_truth_durable": True,
+            "terminal_capture_verified": True,
+            "ddl_retry_blocked_until_terminal_truth_durable": True,
+        }
+    )
+    detail = {key: value for key, value in detail.items() if value is not None}
+    store.record_worker_heartbeat(
+        worker_id=WORKER_ID,
+        state=str(payload.get("state") or "degraded"),
+        error_type=(str(payload["error_type"]) if payload.get("error_type") else None),
+        detail={
+            "stage": stage,
+            "supervisor_observation": True,
+            "supervisor_executes_ddl": False,
+            "dedicated_cycle_history_index_owner": True,
+            "create_index_concurrently_required_in_postgres": True,
+            "schema_free_exact_index_runtime_store": True,
+            "provider_requests_allowed": False,
+            "provider_requests_used": 0,
+            "qualification_thresholds_unchanged": True,
+            "certification_authority": False,
+            "allocation_authority": False,
+            "live_execution_authority": False,
+            "paper_only": True,
+            **detail,
+        },
+    )
+
+    verified, verified_detail = _find_durable_supervisor_terminal(
+        store,
+        expected_attempt_number=expected_attempt_number,
+        stage=stage,
+    )
+    return {
+        "ok": True,
+        "terminal_truth_durable": verified is not None,
+        "attempt_number": expected_attempt_number,
+        "stage": stage,
+        "child_terminal_stage": verified_detail.get("child_terminal_stage"),
+        "child_sql_error_type": verified_detail.get("child_sql_error_type"),
+        "child_sql_error_message": verified_detail.get("child_sql_error_message"),
+        "reason": (
+            "terminal_truth_persisted_and_verified"
+            if verified is not None
+            else "terminal_truth_write_not_verified"
+        ),
+    }
+
+
 def _record(store: Any, payload: dict[str, object]) -> None:
     detail = payload.get("detail")
     detail = dict(detail) if isinstance(detail, dict) else {}
@@ -162,9 +341,6 @@ def _record(store: Any, payload: dict[str, object]) -> None:
             }
         )
 
-    # Status/progress queries can take several seconds. Re-read durable truth only
-    # after those queries finish so a child terminal heartbeat written while this
-    # disposable probe was in flight cannot be replaced by stale observing data.
     heartbeat, previous = _latest_heartbeat(store)
     if str(payload.get("stage") or "") == "cycle_history_index_supervisor_observing":
         expected_attempt = _attempt_number(detail)
@@ -218,6 +394,14 @@ def execute(payload: dict[str, object]) -> dict[str, object]:
         action = str(payload.get("action") or "")
         if action == "status":
             return {"ok": True, "index_status": _status(store)}
+        if action == "next_attempt":
+            _heartbeat, detail = _latest_heartbeat(store)
+            return {
+                "ok": True,
+                "next_attempt_number": max(1, _attempt_number(detail) + 1),
+            }
+        if action == "capture_terminal":
+            return _capture_terminal(store, payload)
         if action == "record":
             _record(store, payload)
             return {"ok": True}
