@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from inefficiency_engine import runtime_index_maintenance
 from inefficiency_engine.config import Settings
-from inefficiency_engine.cycle_history_index_gate import cycle_history_exact_index_status
-from inefficiency_engine.evidence import build_evidence_store
+from inefficiency_engine.cycle_history_exact_index_direct import (
+    EXACT_INDEX_PRE_DDL_STATEMENT_TIMEOUT_MS,
+    ensure_exact_cycle_history_index_direct,
+)
+from inefficiency_engine.cycle_history_index_runtime_store import (
+    build_cycle_history_index_runtime_store,
+)
 
 
 WORKER_ID = "cycle-history-index-maintenance"
@@ -15,9 +19,7 @@ INDEX_NOT_READY_EXIT_CODE = 77
 # after ~320 seconds. The former ten-minute deadline therefore guaranteed repeated
 # cancellation before scan plus PostgreSQL's later concurrent validation phases could
 # complete. This dedicated child is the sole owner of the exact index, so give only
-# this one bounded DDL attempt a one-hour SQL window. Shared runtime-index defaults are
-# restored immediately after the call so ordinary background indexes keep their shorter
-# deadlines.
+# this one bounded DDL attempt a one-hour SQL window.
 DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS = 3_600_000
 
 _PREVIOUS_CHILD_TERMINAL_FIELDS = {
@@ -51,6 +53,8 @@ def _record_heartbeat(
                 "background_maintenance_only": True,
                 "dedicated_cycle_history_index_owner": True,
                 "create_index_concurrently_required_in_postgres": True,
+                "schema_free_exact_index_runtime_store": True,
+                "generic_schema_inspector_bypassed": True,
                 "provider_requests_allowed": False,
                 "provider_requests_used": 0,
                 "qualification_thresholds_unchanged": True,
@@ -76,7 +80,7 @@ def _latest_attempt_detail(store: Any) -> tuple[Any | None, dict[str, object]]:
 
 
 def _previous_child_terminal_context(detail: dict[str, object]) -> dict[str, object]:
-    """Rename the terminal child fields so they remain clearly prior-attempt evidence."""
+    """Rename terminal child fields so they remain clearly prior-attempt evidence."""
 
     return {
         target: detail[source]
@@ -86,14 +90,7 @@ def _previous_child_terminal_context(detail: dict[str, object]) -> dict[str, obj
 
 
 def _previous_attempt_context(store: Any) -> tuple[int, dict[str, object]]:
-    """Carry the last exact-index outcome into the next disposable attempt.
-
-    A new `starting` heartbeat must not erase the useful evidence from the prior
-    failed/timed-out build. Persist a monotonic attempt number plus the prior stage,
-    error, message, SQL failure, return code, termination classification and index name
-    into every new attempt's heartbeat. This is diagnostic only and has no certification
-    authority.
-    """
+    """Carry the last exact-index outcome into the next disposable attempt."""
 
     heartbeat, detail = _latest_attempt_detail(store)
     if heartbeat is None:
@@ -139,122 +136,122 @@ def _current_attempt_context(store: Any) -> tuple[int, dict[str, object]]:
         "previous_effective_index_name",
         *_PREVIOUS_CHILD_TERMINAL_FIELDS.values(),
     )
-    context = {
-        key: detail[key]
-        for key in keys
-        if detail.get(key) is not None
-    }
+    context = {key: detail[key] for key in keys if detail.get(key) is not None}
     return attempt_number, context
 
 
-def run_index_maintenance() -> int:
-    """Verify or build the one exact index required by cycle-history backfill.
+def _index_status_from_result(result: dict[str, object]) -> dict[str, object]:
+    attempted = result.get("attempted")
+    rows = attempted if isinstance(attempted, list) else []
+    row = dict(rows[-1]) if rows and isinstance(rows[-1], dict) else {}
+    ready = bool(result.get("complete"))
+    return {
+        "ready": ready,
+        "planner_usable_verified": bool(
+            result.get("postgres_index_validity_verified") or result.get("postgres_runtime_index_not_required")
+        ),
+        "postgres_index_ready": row.get("postgres_index_ready"),
+        "postgres_index_valid": row.get("postgres_index_valid"),
+        "canonical_index_name": row.get("canonical_index_name"),
+        "effective_index_name": row.get("effective_index_name"),
+        "reason": "planner_usable_index_ready" if ready else "planner_usable_index_unavailable",
+        "direct_exact_index_path": True,
+        "schema_free_runtime_store": True,
+        "allocation_authority": False,
+        "live_execution_authority": False,
+        "paper_only": True,
+    }
 
-    PostgreSQL DDL is delegated to the existing runtime-index maintainer, which uses
-    ``CREATE INDEX CONCURRENTLY`` plus finite statement/lock deadlines and verifies
-    ``pg_index.indisvalid``/``indisready`` before reporting success. The process exits
-    after one bounded attempt so interrupted DDL cannot strand the runtime parent.
+
+def run_index_maintenance() -> int:
+    """Verify/build the one exact index without entering generic schema bootstrap.
+
+    Startup owns schema creation. This disposable child uses a schema-free store and a
+    bounded direct PostgreSQL catalog phase, then enters the unchanged one-hour
+    ``CREATE INDEX CONCURRENTLY`` allowance only after the known table/columns and index
+    state have been verified.
     """
 
     settings = Settings.from_env()
-    store = build_evidence_store(settings.evidence_db_path)
+    store = build_cycle_history_index_runtime_store(settings.evidence_db_path)
     if store is None:
         raise RuntimeError("cycle-history index maintenance requires durable persistence")
 
-    attempt_number, previous_context = _previous_attempt_context(store)
-    attempt_context: dict[str, object] = {
-        "attempt_number": attempt_number,
-        "statement_timeout_ms": DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS,
-        **previous_context,
-    }
-
-    before = cycle_history_exact_index_status(store)
-    if bool(before.get("ready")):
-        _record_heartbeat(
-            store,
-            state="success",
-            stage="cycle_history_index_ready",
-            detail={
-                **attempt_context,
-                "index_status": before,
-                "ddl_required": False,
-            },
-        )
-        return 0
-
-    _record_heartbeat(
-        store,
-        state="running",
-        stage="cycle_history_index_maintenance_starting",
-        detail={**attempt_context, "index_status": before},
-    )
-
-    def progress(row: dict[str, object]) -> None:
-        phase = str(row.get("phase") or "running")
-        _record_heartbeat(
-            store,
-            state="degraded" if phase == "failed" else "running",
-            stage=f"cycle_history_index_{phase}",
-            error_type=(
-                str(row.get("error_type")) if row.get("error_type") else None
-            ),
-            detail={
-                **attempt_context,
-                "current_index": row.get("index"),
-                "current_table": row.get("table"),
-                "current_index_runtime_seconds": row.get("runtime_seconds"),
-                "current_index_ok": row.get("ok"),
-                "current_index_concurrent": row.get("concurrent"),
-                "message": row.get("message"),
-                "effective_index_name": row.get("effective_index_name"),
-            },
-        )
-
-    previous_timeout_ms = (
-        runtime_index_maintenance.CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
-    )
-    runtime_index_maintenance.CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS = (
-        DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS
-    )
     try:
-        result = runtime_index_maintenance.ensure_runtime_indexes_after_api_bind(
+        attempt_number, previous_context = _previous_attempt_context(store)
+        attempt_context: dict[str, object] = {
+            "attempt_number": attempt_number,
+            "statement_timeout_ms": DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS,
+            "pre_ddl_statement_timeout_ms": EXACT_INDEX_PRE_DDL_STATEMENT_TIMEOUT_MS,
+            **previous_context,
+        }
+
+        _record_heartbeat(
             store,
-            index_specs=runtime_index_maintenance.CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
+            state="running",
+            stage="cycle_history_index_preddl_pending",
+            detail={**attempt_context, "ddl_required": None},
+        )
+
+        def progress(row: dict[str, object]) -> None:
+            phase = str(row.get("phase") or "running")
+            _record_heartbeat(
+                store,
+                state="degraded" if phase == "failed" else "running",
+                stage=f"cycle_history_index_{phase}",
+                error_type=(str(row.get("error_type")) if row.get("error_type") else None),
+                detail={
+                    **attempt_context,
+                    "current_index": row.get("index"),
+                    "current_table": row.get("table"),
+                    "current_index_runtime_seconds": row.get("runtime_seconds"),
+                    "current_index_ok": row.get("ok"),
+                    "current_index_concurrent": row.get("concurrent"),
+                    "message": row.get("message"),
+                    "effective_index_name": row.get("effective_index_name"),
+                    "pre_ddl_complete": row.get("pre_ddl_complete"),
+                    "pre_ddl_runtime_seconds": row.get("pre_ddl_runtime_seconds"),
+                    "ddl_runtime_seconds": row.get("ddl_runtime_seconds"),
+                },
+            )
+
+        result = ensure_exact_cycle_history_index_direct(
+            store,
+            statement_timeout_ms=DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS,
             progress=progress,
         )
-    finally:
-        runtime_index_maintenance.CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS = (
-            previous_timeout_ms
+        ready = bool(result.get("complete"))
+        after = _index_status_from_result(result)
+        attempted = result.get("attempted")
+        rows = attempted if isinstance(attempted, list) else []
+        last = dict(rows[-1]) if rows and isinstance(rows[-1], dict) else {}
+        _record_heartbeat(
+            store,
+            state="success" if ready else "degraded",
+            stage="cycle_history_index_ready" if ready else "cycle_history_index_retry_pending",
+            error_type=(None if ready else "CycleHistoryExactIndexUnavailable"),
+            detail={
+                **attempt_context,
+                "maintenance_result": result,
+                "index_status": after,
+                "ddl_required": last.get("ddl_required"),
+                "effective_index_name": last.get("effective_index_name"),
+                "message": last.get("message"),
+            },
         )
-
-    after = cycle_history_exact_index_status(store)
-    ready = bool(result.get("complete")) and bool(after.get("ready"))
-    _record_heartbeat(
-        store,
-        state="success" if ready else "degraded",
-        stage=(
-            "cycle_history_index_ready"
-            if ready
-            else "cycle_history_index_retry_pending"
-        ),
-        error_type=(None if ready else "CycleHistoryExactIndexUnavailable"),
-        detail={
-            **attempt_context,
-            "maintenance_result": result,
-            "index_status": after,
-            "ddl_required": True,
-        },
-    )
-    return 0 if ready else INDEX_NOT_READY_EXIT_CODE
+        return 0 if ready else INDEX_NOT_READY_EXIT_CODE
+    finally:
+        store.dispose()
 
 
 def main() -> int:
     try:
         return run_index_maintenance()
     except Exception as exc:
+        store = None
         try:
             settings = Settings.from_env()
-            store = build_evidence_store(settings.evidence_db_path)
+            store = build_cycle_history_index_runtime_store(settings.evidence_db_path)
             if store is not None:
                 attempt_number, previous_context = _current_attempt_context(store)
                 _record_heartbeat(
@@ -264,15 +261,17 @@ def main() -> int:
                     error_type=type(exc).__name__,
                     detail={
                         "attempt_number": attempt_number,
-                        "statement_timeout_ms": (
-                            DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS
-                        ),
+                        "statement_timeout_ms": DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS,
+                        "pre_ddl_statement_timeout_ms": EXACT_INDEX_PRE_DDL_STATEMENT_TIMEOUT_MS,
                         **previous_context,
                         "message": str(exc)[:500],
                     },
                 )
         except Exception:
             pass
+        finally:
+            if store is not None:
+                store.dispose()
         return 1
 
 
