@@ -47,13 +47,9 @@ def _configure_bounded_heartbeat_session(db: Any) -> None:
 
 
 class CycleHistoryIndexRuntimeStore:
-    """Schema-free store for the dedicated exact-index process and its probes.
+    """Schema-free store for the dedicated exact-index process and its probes."""
 
-    Production schema creation is owned by the serialized startup bootstrap. Exact-index
-    maintenance must never run SQLAlchemy ``metadata.create_all`` while PostgreSQL is
-    already under DDL pressure. This store therefore opens only a bounded engine and
-    implements the two durable heartbeat operations the exact-index path needs.
-    """
+    schema_free_exact_index_runtime_store = True
 
     def __init__(self, engine: Engine):
         self.engine = engine
@@ -133,7 +129,16 @@ def build_cycle_history_index_runtime_store(
         "poolclass": NullPool,
     }
     if url.startswith("postgresql"):
-        kwargs["connect_args"] = {"connect_timeout": EXACT_INDEX_CONNECT_TIMEOUT_SECONDS}
+        # Connect acquisition and every session start with a short catalog/query bound.
+        # The direct exact-index maintainer explicitly raises statement_timeout to the
+        # dedicated one-hour value immediately before CREATE INDEX CONCURRENTLY.
+        kwargs["connect_args"] = {
+            "connect_timeout": EXACT_INDEX_CONNECT_TIMEOUT_SECONDS,
+            "options": (
+                f"-c statement_timeout={EXACT_INDEX_HEARTBEAT_STATEMENT_TIMEOUT_MS} "
+                f"-c lock_timeout={EXACT_INDEX_HEARTBEAT_LOCK_TIMEOUT_MS}"
+            ),
+        }
     elif url.startswith("sqlite:"):
         kwargs["connect_args"] = {"check_same_thread": False}
     return CycleHistoryIndexRuntimeStore(create_engine(url, **kwargs))
