@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 from types import SimpleNamespace
 from typing import Awaitable, Callable, Mapping, Sequence
@@ -27,6 +28,7 @@ PORTFOLIO_SCAN_STAGE_TIMEOUT_SECONDS = 30.0
 PORTFOLIO_ALLOCATION_STAGE_TIMEOUT_SECONDS = 45.0
 ALLOCATION_CERTIFICATION_STAGE_TIMEOUT_SECONDS = 30.0
 OPERATING_CERTIFICATION_STAGE_TIMEOUT_SECONDS = 30.0
+_STAGE_TERMINATE_GRACE_SECONDS = 5.0
 
 StageRunner = Callable[..., Awaitable[dict[str, object]]]
 
@@ -83,12 +85,68 @@ def default_stage_command(stage_command: str) -> list[str]:
     return [sys.executable, "-m", "inefficiency_engine.cli", stage_command]
 
 
+def _stage_process_group_exists(pgid: int) -> bool:
+    if os.name != "posix" or not hasattr(os, "killpg"):
+        return False
+    try:
+        os.killpg(int(pgid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _signal_stage_process_tree(
+    process: asyncio.subprocess.Process,
+    sig: signal.Signals,
+) -> bool:
+    if os.name == "posix" and hasattr(os, "killpg") and getattr(process, "pid", None):
+        try:
+            os.killpg(int(process.pid), sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except OSError:
+            pass
+    if process.returncode is not None:
+        return False
+    if sig == signal.SIGTERM:
+        process.terminate()
+    else:
+        process.kill()
+    return True
+
+
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    group_mode = bool(
+        os.name == "posix"
+        and hasattr(os, "killpg")
+        and getattr(process, "pid", None)
+    )
+    if group_mode:
+        _signal_stage_process_tree(process, signal.SIGTERM)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _STAGE_TERMINATE_GRACE_SECONDS
+        while _stage_process_group_exists(int(process.pid)) and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        if _stage_process_group_exists(int(process.pid)):
+            _signal_stage_process_tree(process, signal.SIGKILL)
+        if process.returncode is None:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=1.0)
+            except TimeoutError:
+                _signal_stage_process_tree(process, signal.SIGKILL)
+                await process.wait()
+        return
+
     if process.returncode is not None:
         return
     process.terminate()
     try:
-        await asyncio.wait_for(process.wait(), timeout=5.0)
+        await asyncio.wait_for(process.wait(), timeout=_STAGE_TERMINATE_GRACE_SECONDS)
     except TimeoutError:
         process.kill()
         await process.wait()
@@ -125,6 +183,7 @@ async def run_stage_subprocess(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=merged_env,
+        start_new_session=(os.name == "posix"),
     )
     try:
         try:
@@ -141,7 +200,11 @@ async def run_stage_subprocess(
             await _terminate_process(process)
             raise
     finally:
-        if process.returncode is None:
+        if process.returncode is None or (
+            os.name == "posix"
+            and getattr(process, "pid", None)
+            and _stage_process_group_exists(int(process.pid))
+        ):
             await _terminate_process(process)
 
     if process.returncode != 0:
