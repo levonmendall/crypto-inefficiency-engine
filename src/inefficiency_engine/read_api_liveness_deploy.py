@@ -216,7 +216,10 @@ def liveness_payload() -> dict[str, object]:
         "live_execution": False,
         "release_commit": _release_commit(),
         "database_check": "deferred_to_readiness",
-        "runtime_diagnostics": "deferred_to_bounded_internal_snapshot",
+        # Preserve the public contract: runtime diagnostics are not part of /health.
+        # The internal watchdog now has a separate bounded heartbeat-only endpoint,
+        # advertised below, without redefining the external liveness semantics.
+        "runtime_diagnostics": "deferred_to_readiness",
         "readiness_endpoint": "/ready",
         "internal_runtime_heartbeat_endpoint": INTERNAL_RUNTIME_HEARTBEAT_PATH,
         "internal_runtime_heartbeat_deadline_seconds": (
