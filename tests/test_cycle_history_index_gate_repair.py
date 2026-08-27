@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import signal
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -97,9 +98,77 @@ def test_supervisor_gives_dedicated_exact_index_a_realistic_bounded_window():
     assert supervisor_repair.BACKFILL_COMMAND[-1] == (
         "inefficiency_engine.cycle_history_background_backfill_repair"
     )
-    assert source.index("INDEX_COMMAND") < source.index("BACKFILL_COMMAND")
+    assert source.index("_safe_index_status(store)") < source.index("_run_index_child(")
+    assert source.index("_run_index_child(") < source.index(
+        "after = _safe_index_status(store)"
+    )
     assert "exact_index_ready = False" in source
     assert "return_code == INDEX_NOT_READY_EXIT_CODE" in source
+
+
+def test_index_supervisor_classifies_hard_kill_without_falsely_claiming_oom():
+    error_type, detail = supervisor_repair._index_child_exit_diagnostics(
+        -int(signal.SIGKILL),
+        timed_out=False,
+    )
+
+    assert error_type == "IndexChildTerminatedBySignal"
+    assert detail["termination_signal"] == "SIGKILL"
+    assert detail["possible_oom_or_external_kill"] is True
+    assert detail["oom_kill_proven"] is False
+    assert detail["process_termination_observed_by_supervisor"] is True
+
+
+def test_index_supervisor_publishes_terminal_truth_and_preserves_attempt_context():
+    previous = SimpleNamespace(
+        detail={
+            "stage": "cycle_history_index_maintenance_starting",
+            "attempt_number": 79,
+            "statement_timeout_ms": 600_000,
+            "previous_attempt_number": 78,
+        }
+    )
+    recorded: list[dict[str, object]] = []
+    store = SimpleNamespace(
+        latest_worker_heartbeat=lambda _worker_id: previous,
+        record_worker_heartbeat=lambda **kwargs: recorded.append(kwargs),
+    )
+
+    supervisor_repair._record_index_supervisor_heartbeat(
+        store,
+        state="degraded",
+        stage="cycle_history_index_child_terminated",
+        error_type="IndexChildTerminatedBySignal",
+        detail={
+            "child_return_code": -int(signal.SIGKILL),
+            "termination_signal": "SIGKILL",
+        },
+    )
+
+    assert len(recorded) == 1
+    heartbeat = recorded[0]
+    assert heartbeat["worker_id"] == index_child.WORKER_ID
+    assert heartbeat["error_type"] == "IndexChildTerminatedBySignal"
+    detail = heartbeat["detail"]
+    assert detail["attempt_number"] == 79
+    assert detail["previous_attempt_number"] == 78
+    assert detail["statement_timeout_ms"] == 600_000
+    assert detail["supervisor_observation"] is True
+    assert detail["supervisor_executes_ddl"] is False
+    assert detail["qualification_thresholds_unchanged"] is True
+    assert detail["paper_only"] is True
+
+
+def test_index_supervisor_observes_blocking_ddl_and_escalates_blind_retry_backoff():
+    source = inspect.getsource(supervisor_repair)
+
+    assert supervisor_repair.INDEX_PROGRESS_HEARTBEAT_SECONDS == 15.0
+    assert supervisor_repair.INDEX_TERMINAL_FAILURE_BACKOFF_THRESHOLD == 3
+    assert supervisor_repair.INDEX_TERMINAL_FAILURE_BACKOFF_SECONDS == 120.0
+    assert "pg_stat_progress_create_index" in source
+    assert "cycle_history_index_supervisor_observing" in source
+    assert "postgres_index_progress" in source
+    assert "retry_backoff_escalated" in source
 
 
 def test_dedicated_index_child_restores_shared_timeout_and_preserves_attempt_context(
