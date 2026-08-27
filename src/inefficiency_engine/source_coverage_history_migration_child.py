@@ -12,6 +12,7 @@ from inefficiency_engine.evidence import build_evidence_store
 from inefficiency_engine.source_coverage import SourceCoverageSnapshot
 from inefficiency_engine.source_coverage_history import (
     DEFAULT_MIGRATION_HEARTBEAT_BATCH,
+    SOURCE_COVERAGE_HISTORY_TABLE,
     SOURCE_COVERAGE_SNAPSHOT_WORKER_ID,
     SourceCoverageHistoryLedger,
 )
@@ -68,16 +69,33 @@ def _record(store: Any, *, state: str, detail: dict[str, object], error_type: st
 def _completed_history_summary(
     store: Any,
     *,
-    checkpoint_heartbeat_id: int,
+    checkpoint_heartbeat_id: int | None = None,
 ) -> dict[str, object]:
-    """Prove compact migration readiness without recounting the archive.
+    """Return compact production proof or an explicit diagnostic archive recount.
 
-    The priority ``worker_heartbeats(worker_id,id)`` access path is already a migration
-    prerequisite. Read only the newest canonical source snapshot, verify that the
-    durable migration checkpoint has caught up to that heartbeat, and derive the 13-lane
-    certification count from the snapshot payload itself. Full archive counts remain
-    diagnostic-only and are deliberately deferred.
+    Production migration always supplies ``checkpoint_heartbeat_id`` and therefore uses
+    one indexed latest-worker lookup. The no-checkpoint form is retained only for the
+    pre-existing offline diagnostic/test contract; it is never called from the bounded
+    migration critical path or the HTTP certification path.
     """
+
+    if checkpoint_heartbeat_id is None:
+        with store.engine.connect() as db:
+            lane_count = int(
+                db.execute(
+                    text(
+                        f"SELECT COUNT(DISTINCT lane_id) FROM {SOURCE_COVERAGE_HISTORY_TABLE}"
+                    )
+                ).scalar_one()
+                or 0
+            )
+            snapshot_count = int(
+                db.execute(
+                    text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_HISTORY_TABLE}")
+                ).scalar_one()
+                or 0
+            )
+        return {"lane_count": lane_count, "snapshot_count": snapshot_count}
 
     with store.engine.connect() as db:
         row = db.execute(
@@ -195,9 +213,6 @@ def advance_one_history_migration_batch(
             6,
         )
         complete = bool(summary.get("compact_certification_summary"))
-        # A new canonical source heartbeat can arrive after the batch query. In that
-        # case the completed checkpoint is truthful but no longer caught up; retry the
-        # migration rather than publishing a false terminal-ready heartbeat.
         result["complete"] = complete
 
     _record(
