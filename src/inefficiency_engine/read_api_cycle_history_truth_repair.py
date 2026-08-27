@@ -6,6 +6,13 @@ from inefficiency_engine import read_api_end_to_end_certification_deploy as base
 END_TO_END_PATH = "/v3/operations/end-to-end-certification"
 CYCLE_HISTORY_INDEX_WORKER_ID = "cycle-history-index-maintenance"
 CYCLE_HISTORY_INDEX_STALE_SECONDS = 180.0
+CYCLE_HISTORY_INDEX_READY_STAGES = frozenset(
+    {
+        "cycle_history_index_ready",
+        "cycle_history_index_ready_observed_before_retry",
+        "cycle_history_index_ready_observed_after_child_exit",
+    }
+)
 CANONICAL_CONTROL_WORKER_ID = "canonical-control-operating-loop"
 
 
@@ -57,7 +64,7 @@ def _worker_snapshot_error(workers: dict[str, object]) -> dict[str, object] | No
 def _cycle_history_index_maintenance_status(
     worker: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    """Expose the dedicated exact-index owner from the same batched worker snapshot."""
+    """Expose exact-index readiness plus supervisor diagnostics from one compact row."""
 
     row = dict(worker) if isinstance(worker, dict) else {}
     if not row or not bool(row.get("available")):
@@ -70,6 +77,8 @@ def _cycle_history_index_maintenance_status(
             "reason": "index_heartbeat_unavailable_in_compact_snapshot",
             "worker_id": CYCLE_HISTORY_INDEX_WORKER_ID,
             "single_owner": True,
+            "diagnostic_source": "batched_latest_worker_heartbeat",
+            "additional_database_reads": 0,
             "certification_authority": False,
             "allocation_authority": False,
             "live_execution_authority": False,
@@ -82,13 +91,19 @@ def _cycle_history_index_maintenance_status(
     maintenance_result = (
         dict(raw_maintenance) if isinstance(raw_maintenance, dict) else {}
     )
+    raw_postgres_progress = row.get("postgres_index_progress")
+    postgres_index_progress = (
+        dict(raw_postgres_progress)
+        if isinstance(raw_postgres_progress, dict)
+        else {}
+    )
     stale = bool(row.get("stale", True))
     state = str(row.get("state") or "unknown")
     stage = str(row.get("stage") or "") or None
     ready = bool(
         not stale
         and state == "success"
-        and stage == "cycle_history_index_ready"
+        and stage in CYCLE_HISTORY_INDEX_READY_STAGES
         and index_status.get("ready") is True
     )
 
@@ -121,6 +136,29 @@ def _cycle_history_index_maintenance_status(
         "previous_error_type": row.get("previous_error_type"),
         "previous_message": row.get("previous_message"),
         "previous_effective_index_name": row.get("previous_effective_index_name"),
+        "supervisor_observation": row.get("supervisor_observation"),
+        "supervisor_executes_ddl": row.get("supervisor_executes_ddl"),
+        "child_pid": row.get("child_pid"),
+        "child_runtime_seconds": row.get("child_runtime_seconds"),
+        "executor_deadline_seconds": row.get("executor_deadline_seconds"),
+        "postgres_progress_available": bool(row.get("postgres_progress_available")),
+        "postgres_index_progress": postgres_index_progress,
+        "child_return_code": row.get("child_return_code"),
+        "child_timed_out": row.get("child_timed_out"),
+        "child_exit_error_type": row.get("child_exit_error_type"),
+        "process_termination_observed_by_supervisor": row.get(
+            "process_termination_observed_by_supervisor"
+        ),
+        "termination_signal_number": row.get("termination_signal_number"),
+        "termination_signal": row.get("termination_signal"),
+        "possible_oom_or_external_kill": row.get("possible_oom_or_external_kill"),
+        "oom_kill_proven": row.get("oom_kill_proven"),
+        "consecutive_terminal_failures": row.get("consecutive_terminal_failures"),
+        "retry_seconds": row.get("retry_seconds"),
+        "retry_backoff_escalated": row.get("retry_backoff_escalated"),
+        "ddl_retry_skipped": row.get("ddl_retry_skipped"),
+        "diagnostic_source": "batched_latest_worker_heartbeat",
+        "additional_database_reads": 0,
         "single_owner": True,
         "generic_runtime_exact_index_maintenance_disabled": True,
         "certification_authority": False,
@@ -136,7 +174,8 @@ def repaired_end_to_end_certification_payload() -> dict[str, object]:
     Base certification requests one compact latest-worker snapshot. This wrapper reuses
     those exact rows to keep generic historical caches from masquerading as cycle-history
     completion and to expose the dedicated exact-index owner. No second readiness call,
-    heartbeat lookup, archive count, or provider work is allowed here.
+    heartbeat lookup, archive count, provider work, or PostgreSQL progress query occurs
+    on the HTTP request path; supervisor diagnostics are copied from its durable row.
     """
 
     payload = dict(base.end_to_end_certification_payload(include_worker_truth=True))
@@ -255,6 +294,7 @@ def repaired_end_to_end_certification_payload() -> dict[str, object]:
 
 __all__ = [
     "CANONICAL_CONTROL_WORKER_ID",
+    "CYCLE_HISTORY_INDEX_READY_STAGES",
     "CYCLE_HISTORY_INDEX_STALE_SECONDS",
     "CYCLE_HISTORY_INDEX_WORKER_ID",
     "END_TO_END_PATH",
