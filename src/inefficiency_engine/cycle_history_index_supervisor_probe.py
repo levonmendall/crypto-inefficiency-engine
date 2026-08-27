@@ -27,7 +27,7 @@ _PROGRESS_QUERY = text(
         idx.relname AS index_name
     FROM pg_stat_progress_create_index AS p
     JOIN pg_class AS tbl ON tbl.oid = p.relid
-    LEFT JOIN pg_class AS idx ON idx.oid = p.index_relid
+    LEFT JOIN pg_class AS idx ON idx.oid = p.indexrelid
     WHERE tbl.relname = 'market_quotes'
     ORDER BY p.pid
     LIMIT 1
@@ -107,6 +107,15 @@ def _carry(previous: dict[str, object]) -> dict[str, object]:
             "previous_error_type",
             "previous_message",
             "previous_effective_index_name",
+            "previous_child_terminal_stage",
+            "previous_child_sql_error_type",
+            "previous_child_sql_error_message",
+            "previous_child_return_code",
+            "previous_child_timed_out",
+            "previous_termination_signal",
+            "previous_termination_signal_number",
+            "previous_possible_oom_or_external_kill",
+            "previous_oom_kill_proven",
             "statement_timeout_ms",
             "index_status",
             "current_index",
