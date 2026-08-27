@@ -9,7 +9,9 @@ from sqlalchemy import text
 from inefficiency_engine.config import Settings
 from inefficiency_engine.cycle_history_index_gate import cycle_history_exact_index_status
 from inefficiency_engine.cycle_history_index_maintenance_child import WORKER_ID
-from inefficiency_engine.evidence import build_evidence_store
+from inefficiency_engine.cycle_history_index_runtime_store import (
+    build_cycle_history_index_runtime_store,
+)
 
 
 _PROGRESS_QUERY = text(
@@ -27,7 +29,7 @@ _PROGRESS_QUERY = text(
         idx.relname AS index_name
     FROM pg_stat_progress_create_index AS p
     JOIN pg_class AS tbl ON tbl.oid = p.relid
-    LEFT JOIN pg_class AS idx ON idx.oid = p.indexrelid
+    LEFT JOIN pg_class AS idx ON idx.oid = p.index_relid
     WHERE tbl.relname = 'market_quotes'
     ORDER BY p.pid
     LIMIT 1
@@ -37,7 +39,7 @@ _PROGRESS_QUERY = text(
 
 def _store() -> Any:
     settings = Settings.from_env()
-    store = build_evidence_store(settings.evidence_db_path)
+    store = build_cycle_history_index_runtime_store(settings.evidence_db_path)
     if store is None:
         raise RuntimeError("cycle-history supervisor probe requires durable persistence")
     return store
@@ -117,6 +119,9 @@ def _carry(previous: dict[str, object]) -> dict[str, object]:
             "previous_possible_oom_or_external_kill",
             "previous_oom_kill_proven",
             "statement_timeout_ms",
+            "pre_ddl_statement_timeout_ms",
+            "pre_ddl_complete",
+            "pre_ddl_runtime_seconds",
             "index_status",
             "current_index",
             "current_table",
@@ -170,9 +175,7 @@ def _record(store: Any, payload: dict[str, object]) -> None:
             return
 
     if bool(payload.get("preserve_child_terminal")) and heartbeat is not None:
-        child_error = getattr(heartbeat, "error_type", None) or previous.get(
-            "error_type"
-        )
+        child_error = getattr(heartbeat, "error_type", None) or previous.get("error_type")
         child_message = previous.get("message")
         sql_error, sql_message = _sql_error_fields(previous.get("maintenance_result"))
         detail.update(
@@ -196,6 +199,7 @@ def _record(store: Any, payload: dict[str, object]) -> None:
             "supervisor_executes_ddl": False,
             "dedicated_cycle_history_index_owner": True,
             "create_index_concurrently_required_in_postgres": True,
+            "schema_free_exact_index_runtime_store": True,
             "provider_requests_allowed": False,
             "provider_requests_used": 0,
             "qualification_thresholds_unchanged": True,
@@ -210,13 +214,16 @@ def _record(store: Any, payload: dict[str, object]) -> None:
 
 def execute(payload: dict[str, object]) -> dict[str, object]:
     store = _store()
-    action = str(payload.get("action") or "")
-    if action == "status":
-        return {"ok": True, "index_status": _status(store)}
-    if action == "record":
-        _record(store, payload)
-        return {"ok": True}
-    raise ValueError(f"unsupported probe action: {action}")
+    try:
+        action = str(payload.get("action") or "")
+        if action == "status":
+            return {"ok": True, "index_status": _status(store)}
+        if action == "record":
+            _record(store, payload)
+            return {"ok": True}
+        raise ValueError(f"unsupported probe action: {action}")
+    finally:
+        store.dispose()
 
 
 def main() -> int:
