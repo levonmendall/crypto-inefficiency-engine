@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from inefficiency_engine.evidence import EvidenceStore
@@ -88,6 +90,32 @@ def test_history_ledger_records_lane_snapshot_idempotently(tmp_path):
     assert row["source_ledgers"] == {SOURCE_COVERAGE_HISTORY_TABLE}
 
 
+def test_concurrent_live_snapshot_writers_resolve_unique_key_inside_insert(tmp_path):
+    store = EvidenceStore(tmp_path / "history-concurrent.sqlite3")
+    # Create schema before the threads so this test isolates the row-level conflict.
+    SourceCoverageHistoryLedger(store)
+    snapshot = _snapshot(START)
+    barrier = threading.Barrier(2)
+
+    def persist(offset_seconds: int) -> int:
+        ledger = SourceCoverageHistoryLedger(store)
+        barrier.wait(timeout=5.0)
+        return ledger.record_snapshot(
+            snapshot,
+            published_at=START + timedelta(seconds=offset_seconds),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(persist, (1, 2)))
+
+    assert sorted(results) == [0, 1]
+    summary = SourceCoverageHistoryLedger(store).summary(
+        start=START - timedelta(minutes=1),
+        end=START + timedelta(minutes=1),
+    )
+    assert summary["yield"]["canonical_snapshot_count"] == 1
+
+
 def test_heartbeat_archive_migration_is_checkpointed_and_resumable(tmp_path):
     store = EvidenceStore(tmp_path / "migration.sqlite3")
     first = _snapshot(START)
@@ -102,6 +130,8 @@ def test_heartbeat_archive_migration_is_checkpointed_and_resumable(tmp_path):
     assert first_pass["complete"] is False
     assert first_pass["migrated_heartbeats"] == 1
     assert first_pass["inserted_lane_snapshots"] == 1
+    assert first_pass["conflict_safe_history_insert"] is True
+    assert first_pass["conflict_safe_checkpoint_upsert"] is True
 
     ledger = SourceCoverageHistoryLedger(store)
     status = ledger.migration_status()
@@ -129,6 +159,29 @@ def test_heartbeat_archive_migration_is_checkpointed_and_resumable(tmp_path):
     assert summary["yield"]["canonical_snapshot_count"] == 2
 
 
+def test_migration_checkpoint_upsert_never_moves_backwards(tmp_path):
+    store = EvidenceStore(tmp_path / "migration-monotonic.sqlite3")
+    ledger = SourceCoverageHistoryLedger(store)
+
+    with store.engine.begin() as db:
+        ledger._upsert_migration_checkpoint(
+            db,
+            checkpoint_heartbeat_id=10,
+            complete=False,
+            updated_at=(START + timedelta(seconds=10)).isoformat(),
+        )
+        ledger._upsert_migration_checkpoint(
+            db,
+            checkpoint_heartbeat_id=5,
+            complete=True,
+            updated_at=(START + timedelta(seconds=20)).isoformat(),
+        )
+
+    status = ledger.migration_status()
+    assert status["checkpoint_heartbeat_id"] == 10
+    assert status["complete"] is False
+
+
 def test_live_snapshot_can_precede_archive_migration_without_duplication(tmp_path):
     store = EvidenceStore(tmp_path / "live-first.sqlite3")
     snapshot = _snapshot(START)
@@ -140,6 +193,8 @@ def test_live_snapshot_can_precede_archive_migration_without_duplication(tmp_pat
 
     assert result["complete"] is True
     assert result["inserted_lane_snapshots"] == 0
+    assert result["conflict_safe_history_insert"] is True
+    assert result["conflict_safe_checkpoint_upsert"] is True
     summary = ledger.summary(
         start=START - timedelta(minutes=1),
         end=START + timedelta(minutes=1),
