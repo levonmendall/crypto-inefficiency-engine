@@ -10,13 +10,15 @@ from inefficiency_engine.evidence import build_evidence_store
 
 WORKER_ID = "cycle-history-index-maintenance"
 INDEX_NOT_READY_EXIT_CODE = 77
-# Production proved the prior 120-second CREATE INDEX CONCURRENTLY deadline could
-# repeatedly abort the one exact cycle-history access-path build before PostgreSQL
-# finished. This dedicated child is the sole owner of that exact index, so give only
-# this one bounded DDL attempt a realistic ten-minute window. The shared runtime-index
-# defaults are restored immediately after the call so ordinary background indexes keep
-# their existing shorter deadlines.
-DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS = 600_000
+# Production pg_stat_progress_create_index evidence showed the exact concurrent index
+# was healthy and actively scanning market_quotes but only ~28.5% through the table
+# after ~320 seconds. The former ten-minute deadline therefore guaranteed repeated
+# cancellation before scan plus PostgreSQL's later concurrent validation phases could
+# complete. This dedicated child is the sole owner of the exact index, so give only
+# this one bounded DDL attempt a one-hour SQL window. Shared runtime-index defaults are
+# restored immediately after the call so ordinary background indexes keep their shorter
+# deadlines.
+DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS = 3_600_000
 
 
 def _record_heartbeat(
