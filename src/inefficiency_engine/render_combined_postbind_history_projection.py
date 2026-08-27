@@ -6,10 +6,18 @@ from inefficiency_engine import render_combined_postbind_lane_repair as base
 from inefficiency_engine.durable_lane_history_projection_supervisor import (
     run_durable_lane_history_projection_supervisor,
 )
+from inefficiency_engine.startup_database_recovery import (
+    install_startup_database_recovery,
+)
 
 
 def main() -> int:
     """Run the canonical combined service plus an independent history projection guard."""
+
+    # Production schema bootstrap must remain serialized before permanent child startup,
+    # but Render's attached PostgreSQL can be briefly unavailable in recovery mode during
+    # a deploy. Patch only that bootstrap boundary with a bounded, recovery-specific retry.
+    install_startup_database_recovery(base.base)
 
     stop_event = threading.Event()
     history_projection_guard = threading.Thread(
