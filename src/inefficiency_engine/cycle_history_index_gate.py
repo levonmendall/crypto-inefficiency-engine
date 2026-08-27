@@ -13,6 +13,19 @@ from inefficiency_engine.runtime_index_maintenance import (
 )
 
 
+def _connection_resilience_detail(store: Any) -> dict[str, object]:
+    """Expose non-secret exact-index connection settings when the store supplies them."""
+
+    getter = getattr(store, "connection_resilience_detail", None)
+    if not callable(getter):
+        return {}
+    try:
+        detail = getter()
+    except Exception:
+        return {}
+    return dict(detail) if isinstance(detail, dict) else {}
+
+
 def cycle_history_exact_index_status(store: Any) -> dict[str, object]:
     """Return whether the exact cycle-history query index is planner-usable.
 
@@ -29,6 +42,7 @@ def cycle_history_exact_index_status(store: Any) -> dict[str, object]:
     canonical_name = _postgres_canonical_index_name(
         _index_name(table_name, columns)
     )
+    connection_resilience = _connection_resilience_detail(store)
 
     if dialect_name != "postgresql":
         return {
@@ -44,6 +58,7 @@ def cycle_history_exact_index_status(store: Any) -> dict[str, object]:
             "allocation_authority": False,
             "live_execution_authority": False,
             "paper_only": True,
+            **connection_resilience,
         }
 
     try:
@@ -68,6 +83,7 @@ def cycle_history_exact_index_status(store: Any) -> dict[str, object]:
                     "allocation_authority": False,
                     "live_execution_authority": False,
                     "paper_only": True,
+                    **connection_resilience,
                 }
 
             replacement_states = _postgres_replacement_index_states(
@@ -95,6 +111,7 @@ def cycle_history_exact_index_status(store: Any) -> dict[str, object]:
                     "allocation_authority": False,
                     "live_execution_authority": False,
                     "paper_only": True,
+                    **connection_resilience,
                 }
     except Exception as exc:
         return {
@@ -112,6 +129,7 @@ def cycle_history_exact_index_status(store: Any) -> dict[str, object]:
             "allocation_authority": False,
             "live_execution_authority": False,
             "paper_only": True,
+            **connection_resilience,
         }
 
     return {
@@ -133,6 +151,7 @@ def cycle_history_exact_index_status(store: Any) -> dict[str, object]:
         "allocation_authority": False,
         "live_execution_authority": False,
         "paper_only": True,
+        **connection_resilience,
     }
 
 
