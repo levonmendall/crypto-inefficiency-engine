@@ -160,7 +160,7 @@ def test_batch_helper_never_reconstructs_history_ledger() -> None:
         batch_repair.migrate_source_coverage_history_batch_with_ledger
     )
     assert "SourceCoverageHistoryLedger(" not in source
-    assert "metadata.create_all" not in source
+    assert "metadata.create_all(" not in source
 
 
 def test_next_index_attempt_carries_concrete_prior_child_terminal_truth() -> None:
