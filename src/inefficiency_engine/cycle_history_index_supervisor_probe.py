@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import text
@@ -12,7 +13,6 @@ from inefficiency_engine.cycle_history_index_maintenance_child import WORKER_ID
 from inefficiency_engine.cycle_history_index_runtime_store import (
     build_cycle_history_index_runtime_store,
 )
-from inefficiency_engine.evidence import WorkerHeartbeat
 
 
 _PROGRESS_QUERY = text(
@@ -30,7 +30,7 @@ _PROGRESS_QUERY = text(
         idx.relname AS index_name
     FROM pg_stat_progress_create_index AS p
     JOIN pg_class AS tbl ON tbl.oid = p.relid
-    LEFT JOIN pg_class AS idx ON idx.oid = p.indexrelid
+    LEFT JOIN pg_class AS idx ON idx.oid = p.index_relid
     WHERE tbl.relname = 'market_quotes'
     ORDER BY p.pid
     LIMIT 1
@@ -80,8 +80,6 @@ def _is_child_terminal(heartbeat: Any, detail: dict[str, object]) -> bool:
 
 
 def _sql_error_fields(value: object) -> tuple[str | None, str | None]:
-    """Find concrete SQL failure fields retained inside maintenance results."""
-
     if isinstance(value, dict):
         error_type = value.get("error_type")
         message = value.get("message") or value.get("error")
@@ -103,39 +101,36 @@ def _sql_error_fields(value: object) -> tuple[str | None, str | None]:
 
 
 def _carry(previous: dict[str, object]) -> dict[str, object]:
-    return {
-        key: previous[key]
-        for key in (
-            "attempt_number",
-            "previous_attempt_number",
-            "previous_stage",
-            "previous_error_type",
-            "previous_message",
-            "previous_effective_index_name",
-            "previous_child_terminal_stage",
-            "previous_child_sql_error_type",
-            "previous_child_sql_error_message",
-            "previous_child_return_code",
-            "previous_child_timed_out",
-            "previous_termination_signal",
-            "previous_termination_signal_number",
-            "previous_possible_oom_or_external_kill",
-            "previous_oom_kill_proven",
-            "statement_timeout_ms",
-            "pre_ddl_statement_timeout_ms",
-            "pre_ddl_complete",
-            "pre_ddl_runtime_seconds",
-            "index_status",
-            "current_index",
-            "current_table",
-            "current_index_runtime_seconds",
-            "current_index_ok",
-            "current_index_concurrent",
-            "message",
-            "effective_index_name",
-        )
-        if previous.get(key) is not None
-    }
+    keys = (
+        "attempt_number",
+        "previous_attempt_number",
+        "previous_stage",
+        "previous_error_type",
+        "previous_message",
+        "previous_effective_index_name",
+        "previous_child_terminal_stage",
+        "previous_child_sql_error_type",
+        "previous_child_sql_error_message",
+        "previous_child_return_code",
+        "previous_child_timed_out",
+        "previous_termination_signal",
+        "previous_termination_signal_number",
+        "previous_possible_oom_or_external_kill",
+        "previous_oom_kill_proven",
+        "statement_timeout_ms",
+        "pre_ddl_statement_timeout_ms",
+        "pre_ddl_complete",
+        "pre_ddl_runtime_seconds",
+        "index_status",
+        "current_index",
+        "current_table",
+        "current_index_runtime_seconds",
+        "current_index_ok",
+        "current_index_concurrent",
+        "message",
+        "effective_index_name",
+    )
+    return {key: previous[key] for key in keys if previous.get(key) is not None}
 
 
 def _progress(store: Any) -> dict[str, object]:
@@ -150,7 +145,26 @@ def _status(store: Any) -> dict[str, object]:
     return dict(cycle_history_exact_index_status(store))
 
 
-def _recent_heartbeats(store: Any) -> list[tuple[WorkerHeartbeat, dict[str, object]]]:
+def _heartbeat_from_raw_payload(payload: object) -> tuple[Any, dict[str, object]] | None:
+    """Decode one persisted heartbeat without importing the full EvidenceStore module."""
+
+    try:
+        value = json.loads(payload) if isinstance(payload, str) else payload
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    detail = value.get("detail")
+    detail_dict = dict(detail) if isinstance(detail, dict) else {}
+    heartbeat = SimpleNamespace(
+        state=value.get("state"),
+        error_type=value.get("error_type"),
+        detail=detail_dict,
+    )
+    return heartbeat, detail_dict
+
+
+def _recent_heartbeats(store: Any) -> list[tuple[Any, dict[str, object]]]:
     """Read a tiny newest-first slice through the existing worker_id/id access path."""
 
     with store.engine.connect() as db:
@@ -163,14 +177,11 @@ def _recent_heartbeats(store: Any) -> list[tuple[WorkerHeartbeat, dict[str, obje
                 {"worker_id": WORKER_ID, "limit": _RECENT_TERMINAL_SCAN_LIMIT},
             ).scalars()
         )
-    rows: list[tuple[WorkerHeartbeat, dict[str, object]]] = []
+    rows: list[tuple[Any, dict[str, object]]] = []
     for payload in payloads:
-        try:
-            heartbeat = WorkerHeartbeat.model_validate_json(payload)
-        except Exception:
-            continue
-        detail = dict(heartbeat.detail or {})
-        rows.append((heartbeat, detail))
+        decoded = _heartbeat_from_raw_payload(payload)
+        if decoded is not None:
+            rows.append(decoded)
     return rows
 
 
@@ -178,7 +189,7 @@ def _find_child_terminal(
     store: Any,
     *,
     expected_attempt_number: int,
-) -> tuple[WorkerHeartbeat | None, dict[str, object]]:
+) -> tuple[Any | None, dict[str, object]]:
     for heartbeat, detail in _recent_heartbeats(store):
         if _attempt_number(detail) != expected_attempt_number:
             continue
@@ -192,7 +203,7 @@ def _find_durable_supervisor_terminal(
     *,
     expected_attempt_number: int,
     stage: str,
-) -> tuple[WorkerHeartbeat | None, dict[str, object]]:
+) -> tuple[Any | None, dict[str, object]]:
     for heartbeat, detail in _recent_heartbeats(store):
         if _attempt_number(detail) != expected_attempt_number:
             continue
@@ -206,15 +217,6 @@ def _find_durable_supervisor_terminal(
 
 
 def _capture_terminal(store: Any, payload: dict[str, object]) -> dict[str, object]:
-    """Durably copy one exited child's terminal evidence before any DDL retry.
-
-    Observing heartbeats may be newer than the child's terminal row, so search only a
-    bounded recent slice for the exact attempt instead of trusting the latest row. For
-    normal child exits, absence of a child terminal row is fail-closed: the supervisor
-    must retry this diagnostic action and may not launch another DDL child. Signal or
-    supervisor-timeout exits can be certified from the parent's process evidence alone.
-    """
-
     expected_attempt_number = max(1, int(payload.get("expected_attempt_number") or 1))
     stage = str(payload.get("stage") or "cycle_history_index_child_retry_pending")
     existing, existing_detail = _find_durable_supervisor_terminal(
@@ -251,7 +253,7 @@ def _capture_terminal(store: Any, payload: dict[str, object]) -> dict[str, objec
     detail = payload.get("detail")
     detail = dict(detail) if isinstance(detail, dict) else {}
     if child_heartbeat is not None:
-        child_error = child_heartbeat.error_type or child_detail.get("error_type")
+        child_error = getattr(child_heartbeat, "error_type", None) or child_detail.get("error_type")
         child_message = child_detail.get("message")
         sql_error, sql_message = _sql_error_fields(child_detail.get("maintenance_result"))
         detail.update(
@@ -364,6 +366,7 @@ def _record(store: Any, payload: dict[str, object]) -> None:
             }
         )
         detail = {key: value for key, value in detail.items() if value is not None}
+
     store.record_worker_heartbeat(
         worker_id=WORKER_ID,
         state=str(payload.get("state") or "running"),
