@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import inspect
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from inefficiency_engine import combined_runtime_parent_heartbeat as parent_heartbeat
 from inefficiency_engine import render_combined_runtime as runtime
 from inefficiency_engine import runtime_watchdog_readiness_repair as watchdog_repair
 from inefficiency_engine import source_coverage_history_migration_supervisor as history_supervisor
@@ -71,6 +73,17 @@ def test_public_health_contract_remains_database_independent():
         "/v3/internal/runtime-heartbeats"
     )
     assert "runtime_heartbeats" not in payload
+
+
+def test_parent_generation_heartbeat_cannot_touch_database_before_api_bind():
+    source = inspect.getsource(parent_heartbeat.main)
+
+    wait_expression = "while not stopping and not _api_is_bound(port):"
+    assert wait_expression in source
+    assert source.index(wait_expression) < source.index("_record(")
+    assert parent_heartbeat.API_BIND_READ_TIMEOUT_SECONDS == 1.0
+    assert parent_heartbeat.API_BIND_POLL_SECONDS == 1.0
+    assert "api_bound_before_durable_heartbeat" in source
 
 
 def test_source_history_supervisor_publishes_timeout_truth_out_of_process_and_retries(
