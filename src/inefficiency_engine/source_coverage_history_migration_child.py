@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from sqlalchemy import text
@@ -10,7 +11,10 @@ from inefficiency_engine.evidence import build_evidence_store
 from inefficiency_engine.source_coverage_history import (
     DEFAULT_MIGRATION_HEARTBEAT_BATCH,
     SOURCE_COVERAGE_HISTORY_TABLE,
-    backfill_source_coverage_history_from_heartbeats,
+    SourceCoverageHistoryLedger,
+)
+from inefficiency_engine.source_coverage_history_batch_repair import (
+    migrate_source_coverage_history_batch_with_ledger,
 )
 from inefficiency_engine.worker_heartbeat_index_gate import (
     worker_heartbeat_priority_index_status,
@@ -83,14 +87,36 @@ def _completed_history_summary(store: Any) -> dict[str, int]:
     }
 
 
-def advance_one_history_migration_batch(store: Any, *, max_heartbeats: int | None = None) -> dict[str, object]:
+def advance_one_history_migration_batch(
+    store: Any,
+    *,
+    ledger: SourceCoverageHistoryLedger | None = None,
+    max_heartbeats: int | None = None,
+) -> dict[str, object]:
     """Advance one small transactional archive batch and publish exact progress."""
 
     batch = migration_batch_size() if max_heartbeats is None else max(1, int(max_heartbeats))
-    result = dict(
-        backfill_source_coverage_history_from_heartbeats(
+    active_ledger = ledger or SourceCoverageHistoryLedger(store)
+
+    def progress(stage: str, detail: dict[str, object]) -> None:
+        _record(
             store,
+            state="running",
+            detail={
+                "stage": stage,
+                "batch_limit": batch,
+                "compact_certification_summary": False,
+                "schema_initialized_outside_archive_batch": ledger is not None,
+                **detail,
+            },
+        )
+
+    result = dict(
+        migrate_source_coverage_history_batch_with_ledger(
+            store,
+            ledger=active_ledger,
             max_heartbeats=batch,
+            progress=progress,
         )
     )
     complete = bool(result.get("complete"))
@@ -145,20 +171,56 @@ def main() -> int:
         )
         return MIGRATION_PREREQUISITE_NOT_READY_EXIT_CODE
 
-    _record(
-        store,
-        state="running",
-        detail={
-            "stage": "canonical_history_archive_batch_starting",
-            "batch_limit": batch,
-            "heartbeat_index_status": index_status,
-            "raw_history_queries_started": True,
-            "migration_prerequisite_ready": True,
-        },
-    )
-
+    current_stage = "canonical_history_schema_initializing"
     try:
-        result = advance_one_history_migration_batch(store, max_heartbeats=batch)
+        schema_started = time.monotonic()
+        _record(
+            store,
+            state="running",
+            detail={
+                "stage": current_stage,
+                "batch_limit": batch,
+                "heartbeat_index_status": index_status,
+                "raw_history_queries_started": False,
+                "migration_prerequisite_ready": True,
+            },
+        )
+        ledger = SourceCoverageHistoryLedger(store)
+        schema_seconds = max(0.0, time.monotonic() - schema_started)
+        current_stage = "canonical_history_schema_ready"
+        _record(
+            store,
+            state="running",
+            detail={
+                "stage": current_stage,
+                "batch_limit": batch,
+                "heartbeat_index_status": index_status,
+                "raw_history_queries_started": False,
+                "migration_prerequisite_ready": True,
+                "schema_initialization_seconds": round(schema_seconds, 6),
+                "schema_initialized_once_per_child": True,
+            },
+        )
+
+        current_stage = "canonical_history_archive_batch_starting"
+        _record(
+            store,
+            state="running",
+            detail={
+                "stage": current_stage,
+                "batch_limit": batch,
+                "heartbeat_index_status": index_status,
+                "raw_history_queries_started": True,
+                "migration_prerequisite_ready": True,
+                "schema_initialization_seconds": round(schema_seconds, 6),
+                "schema_initialized_once_per_child": True,
+            },
+        )
+        result = advance_one_history_migration_batch(
+            store,
+            ledger=ledger,
+            max_heartbeats=batch,
+        )
     except Exception as exc:
         _record(
             store,
@@ -166,9 +228,14 @@ def main() -> int:
             error_type=type(exc).__name__,
             detail={
                 "stage": "canonical_history_archive_migration_failed",
+                "failed_stage": current_stage,
                 "message": str(exc)[:1000],
                 "heartbeat_index_status": index_status,
-                "raw_history_queries_started": True,
+                "raw_history_queries_started": current_stage
+                not in {
+                    "canonical_history_schema_initializing",
+                    "canonical_history_schema_ready",
+                },
                 "retrying": True,
             },
         )
