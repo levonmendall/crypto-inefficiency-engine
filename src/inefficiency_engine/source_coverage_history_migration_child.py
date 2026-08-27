@@ -12,10 +12,14 @@ from inefficiency_engine.source_coverage_history import (
     SOURCE_COVERAGE_HISTORY_TABLE,
     backfill_source_coverage_history_from_heartbeats,
 )
+from inefficiency_engine.worker_heartbeat_index_gate import (
+    worker_heartbeat_priority_index_status,
+)
 
 
 SOURCE_COVERAGE_HISTORY_MIGRATION_WORKER_ID = "canonical-source-coverage-history-migration"
 MIGRATION_INCOMPLETE_EXIT_CODE = 3
+MIGRATION_PREREQUISITE_NOT_READY_EXIT_CODE = 78
 DEFAULT_CHILD_MIGRATION_BATCH = min(50, DEFAULT_MIGRATION_HEARTBEAT_BATCH)
 
 
@@ -114,8 +118,47 @@ def main() -> int:
     if store is None:
         raise RuntimeError("source coverage history migration requires durable persistence")
 
+    batch = migration_batch_size()
+    _record(
+        store,
+        state="running",
+        detail={
+            "stage": "canonical_history_store_opened",
+            "batch_limit": batch,
+            "raw_history_queries_started": False,
+        },
+    )
+
+    index_status = worker_heartbeat_priority_index_status(store)
+    if not bool(index_status.get("ready")):
+        _record(
+            store,
+            state="running",
+            detail={
+                "stage": "canonical_history_waiting_for_heartbeat_index",
+                "batch_limit": batch,
+                "heartbeat_index_status": index_status,
+                "raw_history_queries_started": False,
+                "migration_prerequisite_ready": False,
+                "retrying": True,
+            },
+        )
+        return MIGRATION_PREREQUISITE_NOT_READY_EXIT_CODE
+
+    _record(
+        store,
+        state="running",
+        detail={
+            "stage": "canonical_history_archive_batch_starting",
+            "batch_limit": batch,
+            "heartbeat_index_status": index_status,
+            "raw_history_queries_started": True,
+            "migration_prerequisite_ready": True,
+        },
+    )
+
     try:
-        result = advance_one_history_migration_batch(store)
+        result = advance_one_history_migration_batch(store, max_heartbeats=batch)
     except Exception as exc:
         _record(
             store,
@@ -124,6 +167,8 @@ def main() -> int:
             detail={
                 "stage": "canonical_history_archive_migration_failed",
                 "message": str(exc)[:1000],
+                "heartbeat_index_status": index_status,
+                "raw_history_queries_started": True,
                 "retrying": True,
             },
         )
@@ -139,6 +184,7 @@ if __name__ == "__main__":
 __all__ = [
     "DEFAULT_CHILD_MIGRATION_BATCH",
     "MIGRATION_INCOMPLETE_EXIT_CODE",
+    "MIGRATION_PREREQUISITE_NOT_READY_EXIT_CODE",
     "SOURCE_COVERAGE_HISTORY_MIGRATION_WORKER_ID",
     "_completed_history_summary",
     "advance_one_history_migration_batch",
