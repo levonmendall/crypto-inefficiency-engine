@@ -34,7 +34,9 @@ def test_render_blueprint_defines_single_paid_combined_runtime():
     ).read_text()
     assert "from inefficiency_engine import render_combined_postbind as base" in repair_bootstrap
     assert 'commands["source"] = list(SOURCE_REPAIR_COMMAND)' in repair_bootstrap
-    assert "return base.main()" in repair_bootstrap
+    assert "return_code = base.main()" in repair_bootstrap
+    assert "_record_parent_terminal(" in repair_bootstrap
+    assert "return return_code" in repair_bootstrap
 
     projection_bootstrap = Path(
         "src/inefficiency_engine/render_combined_postbind_history_projection.py"
