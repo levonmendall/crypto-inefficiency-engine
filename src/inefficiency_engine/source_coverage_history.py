@@ -5,7 +5,23 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Boolean, Column, Index, Integer, MetaData, String, Table, Text, func, insert, inspect, select, update
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    func,
+    insert,
+    inspect,
+    select,
+    update,
+)
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from inefficiency_engine.source_coverage import SourceCoverageSnapshot
 
@@ -141,9 +157,41 @@ class SourceCoverageHistoryLedger:
             )
         return rows
 
+    @staticmethod
+    def _rowcount(result: Any) -> int:
+        try:
+            value = int(result.rowcount)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+        return max(0, value)
+
     def _insert_missing_rows(self, db: Any, rows: list[dict[str, object]]) -> int:
+        """Insert canonical snapshots atomically when a live writer races migration.
+
+        Production PostgreSQL and test SQLite both use native conflict handling. The
+        old SELECT-existing-then-INSERT sequence allowed the live snapshot publisher and
+        archive migration child to observe the same key as absent, after which one would
+        fail with a uniqueness IntegrityError. The unique snapshot_key remains the source
+        of idempotency; conflicts are now resolved by the database in the INSERT itself.
+        """
+
         if not rows:
             return 0
+
+        dialect = str(getattr(db.dialect, "name", ""))
+        if dialect == "postgresql":
+            statement = postgresql_insert(self.rows).on_conflict_do_nothing(
+                index_elements=[self.rows.c.snapshot_key]
+            )
+            return self._rowcount(db.execute(statement, rows))
+        if dialect == "sqlite":
+            statement = sqlite_insert(self.rows).on_conflict_do_nothing(
+                index_elements=[self.rows.c.snapshot_key]
+            )
+            return self._rowcount(db.execute(statement, rows))
+
+        # Other dialects are not production targets. Preserve the prior idempotent
+        # behavior for portability without weakening PostgreSQL/SQLite race safety.
         keys = [str(row["snapshot_key"]) for row in rows]
         existing: set[str] = set()
         for offset in range(0, len(keys), 500):
@@ -159,6 +207,87 @@ class SourceCoverageHistoryLedger:
         if pending:
             db.execute(insert(self.rows), pending)
         return len(pending)
+
+    def _upsert_migration_checkpoint(
+        self,
+        db: Any,
+        *,
+        checkpoint_heartbeat_id: int,
+        complete: bool,
+        updated_at: str,
+    ) -> None:
+        """Advance the archive checkpoint without a select-before-insert race.
+
+        Concurrent bounded migration children are not expected, but deployment overlap
+        can briefly create them. Native UPSERT makes creation atomic and the WHERE clause
+        prevents a slower older child from moving the checkpoint backwards.
+        """
+
+        payload = {
+            "migration_name": MIGRATION_NAME,
+            "checkpoint_heartbeat_id": int(checkpoint_heartbeat_id),
+            "complete": bool(complete),
+            "updated_at": updated_at,
+        }
+        dialect = str(getattr(db.dialect, "name", ""))
+        if dialect == "postgresql":
+            statement = postgresql_insert(self.migrations).values(payload)
+            excluded = statement.excluded
+            statement = statement.on_conflict_do_update(
+                index_elements=[self.migrations.c.migration_name],
+                set_={
+                    "checkpoint_heartbeat_id": excluded.checkpoint_heartbeat_id,
+                    "complete": excluded.complete,
+                    "updated_at": excluded.updated_at,
+                },
+                where=(
+                    excluded.checkpoint_heartbeat_id
+                    >= self.migrations.c.checkpoint_heartbeat_id
+                ),
+            )
+            db.execute(statement)
+            return
+        if dialect == "sqlite":
+            statement = sqlite_insert(self.migrations).values(payload)
+            excluded = statement.excluded
+            statement = statement.on_conflict_do_update(
+                index_elements=[self.migrations.c.migration_name],
+                set_={
+                    "checkpoint_heartbeat_id": excluded.checkpoint_heartbeat_id,
+                    "complete": excluded.complete,
+                    "updated_at": excluded.updated_at,
+                },
+                where=(
+                    excluded.checkpoint_heartbeat_id
+                    >= self.migrations.c.checkpoint_heartbeat_id
+                ),
+            )
+            db.execute(statement)
+            return
+
+        # Non-production fallback: update-first minimizes the insert race while keeping
+        # compatibility with SQLAlchemy dialects that do not expose ON CONFLICT helpers.
+        result = db.execute(
+            update(self.migrations)
+            .where(self.migrations.c.migration_name == MIGRATION_NAME)
+            .where(
+                self.migrations.c.checkpoint_heartbeat_id
+                <= int(checkpoint_heartbeat_id)
+            )
+            .values(
+                checkpoint_heartbeat_id=int(checkpoint_heartbeat_id),
+                complete=bool(complete),
+                updated_at=updated_at,
+            )
+        )
+        if self._rowcount(result) == 0:
+            existing = db.execute(
+                select(self.migrations.c.migration_name).where(
+                    self.migrations.c.migration_name == MIGRATION_NAME
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                db.execute(insert(self.migrations), payload)
 
     def record_snapshot(
         self,
@@ -339,27 +468,12 @@ def backfill_source_coverage_history_from_heartbeats(
     now_text = datetime.now(timezone.utc).isoformat()
     with store.engine.begin() as db:
         inserted_lane_snapshots = ledger._insert_missing_rows(db, lane_rows)
-        existing = db.execute(
-            select(ledger.migrations.c.migration_name).where(
-                ledger.migrations.c.migration_name == MIGRATION_NAME
-            )
-        ).scalar_one_or_none()
-        values = {
-            "checkpoint_heartbeat_id": latest_heartbeat_id,
-            "complete": migration_complete,
-            "updated_at": now_text,
-        }
-        if existing is None:
-            db.execute(
-                insert(ledger.migrations),
-                {"migration_name": MIGRATION_NAME, **values},
-            )
-        else:
-            db.execute(
-                update(ledger.migrations)
-                .where(ledger.migrations.c.migration_name == MIGRATION_NAME)
-                .values(**values)
-            )
+        ledger._upsert_migration_checkpoint(
+            db,
+            checkpoint_heartbeat_id=latest_heartbeat_id,
+            complete=migration_complete,
+            updated_at=now_text,
+        )
 
     return {
         "complete": migration_complete,
@@ -368,6 +482,8 @@ def backfill_source_coverage_history_from_heartbeats(
         "inserted_lane_snapshots": inserted_lane_snapshots,
         "invalid_heartbeats": invalid_heartbeats,
         "batch_limit": bounded,
+        "conflict_safe_history_insert": True,
+        "conflict_safe_checkpoint_upsert": True,
         "paper_only": True,
         "qualification_authority": False,
         "allocation_authority": False,
