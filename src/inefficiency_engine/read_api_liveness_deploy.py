@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
 from typing import Any
 
 from inefficiency_engine import __version__
@@ -10,6 +12,13 @@ from inefficiency_engine.read_api_durable_history_projection_deploy import app a
 
 
 END_TO_END_CERTIFICATION_DEADLINE_SECONDS = 8.0
+RUNTIME_HEARTBEAT_SNAPSHOT_DEADLINE_SECONDS = 8.0
+INTERNAL_RUNTIME_HEARTBEAT_PATH = "/v3/internal/runtime-heartbeats"
+RUNTIME_HEARTBEAT_SNAPSHOT_COMMAND = [
+    sys.executable,
+    "-m",
+    "inefficiency_engine.runtime_heartbeat_snapshot_child",
+]
 
 
 async def _send_json(
@@ -50,14 +59,33 @@ async def _send_json(
     )
 
 
+def _runtime_heartbeat_snapshot_subprocess() -> dict[str, object]:
+    completed = subprocess.run(
+        RUNTIME_HEARTBEAT_SNAPSHOT_COMMAND,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=RUNTIME_HEARTBEAT_SNAPSHOT_DEADLINE_SECONDS,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "runtime heartbeat snapshot child exited "
+            f"code={completed.returncode}: {completed.stderr[-500:]}"
+        )
+    payload = json.loads(completed.stdout)
+    if not isinstance(payload, dict):
+        raise ValueError("runtime heartbeat snapshot payload is not an object")
+    return payload
+
+
 class DatabaseIndependentLivenessApp:
     """Answer Render liveness without touching PostgreSQL or worker diagnostics.
 
-    `/health` remains a process-only branch with no database imports or reads. The
-    explicit E2E diagnostic is intercepted only after path selection and runs outside
-    the event loop behind a short client-facing deadline. A slow durable read therefore
-    returns explicit 503 diagnostic JSON instead of leaving browsers waiting forever,
-    without changing the canonical production ASGI target or liveness contract.
+    `/health` remains a process-only branch with no database imports or reads. Explicit
+    diagnostics are intercepted only after path selection and run in disposable bounded
+    subprocesses/threads. A slow durable read therefore cannot strand the web event loop
+    or the long-lived runtime parent, without changing the canonical production ASGI
+    target or liveness contract.
     """
 
     def __init__(self, inner: Any) -> None:
@@ -65,9 +93,10 @@ class DatabaseIndependentLivenessApp:
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         method = str(scope.get("method") or "").upper()
+        path = scope.get("path")
         if (
             scope.get("type") == "http"
-            and scope.get("path") == "/health"
+            and path == "/health"
             and method in {"GET", "HEAD"}
         ):
             await _send_json(
@@ -80,7 +109,49 @@ class DatabaseIndependentLivenessApp:
 
         if (
             scope.get("type") == "http"
-            and scope.get("path") == "/v3/operations/end-to-end-certification"
+            and path == INTERNAL_RUNTIME_HEARTBEAT_PATH
+            and method in {"GET", "HEAD"}
+        ):
+            status = 200
+            try:
+                body_value: object = await asyncio.to_thread(
+                    _runtime_heartbeat_snapshot_subprocess
+                )
+            except (subprocess.TimeoutExpired, asyncio.TimeoutError):
+                status = 503
+                body_value = {
+                    "detail": {
+                        "message": "runtime heartbeat snapshot exceeded its bounded deadline",
+                        "error_type": "RuntimeHeartbeatSnapshotDeadlineExceeded",
+                        "deadline_seconds": RUNTIME_HEARTBEAT_SNAPSHOT_DEADLINE_SECONDS,
+                        "retryable": True,
+                        "diagnostic_only": True,
+                        "allocation_authority": False,
+                        "live_execution_authority": False,
+                        "paper_only": True,
+                    }
+                }
+            except Exception as exc:
+                status = 503
+                body_value = {
+                    "detail": {
+                        "message": "runtime heartbeat snapshot is temporarily unavailable",
+                        "error_type": type(exc).__name__,
+                        "retryable": True,
+                        "diagnostic_only": True,
+                    }
+                }
+            await _send_json(
+                send,
+                status=status,
+                value=body_value,
+                head_only=method == "HEAD",
+            )
+            return
+
+        if (
+            scope.get("type") == "http"
+            and path == "/v3/operations/end-to-end-certification"
             and method in {"GET", "HEAD"}
         ):
             from fastapi import HTTPException
@@ -90,7 +161,7 @@ class DatabaseIndependentLivenessApp:
 
             status = 200
             try:
-                body_value: object = await asyncio.wait_for(
+                body_value = await asyncio.wait_for(
                     asyncio.to_thread(repaired_end_to_end_certification_payload),
                     timeout=END_TO_END_CERTIFICATION_DEADLINE_SECONDS,
                 )
@@ -145,8 +216,15 @@ def liveness_payload() -> dict[str, object]:
         "live_execution": False,
         "release_commit": _release_commit(),
         "database_check": "deferred_to_readiness",
+        # Preserve the public contract: runtime diagnostics are not part of /health.
+        # The internal watchdog now has a separate bounded heartbeat-only endpoint,
+        # advertised below, without redefining the external liveness semantics.
         "runtime_diagnostics": "deferred_to_readiness",
         "readiness_endpoint": "/ready",
+        "internal_runtime_heartbeat_endpoint": INTERNAL_RUNTIME_HEARTBEAT_PATH,
+        "internal_runtime_heartbeat_deadline_seconds": (
+            RUNTIME_HEARTBEAT_SNAPSHOT_DEADLINE_SECONDS
+        ),
         "end_to_end_certification_endpoint": "/v3/operations/end-to-end-certification",
         "end_to_end_certification_deadline_seconds": END_TO_END_CERTIFICATION_DEADLINE_SECONDS,
         "durable_history_endpoint": "/v3/dashboard/durable-lane-history",
@@ -161,6 +239,9 @@ app = DatabaseIndependentLivenessApp(_inner_app)
 __all__ = [
     "DatabaseIndependentLivenessApp",
     "END_TO_END_CERTIFICATION_DEADLINE_SECONDS",
+    "INTERNAL_RUNTIME_HEARTBEAT_PATH",
+    "RUNTIME_HEARTBEAT_SNAPSHOT_COMMAND",
+    "RUNTIME_HEARTBEAT_SNAPSHOT_DEADLINE_SECONDS",
     "app",
     "liveness_payload",
 ]

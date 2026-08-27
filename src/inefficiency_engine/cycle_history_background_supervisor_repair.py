@@ -1,24 +1,19 @@
 from __future__ import annotations
 
+import json
 import signal
 import subprocess
 import sys
 import threading
 import time
-from typing import Any
-
-from sqlalchemy import text
 
 from inefficiency_engine import cycle_history_background_supervisor as base
-from inefficiency_engine.config import Settings
 from inefficiency_engine.cycle_history_background_backfill_repair import (
     INDEX_NOT_READY_EXIT_CODE,
 )
-from inefficiency_engine.cycle_history_index_gate import cycle_history_exact_index_status
 from inefficiency_engine.cycle_history_index_maintenance_child import (
     WORKER_ID as INDEX_WORKER_ID,
 )
-from inefficiency_engine.evidence import build_evidence_store
 from inefficiency_engine.instance_memory import instance_memory_snapshot
 
 
@@ -26,6 +21,11 @@ INDEX_COMMAND = [
     sys.executable,
     "-m",
     "inefficiency_engine.cycle_history_index_maintenance_child",
+]
+INDEX_DIAGNOSTIC_COMMAND = [
+    sys.executable,
+    "-m",
+    "inefficiency_engine.cycle_history_index_supervisor_probe",
 ]
 BACKFILL_COMMAND = [
     sys.executable,
@@ -40,6 +40,7 @@ BACKFILL_COMMAND = [
 INDEX_EXECUTOR_DEADLINE_SECONDS = 3660.0
 INDEX_RETRY_SECONDS = 30.0
 INDEX_PROGRESS_HEARTBEAT_SECONDS = 15.0
+INDEX_DIAGNOSTIC_DEADLINE_SECONDS = 8.0
 INDEX_TERMINAL_FAILURE_BACKOFF_THRESHOLD = 3
 INDEX_TERMINAL_FAILURE_BACKOFF_SECONDS = 120.0
 
@@ -67,136 +68,67 @@ def _run_bounded_child(
     return child.poll(), timed_out
 
 
-def _index_store() -> Any | None:
-    """Open the lightweight durable store used only for index supervision truth."""
+def _run_index_diagnostic(payload: dict[str, object]) -> dict[str, object] | None:
+    """Run every supervisor DB observation outside the long-lived parent process."""
 
     try:
-        settings = Settings.from_env()
-        return build_evidence_store(settings.evidence_db_path)
-    except Exception as exc:
+        completed = subprocess.run(
+            [*INDEX_DIAGNOSTIC_COMMAND, json.dumps(payload, separators=(",", ":"))],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=INDEX_DIAGNOSTIC_DEADLINE_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
         print(
-            f"cycle-history index supervisor durable store unavailable: {type(exc).__name__}: {exc}",
+            "cycle-history index diagnostic child exceeded its bounded deadline; "
+            "continuing to supervise DDL",
             flush=True,
         )
         return None
-
-
-def _safe_index_status(store: Any | None) -> dict[str, object] | None:
-    if store is None:
+    if completed.returncode != 0:
+        print(
+            "cycle-history index diagnostic child exited "
+            f"code={completed.returncode}; continuing to supervise DDL",
+            flush=True,
+        )
         return None
     try:
-        return dict(cycle_history_exact_index_status(store))
-    except Exception:
+        value = json.loads(completed.stdout)
+    except (TypeError, ValueError):
         return None
+    return value if isinstance(value, dict) else None
 
 
-def _latest_index_detail(store: Any | None) -> dict[str, object]:
-    if store is None:
-        return {}
-    try:
-        heartbeat = store.latest_worker_heartbeat(INDEX_WORKER_ID)
-    except Exception:
-        return {}
-    if heartbeat is None:
-        return {}
-    detail = getattr(heartbeat, "detail", None)
-    return dict(detail) if isinstance(detail, dict) else {}
-
-
-def _postgres_index_progress(store: Any | None) -> dict[str, object]:
-    """Best-effort read-only progress for the active market_quotes index build."""
-
-    if store is None or getattr(store.engine.dialect, "name", "") != "postgresql":
-        return {}
-    query = text(
-        """
-        SELECT
-            p.pid,
-            p.command,
-            p.phase,
-            p.blocks_total,
-            p.blocks_done,
-            p.tuples_total,
-            p.tuples_done,
-            p.partitions_total,
-            p.partitions_done,
-            idx.relname AS index_name
-        FROM pg_stat_progress_create_index AS p
-        JOIN pg_class AS tbl ON tbl.oid = p.relid
-        LEFT JOIN pg_class AS idx ON idx.oid = p.index_relid
-        WHERE tbl.relname = 'market_quotes'
-        ORDER BY p.pid
-        LIMIT 1
-        """
-    )
-    try:
-        with store.engine.connect() as db:
-            row = db.execute(query).mappings().first()
-    except Exception:
-        return {}
-    if row is None:
-        return {}
-    return {str(key): value for key, value in row.items()}
+def _safe_index_status() -> dict[str, object] | None:
+    result = _run_index_diagnostic({"action": "status"})
+    if not isinstance(result, dict):
+        return None
+    status = result.get("index_status")
+    return dict(status) if isinstance(status, dict) else None
 
 
 def _record_index_supervisor_heartbeat(
-    store: Any | None,
+    _store=None,
     *,
     state: str,
     stage: str,
     error_type: str | None = None,
     detail: dict[str, object] | None = None,
+    include_status_progress: bool = False,
 ) -> None:
-    """Publish parent-observed liveness without granting the parent DDL authority."""
+    """Publish supervisor truth through an eight-second disposable DB process."""
 
-    if store is None:
-        return
-    previous = _latest_index_detail(store)
-    carried = {
-        key: previous[key]
-        for key in (
-            "attempt_number",
-            "previous_attempt_number",
-            "previous_stage",
-            "previous_error_type",
-            "previous_message",
-            "previous_effective_index_name",
-            "statement_timeout_ms",
-            "index_status",
-            "current_index",
-            "current_table",
-            "current_index_runtime_seconds",
-            "current_index_ok",
-            "current_index_concurrent",
-            "message",
-            "effective_index_name",
-        )
-        if previous.get(key) is not None
-    }
-    try:
-        store.record_worker_heartbeat(
-            worker_id=INDEX_WORKER_ID,
-            state=state,
-            error_type=error_type,
-            detail={
-                "stage": stage,
-                **carried,
-                "supervisor_observation": True,
-                "supervisor_executes_ddl": False,
-                "dedicated_cycle_history_index_owner": True,
-                "create_index_concurrently_required_in_postgres": True,
-                "provider_requests_allowed": False,
-                "provider_requests_used": 0,
-                "qualification_thresholds_unchanged": True,
-                "certification_authority": False,
-                "allocation_authority": False,
-                "live_execution_authority": False,
-                "paper_only": True,
-                **(detail or {}),
-            },
-        )
-    except Exception:
-        pass
+    _run_index_diagnostic(
+        {
+            "action": "record",
+            "state": state,
+            "stage": stage,
+            "error_type": error_type,
+            "detail": dict(detail or {}),
+            "include_status_progress": bool(include_status_progress),
+        }
+    )
 
 
 def _index_child_exit_diagnostics(
@@ -225,8 +157,6 @@ def _index_child_exit_diagnostics(
             {
                 "termination_signal_number": signal_number,
                 "termination_signal": signal_name,
-                # SIGKILL is consistent with an OOM kill or external hard kill, but the
-                # process return code alone cannot distinguish those causes.
                 "possible_oom_or_external_kill": signal_name == "SIGKILL",
                 "oom_kill_proven": False,
             }
@@ -238,11 +168,10 @@ def _index_child_exit_diagnostics(
 
 
 def _run_index_child(
-    store: Any | None,
     *,
     stop_event: threading.Event,
 ) -> tuple[int | None, bool]:
-    """Run the sole DDL owner while the parent publishes independent liveness."""
+    """Run the sole DDL owner while disposable probes publish bounded liveness."""
 
     print(f"starting disposable child: {' '.join(INDEX_COMMAND)}", flush=True)
     child = subprocess.Popen(INDEX_COMMAND)
@@ -258,27 +187,20 @@ def _run_index_child(
             base._terminate(child)
             break
         if now >= next_progress:
-            progress = _postgres_index_progress(store)
-            index_status = _safe_index_status(store)
             _record_index_supervisor_heartbeat(
-                store,
                 state="running",
                 stage="cycle_history_index_supervisor_observing",
                 detail={
                     "child_pid": child.pid,
                     "child_runtime_seconds": runtime_seconds,
                     "executor_deadline_seconds": INDEX_EXECUTOR_DEADLINE_SECONDS,
-                    "index_status": index_status,
-                    "planner_usable_verified": (
-                        index_status.get("planner_usable_verified")
-                        if isinstance(index_status, dict)
-                        else None
+                    "diagnostic_process_deadline_seconds": (
+                        INDEX_DIAGNOSTIC_DEADLINE_SECONDS
                     ),
-                    "postgres_progress_available": bool(progress),
-                    "postgres_index_progress": progress,
                 },
+                include_status_progress=True,
             )
-            next_progress = now + INDEX_PROGRESS_HEARTBEAT_SECONDS
+            next_progress = time.monotonic() + INDEX_PROGRESS_HEARTBEAT_SECONDS
         stop_event.wait(0.5)
 
     if stop_event.is_set():
@@ -289,11 +211,11 @@ def _run_index_child(
 def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None:
     """Verify the exact query index before any raw cycle-history reconstruction.
 
-    The first child remains the sole owner of bounded PostgreSQL index maintenance. The
-    lightweight supervisor independently verifies catalog readiness before every retry,
-    publishes progress while the DDL call is blocking, and records exit-code/signal truth
-    if the child disappears before it can publish its own terminal heartbeat. The second
-    child owns only the existing checkpointed 180-day history slice.
+    The exact-index child remains the sole DDL owner. All parent-side catalog/progress
+    observation and heartbeat persistence now occur in eight-second disposable probe
+    processes, so PostgreSQL connection pressure cannot freeze this long-lived supervisor
+    or consume the one-hour DDL child's lifetime. The second child owns only the existing
+    checkpointed 180-day history slice.
     """
 
     port = base.os.getenv("PORT", "10000")
@@ -302,20 +224,16 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
     if stop_event.is_set():
         return
 
-    store = _index_store()
     exact_index_ready = False
     consecutive_terminal_failures = 0
     while not stop_event.is_set():
         if not exact_index_ready:
-            # A prior child can be terminated after PostgreSQL completed the concurrent
-            # build but before the child recorded success. Verify catalog truth first so
-            # a valid replacement index is never rebuilt just because the process died.
-            before = _safe_index_status(store)
+            # Verify catalog truth before every retry in a killable diagnostic process.
+            before = _safe_index_status()
             if before is not None and bool(before.get("ready")):
                 exact_index_ready = True
                 consecutive_terminal_failures = 0
                 _record_index_supervisor_heartbeat(
-                    store,
                     state="success",
                     stage="cycle_history_index_ready_observed_before_retry",
                     detail={
@@ -325,17 +243,13 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
                     },
                 )
             else:
-                return_code, timed_out = _run_index_child(
-                    store,
-                    stop_event=stop_event,
-                )
+                return_code, timed_out = _run_index_child(stop_event=stop_event)
                 if stop_event.is_set():
                     return
 
-                # Always re-read planner/catalog truth after the child exits. A valid
-                # index wins over an abnormal process exit because the gate is about the
-                # access path, not the lifecycle of the disposable interpreter.
-                after = _safe_index_status(store)
+                # Catalog truth wins over child lifecycle, but this verification is also
+                # bounded outside the parent so it can never strand future retries.
+                after = _safe_index_status()
                 if after is not None and bool(after.get("ready")):
                     error_type, exit_detail = _index_child_exit_diagnostics(
                         return_code,
@@ -344,7 +258,6 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
                     exact_index_ready = True
                     consecutive_terminal_failures = 0
                     _record_index_supervisor_heartbeat(
-                        store,
                         state="success",
                         stage="cycle_history_index_ready_observed_after_child_exit",
                         detail={
@@ -358,7 +271,7 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
                         },
                     )
                 elif return_code == INDEX_NOT_READY_EXIT_CODE and not timed_out:
-                    # The child completed normally and already published the concrete SQL
+                    # The child completed normally and already published concrete SQL
                     # failure/retry detail. Preserve that terminal heartbeat verbatim.
                     stop_event.wait(INDEX_RETRY_SECONDS)
                     continue
@@ -375,7 +288,6 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
                         else INDEX_RETRY_SECONDS
                     )
                     _record_index_supervisor_heartbeat(
-                        store,
                         state="degraded",
                         stage="cycle_history_index_child_terminated",
                         error_type=error_type,
@@ -399,7 +311,6 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
                 elif after is not None:
                     consecutive_terminal_failures += 1
                     _record_index_supervisor_heartbeat(
-                        store,
                         state="degraded",
                         stage="cycle_history_index_child_returned_without_ready_index",
                         error_type="IndexChildReturnedWithoutPlannerUsableIndex",
@@ -413,9 +324,8 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
                     stop_event.wait(INDEX_RETRY_SECONDS)
                     continue
                 else:
-                    # If durable verification itself is unavailable, preserve legacy
-                    # behavior only for a clean child exit; any nonzero exit is handled
-                    # above and never silently promoted.
+                    # If bounded verification itself is unavailable, preserve legacy
+                    # behavior only for a clean child exit; nonzero exits are handled above.
                     exact_index_ready = return_code in (0, None) and not timed_out
 
             if exact_index_ready:
@@ -449,7 +359,6 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
             continue
 
         if return_code == INDEX_NOT_READY_EXIT_CODE:
-            # Never continue raw reconstruction against a vanished/invalid access path.
             exact_index_ready = False
             stop_event.wait(INDEX_RETRY_SECONDS)
             continue
@@ -473,10 +382,16 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
 __all__ = [
     "BACKFILL_COMMAND",
     "INDEX_COMMAND",
+    "INDEX_DIAGNOSTIC_COMMAND",
+    "INDEX_DIAGNOSTIC_DEADLINE_SECONDS",
     "INDEX_EXECUTOR_DEADLINE_SECONDS",
     "INDEX_PROGRESS_HEARTBEAT_SECONDS",
     "INDEX_RETRY_SECONDS",
     "INDEX_TERMINAL_FAILURE_BACKOFF_SECONDS",
     "INDEX_TERMINAL_FAILURE_BACKOFF_THRESHOLD",
+    "_index_child_exit_diagnostics",
+    "_record_index_supervisor_heartbeat",
+    "_run_index_diagnostic",
+    "_safe_index_status",
     "run_cycle_history_background_supervisor",
 ]

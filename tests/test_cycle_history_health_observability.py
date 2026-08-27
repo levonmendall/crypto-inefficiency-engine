@@ -95,10 +95,15 @@ def test_production_api_installs_cycle_history_observability_and_bounded_heartbe
     assert "install_cycle_history_health_observability(active)" in source
 
 
-def test_render_entrypoint_already_uses_bounded_portfolio_wrapper():
-    source = Path(
+def test_render_entrypoint_isolates_portfolio_while_retaining_bounded_worker():
+    entrypoint = Path(
         "src/inefficiency_engine/render_combined_postbind_lane_repair.py"
     ).read_text()
+    supervisor = Path(
+        "src/inefficiency_engine/portfolio_process_supervisor.py"
+    ).read_text()
 
-    assert "lightweight_portfolio_worker_bounded_heartbeat" in source
-    assert 'commands["portfolio"] = list(PORTFOLIO_BOUNDED_HEARTBEAT_COMMAND)' in source
+    assert "inefficiency_engine.portfolio_process_supervisor" in entrypoint
+    assert 'commands["portfolio"] = list(PORTFOLIO_BOUNDED_HEARTBEAT_COMMAND)' in entrypoint
+    assert "lightweight_portfolio_worker_bounded_heartbeat" in supervisor
+    assert "restarting portfolio only" in supervisor

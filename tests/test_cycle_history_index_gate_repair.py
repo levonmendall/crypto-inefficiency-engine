@@ -10,6 +10,7 @@ from inefficiency_engine import cycle_history_background_backfill_repair as back
 from inefficiency_engine import cycle_history_background_supervisor_repair as supervisor_repair
 from inefficiency_engine import cycle_history_index_gate as index_gate
 from inefficiency_engine import cycle_history_index_maintenance_child as index_child
+from inefficiency_engine import cycle_history_index_supervisor_probe as supervisor_probe
 from inefficiency_engine import read_api_cycle_history_truth_repair as api_truth
 from inefficiency_engine import render_combined_postbind_lane_repair as entrypoint
 from inefficiency_engine import runtime_index_maintenance
@@ -92,15 +93,19 @@ def test_supervisor_gives_dedicated_exact_index_a_realistic_bounded_window():
 
     assert index_child.DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS == 3_600_000
     assert supervisor_repair.INDEX_EXECUTOR_DEADLINE_SECONDS == 3660.0
+    assert supervisor_repair.INDEX_DIAGNOSTIC_DEADLINE_SECONDS == 8.0
     assert supervisor_repair.INDEX_COMMAND[-1] == (
         "inefficiency_engine.cycle_history_index_maintenance_child"
+    )
+    assert supervisor_repair.INDEX_DIAGNOSTIC_COMMAND[-1] == (
+        "inefficiency_engine.cycle_history_index_supervisor_probe"
     )
     assert supervisor_repair.BACKFILL_COMMAND[-1] == (
         "inefficiency_engine.cycle_history_background_backfill_repair"
     )
-    assert source.index("_safe_index_status(store)") < source.index("_run_index_child(")
+    assert source.index("_safe_index_status()") < source.index("_run_index_child(")
     assert source.index("_run_index_child(") < source.index(
-        "after = _safe_index_status(store)"
+        "after = _safe_index_status()"
     )
     assert "exact_index_ready = False" in source
     assert "return_code == INDEX_NOT_READY_EXIT_CODE" in source
@@ -119,23 +124,15 @@ def test_index_supervisor_classifies_hard_kill_without_falsely_claiming_oom():
     assert detail["process_termination_observed_by_supervisor"] is True
 
 
-def test_index_supervisor_publishes_terminal_truth_and_preserves_attempt_context():
-    previous = SimpleNamespace(
-        detail={
-            "stage": "cycle_history_index_maintenance_starting",
-            "attempt_number": 79,
-            "statement_timeout_ms": 3_600_000,
-            "previous_attempt_number": 78,
-        }
-    )
-    recorded: list[dict[str, object]] = []
-    store = SimpleNamespace(
-        latest_worker_heartbeat=lambda _worker_id: previous,
-        record_worker_heartbeat=lambda **kwargs: recorded.append(kwargs),
+def test_index_supervisor_publishes_terminal_truth_through_bounded_probe(monkeypatch):
+    payloads: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        supervisor_repair,
+        "_run_index_diagnostic",
+        lambda payload: payloads.append(dict(payload)) or {"ok": True},
     )
 
     supervisor_repair._record_index_supervisor_heartbeat(
-        store,
         state="degraded",
         stage="cycle_history_index_child_terminated",
         error_type="IndexChildTerminatedBySignal",
@@ -145,30 +142,30 @@ def test_index_supervisor_publishes_terminal_truth_and_preserves_attempt_context
         },
     )
 
-    assert len(recorded) == 1
-    heartbeat = recorded[0]
-    assert heartbeat["worker_id"] == index_child.WORKER_ID
-    assert heartbeat["error_type"] == "IndexChildTerminatedBySignal"
-    detail = heartbeat["detail"]
-    assert detail["attempt_number"] == 79
-    assert detail["previous_attempt_number"] == 78
-    assert detail["statement_timeout_ms"] == 3_600_000
-    assert detail["supervisor_observation"] is True
-    assert detail["supervisor_executes_ddl"] is False
-    assert detail["qualification_thresholds_unchanged"] is True
-    assert detail["paper_only"] is True
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["action"] == "record"
+    assert payload["state"] == "degraded"
+    assert payload["error_type"] == "IndexChildTerminatedBySignal"
+    assert payload["detail"]["termination_signal"] == "SIGKILL"
+    assert payload["include_status_progress"] is False
 
 
-def test_index_supervisor_observes_blocking_ddl_and_escalates_blind_retry_backoff():
-    source = inspect.getsource(supervisor_repair)
+def test_index_supervisor_observes_blocking_ddl_with_disposable_probe():
+    supervisor_source = inspect.getsource(supervisor_repair)
+    probe_source = inspect.getsource(supervisor_probe)
 
     assert supervisor_repair.INDEX_PROGRESS_HEARTBEAT_SECONDS == 15.0
+    assert supervisor_repair.INDEX_DIAGNOSTIC_DEADLINE_SECONDS == 8.0
     assert supervisor_repair.INDEX_TERMINAL_FAILURE_BACKOFF_THRESHOLD == 3
     assert supervisor_repair.INDEX_TERMINAL_FAILURE_BACKOFF_SECONDS == 120.0
-    assert "pg_stat_progress_create_index" in source
-    assert "cycle_history_index_supervisor_observing" in source
-    assert "postgres_index_progress" in source
-    assert "retry_backoff_escalated" in source
+    assert "subprocess.run" in supervisor_source
+    assert "timeout=INDEX_DIAGNOSTIC_DEADLINE_SECONDS" in supervisor_source
+    assert "pg_stat_progress_create_index" in probe_source
+    assert "cycle_history_index_supervisor_observing" in supervisor_source
+    assert "postgres_index_progress" in probe_source
+    assert "retry_backoff_escalated" in supervisor_source
+    assert "build_evidence_store" not in supervisor_source
 
 
 def test_dedicated_index_child_restores_shared_timeout_and_preserves_attempt_context(
@@ -378,6 +375,13 @@ def test_production_entrypoint_wires_repaired_history_and_control_executor():
     assert entrypoint.CONTROL_TRUTH_COMMAND[-1] == (
         "inefficiency_engine.permanent_control_worker_truth_repair"
     )
+    assert entrypoint.PORTFOLIO_BOUNDED_HEARTBEAT_COMMAND[-1] == (
+        "inefficiency_engine.portfolio_process_supervisor"
+    )
+    assert entrypoint.RUNTIME_PARENT_HEARTBEAT_COMMAND[-1] == (
+        "inefficiency_engine.combined_runtime_parent_heartbeat"
+    )
     source = inspect.getsource(entrypoint.main)
     assert "install_control_truth_command()" in source
     assert "run_cycle_history_background_supervisor" in source
+    assert "RUNTIME_PARENT_HEARTBEAT_COMMAND" in source
