@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import signal
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -18,13 +20,68 @@ def _release_commit() -> str | None:
     return value.strip() if value and value.strip() else None
 
 
-def main() -> int:
-    """Publish the owning combined-runtime generation from an isolated process.
+def _identity() -> tuple[int, str | None, str]:
+    parent_pid = os.getppid()
+    release_commit = _release_commit()
+    generation = f"{release_commit or 'unknown'}:{parent_pid}"
+    return parent_pid, release_commit, generation
 
-    The worker has no authority over certification, allocation or execution. Its only
-    purpose is to make whole-service restarts directly observable: a new parent PID and
-    generation replaces the previous one after each Render/runtime recycle.
-    """
+
+def _record(*, state: str, stage: str, detail: dict[str, object]) -> None:
+    settings = Settings.from_env()
+    store = build_evidence_store(settings.evidence_db_path)
+    if store is None:
+        raise RuntimeError("combined runtime parent heartbeat requires durable persistence")
+    parent_pid, release_commit, generation = _identity()
+    store.record_worker_heartbeat(
+        worker_id=WORKER_ID,
+        state=state,
+        detail={
+            "stage": stage,
+            "parent_pid": parent_pid,
+            "parent_generation": generation,
+            "release_commit": release_commit,
+            "diagnostic_only": True,
+            "qualification_thresholds_unchanged": True,
+            "certification_authority": False,
+            "allocation_authority": False,
+            "live_execution_authority": False,
+            "paper_only": True,
+            **detail,
+        },
+    )
+
+
+def _record_terminal(raw: str) -> int:
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        return 2
+    _record(
+        state="degraded",
+        stage="combined_runtime_parent_terminating",
+        detail={
+            "parent_exit_observed": True,
+            "exit_reason": payload.get("exit_reason"),
+            "return_code": payload.get("return_code"),
+            "error_type": payload.get("error_type"),
+            "message": payload.get("message"),
+        },
+    )
+    return 0
+
+
+def main() -> int:
+    """Publish combined-runtime generation or one terminal parent observation."""
+
+    if len(sys.argv) == 3 and sys.argv[1] == "--terminal":
+        try:
+            return _record_terminal(sys.argv[2])
+        except Exception as exc:
+            print(
+                f"combined runtime terminal heartbeat unavailable: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return 1
 
     stopping = False
 
@@ -35,36 +92,19 @@ def main() -> int:
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
 
-    parent_pid = os.getppid()
     started_at = datetime.now(timezone.utc)
-    release_commit = _release_commit()
-    generation = f"{release_commit or 'unknown'}:{parent_pid}:{started_at.isoformat()}"
     sequence = 0
-
     while not stopping:
         sequence += 1
         try:
-            settings = Settings.from_env()
-            store = build_evidence_store(settings.evidence_db_path)
-            if store is not None:
-                store.record_worker_heartbeat(
-                    worker_id=WORKER_ID,
-                    state="running",
-                    detail={
-                        "stage": "combined_runtime_parent_alive",
-                        "parent_pid": parent_pid,
-                        "parent_generation": generation,
-                        "parent_started_at": started_at.isoformat(),
-                        "release_commit": release_commit,
-                        "sequence": sequence,
-                        "diagnostic_only": True,
-                        "qualification_thresholds_unchanged": True,
-                        "certification_authority": False,
-                        "allocation_authority": False,
-                        "live_execution_authority": False,
-                        "paper_only": True,
-                    },
-                )
+            _record(
+                state="running",
+                stage="combined_runtime_parent_alive",
+                detail={
+                    "parent_started_at": started_at.isoformat(),
+                    "sequence": sequence,
+                },
+            )
         except Exception as exc:
             print(
                 "combined runtime parent heartbeat unavailable: "
@@ -83,4 +123,10 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["HEARTBEAT_INTERVAL_SECONDS", "WORKER_ID", "main"]
+__all__ = [
+    "HEARTBEAT_INTERVAL_SECONDS",
+    "WORKER_ID",
+    "_identity",
+    "_record_terminal",
+    "main",
+]
