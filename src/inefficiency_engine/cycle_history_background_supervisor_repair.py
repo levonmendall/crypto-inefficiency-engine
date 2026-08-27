@@ -32,12 +32,12 @@ BACKFILL_COMMAND = [
     "-m",
     "inefficiency_engine.cycle_history_background_backfill_repair",
 ]
-# Production proved the former 120-second PostgreSQL statement timeout could restart
-# CREATE INDEX CONCURRENTLY indefinitely before the exact four-column index finished.
-# The dedicated child now gives that one build a ten-minute SQL deadline. Keep a small
-# bounded process margin for verification and clean shutdown without changing any
-# history/backfill deadline.
-INDEX_EXECUTOR_DEADLINE_SECONDS = 630.0
+# Production pg_stat_progress_create_index proved the exact concurrent index was healthy
+# and still scanning the large market_quotes table well past the pace compatible with a
+# ten-minute deadline. Give the sole DDL owner one bounded hour plus a one-minute process
+# margin for post-DDL catalog verification and clean shutdown. No history/backfill
+# deadline, shared runtime-index timeout, or certification rule is changed here.
+INDEX_EXECUTOR_DEADLINE_SECONDS = 3660.0
 INDEX_RETRY_SECONDS = 30.0
 INDEX_PROGRESS_HEARTBEAT_SECONDS = 15.0
 INDEX_TERMINAL_FAILURE_BACKOFF_THRESHOLD = 3

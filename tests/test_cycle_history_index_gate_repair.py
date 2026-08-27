@@ -90,8 +90,8 @@ def test_supervisor_gives_dedicated_exact_index_a_realistic_bounded_window():
         supervisor_repair.run_cycle_history_background_supervisor
     )
 
-    assert index_child.DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS == 600_000
-    assert supervisor_repair.INDEX_EXECUTOR_DEADLINE_SECONDS == 630.0
+    assert index_child.DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS == 3_600_000
+    assert supervisor_repair.INDEX_EXECUTOR_DEADLINE_SECONDS == 3660.0
     assert supervisor_repair.INDEX_COMMAND[-1] == (
         "inefficiency_engine.cycle_history_index_maintenance_child"
     )
@@ -124,7 +124,7 @@ def test_index_supervisor_publishes_terminal_truth_and_preserves_attempt_context
         detail={
             "stage": "cycle_history_index_maintenance_starting",
             "attempt_number": 79,
-            "statement_timeout_ms": 600_000,
+            "statement_timeout_ms": 3_600_000,
             "previous_attempt_number": 78,
         }
     )
@@ -152,7 +152,7 @@ def test_index_supervisor_publishes_terminal_truth_and_preserves_attempt_context
     detail = heartbeat["detail"]
     assert detail["attempt_number"] == 79
     assert detail["previous_attempt_number"] == 78
-    assert detail["statement_timeout_ms"] == 600_000
+    assert detail["statement_timeout_ms"] == 3_600_000
     assert detail["supervisor_observation"] is True
     assert detail["supervisor_executes_ddl"] is False
     assert detail["qualification_thresholds_unchanged"] is True
@@ -246,7 +246,7 @@ def test_dedicated_index_child_restores_shared_timeout_and_preserves_attempt_con
 
     assert index_child.run_index_maintenance() == 0
 
-    assert captured["timeout_ms"] == 600_000
+    assert captured["timeout_ms"] == 3_600_000
     assert captured["index_specs"] == (
         runtime_index_maintenance.CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS
     )
@@ -264,7 +264,7 @@ def test_dedicated_index_child_restores_shared_timeout_and_preserves_attempt_con
         "canceling statement due to statement timeout"
     )
     assert first_detail["previous_effective_index_name"].endswith("_v4")
-    assert first_detail["statement_timeout_ms"] == 600_000
+    assert first_detail["statement_timeout_ms"] == 3_600_000
 
 
 def test_e2e_truth_never_promotes_generic_history_to_cycle_history(monkeypatch):
