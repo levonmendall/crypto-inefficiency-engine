@@ -14,6 +14,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
 
+from inefficiency_engine.process_tree import (
+    process_tree_alive,
+    signal_process_tree,
+    subprocess_group_kwargs,
+)
+
 
 class ControlCycleDeadlineExceeded(TimeoutError):
     """Raised when one synchronous canonical-control cycle exceeds its wall-clock budget."""
@@ -85,27 +91,24 @@ def _terminate_executor(
     *,
     grace_seconds: float,
 ) -> tuple[bool, bool]:
-    """Terminate one executor and escalate to SIGKILL without touching its parent."""
+    """Terminate the executor process tree and escalate without touching its parent."""
 
-    if process.poll() is not None:
+    if not process_tree_alive(process):
         return False, False
-    terminated = True
+    terminated = signal_process_tree(process, signal.SIGTERM)
     killed = False
-    process.terminate()
     deadline = time.monotonic() + max(0.0, float(grace_seconds))
-    while process.poll() is None and time.monotonic() < deadline:
+    while process_tree_alive(process) and time.monotonic() < deadline:
         time.sleep(0.01)
-    if process.poll() is None:
-        killed = True
-        process.kill()
+    if process_tree_alive(process):
+        killed = signal_process_tree(process, signal.SIGKILL)
     try:
         process.wait(timeout=max(0.1, float(grace_seconds) + 0.1))
     except subprocess.TimeoutExpired:
-        if process.poll() is None:
-            killed = True
-            process.kill()
-            process.wait(timeout=1.0)
-    return terminated, killed
+        if process_tree_alive(process):
+            killed = signal_process_tree(process, signal.SIGKILL) or killed
+        process.wait(timeout=1.0)
+    return bool(terminated), bool(killed)
 
 
 def _linux_parent_death_signal() -> None:
@@ -237,12 +240,12 @@ class ControlExecutorSupervisor:
             process = subprocess.Popen(
                 child_command,
                 env=child_env,
-                start_new_session=True,
                 preexec_fn=(
                     _linux_parent_death_signal
                     if sys.platform.startswith("linux")
                     else None
                 ),
+                **subprocess_group_kwargs(),
             )
             last_status: dict[str, object] = {}
             terminated = False
