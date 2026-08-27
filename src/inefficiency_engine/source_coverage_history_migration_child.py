@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Any
@@ -8,9 +9,10 @@ from sqlalchemy import text
 
 from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import build_evidence_store
+from inefficiency_engine.source_coverage import SourceCoverageSnapshot
 from inefficiency_engine.source_coverage_history import (
     DEFAULT_MIGRATION_HEARTBEAT_BATCH,
-    SOURCE_COVERAGE_HISTORY_TABLE,
+    SOURCE_COVERAGE_SNAPSHOT_WORKER_ID,
     SourceCoverageHistoryLedger,
 )
 from inefficiency_engine.source_coverage_history_batch_repair import (
@@ -63,27 +65,77 @@ def _record(store: Any, *, state: str, detail: dict[str, object], error_type: st
         pass
 
 
-def _completed_history_summary(store: Any) -> dict[str, int]:
-    """Publish final archive counts once, off the HTTP request path."""
+def _completed_history_summary(
+    store: Any,
+    *,
+    checkpoint_heartbeat_id: int,
+) -> dict[str, object]:
+    """Prove compact migration readiness without recounting the archive.
+
+    The priority ``worker_heartbeats(worker_id,id)`` access path is already a migration
+    prerequisite. Read only the newest canonical source snapshot, verify that the
+    durable migration checkpoint has caught up to that heartbeat, and derive the 13-lane
+    certification count from the snapshot payload itself. Full archive counts remain
+    diagnostic-only and are deliberately deferred.
+    """
 
     with store.engine.connect() as db:
-        lane_count = int(
-            db.execute(
-                text(
-                    f"SELECT COUNT(DISTINCT lane_id) FROM {SOURCE_COVERAGE_HISTORY_TABLE}"
-                )
-            ).scalar_one()
-            or 0
-        )
-        snapshot_count = int(
-            db.execute(
-                text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_HISTORY_TABLE}")
-            ).scalar_one()
-            or 0
-        )
+        row = db.execute(
+            text(
+                "SELECT id, payload_json FROM worker_heartbeats "
+                "WHERE worker_id = :worker_id ORDER BY id DESC LIMIT 1"
+            ),
+            {"worker_id": SOURCE_COVERAGE_SNAPSHOT_WORKER_ID},
+        ).mappings().first()
+
+    if row is None:
+        return {
+            "compact_certification_summary": False,
+            "compact_summary_reason": "canonical_source_snapshot_unavailable",
+            "lane_count": 0,
+            "snapshot_count": 0,
+            "archive_snapshot_count_deferred": True,
+            "summary_scope": "latest_canonical_source_snapshot",
+        }
+
+    latest_heartbeat_id = int(row["id"])
+    caught_up = int(checkpoint_heartbeat_id) >= latest_heartbeat_id
+    try:
+        heartbeat_payload = json.loads(str(row["payload_json"]))
+        detail = heartbeat_payload.get("detail") if isinstance(heartbeat_payload, dict) else None
+        snapshot_payload = detail.get("snapshot") if isinstance(detail, dict) else None
+        if not isinstance(snapshot_payload, dict):
+            raise ValueError("snapshot missing")
+        snapshot = SourceCoverageSnapshot.model_validate(snapshot_payload)
+        lane_count = len(snapshot.lanes)
+    except Exception as exc:
+        return {
+            "compact_certification_summary": False,
+            "compact_summary_reason": "canonical_source_snapshot_invalid",
+            "compact_summary_error_type": type(exc).__name__,
+            "lane_count": 0,
+            "snapshot_count": 0,
+            "summary_heartbeat_id": latest_heartbeat_id,
+            "checkpoint_heartbeat_id": int(checkpoint_heartbeat_id),
+            "archive_snapshot_count_deferred": True,
+            "summary_scope": "latest_canonical_source_snapshot",
+        }
+
     return {
+        "compact_certification_summary": caught_up,
+        "compact_summary_reason": (
+            "checkpoint_covers_latest_canonical_source_snapshot"
+            if caught_up
+            else "source_snapshot_tail_advanced_after_batch"
+        ),
         "lane_count": lane_count,
-        "snapshot_count": snapshot_count,
+        "snapshot_count": 0,
+        "summary_heartbeat_id": latest_heartbeat_id,
+        "checkpoint_heartbeat_id": int(checkpoint_heartbeat_id),
+        "migration_checkpoint_covers_summary": caught_up,
+        "archive_snapshot_count_deferred": True,
+        "summary_scope": "latest_canonical_source_snapshot",
+        "request_time_archive_count_queries": 0,
     }
 
 
@@ -121,10 +173,33 @@ def advance_one_history_migration_batch(
     )
     complete = bool(result.get("complete"))
     if complete:
-        # The migration child owns this one-time aggregate read. Certification later
-        # consumes the published counts from the worker heartbeat and never recounts
-        # the append-only archive on a browser request.
-        result.update(_completed_history_summary(store))
+        summary_started = time.monotonic()
+        _record(
+            store,
+            state="running",
+            detail={
+                "stage": "canonical_history_compact_summary_starting",
+                "batch_limit": batch,
+                "checkpoint_heartbeat_id": int(result.get("checkpoint_heartbeat_id") or 0),
+                "compact_certification_summary": False,
+                "archive_snapshot_count_deferred": True,
+            },
+        )
+        summary = _completed_history_summary(
+            store,
+            checkpoint_heartbeat_id=int(result.get("checkpoint_heartbeat_id") or 0),
+        )
+        result.update(summary)
+        result["compact_summary_runtime_seconds"] = round(
+            max(0.0, time.monotonic() - summary_started),
+            6,
+        )
+        complete = bool(summary.get("compact_certification_summary"))
+        # A new canonical source heartbeat can arrive after the batch query. In that
+        # case the completed checkpoint is truthful but no longer caught up; retry the
+        # migration rather than publishing a false terminal-ready heartbeat.
+        result["complete"] = complete
+
     _record(
         store,
         state="success" if complete else "running",
