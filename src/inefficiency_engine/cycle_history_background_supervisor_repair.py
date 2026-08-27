@@ -162,6 +162,14 @@ def _record_index_supervisor_heartbeat(
             "previous_message",
             "previous_effective_index_name",
             "statement_timeout_ms",
+            "index_status",
+            "current_index",
+            "current_table",
+            "current_index_runtime_seconds",
+            "current_index_ok",
+            "current_index_concurrent",
+            "message",
+            "effective_index_name",
         )
         if previous.get(key) is not None
     }
@@ -251,6 +259,7 @@ def _run_index_child(
             break
         if now >= next_progress:
             progress = _postgres_index_progress(store)
+            index_status = _safe_index_status(store)
             _record_index_supervisor_heartbeat(
                 store,
                 state="running",
@@ -259,6 +268,12 @@ def _run_index_child(
                     "child_pid": child.pid,
                     "child_runtime_seconds": runtime_seconds,
                     "executor_deadline_seconds": INDEX_EXECUTOR_DEADLINE_SECONDS,
+                    "index_status": index_status,
+                    "planner_usable_verified": (
+                        index_status.get("planner_usable_verified")
+                        if isinstance(index_status, dict)
+                        else None
+                    ),
                     "postgres_progress_available": bool(progress),
                     "postgres_index_progress": progress,
                 },
