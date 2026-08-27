@@ -49,6 +49,96 @@ def test_dedicated_index_heartbeat_is_exposed_as_single_owner_from_compact_row()
     assert status["effective_index_name"] == "ix_cycle_history_v2"
     assert status["generic_runtime_exact_index_maintenance_disabled"] is True
     assert status["certification_authority"] is False
+    assert status["additional_database_reads"] == 0
+
+
+def test_supervisor_observed_ready_stage_is_accepted_as_exact_index_truth():
+    status = api_truth._cycle_history_index_maintenance_status(
+        {
+            "worker_id": api_truth.CYCLE_HISTORY_INDEX_WORKER_ID,
+            "available": True,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "age_seconds": 0.0,
+            "stale": False,
+            "state": "success",
+            "error_type": None,
+            "stage": "cycle_history_index_ready_observed_after_child_exit",
+            "index_status": {
+                "ready": True,
+                "canonical_index_name": "ix_cycle_history",
+                "effective_index_name": "ix_cycle_history_v8",
+                "planner_usable_verified": True,
+                "reason": "replacement_index_ready",
+            },
+            "child_return_code": -9,
+            "child_exit_error_type": "IndexChildTerminatedBySignal",
+            "termination_signal": "SIGKILL",
+            "possible_oom_or_external_kill": True,
+            "oom_kill_proven": False,
+            "ddl_retry_skipped": True,
+        }
+    )
+
+    assert status["ready"] is True
+    assert status["stage"] in api_truth.CYCLE_HISTORY_INDEX_READY_STAGES
+    assert status["child_return_code"] == -9
+    assert status["child_exit_error_type"] == "IndexChildTerminatedBySignal"
+    assert status["termination_signal"] == "SIGKILL"
+    assert status["possible_oom_or_external_kill"] is True
+    assert status["oom_kill_proven"] is False
+    assert status["ddl_retry_skipped"] is True
+
+
+def test_dedicated_index_supervisor_progress_is_exposed_without_request_time_db_read():
+    status = api_truth._cycle_history_index_maintenance_status(
+        {
+            "worker_id": api_truth.CYCLE_HISTORY_INDEX_WORKER_ID,
+            "available": True,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "age_seconds": 1.0,
+            "stale": False,
+            "state": "running",
+            "error_type": None,
+            "stage": "cycle_history_index_supervisor_observing",
+            "index_status": {
+                "ready": False,
+                "canonical_index_name": "ix_cycle_history",
+                "effective_index_name": None,
+                "planner_usable_verified": True,
+                "reason": "planner_usable_index_unavailable",
+            },
+            "supervisor_observation": True,
+            "supervisor_executes_ddl": False,
+            "child_pid": 4321,
+            "child_runtime_seconds": 47.5,
+            "executor_deadline_seconds": 630.0,
+            "postgres_progress_available": True,
+            "postgres_index_progress": {
+                "pid": 998,
+                "command": "CREATE INDEX CONCURRENTLY",
+                "phase": "building index: scanning table",
+                "blocks_total": 1000,
+                "blocks_done": 325,
+                "index_name": "ix_cycle_history_v9",
+            },
+            "attempt_number": 107,
+        }
+    )
+
+    assert status["ready"] is False
+    assert status["supervisor_observation"] is True
+    assert status["supervisor_executes_ddl"] is False
+    assert status["child_pid"] == 4321
+    assert status["child_runtime_seconds"] == 47.5
+    assert status["executor_deadline_seconds"] == 630.0
+    assert status["postgres_progress_available"] is True
+    assert status["postgres_index_progress"]["blocks_done"] == 325
+    assert status["postgres_index_progress"]["phase"] == (
+        "building index: scanning table"
+    )
+    assert status["attempt_number"] == 107
+    assert status["diagnostic_source"] == "batched_latest_worker_heartbeat"
+    assert status["additional_database_reads"] == 0
 
 
 def test_e2e_payload_surfaces_dedicated_index_owner_without_extra_db_read(monkeypatch):
@@ -67,13 +157,21 @@ def test_e2e_payload_surfaces_dedicated_index_owner_without_extra_db_read(monkey
             "stale": False,
             "state": "running",
             "error_type": None,
-            "stage": "cycle_history_index_maintenance_starting",
+            "stage": "cycle_history_index_supervisor_observing",
             "index_status": {
                 "ready": False,
                 "canonical_index_name": "ix_cycle_history",
                 "effective_index_name": None,
                 "planner_usable_verified": True,
                 "reason": "planner_usable_index_unavailable",
+            },
+            "supervisor_observation": True,
+            "child_pid": 4321,
+            "child_runtime_seconds": 15.0,
+            "executor_deadline_seconds": 630.0,
+            "postgres_progress_available": True,
+            "postgres_index_progress": {
+                "phase": "waiting for writers before build",
             },
         },
     }
@@ -107,8 +205,15 @@ def test_e2e_payload_surfaces_dedicated_index_owner_without_extra_db_read(monkey
     assert payload["cycle_history_exact_index_owner"] == (
         "cycle-history-index-maintenance"
     )
-    assert payload["cycle_history_index_maintenance"]["state"] == "running"
-    assert payload["cycle_history_index_maintenance"]["ready"] is False
+    exact = payload["cycle_history_index_maintenance"]
+    assert exact["state"] == "running"
+    assert exact["ready"] is False
+    assert exact["child_pid"] == 4321
+    assert exact["postgres_progress_available"] is True
+    assert exact["postgres_index_progress"]["phase"] == (
+        "waiting for writers before build"
+    )
+    assert exact["additional_database_reads"] == 0
     assert payload["cycle_history_backfill"]["waiting_on_exact_index"] is True
     assert payload["cycle_history_backfill"]["exact_index_worker_id"] == (
         "cycle-history-index-maintenance"
