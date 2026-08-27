@@ -6,6 +6,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from urllib.request import urlopen
 
 from inefficiency_engine.config import Settings
 from inefficiency_engine.evidence import build_evidence_store
@@ -13,6 +14,8 @@ from inefficiency_engine.evidence import build_evidence_store
 
 WORKER_ID = "combined-runtime-parent-liveness"
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+API_BIND_POLL_SECONDS = 1.0
+API_BIND_READ_TIMEOUT_SECONDS = 1.0
 
 
 def _release_commit() -> str | None:
@@ -25,6 +28,19 @@ def _identity() -> tuple[int, str | None, str]:
     release_commit = _release_commit()
     generation = f"{release_commit or 'unknown'}:{parent_pid}"
     return parent_pid, release_commit, generation
+
+
+def _api_is_bound(port: str | int) -> bool:
+    """Check process-only API liveness without touching the durable store."""
+
+    try:
+        with urlopen(
+            f"http://127.0.0.1:{port}/health",
+            timeout=API_BIND_READ_TIMEOUT_SECONDS,
+        ) as response:
+            return int(getattr(response, "status", 200)) == 200
+    except Exception:
+        return False
 
 
 def _record(*, state: str, stage: str, detail: dict[str, object]) -> None:
@@ -71,7 +87,14 @@ def _record_terminal(raw: str) -> int:
 
 
 def main() -> int:
-    """Publish combined-runtime generation or one terminal parent observation."""
+    """Publish combined-runtime generation or one terminal parent observation.
+
+    The long-lived heartbeat subprocess is spawned before the canonical combined runtime
+    enters its serialized schema bootstrap. It therefore must not open the evidence
+    store until the public zero-database `/health` endpoint proves that bootstrap has
+    completed and the API has bound. This preserves the single-process bootstrap barrier
+    while retaining durable generation diagnostics after startup.
+    """
 
     if len(sys.argv) == 3 and sys.argv[1] == "--terminal":
         try:
@@ -92,7 +115,15 @@ def main() -> int:
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
 
-    started_at = datetime.now(timezone.utc)
+    process_started_at = datetime.now(timezone.utc)
+    port = os.getenv("PORT", "10000")
+    while not stopping and not _api_is_bound(port):
+        deadline = time.monotonic() + API_BIND_POLL_SECONDS
+        while not stopping and time.monotonic() < deadline:
+            time.sleep(0.1)
+    if stopping:
+        return 0
+
     sequence = 0
     while not stopping:
         sequence += 1
@@ -101,7 +132,8 @@ def main() -> int:
                 state="running",
                 stage="combined_runtime_parent_alive",
                 detail={
-                    "parent_started_at": started_at.isoformat(),
+                    "parent_started_at": process_started_at.isoformat(),
+                    "api_bound_before_durable_heartbeat": True,
                     "sequence": sequence,
                 },
             )
@@ -124,8 +156,11 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "API_BIND_POLL_SECONDS",
+    "API_BIND_READ_TIMEOUT_SECONDS",
     "HEARTBEAT_INTERVAL_SECONDS",
     "WORKER_ID",
+    "_api_is_bound",
     "_identity",
     "_record_terminal",
     "main",
