@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -24,6 +25,30 @@ _SCHEMA_VERSION = 1
 def durable_control_cache_namespace() -> str | None:
     value = os.getenv("CIE_CONTROL_CACHE_NAMESPACE")
     return value.strip() if value and value.strip() else None
+
+
+def control_cache_structure_identity(*parts: object) -> str:
+    """Return a stable, credential-free identity for one exact cache structure."""
+
+    material = "\x1f".join(str(part) for part in parts)
+    return "sha256:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def control_cache_store_identity(store: Any) -> str:
+    """Identify one durable store without depending on process-local object ids."""
+
+    safe = str(getattr(store, "safe_database_url", "") or "").strip()
+    if safe:
+        return safe
+    engine = getattr(store, "engine", None)
+    url = getattr(engine, "url", None)
+    render = getattr(url, "render_as_string", None)
+    if callable(render):
+        try:
+            return str(render(hide_password=True))
+        except TypeError:
+            return str(render())
+    return f"{type(engine).__module__}.{type(engine).__qualname__}:{id(engine)}"
 
 
 def ensure_durable_control_cache_schema(store: Any) -> None:
