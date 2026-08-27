@@ -11,6 +11,7 @@ from urllib.request import urlopen
 
 from inefficiency_engine.source_coverage_history_migration_child import (
     MIGRATION_INCOMPLETE_EXIT_CODE,
+    MIGRATION_PREREQUISITE_NOT_READY_EXIT_CODE,
 )
 
 
@@ -198,6 +199,14 @@ def run_source_coverage_history_migration_supervisor(stop_event: threading.Event
             return
         if return_code == MIGRATION_INCOMPLETE_EXIT_CODE:
             stop_event.wait(MIGRATION_PROGRESS_INTERVAL_SECONDS)
+            continue
+        if return_code == MIGRATION_PREREQUISITE_NOT_READY_EXIT_CODE:
+            print(
+                "source coverage history migration waiting for planner-usable "
+                "worker-heartbeat read index",
+                flush=True,
+            )
+            stop_event.wait(MIGRATION_FAILURE_RETRY_SECONDS)
             continue
 
         terminal_error_type = (
