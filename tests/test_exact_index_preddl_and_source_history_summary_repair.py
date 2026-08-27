@@ -82,10 +82,12 @@ def test_compact_source_history_summary_uses_latest_indexed_snapshot_not_archive
     assert summary["archive_snapshot_count_deferred"] is True
     assert summary["snapshot_count"] == 0
 
-    source = inspect.getsource(source_child._completed_history_summary)
-    assert "COUNT(*)" not in source
-    assert "COUNT(DISTINCT" not in source
-    assert "ORDER BY id DESC LIMIT 1" in source
+    helper_source = inspect.getsource(source_child._completed_history_summary)
+    production_source = inspect.getsource(source_child.advance_one_history_migration_batch)
+    assert "ORDER BY id DESC LIMIT 1" in helper_source
+    assert "checkpoint_heartbeat_id=int(result.get" in production_source
+    assert "_completed_history_summary(" in production_source
+    assert "checkpoint_heartbeat_id=None" not in production_source
 
 
 def test_compact_source_history_summary_fails_closed_when_tail_advances() -> None:
