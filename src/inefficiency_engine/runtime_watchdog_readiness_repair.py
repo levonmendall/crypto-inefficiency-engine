@@ -3,10 +3,9 @@ from __future__ import annotations
 import json
 from urllib.request import urlopen
 
-from inefficiency_engine.read_api_liveness_deploy import INTERNAL_RUNTIME_HEARTBEAT_PATH
-
 
 _PATCH_MARKER = "_cie_runtime_watchdog_readiness_repair_installed"
+INTERNAL_RUNTIME_HEARTBEAT_PATH = "/v3/internal/runtime-heartbeats"
 WATCHDOG_HEARTBEAT_READ_TIMEOUT_SECONDS = 10.0
 
 
@@ -35,7 +34,8 @@ def install_runtime_watchdog_readiness_repair() -> None:
     truth, so it now uses a dedicated endpoint backed by one batched latest-worker query
     in a disposable subprocess. A slow database read therefore cannot keep the watchdog
     blocked indefinitely, while unrelated local dashboard reads retain their original
-    shorter timeout.
+    shorter timeout. This patch itself intentionally imports no API/database stack into
+    the lightweight coordinator.
     """
 
     from inefficiency_engine import render_combined_runtime as runtime
@@ -55,6 +55,7 @@ def install_runtime_watchdog_readiness_repair() -> None:
 
 
 __all__ = [
+    "INTERNAL_RUNTIME_HEARTBEAT_PATH",
     "WATCHDOG_HEARTBEAT_READ_TIMEOUT_SECONDS",
     "_bounded_runtime_heartbeat_json",
     "install_runtime_watchdog_readiness_repair",
