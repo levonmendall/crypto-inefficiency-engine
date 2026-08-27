@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 import threading
 
@@ -26,10 +27,14 @@ SOURCE_REPAIR_COMMAND = [
     "-m",
     "inefficiency_engine.permanent_source_worker_lane_repair",
 ]
+# The outer combined runtime considers its portfolio child critical. Keep that permanent
+# slot occupied by a tiny supervisor so a canonical portfolio/database failure recycles
+# only the actual portfolio worker instead of returning from the combined parent and
+# terminating the API plus every long-running background supervisor.
 PORTFOLIO_BOUNDED_HEARTBEAT_COMMAND = [
     sys.executable,
     "-m",
-    "inefficiency_engine.lightweight_portfolio_worker_bounded_heartbeat",
+    "inefficiency_engine.portfolio_process_supervisor",
 ]
 RESEARCH_OBSERVABILITY_COMMAND = [
     sys.executable,
@@ -41,17 +46,22 @@ CONTROL_TRUTH_COMMAND = [
     "-m",
     "inefficiency_engine.permanent_control_worker_truth_repair",
 ]
+RUNTIME_PARENT_HEARTBEAT_COMMAND = [
+    sys.executable,
+    "-m",
+    "inefficiency_engine.combined_runtime_parent_heartbeat",
+]
 WORKER_HEARTBEAT_READ_INDEX_SPEC = {
     "worker_heartbeats": ("worker_id", "id"),
 }
 # Keep the canonical database-independent liveness app as the production ASGI target.
-# That app now intercepts only the explicit E2E diagnostic after path selection, while
-# /health remains a zero-database process-liveness branch.
+# It intercepts bounded explicit diagnostics after path selection, while /health remains
+# a zero-database process-liveness branch.
 BOUNDED_HEARTBEAT_API_APP = "inefficiency_engine.read_api_liveness_deploy:app"
 
 
 def install_source_repair_child_command() -> None:
-    """Install source-lane repair plus bounded diagnostic heartbeat reads."""
+    """Install source-lane repair plus isolated portfolio and bounded diagnostics."""
 
     if getattr(base.base, "_remaining_source_lane_repair_installed", False):
         return
@@ -111,6 +121,17 @@ def install_research_observability_heavy_command() -> None:
     runtime._research_observability_repair_installed = True
 
 
+def _stop_diagnostic_child(child: subprocess.Popen[bytes] | None) -> None:
+    if child is None or child.poll() is not None:
+        return
+    child.terminate()
+    try:
+        child.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=5.0)
+
+
 def main() -> int:
     install_source_repair_child_command()
     install_control_truth_command()
@@ -142,6 +163,7 @@ def main() -> int:
         name="research-projection-refresh-supervisor",
         daemon=True,
     )
+    runtime_parent_heartbeat = subprocess.Popen(RUNTIME_PARENT_HEARTBEAT_COMMAND)
     cycle_history_guard.start()
     observatory_backfill_guard.start()
     source_history_guard.start()
@@ -150,6 +172,7 @@ def main() -> int:
         return base.main()
     finally:
         stop_event.set()
+        _stop_diagnostic_child(runtime_parent_heartbeat)
         cycle_history_guard.join(timeout=10.0)
         observatory_backfill_guard.join(timeout=10.0)
         source_history_guard.join(timeout=10.0)
