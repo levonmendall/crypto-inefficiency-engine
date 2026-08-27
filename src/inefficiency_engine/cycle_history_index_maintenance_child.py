@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from inefficiency_engine import runtime_index_maintenance
@@ -20,7 +21,10 @@ build_evidence_store = build_cycle_history_index_runtime_store
 
 WORKER_ID = "cycle-history-index-maintenance"
 INDEX_NOT_READY_EXIT_CODE = 77
+INDEX_TERMINAL_HEARTBEAT_UNAVAILABLE_EXIT_CODE = 79
 DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS = 3_600_000
+TERMINAL_HEARTBEAT_WRITE_ATTEMPTS = 4
+TERMINAL_HEARTBEAT_RETRY_SECONDS = 1.0
 
 _PREVIOUS_CHILD_TERMINAL_FIELDS = {
     "child_terminal_stage": "previous_child_terminal_stage",
@@ -42,31 +46,41 @@ def _record_heartbeat(
     stage: str,
     error_type: str | None = None,
     detail: dict[str, object] | None = None,
-) -> None:
-    try:
-        store.record_worker_heartbeat(
-            worker_id=WORKER_ID,
-            state=state,
-            error_type=error_type,
-            detail={
-                "stage": stage,
-                "background_maintenance_only": True,
-                "dedicated_cycle_history_index_owner": True,
-                "create_index_concurrently_required_in_postgres": True,
-                "schema_free_exact_index_runtime_store": True,
-                "generic_schema_inspector_bypassed": True,
-                "provider_requests_allowed": False,
-                "provider_requests_used": 0,
-                "qualification_thresholds_unchanged": True,
-                "certification_authority": False,
-                "allocation_authority": False,
-                "live_execution_authority": False,
-                "paper_only": True,
-                **(detail or {}),
-            },
-        )
-    except Exception:
-        pass
+    durable_attempts: int = 1,
+) -> bool:
+    """Write a heartbeat; terminal callers may request bounded persistence retries."""
+
+    attempts = max(1, int(durable_attempts))
+    for attempt in range(attempts):
+        try:
+            store.record_worker_heartbeat(
+                worker_id=WORKER_ID,
+                state=state,
+                error_type=error_type,
+                detail={
+                    "stage": stage,
+                    "background_maintenance_only": True,
+                    "dedicated_cycle_history_index_owner": True,
+                    "create_index_concurrently_required_in_postgres": True,
+                    "schema_free_exact_index_runtime_store": True,
+                    "generic_schema_inspector_bypassed": True,
+                    "provider_requests_allowed": False,
+                    "provider_requests_used": 0,
+                    "qualification_thresholds_unchanged": True,
+                    "certification_authority": False,
+                    "allocation_authority": False,
+                    "live_execution_authority": False,
+                    "paper_only": True,
+                    "terminal_heartbeat_write_attempt": attempt + 1,
+                    "terminal_heartbeat_write_attempts_allowed": attempts,
+                    **(detail or {}),
+                },
+            )
+            return True
+        except Exception:
+            if attempt + 1 < attempts:
+                time.sleep(TERMINAL_HEARTBEAT_RETRY_SECONDS)
+    return False
 
 
 def _latest_attempt_detail(store: Any) -> tuple[Any | None, dict[str, object]]:
@@ -153,13 +167,14 @@ def run_index_maintenance() -> int:
 
         before = cycle_history_exact_index_status(store)
         if bool(before.get("ready")):
-            _record_heartbeat(
+            durable = _record_heartbeat(
                 store,
                 state="success",
                 stage="cycle_history_index_ready",
                 detail={**attempt_context, "index_status": before, "ddl_required": False},
+                durable_attempts=TERMINAL_HEARTBEAT_WRITE_ATTEMPTS,
             )
-            return 0
+            return 0 if durable else INDEX_TERMINAL_HEARTBEAT_UNAVAILABLE_EXIT_CODE
 
         _record_heartbeat(
             store,
@@ -188,6 +203,9 @@ def run_index_maintenance() -> int:
                     "pre_ddl_runtime_seconds": row.get("pre_ddl_runtime_seconds"),
                     "ddl_runtime_seconds": row.get("ddl_runtime_seconds"),
                 },
+                durable_attempts=(
+                    TERMINAL_HEARTBEAT_WRITE_ATTEMPTS if phase == "failed" else 1
+                ),
             )
 
         previous_timeout_ms = (
@@ -212,7 +230,7 @@ def run_index_maintenance() -> int:
         attempted = result.get("attempted")
         rows = attempted if isinstance(attempted, list) else []
         last = dict(rows[-1]) if rows and isinstance(rows[-1], dict) else {}
-        _record_heartbeat(
+        terminal_durable = _record_heartbeat(
             store,
             state="success" if ready else "degraded",
             stage="cycle_history_index_ready" if ready else "cycle_history_index_retry_pending",
@@ -224,8 +242,12 @@ def run_index_maintenance() -> int:
                 "ddl_required": last.get("ddl_required", True),
                 "effective_index_name": last.get("effective_index_name"),
                 "message": last.get("message"),
+                "child_terminal_heartbeat_required_before_retry": True,
             },
+            durable_attempts=TERMINAL_HEARTBEAT_WRITE_ATTEMPTS,
         )
+        if not terminal_durable:
+            return INDEX_TERMINAL_HEARTBEAT_UNAVAILABLE_EXIT_CODE
         return 0 if ready else INDEX_NOT_READY_EXIT_CODE
     finally:
         dispose = getattr(store, "dispose", None)
@@ -254,7 +276,9 @@ def main() -> int:
                         "pre_ddl_statement_timeout_ms": EXACT_INDEX_PRE_DDL_STATEMENT_TIMEOUT_MS,
                         **previous_context,
                         "message": str(exc)[:500],
+                        "child_terminal_heartbeat_required_before_retry": True,
                     },
+                    durable_attempts=TERMINAL_HEARTBEAT_WRITE_ATTEMPTS,
                 )
         except Exception:
             pass
@@ -273,6 +297,9 @@ if __name__ == "__main__":
 __all__ = [
     "DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS",
     "INDEX_NOT_READY_EXIT_CODE",
+    "INDEX_TERMINAL_HEARTBEAT_UNAVAILABLE_EXIT_CODE",
+    "TERMINAL_HEARTBEAT_RETRY_SECONDS",
+    "TERMINAL_HEARTBEAT_WRITE_ATTEMPTS",
     "WORKER_ID",
     "run_index_maintenance",
 ]

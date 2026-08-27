@@ -32,15 +32,11 @@ BACKFILL_COMMAND = [
     "-m",
     "inefficiency_engine.cycle_history_background_backfill_repair",
 ]
-# Production pg_stat_progress_create_index proved the exact concurrent index was healthy
-# and still scanning the large market_quotes table well past the pace compatible with a
-# ten-minute deadline. Give the sole DDL owner one bounded hour plus a one-minute process
-# margin for post-DDL catalog verification and clean shutdown. No history/backfill
-# deadline, shared runtime-index timeout, or certification rule is changed here.
 INDEX_EXECUTOR_DEADLINE_SECONDS = 3660.0
 INDEX_RETRY_SECONDS = 30.0
 INDEX_PROGRESS_HEARTBEAT_SECONDS = 15.0
 INDEX_DIAGNOSTIC_DEADLINE_SECONDS = 8.0
+INDEX_TERMINAL_CAPTURE_RETRY_SECONDS = 5.0
 INDEX_TERMINAL_FAILURE_BACKOFF_THRESHOLD = 3
 INDEX_TERMINAL_FAILURE_BACKOFF_SECONDS = 120.0
 
@@ -82,14 +78,14 @@ def _run_index_diagnostic(payload: dict[str, object]) -> dict[str, object] | Non
     except subprocess.TimeoutExpired:
         print(
             "cycle-history index diagnostic child exceeded its bounded deadline; "
-            "continuing to supervise DDL",
+            "continuing supervision without launching replacement DDL",
             flush=True,
         )
         return None
     if completed.returncode != 0:
         print(
             "cycle-history index diagnostic child exited "
-            f"code={completed.returncode}; continuing to supervise DDL",
+            f"code={completed.returncode}; continuing supervision without replacement DDL",
             flush=True,
         )
         return None
@@ -108,6 +104,18 @@ def _safe_index_status() -> dict[str, object] | None:
     return dict(status) if isinstance(status, dict) else None
 
 
+def _next_index_attempt_number() -> int | None:
+    """Resolve the exact attempt before launch; uncertainty blocks DDL rather than guessing."""
+
+    result = _run_index_diagnostic({"action": "next_attempt"})
+    if not isinstance(result, dict):
+        return None
+    try:
+        return max(1, int(result.get("next_attempt_number") or 0))
+    except (TypeError, ValueError):
+        return None
+
+
 def _record_index_supervisor_heartbeat(
     _store=None,
     *,
@@ -118,7 +126,7 @@ def _record_index_supervisor_heartbeat(
     include_status_progress: bool = False,
     preserve_child_terminal: bool = False,
 ) -> None:
-    """Publish supervisor truth through an eight-second disposable DB process."""
+    """Publish non-gating supervisor truth through an eight-second disposable process."""
 
     _run_index_diagnostic(
         {
@@ -131,6 +139,48 @@ def _record_index_supervisor_heartbeat(
             "preserve_child_terminal": bool(preserve_child_terminal),
         }
     )
+
+
+def _capture_index_terminal_truth(
+    *,
+    stop_event: threading.Event,
+    expected_attempt_number: int,
+    state: str,
+    stage: str,
+    error_type: str | None,
+    detail: dict[str, object],
+    allow_supervisor_only_terminal: bool,
+) -> dict[str, object] | None:
+    """Block replacement DDL until terminal truth for one exact attempt is durable.
+
+    Normal exits require the child's own terminal heartbeat so SQL error/message and
+    maintenance result cannot be lost behind a later observing row. Signal/timeout exits
+    can be proven by the supervisor's process evidence. Diagnostic failures retry only
+    this capture operation; no new index child can start while the gate is unresolved.
+    """
+
+    while not stop_event.is_set():
+        result = _run_index_diagnostic(
+            {
+                "action": "capture_terminal",
+                "expected_attempt_number": expected_attempt_number,
+                "state": state,
+                "stage": stage,
+                "error_type": error_type,
+                "detail": dict(detail),
+                "allow_supervisor_only_terminal": allow_supervisor_only_terminal,
+            }
+        )
+        if isinstance(result, dict) and result.get("terminal_truth_durable") is True:
+            return result
+        reason = result.get("reason") if isinstance(result, dict) else "diagnostic_unavailable"
+        print(
+            "cycle-history exact-index retry gate waiting for durable terminal truth "
+            f"attempt={expected_attempt_number} reason={reason}; DDL retry blocked",
+            flush=True,
+        )
+        stop_event.wait(INDEX_TERMINAL_CAPTURE_RETRY_SECONDS)
+    return None
 
 
 def _index_child_exit_diagnostics(
@@ -189,9 +239,6 @@ def _run_index_child(
             base._terminate(child)
             break
         if now >= next_progress:
-            # The bounded diagnostic may start near the exact instant the DDL owner
-            # exits. Re-check immediately before launching it; the probe also performs
-            # a durable compare-after-diagnostics guard before any observing write.
             if child.poll() is not None:
                 break
             _record_index_supervisor_heartbeat(
@@ -216,14 +263,7 @@ def _run_index_child(
 
 
 def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None:
-    """Verify the exact query index before any raw cycle-history reconstruction.
-
-    The exact-index child remains the sole DDL owner. All parent-side catalog/progress
-    observation and heartbeat persistence now occur in eight-second disposable probe
-    processes, so PostgreSQL connection pressure cannot freeze this long-lived supervisor
-    or consume the one-hour DDL child's lifetime. The second child owns only the existing
-    checkpointed 180-day history slice.
-    """
+    """Verify the exact query index before any raw cycle-history reconstruction."""
 
     port = base.os.getenv("PORT", "10000")
     while not stop_event.is_set() and not base._api_is_bound(port):
@@ -235,7 +275,6 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
     consecutive_terminal_failures = 0
     while not stop_event.is_set():
         if not exact_index_ready:
-            # Verify catalog truth before every retry in a killable diagnostic process.
             before = _safe_index_status()
             if before is not None and bool(before.get("ready")):
                 exact_index_ready = True
@@ -250,122 +289,108 @@ def run_cycle_history_background_supervisor(stop_event: threading.Event) -> None
                     },
                 )
             else:
+                expected_attempt_number = _next_index_attempt_number()
+                if expected_attempt_number is None:
+                    print(
+                        "cycle-history exact-index attempt identity unavailable; DDL launch blocked",
+                        flush=True,
+                    )
+                    stop_event.wait(INDEX_TERMINAL_CAPTURE_RETRY_SECONDS)
+                    continue
+
                 return_code, timed_out = _run_index_child(stop_event=stop_event)
                 if stop_event.is_set():
                     return
 
-                # Catalog truth wins over child lifecycle, but this verification is also
-                # bounded outside the parent so it can never strand future retries.
                 after = _safe_index_status()
+                exit_error_type, exit_detail = _index_child_exit_diagnostics(
+                    return_code,
+                    timed_out=timed_out,
+                )
+
                 if after is not None and bool(after.get("ready")):
-                    error_type, exit_detail = _index_child_exit_diagnostics(
-                        return_code,
-                        timed_out=timed_out,
-                    )
-                    exact_index_ready = True
-                    consecutive_terminal_failures = 0
-                    _record_index_supervisor_heartbeat(
+                    capture = _capture_index_terminal_truth(
+                        stop_event=stop_event,
+                        expected_attempt_number=expected_attempt_number,
                         state="success",
                         stage="cycle_history_index_ready_observed_after_child_exit",
+                        error_type=None,
                         detail={
                             **exit_detail,
-                            "child_exit_error_type": error_type,
+                            "child_exit_error_type": exit_error_type,
                             "index_status": after,
-                            "planner_usable_verified": after.get(
-                                "planner_usable_verified"
-                            ),
+                            "planner_usable_verified": after.get("planner_usable_verified"),
                             "ddl_retry_skipped": True,
                         },
+                        allow_supervisor_only_terminal=True,
                     )
-                elif return_code == INDEX_NOT_READY_EXIT_CODE and not timed_out:
-                    error_type, exit_detail = _index_child_exit_diagnostics(
-                        return_code,
-                        timed_out=timed_out,
-                    )
+                    if capture is None:
+                        return
+                    exact_index_ready = True
+                    consecutive_terminal_failures = 0
+                else:
                     consecutive_terminal_failures += 1
-                    _record_index_supervisor_heartbeat(
+                    if return_code == INDEX_NOT_READY_EXIT_CODE and not timed_out:
+                        terminal_stage = "cycle_history_index_child_retry_pending"
+                        terminal_error_type = exit_error_type
+                        retry_seconds = INDEX_RETRY_SECONDS
+                        allow_supervisor_only_terminal = False
+                    elif timed_out or return_code not in (0, None):
+                        terminal_stage = "cycle_history_index_child_terminated"
+                        terminal_error_type = exit_error_type
+                        retry_seconds = (
+                            INDEX_TERMINAL_FAILURE_BACKOFF_SECONDS
+                            if consecutive_terminal_failures
+                            >= INDEX_TERMINAL_FAILURE_BACKOFF_THRESHOLD
+                            else INDEX_RETRY_SECONDS
+                        )
+                        allow_supervisor_only_terminal = bool(
+                            timed_out or (return_code is not None and return_code < 0)
+                        )
+                    elif after is not None:
+                        terminal_stage = (
+                            "cycle_history_index_child_returned_without_ready_index"
+                        )
+                        terminal_error_type = (
+                            "IndexChildReturnedWithoutPlannerUsableIndex"
+                        )
+                        retry_seconds = INDEX_RETRY_SECONDS
+                        allow_supervisor_only_terminal = False
+                    else:
+                        terminal_stage = "cycle_history_index_child_exit_unverified"
+                        terminal_error_type = (
+                            exit_error_type or "IndexChildExitVerificationUnavailable"
+                        )
+                        retry_seconds = INDEX_RETRY_SECONDS
+                        allow_supervisor_only_terminal = bool(
+                            timed_out or (return_code is not None and return_code < 0)
+                        )
+
+                    terminal_detail = {
+                        **exit_detail,
+                        "index_status": after,
+                        "consecutive_terminal_failures": consecutive_terminal_failures,
+                        "retry_seconds": retry_seconds,
+                        "retry_backoff_escalated": retry_seconds > INDEX_RETRY_SECONDS,
+                    }
+                    capture = _capture_index_terminal_truth(
+                        stop_event=stop_event,
+                        expected_attempt_number=expected_attempt_number,
                         state="degraded",
-                        stage="cycle_history_index_child_retry_pending",
-                        error_type=error_type,
-                        detail={
-                            **exit_detail,
-                            "index_status": after,
-                            "consecutive_terminal_failures": consecutive_terminal_failures,
-                            "retry_seconds": INDEX_RETRY_SECONDS,
-                        },
-                        preserve_child_terminal=True,
+                        stage=terminal_stage,
+                        error_type=terminal_error_type,
+                        detail=terminal_detail,
+                        allow_supervisor_only_terminal=allow_supervisor_only_terminal,
                     )
-                    stop_event.wait(INDEX_RETRY_SECONDS)
-                    continue
-                elif timed_out or return_code not in (0, None):
-                    error_type, exit_detail = _index_child_exit_diagnostics(
-                        return_code,
-                        timed_out=timed_out,
-                    )
-                    consecutive_terminal_failures += 1
-                    retry_seconds = (
-                        INDEX_TERMINAL_FAILURE_BACKOFF_SECONDS
-                        if consecutive_terminal_failures
-                        >= INDEX_TERMINAL_FAILURE_BACKOFF_THRESHOLD
-                        else INDEX_RETRY_SECONDS
-                    )
-                    _record_index_supervisor_heartbeat(
-                        state="degraded",
-                        stage="cycle_history_index_child_terminated",
-                        error_type=error_type,
-                        detail={
-                            **exit_detail,
-                            "index_status": after,
-                            "consecutive_terminal_failures": consecutive_terminal_failures,
-                            "retry_seconds": retry_seconds,
-                            "retry_backoff_escalated": retry_seconds
-                            > INDEX_RETRY_SECONDS,
-                        },
-                        preserve_child_terminal=True,
-                    )
+                    if capture is None:
+                        return
                     print(
-                        "cycle-history exact-index child terminated "
-                        f"code={return_code} timed_out={timed_out}; "
-                        f"retrying in {retry_seconds:.0f}s",
+                        "cycle-history exact-index terminal truth durable "
+                        f"attempt={expected_attempt_number} code={return_code} "
+                        f"timed_out={timed_out}; retrying in {retry_seconds:.0f}s",
                         flush=True,
                     )
                     stop_event.wait(retry_seconds)
-                    continue
-                elif after is not None:
-                    consecutive_terminal_failures += 1
-                    _record_index_supervisor_heartbeat(
-                        state="degraded",
-                        stage="cycle_history_index_child_returned_without_ready_index",
-                        error_type="IndexChildReturnedWithoutPlannerUsableIndex",
-                        detail={
-                            "child_return_code": return_code,
-                            "index_status": after,
-                            "consecutive_terminal_failures": consecutive_terminal_failures,
-                            "retry_seconds": INDEX_RETRY_SECONDS,
-                        },
-                        preserve_child_terminal=True,
-                    )
-                    stop_event.wait(INDEX_RETRY_SECONDS)
-                    continue
-                else:
-                    error_type, exit_detail = _index_child_exit_diagnostics(
-                        return_code,
-                        timed_out=timed_out,
-                    )
-                    consecutive_terminal_failures += 1
-                    _record_index_supervisor_heartbeat(
-                        state="degraded",
-                        stage="cycle_history_index_child_exit_unverified",
-                        error_type=(error_type or "IndexChildExitVerificationUnavailable"),
-                        detail={
-                            **exit_detail,
-                            "index_status": None,
-                            "consecutive_terminal_failures": consecutive_terminal_failures,
-                            "retry_seconds": INDEX_RETRY_SECONDS,
-                        },
-                        preserve_child_terminal=True,
-                    )
-                    stop_event.wait(INDEX_RETRY_SECONDS)
                     continue
 
             if exact_index_ready:
@@ -427,9 +452,12 @@ __all__ = [
     "INDEX_EXECUTOR_DEADLINE_SECONDS",
     "INDEX_PROGRESS_HEARTBEAT_SECONDS",
     "INDEX_RETRY_SECONDS",
+    "INDEX_TERMINAL_CAPTURE_RETRY_SECONDS",
     "INDEX_TERMINAL_FAILURE_BACKOFF_SECONDS",
     "INDEX_TERMINAL_FAILURE_BACKOFF_THRESHOLD",
+    "_capture_index_terminal_truth",
     "_index_child_exit_diagnostics",
+    "_next_index_attempt_number",
     "_record_index_supervisor_heartbeat",
     "_run_index_diagnostic",
     "_safe_index_status",
