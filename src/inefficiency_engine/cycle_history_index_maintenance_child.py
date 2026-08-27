@@ -2,24 +2,24 @@ from __future__ import annotations
 
 from typing import Any
 
+from inefficiency_engine import runtime_index_maintenance
 from inefficiency_engine.config import Settings
 from inefficiency_engine.cycle_history_exact_index_direct import (
     EXACT_INDEX_PRE_DDL_STATEMENT_TIMEOUT_MS,
     ensure_exact_cycle_history_index_direct,
 )
+from inefficiency_engine.cycle_history_index_gate import cycle_history_exact_index_status
 from inefficiency_engine.cycle_history_index_runtime_store import (
     build_cycle_history_index_runtime_store,
 )
 
 
+# Keep this module-level seam for existing regression tests while production resolves to
+# the schema-free builder. No EvidenceStore/schema bootstrap is used on this path.
+build_evidence_store = build_cycle_history_index_runtime_store
+
 WORKER_ID = "cycle-history-index-maintenance"
 INDEX_NOT_READY_EXIT_CODE = 77
-# Production pg_stat_progress_create_index evidence showed the exact concurrent index
-# was healthy and actively scanning market_quotes but only ~28.5% through the table
-# after ~320 seconds. The former ten-minute deadline therefore guaranteed repeated
-# cancellation before scan plus PostgreSQL's later concurrent validation phases could
-# complete. This dedicated child is the sole owner of the exact index, so give only
-# this one bounded DDL attempt a one-hour SQL window.
 DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS = 3_600_000
 
 _PREVIOUS_CHILD_TERMINAL_FIELDS = {
@@ -80,8 +80,6 @@ def _latest_attempt_detail(store: Any) -> tuple[Any | None, dict[str, object]]:
 
 
 def _previous_child_terminal_context(detail: dict[str, object]) -> dict[str, object]:
-    """Rename terminal child fields so they remain clearly prior-attempt evidence."""
-
     return {
         target: detail[source]
         for source, target in _PREVIOUS_CHILD_TERMINAL_FIELDS.items()
@@ -90,8 +88,6 @@ def _previous_child_terminal_context(detail: dict[str, object]) -> dict[str, obj
 
 
 def _previous_attempt_context(store: Any) -> tuple[int, dict[str, object]]:
-    """Carry the last exact-index outcome into the next disposable attempt."""
-
     heartbeat, detail = _latest_attempt_detail(store)
     if heartbeat is None:
         return 1, {}
@@ -121,8 +117,6 @@ def _previous_attempt_context(store: Any) -> tuple[int, dict[str, object]]:
 
 
 def _current_attempt_context(store: Any) -> tuple[int, dict[str, object]]:
-    """Return the attempt already in progress without incrementing it again."""
-
     _heartbeat, detail = _latest_attempt_detail(store)
     try:
         attempt_number = max(1, int(detail.get("attempt_number") or 1))
@@ -140,40 +134,11 @@ def _current_attempt_context(store: Any) -> tuple[int, dict[str, object]]:
     return attempt_number, context
 
 
-def _index_status_from_result(result: dict[str, object]) -> dict[str, object]:
-    attempted = result.get("attempted")
-    rows = attempted if isinstance(attempted, list) else []
-    row = dict(rows[-1]) if rows and isinstance(rows[-1], dict) else {}
-    ready = bool(result.get("complete"))
-    return {
-        "ready": ready,
-        "planner_usable_verified": bool(
-            result.get("postgres_index_validity_verified") or result.get("postgres_runtime_index_not_required")
-        ),
-        "postgres_index_ready": row.get("postgres_index_ready"),
-        "postgres_index_valid": row.get("postgres_index_valid"),
-        "canonical_index_name": row.get("canonical_index_name"),
-        "effective_index_name": row.get("effective_index_name"),
-        "reason": "planner_usable_index_ready" if ready else "planner_usable_index_unavailable",
-        "direct_exact_index_path": True,
-        "schema_free_runtime_store": True,
-        "allocation_authority": False,
-        "live_execution_authority": False,
-        "paper_only": True,
-    }
-
-
 def run_index_maintenance() -> int:
-    """Verify/build the one exact index without entering generic schema bootstrap.
-
-    Startup owns schema creation. This disposable child uses a schema-free store and a
-    bounded direct PostgreSQL catalog phase, then enters the unchanged one-hour
-    ``CREATE INDEX CONCURRENTLY`` allowance only after the known table/columns and index
-    state have been verified.
-    """
+    """Verify/build the exact index without entering generic PostgreSQL schema bootstrap."""
 
     settings = Settings.from_env()
-    store = build_cycle_history_index_runtime_store(settings.evidence_db_path)
+    store = build_evidence_store(settings.evidence_db_path)
     if store is None:
         raise RuntimeError("cycle-history index maintenance requires durable persistence")
 
@@ -186,11 +151,21 @@ def run_index_maintenance() -> int:
             **previous_context,
         }
 
+        before = cycle_history_exact_index_status(store)
+        if bool(before.get("ready")):
+            _record_heartbeat(
+                store,
+                state="success",
+                stage="cycle_history_index_ready",
+                detail={**attempt_context, "index_status": before, "ddl_required": False},
+            )
+            return 0
+
         _record_heartbeat(
             store,
             state="running",
             stage="cycle_history_index_preddl_pending",
-            detail={**attempt_context, "ddl_required": None},
+            detail={**attempt_context, "index_status": before},
         )
 
         def progress(row: dict[str, object]) -> None:
@@ -215,13 +190,25 @@ def run_index_maintenance() -> int:
                 },
             )
 
-        result = ensure_exact_cycle_history_index_direct(
-            store,
-            statement_timeout_ms=DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS,
-            progress=progress,
+        previous_timeout_ms = (
+            runtime_index_maintenance.CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS
         )
-        ready = bool(result.get("complete"))
-        after = _index_status_from_result(result)
+        runtime_index_maintenance.CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS = (
+            DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS
+        )
+        try:
+            result = ensure_exact_cycle_history_index_direct(
+                store,
+                statement_timeout_ms=DEDICATED_CYCLE_HISTORY_INDEX_STATEMENT_TIMEOUT_MS,
+                progress=progress,
+            )
+        finally:
+            runtime_index_maintenance.CYCLE_HISTORY_POSTGRES_INDEX_STATEMENT_TIMEOUT_MS = (
+                previous_timeout_ms
+            )
+
+        after = cycle_history_exact_index_status(store)
+        ready = bool(result.get("complete")) and bool(after.get("ready"))
         attempted = result.get("attempted")
         rows = attempted if isinstance(attempted, list) else []
         last = dict(rows[-1]) if rows and isinstance(rows[-1], dict) else {}
@@ -234,14 +221,16 @@ def run_index_maintenance() -> int:
                 **attempt_context,
                 "maintenance_result": result,
                 "index_status": after,
-                "ddl_required": last.get("ddl_required"),
+                "ddl_required": last.get("ddl_required", True),
                 "effective_index_name": last.get("effective_index_name"),
                 "message": last.get("message"),
             },
         )
         return 0 if ready else INDEX_NOT_READY_EXIT_CODE
     finally:
-        store.dispose()
+        dispose = getattr(store, "dispose", None)
+        if callable(dispose):
+            dispose()
 
 
 def main() -> int:
@@ -251,7 +240,7 @@ def main() -> int:
         store = None
         try:
             settings = Settings.from_env()
-            store = build_cycle_history_index_runtime_store(settings.evidence_db_path)
+            store = build_evidence_store(settings.evidence_db_path)
             if store is not None:
                 attempt_number, previous_context = _current_attempt_context(store)
                 _record_heartbeat(
@@ -271,7 +260,9 @@ def main() -> int:
             pass
         finally:
             if store is not None:
-                store.dispose()
+                dispose = getattr(store, "dispose", None)
+                if callable(dispose):
+                    dispose()
         return 1
 
 
