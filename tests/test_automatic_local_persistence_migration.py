@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import yaml
 
+import inefficiency_engine.local_persistence_migration_supervisor as migration_supervisor
 from inefficiency_engine.evidence import EvidenceStore, ProviderStatus
 from inefficiency_engine.local_persistence_migration_supervisor import (
     migration_preflight,
@@ -58,9 +61,9 @@ def test_render_stage_one_enables_guard_without_cutover():
     assert "CIE_EVIDENCE_DB_PATH" not in env
 
 
-def test_migration_preflight_requires_same_authoritative_postgres(tmp_path, monkeypatch):
+def test_migration_preflight_requires_same_authoritative_postgres(monkeypatch):
     monkeypatch.setenv("CIE_AUTO_LOCAL_PERSISTENCE_MIGRATION", "true")
-    monkeypatch.setenv("CIE_STORAGE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CIE_STORAGE_ROOT", "/var/data/cie")
     monkeypatch.setenv("DATABASE_URL", "postgresql://authoritative")
     monkeypatch.setenv("CIE_MIGRATION_POSTGRES_URL", "postgresql://other")
     assert migration_preflight() == (False, "migration_source_not_authoritative_database")
@@ -72,11 +75,16 @@ def test_migration_preflight_requires_same_authoritative_postgres(tmp_path, monk
 
 def test_verified_progress_is_restart_safe_and_never_grants_cutover(tmp_path, monkeypatch):
     monkeypatch.setenv("CIE_AUTO_LOCAL_PERSISTENCE_MIGRATION", "true")
-    monkeypatch.setenv("CIE_STORAGE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CIE_STORAGE_ROOT", "/var/data/cie")
     monkeypatch.setenv("DATABASE_URL", "postgresql://same")
     monkeypatch.setenv("CIE_MIGRATION_POSTGRES_URL", "postgresql://same")
     migration = tmp_path / "migration"
     migration.mkdir(parents=True)
+    monkeypatch.setattr(
+        migration_supervisor,
+        "local_storage_paths",
+        lambda: SimpleNamespace(migration=migration),
+    )
     (migration / "postgres-import-progress.json").write_text(json.dumps({
         "state": "verified",
         "completed_at": "2026-08-28T01:00:00+00:00",
@@ -92,7 +100,6 @@ def test_verified_progress_is_restart_safe_and_never_grants_cutover(tmp_path, mo
             }
         },
     }))
-    import threading
 
     run_local_persistence_migration_supervisor(threading.Event())
     payload = migration_status_payload()
