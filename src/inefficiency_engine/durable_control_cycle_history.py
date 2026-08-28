@@ -159,9 +159,37 @@ def _replace_bucket(
 ) -> int:
     """Replace one bucket using a narrow indexed top-N id seek, then fetch payloads."""
 
-    table = factory.store.market_quotes
     selected: list[dict[str, object]] = []
-    if end > start and limit > 0:
+    if (
+        end > start
+        and limit > 0
+        and os.getenv("CIE_MARKET_HISTORY_BACKEND", "").strip().lower() == "parquet"
+    ):
+        from inefficiency_engine.partitioned_market_history import PartitionedMarketHistory
+
+        quotes = PartitionedMarketHistory().range(
+            start=start, end=end - timedelta(microseconds=1), venues=[venue], assets=[asset]
+        )
+        for quote in reversed(quotes[-limit:]):
+            import hashlib
+
+            source_id = int(hashlib.sha256(quote.model_dump_json().encode()).hexdigest()[:15], 16)
+            selected.append(
+                {
+                    "namespace": namespace,
+                    # This id is only a deterministic bucket tie-breaker in the
+                    # compact projection; source lineage remains in payload_json.
+                    "source_id": source_id,
+                    "venue": quote.venue,
+                    "asset": quote.asset.upper(),
+                    "market_kind": quote.market_kind.value,
+                    "day": day.isoformat(),
+                    "observed_at": quote.observed_at.isoformat(),
+                    "payload_json": quote.model_dump_json(),
+                }
+            )
+    elif end > start and limit > 0:
+        table = factory.store.market_quotes
         id_query = (
             select(table.c.id)
             .where(table.c.venue == venue)

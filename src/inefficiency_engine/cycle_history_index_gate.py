@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Any
+import os
+from datetime import datetime, timedelta, timezone
 
 from inefficiency_engine.runtime_index_maintenance import (
     CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
@@ -43,6 +45,27 @@ def cycle_history_exact_index_status(store: Any) -> dict[str, object]:
         _index_name(table_name, columns)
     )
     connection_resilience = _connection_resilience_detail(store)
+
+    if os.getenv("CIE_MARKET_HISTORY_BACKEND", "").strip().lower() == "parquet":
+        from inefficiency_engine.partitioned_market_history import PartitionedMarketHistory
+
+        end = datetime.now(timezone.utc)
+        status = PartitionedMarketHistory().readiness(
+            required_start=end - timedelta(days=180),
+            required_end=end - timedelta(minutes=10),
+        )
+        return {
+            **status,
+            "dialect": dialect_name,
+            "table": "partitioned_market_history",
+            "columns": ["venue", "asset", "observed_at", "lineage_hash"],
+            "canonical_index_name": None,
+            "effective_index_name": None,
+            "planner_usable_verified": False,
+            "filesystem_history_verified": bool(status["ready"]),
+            "allocation_authority": False,
+            **connection_resilience,
+        }
 
     if dialect_name != "postgresql":
         return {

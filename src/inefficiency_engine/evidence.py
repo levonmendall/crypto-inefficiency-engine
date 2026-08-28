@@ -16,6 +16,7 @@ from sqlalchemy.engine import Engine
 from inefficiency_engine.dex_frontier import DexRouteSizeFrontier, summarize_size_frontiers
 from inefficiency_engine.dex_shadow import DexRouteQuoteRecord, DexRouteShadowCycle, summarize_route_cycles
 from inefficiency_engine.models import FundingQuote, MarketQuote, Opportunity, OpportunityExecutability, OrderBookSnapshot, ShadowCycle
+from inefficiency_engine.local_storage import local_storage_paths
 
 
 def _now() -> datetime:
@@ -79,7 +80,12 @@ class PersistedCounts:
 
 
 def evidence_location_from_env(fallback_path: str | Path | None = None) -> str | Path | None:
-    return os.getenv("CIE_DATABASE_URL") or os.getenv("DATABASE_URL") or fallback_path
+    explicit = os.getenv("CIE_DATABASE_URL") or os.getenv("DATABASE_URL")
+    if explicit:
+        return explicit
+    if os.getenv("CIE_STORAGE_ROOT"):
+        return local_storage_paths().metadata_db
+    return fallback_path
 
 
 def build_evidence_store(fallback_path: str | Path | None = None) -> EvidenceStore | None:
@@ -118,6 +124,8 @@ class EvidenceStore:
             with self.engine.begin() as db:
                 db.execute(text("PRAGMA journal_mode=WAL"))
                 db.execute(text("PRAGMA foreign_keys=ON"))
+                db.execute(text("PRAGMA synchronous=FULL"))
+                db.execute(text("PRAGMA busy_timeout=30000"))
 
     def _schema(self) -> None:
         self.scans = Table(
@@ -227,6 +235,12 @@ class EvidenceStore:
                     analysis_config: dict[str, object] | None = None, order_books: list[OrderBookSnapshot] | None = None,
                     executability: list[OpportunityExecutability] | None = None) -> str:
         scan_id = scan_id or uuid.uuid4().hex
+        if os.getenv("CIE_MARKET_HISTORY_BACKEND", "").strip().lower() == "parquet":
+            # Commit immutable history before its relational compatibility
+            # projection. Retry is idempotent by lineage hash.
+            from inefficiency_engine.partitioned_market_history import PartitionedMarketHistory
+
+            PartitionedMarketHistory().append(market_quotes)
         batches = [
             (self.provider_statuses, self._payload_rows(scan_id, providers, lambda x: {"provider": x.provider, "ok": x.ok, "item_count": x.item_count, "error_type": x.error_type})),
             (self.funding_quotes, self._payload_rows(scan_id, funding_quotes, lambda x: {"venue": x.venue, "asset": x.asset})),

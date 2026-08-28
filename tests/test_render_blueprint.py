@@ -6,7 +6,7 @@ import yaml
 def test_render_blueprint_defines_single_paid_combined_runtime():
     blueprint = yaml.safe_load(Path("render.yaml").read_text())
     services = {service["name"]: service for service in blueprint["services"]}
-    databases = {database["name"]: database for database in blueprint["databases"]}
+    databases = {database["name"]: database for database in blueprint.get("databases", [])}
 
     assert set(services) == {"cie-shadow-worker"}
 
@@ -62,13 +62,15 @@ def test_render_blueprint_defines_single_paid_combined_runtime():
     assert runtime_env["CIE_SHADOW_MAX_CANDIDATES"]["value"] == "80"
     assert runtime_env["CIE_DEX_ROUTE_TIER_SHADOW_MAX_CONCURRENCY"]["value"] == "1"
 
-    database_env = runtime_env["DATABASE_URL"]
-    assert database_env["fromDatabase"]["name"] == "cie-evidence"
-    assert database_env["fromDatabase"]["property"] == "connectionString"
-
-    database = databases["cie-evidence"]
-    assert database["plan"] != "free"
-    assert database["ipAllowList"] == []
+    assert databases == {}
+    assert "DATABASE_URL" not in runtime_env
+    assert runtime_env["CIE_STORAGE_ROOT"]["value"] == "/var/data/cie"
+    assert runtime_env["CIE_MARKET_HISTORY_BACKEND"]["value"] == "parquet"
+    assert runtime["disk"] == {
+        "name": "cie-durable-storage",
+        "mountPath": "/var/data/cie",
+        "sizeGB": 50,
+    }
 
 
 def test_free_api_service_is_removed_from_blueprint():
