@@ -95,9 +95,10 @@ def test_retry_verified_helper_accepts_only_already_verified_tables(monkeypatch)
     assert observed["fallback_called"] is True
 
 
-def test_stage_one_runtime_guard_routes_dashboard_projection_to_captured_append_only(monkeypatch):
+def test_stage_one_runtime_guard_routes_proven_append_only_ledgers_to_captured_path(monkeypatch):
     routed = set(migration.RESUMABLE_APPEND_ONLY_TABLES)
     routed.discard("dashboard_projection_snapshots")
+    routed.discard("source_coverage_history")
 
     def fake_migrate(source, target, history, *, progress_path, batch_size, interrupt_after_batches=None):
         return {"state": "verified"}
@@ -109,11 +110,18 @@ def test_stage_one_runtime_guard_routes_dashboard_projection_to_captured_append_
 
     assert "cycle_historical_quotes" in migration.RESUMABLE_APPEND_ONLY_TABLES
     assert "dashboard_projection_snapshots" in migration.RESUMABLE_APPEND_ONLY_TABLES
+    assert "source_coverage_history" in migration.RESUMABLE_APPEND_ONLY_TABLES
 
 
-def test_dashboard_projection_routing_avoids_generic_whole_import_retry(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "table_name",
+    ["dashboard_projection_snapshots", "source_coverage_history"],
+)
+def test_captured_append_only_routing_avoids_generic_whole_import_retry(
+    table_name, tmp_path, monkeypatch
+):
     routed = set(migration.RESUMABLE_APPEND_ONLY_TABLES)
-    routed.add("dashboard_projection_snapshots")
+    routed.add(table_name)
     monkeypatch.setattr(migration, "RESUMABLE_APPEND_ONLY_TABLES", routed)
 
     progress = tmp_path / "progress.json"
@@ -121,8 +129,8 @@ def test_dashboard_projection_routing_avoids_generic_whole_import_retry(tmp_path
         json.dumps(
             {
                 "state": "failed",
-                "current_table": "dashboard_projection_snapshots",
-                "tables": {"dashboard_projection_snapshots": {"verified": False}},
+                "current_table": table_name,
+                "tables": {table_name: {"verified": False}},
             }
         )
     )

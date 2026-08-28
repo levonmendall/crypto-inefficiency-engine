@@ -13,6 +13,7 @@ _STAGE_ONE_MAX_BATCH_SIZE = 256
 _STAGE_ONE_CAPTURED_APPEND_ONLY_TABLES = {
     "cycle_historical_quotes",
     "dashboard_projection_snapshots",
+    "source_coverage_history",
 }
 
 
