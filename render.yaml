@@ -27,7 +27,7 @@ services:
     disk:
       name: cie-durable-storage
       mountPath: /var/data/cie
-      sizeGB: 50
+      sizeGB: 10
     envVars:
       # Stage 1 keeps PostgreSQL authoritative while the new disk is populated and
       # verified. A later, separately reviewed cutover removes this binding.

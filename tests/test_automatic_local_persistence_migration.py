@@ -66,6 +66,8 @@ def test_render_stage_one_enables_guard_without_cutover():
     blueprint = yaml.safe_load(open("render.yaml").read())
     runtime = blueprint["services"][0]
     env = {item["key"]: item for item in runtime["envVars"]}
+    assert runtime["disk"]["mountPath"] == "/var/data/cie"
+    assert runtime["disk"]["sizeGB"] == 10
     assert env["CIE_AUTO_LOCAL_PERSISTENCE_MIGRATION"]["value"] == "true"
     assert env["DATABASE_URL"]["fromDatabase"]["name"] == "cie-evidence"
     assert env["CIE_MIGRATION_POSTGRES_URL"]["fromDatabase"]["name"] == "cie-evidence"
