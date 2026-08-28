@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from sqlalchemy import Engine, Table, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import OperationalError
 
 from inefficiency_engine import postgres_local_migration as base
@@ -16,10 +17,17 @@ from inefficiency_engine import postgres_local_migration as base
 
 SNAPSHOT_MIGRATION_MODE = "captured_primary_key_membership_manifest"
 SNAPSHOT_VERIFICATION_SCOPE = "captured_primary_key_membership"
+MAX_SNAPSHOT_BATCH_SIZE = 256
+SNAPSHOT_STREAM_BUFFER_ROWS = 512
+SNAPSHOT_CAPTURE_PROGRESS_INTERVAL_ROWS = 10_000
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _effective_batch_size(requested: int) -> int:
+    return max(1, min(int(requested), MAX_SNAPSHOT_BATCH_SIZE))
 
 
 def _manifest_path(progress_path: Path, table_name: str) -> Path:
@@ -56,8 +64,8 @@ def _capture_membership_manifest(
     Hash primary keys are deterministic but not insertion ordered. A max hash therefore
     cannot be a stage-one high-water: a later insert can sort behind it. We instead
     persist the exact primary-key membership visible in one repeatable-read snapshot.
-    Once this small manifest is durable, every expensive row copy and verification read
-    can use short-lived connections without chasing writes that arrive afterward.
+    Once this compact manifest is durable, every expensive row copy and verification
+    read can use short-lived connections without chasing writes that arrive afterward.
     """
 
     path = _manifest_path(progress_path, source_table.name)
@@ -81,14 +89,21 @@ def _capture_membership_manifest(
         digest = hashlib.sha256()
         count = 0
         last_key: object | None = None
+        table_report.update(
+            snapshot_phase="capturing_membership",
+            snapshot_manifest_rows_captured=0,
+            last_progress_at=_now(),
+        )
+        base._publish(report, progress_path)
         try:
             with base._open_relational_snapshot(source) as source_db:
                 with source_db.begin():
                     if source.dialect.name == "postgresql":
                         source_db.exec_driver_sql("SET TRANSACTION READ ONLY")
-                    rows = source_db.execution_options(stream_results=True).execute(
-                        select(source_pk).order_by(source_pk)
-                    )
+                    rows = source_db.execution_options(
+                        stream_results=True,
+                        max_row_buffer=SNAPSHOT_STREAM_BUFFER_ROWS,
+                    ).execute(select(source_pk).order_by(source_pk))
                     with temporary.open("wb") as manifest:
                         for row in rows:
                             value = row[0]
@@ -100,6 +115,12 @@ def _capture_membership_manifest(
                             digest.update(encoded)
                             count += 1
                             last_key = value
+                            if count % SNAPSHOT_CAPTURE_PROGRESS_INTERVAL_ROWS == 0:
+                                table_report.update(
+                                    snapshot_manifest_rows_captured=count,
+                                    last_progress_at=_now(),
+                                )
+                                base._publish(report, progress_path)
                         manifest.flush()
                         os.fsync(manifest.fileno())
             os.replace(temporary, path)
@@ -109,8 +130,10 @@ def _capture_membership_manifest(
                 snapshot_manifest_file=path.name,
                 snapshot_max_primary_key=[last_key] if count else None,
                 snapshot_captured_at=_now(),
+                snapshot_manifest_rows_captured=count,
                 snapshot_rows_copied=0,
                 snapshot_rows_verified=0,
+                snapshot_phase="membership_captured",
                 last_progress_at=_now(),
             )
             base._publish(report, progress_path)
@@ -180,6 +203,74 @@ def _rows_for_keys(
         return [dict(row) for row in db.execute(statement).mappings()]
 
 
+def _insert_immutable_rows(
+    target: Engine,
+    table: Table,
+    rows: list[dict[str, object]],
+) -> None:
+    """Insert only missing append-only rows without rewriting existing SQLite pages."""
+    if not rows:
+        return
+    primary_key_names = [column.name for column in base._primary_key(table)]
+    statement = sqlite_insert(table).values(rows).on_conflict_do_nothing(
+        index_elements=primary_key_names
+    )
+    with target.begin() as db:
+        db.execute(statement)
+
+
+def _update_digest(
+    digest: Any,
+    rows: list[dict[str, object]],
+    shared: list[str],
+) -> None:
+    for row in rows:
+        digest.update(
+            json.dumps(
+                [row.get(name) for name in shared],
+                sort_keys=True,
+                default=str,
+            ).encode()
+            + b"\n"
+        )
+
+
+def _verified_captured_target_is_intact(
+    target: Engine,
+    target_table: Table,
+    shared: list[str],
+    target_pk: Any,
+    manifest_path: Path,
+    table_report: dict[str, Any],
+    *,
+    batch_size: int,
+) -> bool:
+    if table_report.get("verified") is not True:
+        return False
+    expected_count = table_report.get("verified_rows")
+    expected_digest = table_report.get("row_digest")
+    if expected_count is None or not expected_digest:
+        return False
+    digest = hashlib.sha256()
+    count = 0
+    for keys in _manifest_batches(manifest_path, batch_size):
+        immutable_keys = tuple(keys)
+        rows = _rows_for_keys(target, target_table, shared, target_pk, immutable_keys)
+        if [row[target_pk.name] for row in rows] != list(immutable_keys):
+            raise RuntimeError(
+                f"verified captured membership missing from local target: {target_table.name}"
+            )
+        _update_digest(digest, rows, shared)
+        count += len(rows)
+    if count != int(expected_count) or digest.hexdigest() != str(expected_digest):
+        raise RuntimeError(
+            f"verified captured snapshot changed for {target_table.name}: "
+            f"expected={expected_count}/{expected_digest} "
+            f"current={count}/{digest.hexdigest()}"
+        )
+    return True
+
+
 def _migrate_captured_append_only_table(
     source: Engine,
     target: Engine,
@@ -201,18 +292,39 @@ def _migrate_captured_append_only_table(
         )
     source_pk = primary_key[0]
     target_pk = target_table.c[source_pk.name]
+    bounded_batch_size = _effective_batch_size(batch_size)
 
-    if table_report.get("verified") is True and base._verified_target_is_intact(
-        target, target_table, shared, table_report
+    if (
+        table_report.get("verified") is True
+        and table_report.get("migration_mode") == SNAPSHOT_MIGRATION_MODE
     ):
-        return completed_batches
+        manifest_path, _, _ = _capture_membership_manifest(
+            source,
+            source_table,
+            source_pk,
+            table_report,
+            report,
+            progress_path,
+        )
+        if _verified_captured_target_is_intact(
+            target,
+            target_table,
+            shared,
+            target_pk,
+            manifest_path,
+            table_report,
+            batch_size=bounded_batch_size,
+        ):
+            return completed_batches
 
     if table_report.get("migration_mode") != SNAPSHOT_MIGRATION_MODE:
-        # The previous implementation tried to converge against the moving live table.
-        # Its target may contain an indeterminate mixture of pre/post-snapshot rows, so
-        # reset only this non-authoritative local table before establishing finite truth.
+        # The legacy implementation tried to converge against the moving live table.
+        # Preserve its non-authoritative local rows instead of DELETEing a potentially
+        # huge SQLite table in one transaction. That destructive reset can churn the
+        # WAL/page cache enough to OOM the combined 2 GiB Render service. Because this
+        # archive is immutable, existing rows are safe to retain: captured membership
+        # is inserted with DO NOTHING and then verified exactly by key/content.
         preserved_retries = int(table_report.get("source_transport_retries") or 0)
-        base._clear_unverified_target(target, target_table)
         path = _manifest_path(progress_path, source_table.name)
         try:
             path.unlink()
@@ -226,12 +338,16 @@ def _migrate_captured_append_only_table(
             verification_scope=SNAPSHOT_VERIFICATION_SCOPE,
             snapshot_rows_copied=0,
             snapshot_rows_verified=0,
+            snapshot_batch_size=bounded_batch_size,
             source_transport_retries=preserved_retries,
-            reset_reason="legacy_live_reconciliation_replaced",
+            legacy_target_preserved=True,
+            upgrade_reason="legacy_live_reconciliation_replaced_without_target_reset",
+            snapshot_phase="preparing_snapshot",
             last_progress_at=_now(),
         )
         base._publish(report, progress_path)
 
+    table_report["snapshot_batch_size"] = bounded_batch_size
     manifest_path, snapshot_count, maximum = _capture_membership_manifest(
         source,
         source_table,
@@ -247,7 +363,9 @@ def _migrate_captured_append_only_table(
             f"invalid snapshot copy checkpoint for {source_table.name}: {copied}/{snapshot_count}"
         )
 
-    for keys in _manifest_batches(manifest_path, batch_size, skip_rows=copied):
+    table_report.update(snapshot_phase="copying_snapshot", last_progress_at=_now())
+    base._publish(report, progress_path)
+    for keys in _manifest_batches(manifest_path, bounded_batch_size, skip_rows=copied):
         immutable_keys = tuple(keys)
         rows = base._source_read_with_retry(
             source,
@@ -265,7 +383,7 @@ def _migrate_captured_append_only_table(
                 f"captured source membership changed for {source_table.name}: "
                 f"expected={list(immutable_keys)!r} observed={observed_keys!r}"
             )
-        base._upsert_rows(target, target_table, rows)
+        _insert_immutable_rows(target, target_table, rows)
         copied += len(rows)
         table_report.update(
             snapshot_rows_copied=copied,
@@ -278,7 +396,10 @@ def _migrate_captured_append_only_table(
             raise InterruptedError("injected migration interruption")
 
     verified = 0
-    for keys in _manifest_batches(manifest_path, batch_size):
+    target_digest = hashlib.sha256()
+    table_report.update(snapshot_phase="verifying_snapshot", last_progress_at=_now())
+    base._publish(report, progress_path)
+    for keys in _manifest_batches(manifest_path, bounded_batch_size):
         immutable_keys = tuple(keys)
         source_rows = base._source_read_with_retry(
             source,
@@ -299,26 +420,15 @@ def _migrate_captured_append_only_table(
             )
         if base._canonical_rows(source_rows, shared) != base._canonical_rows(target_rows, shared):
             raise RuntimeError(f"captured row-content mismatch for {source_table.name}")
+        _update_digest(target_digest, target_rows, shared)
         verified += len(keys)
         table_report.update(snapshot_rows_verified=verified, last_progress_at=_now())
         base._publish(report, progress_path)
 
-    target_count = base._row_count(target, target_table)
-    if target_count != snapshot_count:
+    if verified != snapshot_count:
         raise RuntimeError(
-            f"captured target row-count mismatch for {source_table.name}: "
-            f"snapshot={snapshot_count} target={target_count}"
-        )
-    target_digest_count, target_digest = base._row_digest(
-        target,
-        target_table,
-        shared,
-        high_water=maximum,
-    )
-    if target_digest_count != snapshot_count:
-        raise RuntimeError(
-            f"captured target digest-count mismatch for {source_table.name}: "
-            f"snapshot={snapshot_count} digest_count={target_digest_count}"
+            f"captured verification count mismatch for {source_table.name}: "
+            f"snapshot={snapshot_count} verified={verified}"
         )
 
     table_report.update(
@@ -326,14 +436,16 @@ def _migrate_captured_append_only_table(
         verified_rows=snapshot_count,
         snapshot_rows_copied=snapshot_count,
         snapshot_rows_verified=snapshot_count,
-        row_digest=target_digest,
+        row_digest=target_digest.hexdigest(),
         high_water_primary_key=maximum,
         last_primary_key=maximum,
         verification_scope=SNAPSHOT_VERIFICATION_SCOPE,
+        target_extra_rows_allowed=True,
+        snapshot_phase="verified",
         verified=True,
         last_progress_at=_now(),
     )
-    table_report.pop("reset_reason", None)
+    table_report.pop("upgrade_reason", None)
     base._publish(report, progress_path)
     return completed_batches
 
