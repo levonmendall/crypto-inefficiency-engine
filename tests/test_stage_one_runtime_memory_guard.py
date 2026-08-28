@@ -53,7 +53,10 @@ def test_stage_one_runtime_guard_caps_batches_and_skips_verified_rescans_on_retr
     }
     assert calls[0]["batch_size"] == 256
     assert calls[0]["verified_helper"] is original_verified
-    assert calls[0]["append_helper"] is original_append
+    # Append-only work is routed even on the first call so proven monotonic integer
+    # ledgers can use their finite high-water path; the original handler is restored
+    # immediately after the guarded import returns.
+    assert calls[0]["append_helper"] is not original_append
 
     assert guarded(object(), target, object(), progress_path=object(), batch_size=2_000) == {
         "state": "verified"
@@ -63,7 +66,7 @@ def test_stage_one_runtime_guard_caps_batches_and_skips_verified_rescans_on_retr
     assert calls[1]["append_helper"] is not original_append
     assert target_engine.dispose_calls == 1
 
-    # The retry-only substitutions are always restored after the call.
+    # The temporary substitutions are always restored after each call.
     assert migration._verified_target_is_intact is original_verified
     assert migration._migrate_resumable_append_only_table is original_append
 
@@ -113,6 +116,7 @@ def test_stage_one_runtime_guard_routes_proven_append_only_ledgers_to_captured_p
     assert "dashboard_projection_snapshots" in migration.RESUMABLE_APPEND_ONLY_TABLES
     assert "source_coverage_history" in migration.RESUMABLE_APPEND_ONLY_TABLES
     assert "source_event_observations" in migration.RESUMABLE_APPEND_ONLY_TABLES
+    assert package._STAGE_ONE_MONOTONIC_HIGH_WATER_TABLES == {"source_event_observations"}
 
 
 @pytest.mark.parametrize(
