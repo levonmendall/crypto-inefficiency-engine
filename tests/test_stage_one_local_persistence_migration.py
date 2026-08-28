@@ -63,11 +63,17 @@ def test_stage_one_snapshot_does_not_chase_hash_keys_appended_after_capture(tmp_
     assert cycle_progress["snapshot_rows_copied"] == 1
     assert cycle_progress["snapshot_manifest_sha256"]
 
-    # This key sorts behind the durable copy checkpoint. The old implementation
-    # repeatedly reset and chased it. The repaired stage-one snapshot must remain the
-    # already-captured {b, d}; the later row belongs to the final quiesced catch-up.
+    # This key sorts behind the durable copy checkpoint. The finite stage-one
+    # membership remains {b, d}. A harmless extra local row is deliberately retained
+    # so stage one never needs a destructive whole-table DELETE merely to certify the
+    # captured membership; the final quiesced catch-up owns post-snapshot equivalence.
     with source.begin() as db:
         db.execute(cycle.insert(), {"quote_id": "a", "payload_json": "payload-a"})
+    with target.engine.begin() as db:
+        db.exec_driver_sql(
+            "INSERT INTO cycle_historical_quotes (quote_id, payload_json) VALUES (?, ?)",
+            ("a", "payload-a"),
+        )
 
     result = base_migration.migrate_engines(
         source,
@@ -84,15 +90,20 @@ def test_stage_one_snapshot_does_not_chase_hash_keys_appended_after_capture(tmp_
     assert table_result["snapshot_rows_copied"] == 2
     assert table_result["snapshot_rows_verified"] == 2
     assert table_result["source_rows"] == table_result["verified_rows"] == 2
+    assert table_result["target_extra_rows_allowed"] is True
 
     with target.engine.connect() as db:
         rows = db.exec_driver_sql(
             "SELECT quote_id, payload_json FROM cycle_historical_quotes ORDER BY quote_id"
         ).all()
-    assert rows == [("b", "payload-b"), ("d", "payload-d")]
+    assert rows == [
+        ("a", "payload-a"),
+        ("b", "payload-b"),
+        ("d", "payload-d"),
+    ]
 
 
-def test_stage_one_replaces_legacy_live_reconciliation_progress(tmp_path, monkeypatch):
+def test_stage_one_upgrades_legacy_progress_without_deleting_large_target(tmp_path, monkeypatch):
     source, _cycle = _cycle_source(tmp_path)
     target = EvidenceStore(tmp_path / "target.sqlite3")
     history = PartitionedMarketHistory(tmp_path / "history")
@@ -129,6 +140,15 @@ def test_stage_one_replaces_legacy_live_reconciliation_progress(tmp_path, monkey
         },
     }))
 
+    # The production OOM followed the legacy-upgrade DELETE. Make any regression to
+    # that destructive path fail this test immediately.
+    monkeypatch.setattr(
+        base_migration,
+        "_clear_unverified_target",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stage-one cycle history must not delete the existing target")
+        ),
+    )
     monkeypatch.setattr(
         base_migration,
         "_migrate_resumable_append_only_table",
@@ -148,7 +168,54 @@ def test_stage_one_replaces_legacy_live_reconciliation_progress(tmp_path, monkey
     assert table_result["verification_scope"] == stage_one.SNAPSHOT_VERIFICATION_SCOPE
     assert table_result["snapshot_row_count"] == 2
     assert table_result["verified"] is True
+    assert table_result["legacy_target_preserved"] is True
     assert "reconciliation_pass" not in table_result
+    with target.engine.connect() as db:
+        assert db.exec_driver_sql(
+            "SELECT payload_json FROM cycle_historical_quotes WHERE quote_id = 'b'"
+        ).scalar_one() == "payload-b"
+
+
+def test_stage_one_caps_cycle_history_batches_below_general_migration_default(tmp_path, monkeypatch):
+    source, cycle = _cycle_source(tmp_path)
+    with source.begin() as db:
+        db.execute(
+            cycle.insert(),
+            [
+                {"quote_id": f"k-{index:04d}", "payload_json": f"payload-{index}"}
+                for index in range(stage_one.MAX_SNAPSHOT_BATCH_SIZE + 37)
+            ],
+        )
+
+    target = EvidenceStore(tmp_path / "target.sqlite3")
+    history = PartitionedMarketHistory(tmp_path / "history")
+    progress = tmp_path / "progress.json"
+    observed_batch_sizes: list[int] = []
+    original_rows_for_keys = stage_one._rows_for_keys
+
+    def recording_rows_for_keys(engine, table, shared, primary_key, keys):
+        observed_batch_sizes.append(len(keys))
+        return original_rows_for_keys(engine, table, shared, primary_key, keys)
+
+    monkeypatch.setattr(stage_one, "_rows_for_keys", recording_rows_for_keys)
+    monkeypatch.setattr(
+        base_migration,
+        "_migrate_resumable_append_only_table",
+        stage_one._migrate_captured_append_only_table,
+    )
+
+    result = base_migration.migrate_engines(
+        source,
+        target,
+        history,
+        progress_path=progress,
+        batch_size=base_migration.BATCH_SIZE,
+    )
+    table_result = result["tables"]["cycle_historical_quotes"]
+    assert result["state"] == "verified"
+    assert table_result["snapshot_batch_size"] == stage_one.MAX_SNAPSHOT_BATCH_SIZE
+    assert observed_batch_sizes
+    assert max(observed_batch_sizes) <= stage_one.MAX_SNAPSHOT_BATCH_SIZE
 
 
 def test_public_status_exposes_cycle_snapshot_progress(tmp_path, monkeypatch):
