@@ -45,6 +45,11 @@ services:
         fromDatabase:
           name: cie-evidence
           property: connectionString
+      # Run the one-time stage-one importer only after the public API has bound.
+      # Guard code requires PostgreSQL to remain authoritative and refuses to run
+      # once local SQLite/Parquet authority is enabled.
+      - key: CIE_AUTO_LOCAL_PERSISTENCE_MIGRATION
+        value: "true"
       - key: MALLOC_ARENA_MAX
         value: "2"
       - key: CIE_PAPER_ONLY
