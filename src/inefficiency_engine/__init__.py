@@ -14,6 +14,7 @@ _STAGE_ONE_CAPTURED_APPEND_ONLY_TABLES = {
     "cycle_historical_quotes",
     "dashboard_projection_snapshots",
     "source_coverage_history",
+    "source_event_observations",
 }
 
 
