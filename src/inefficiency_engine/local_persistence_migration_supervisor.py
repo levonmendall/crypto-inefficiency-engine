@@ -23,8 +23,18 @@ AUTO_MIGRATION_ENV = "CIE_AUTO_LOCAL_PERSISTENCE_MIGRATION"
 MIGRATION_COMMAND = [sys.executable, "-m", "inefficiency_engine.postgres_local_migration"]
 API_BIND_WAIT_SECONDS = 180.0
 TRUE_VALUES = {"1", "true", "yes", "on"}
+MAX_TRANSIENT_SOURCE_RETRIES = 3
+TRANSIENT_SOURCE_RETRY_DELAYS_SECONDS = (1.0, 3.0, 8.0)
 _URL_CREDENTIALS = re.compile(
     r"(?i)\b(postgres(?:ql)?(?:\+psycopg)?://)([^@\s]+)@"
+)
+_TRANSIENT_SOURCE_FAILURE_MARKERS = (
+    "unexpected eof while reading",
+    "consuming input failed",
+    "server closed the connection unexpectedly",
+    "connection reset by peer",
+    "ssl connection has been closed unexpectedly",
+    "terminating connection due to administrator command",
 )
 
 
@@ -98,6 +108,16 @@ def _bounded_public_error(value: object) -> str | None:
         return None
     text = _URL_CREDENTIALS.sub(r"\1***@", text)
     return text[:600]
+
+
+def _is_transient_source_disconnect(progress: dict[str, Any]) -> bool:
+    """Classify only transport-level PostgreSQL failures as retryable."""
+
+    error_type = str(progress.get("error_type") or "").lower()
+    error = str(progress.get("error") or "").lower()
+    if "operationalerror" not in error_type and "psycopg.operationalerror" not in error:
+        return False
+    return any(marker in error for marker in _TRANSIENT_SOURCE_FAILURE_MARKERS)
 
 
 def _publish_status(payload: dict[str, object]) -> None:
@@ -188,7 +208,7 @@ def migration_status_payload() -> dict[str, object]:
         1 for value in tables.values()
         if isinstance(value, dict) and value.get("verified") is True
     )
-    current_table = next(
+    current_table = progress.get("current_table") or next(
         (
             name for name, value in tables.items()
             if not (isinstance(value, dict) and value.get("verified") is True)
@@ -203,6 +223,8 @@ def migration_status_payload() -> dict[str, object]:
         "supervisor_started_at": supervisor.get("started_at"),
         "supervisor_completed_at": supervisor.get("completed_at"),
         "child_return_code": supervisor.get("child_return_code"),
+        "supervisor_attempt": supervisor.get("attempt"),
+        "source_disconnect_retries": supervisor.get("source_disconnect_retries", 0),
         "progress_state": progress.get("state"),
         "progress_started_at": progress.get("started_at"),
         "progress_completed_at": progress.get("completed_at"),
@@ -323,38 +345,69 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
         child_env = os.environ.copy()
         child_env["CIE_MIGRATION_POSTGRES_URL"] = _migration_source_url()
+        source_disconnect_retries = 0
+        attempt = 0
+
         with stdout_path.open("ab") as stdout_file, stderr_path.open("ab") as stderr_file:
-            child = subprocess.Popen(
-                MIGRATION_COMMAND,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                env=child_env,
-                start_new_session=True,
-            )
-            _publish_status(
-                {
-                    "state": "running",
-                    "reason": None,
-                    "started_at": started_at,
-                    "child_pid": child.pid,
-                    "observed_at": _now(),
-                    "postgresql_authoritative": True,
-                    "cutover_ready": False,
-                    "paper_only": True,
-                    "live_execution_authority": False,
-                }
-            )
-            while child.poll() is None:
-                if stop_event.wait(1.0):
-                    _terminate_child(child)
+            while True:
+                attempt += 1
+                child = subprocess.Popen(
+                    MIGRATION_COMMAND,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    env=child_env,
+                    start_new_session=True,
+                )
+                _publish_status(
+                    {
+                        "state": "running",
+                        "reason": None,
+                        "started_at": started_at,
+                        "child_pid": child.pid,
+                        "attempt": attempt,
+                        "source_disconnect_retries": source_disconnect_retries,
+                        "observed_at": _now(),
+                        "postgresql_authoritative": True,
+                        "cutover_ready": False,
+                        "paper_only": True,
+                        "live_execution_authority": False,
+                    }
+                )
+                while child.poll() is None:
+                    if stop_event.wait(1.0):
+                        _terminate_child(child)
+                        _publish_status(
+                            {
+                                "state": "interrupted",
+                                "reason": "service_shutdown",
+                                "started_at": started_at,
+                                "completed_at": _now(),
+                                "child_return_code": child.returncode,
+                                "attempt": attempt,
+                                "source_disconnect_retries": source_disconnect_retries,
+                                "postgresql_authoritative": True,
+                                "cutover_ready": False,
+                                "paper_only": True,
+                                "live_execution_authority": False,
+                            }
+                        )
+                        return
+
+                return_code = int(child.returncode or 0)
+                progress = _read_json(progress_path)
+                verified = return_code == 0 and progress.get("state") == "verified"
+                if verified:
                     _publish_status(
                         {
-                            "state": "interrupted",
-                            "reason": "service_shutdown",
+                            "state": "verified",
+                            "reason": "snapshot_verification_complete",
                             "started_at": started_at,
                             "completed_at": _now(),
-                            "child_return_code": child.returncode,
+                            "child_return_code": return_code,
+                            "attempt": attempt,
+                            "source_disconnect_retries": source_disconnect_retries,
+                            "progress_state": progress.get("state"),
                             "postgresql_authoritative": True,
                             "cutover_ready": False,
                             "paper_only": True,
@@ -363,24 +416,68 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
                     )
                     return
 
-            return_code = int(child.returncode or 0)
+                if (
+                    return_code != 0
+                    and _is_transient_source_disconnect(progress)
+                    and source_disconnect_retries < MAX_TRANSIENT_SOURCE_RETRIES
+                ):
+                    delay = TRANSIENT_SOURCE_RETRY_DELAYS_SECONDS[
+                        min(source_disconnect_retries, len(TRANSIENT_SOURCE_RETRY_DELAYS_SECONDS) - 1)
+                    ]
+                    source_disconnect_retries += 1
+                    _publish_status(
+                        {
+                            "state": "retry_wait",
+                            "reason": "transient_source_disconnect",
+                            "started_at": started_at,
+                            "child_return_code": return_code,
+                            "attempt": attempt,
+                            "source_disconnect_retries": source_disconnect_retries,
+                            "retry_after_seconds": delay,
+                            "progress_state": progress.get("state"),
+                            "observed_at": _now(),
+                            "postgresql_authoritative": True,
+                            "cutover_ready": False,
+                            "paper_only": True,
+                            "live_execution_authority": False,
+                        }
+                    )
+                    if stop_event.wait(delay):
+                        _publish_status(
+                            {
+                                "state": "interrupted",
+                                "reason": "service_shutdown",
+                                "started_at": started_at,
+                                "completed_at": _now(),
+                                "child_return_code": return_code,
+                                "attempt": attempt,
+                                "source_disconnect_retries": source_disconnect_retries,
+                                "postgresql_authoritative": True,
+                                "cutover_ready": False,
+                                "paper_only": True,
+                                "live_execution_authority": False,
+                            }
+                        )
+                        return
+                    continue
 
-        progress = _read_json(progress_path)
-        verified = return_code == 0 and progress.get("state") == "verified"
-        _publish_status(
-            {
-                "state": "verified" if verified else "failed",
-                "reason": "snapshot_verification_complete" if verified else "migration_child_failed",
-                "started_at": started_at,
-                "completed_at": _now(),
-                "child_return_code": return_code,
-                "progress_state": progress.get("state"),
-                "postgresql_authoritative": True,
-                "cutover_ready": False,
-                "paper_only": True,
-                "live_execution_authority": False,
-            }
-        )
+                _publish_status(
+                    {
+                        "state": "failed",
+                        "reason": "migration_child_failed",
+                        "started_at": started_at,
+                        "completed_at": _now(),
+                        "child_return_code": return_code,
+                        "attempt": attempt,
+                        "source_disconnect_retries": source_disconnect_retries,
+                        "progress_state": progress.get("state"),
+                        "postgresql_authoritative": True,
+                        "cutover_ready": False,
+                        "paper_only": True,
+                        "live_execution_authority": False,
+                    }
+                )
+                return
 
 
 __all__ = [
