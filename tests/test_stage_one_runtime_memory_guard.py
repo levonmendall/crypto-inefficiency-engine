@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
 import inefficiency_engine as package
 import inefficiency_engine.postgres_local_migration as migration
+import inefficiency_engine.stage_one_local_persistence_migration as stage_one
 
 
 class _DisposableEngine:
@@ -91,6 +93,41 @@ def test_retry_verified_helper_accepts_only_already_verified_tables(monkeypatch)
     assert observed["verified_result"] is True
     assert observed["unverified_result"] is False
     assert observed["fallback_called"] is True
+
+
+def test_stage_one_runtime_guard_routes_dashboard_projection_to_captured_append_only(monkeypatch):
+    routed = set(migration.RESUMABLE_APPEND_ONLY_TABLES)
+    routed.discard("dashboard_projection_snapshots")
+
+    def fake_migrate(source, target, history, *, progress_path, batch_size, interrupt_after_batches=None):
+        return {"state": "verified"}
+
+    monkeypatch.setattr(migration, "RESUMABLE_APPEND_ONLY_TABLES", routed)
+    monkeypatch.setattr(migration, "migrate_engines", fake_migrate)
+
+    package._install_stage_one_runtime_memory_guard()
+
+    assert "cycle_historical_quotes" in migration.RESUMABLE_APPEND_ONLY_TABLES
+    assert "dashboard_projection_snapshots" in migration.RESUMABLE_APPEND_ONLY_TABLES
+
+
+def test_dashboard_projection_routing_avoids_generic_whole_import_retry(tmp_path, monkeypatch):
+    routed = set(migration.RESUMABLE_APPEND_ONLY_TABLES)
+    routed.add("dashboard_projection_snapshots")
+    monkeypatch.setattr(migration, "RESUMABLE_APPEND_ONLY_TABLES", routed)
+
+    progress = tmp_path / "progress.json"
+    progress.write_text(
+        json.dumps(
+            {
+                "state": "failed",
+                "current_table": "dashboard_projection_snapshots",
+                "tables": {"dashboard_projection_snapshots": {"verified": False}},
+            }
+        )
+    )
+
+    assert stage_one._current_unverified_relational_table(progress) is None
 
 
 def test_stage_one_module_detection_uses_original_python_argv(monkeypatch):
