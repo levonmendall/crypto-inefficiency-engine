@@ -10,6 +10,10 @@ __version__ = "3.8.3"
 
 _STAGE_ONE_MODULE = "inefficiency_engine.stage_one_local_persistence_migration"
 _STAGE_ONE_MAX_BATCH_SIZE = 256
+_STAGE_ONE_CAPTURED_APPEND_ONLY_TABLES = {
+    "cycle_historical_quotes",
+    "dashboard_projection_snapshots",
+}
 
 
 def _running_stage_one_migration() -> bool:
@@ -22,13 +26,20 @@ def _install_stage_one_runtime_memory_guard() -> None:
     """Keep Stage 1 retries inside the 2 GiB Render cgroup memory budget.
 
     The migration-specific entrypoint already owns the retry semantics. This early hook
-    only bounds each relational batch and makes a *same-process* retry skip integrity
+    bounds each relational batch, routes proven append-only Stage 1 ledgers through the
+    finite captured-membership path, and makes a *same-process* retry skip integrity
     rescans of tables that the immediately preceding attempt already verified. A fresh
     migration process still performs every full integrity check, so restart behavior
     remains fail-closed.
     """
 
     from inefficiency_engine import postgres_local_migration as migration
+
+    # These tables have immutable INSERT-only writers. Stage 1 therefore does not need
+    # a long-lived repeatable-read connection for their full payload copy. The
+    # migration entrypoint replaces the append-only handler with the finite captured
+    # membership implementation after this package hook runs.
+    migration.RESUMABLE_APPEND_ONLY_TABLES.update(_STAGE_ONE_CAPTURED_APPEND_ONLY_TABLES)
 
     current = migration.migrate_engines
     if getattr(current, "_cie_stage_one_memory_guard", False):
