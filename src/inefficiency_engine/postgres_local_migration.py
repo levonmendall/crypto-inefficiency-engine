@@ -220,7 +220,6 @@ def _portable_column_type(column: Any):
         return Boolean()
     if python_type is int:
         if column.primary_key and len(column.table.primary_key.columns) == 1:
-            # SQLite rowid autoincrement requires the exact INTEGER affinity.
             return Integer()
         return BigInteger() if isinstance(column.type, BigInteger) else Integer()
     if python_type is float:
@@ -233,13 +232,7 @@ def _portable_column_type(column: Any):
 
 
 def bootstrap_local_schema_from_source(source_metadata: MetaData, target_engine: Engine) -> set[str]:
-    """Create every reflected production table before copying any canonical rows.
-
-    Runtime modules remain the owners of their models. This bootstrap mirrors the
-    already-deployed schema with portable SQLite affinities so supplemental source,
-    control, history, portfolio and reconciliation tables cannot be omitted merely
-    because ``EvidenceStore`` itself does not declare them.
-    """
+    """Create every reflected production table before copying any canonical rows."""
 
     target_metadata = MetaData()
     for source_table in source_metadata.sorted_tables:
@@ -330,8 +323,6 @@ def _verified_target_is_intact(
 
 
 def _clear_unverified_target(target: Engine, table: Table) -> None:
-    """Discard only an unverified local copy before taking a fresh source snapshot."""
-
     with target.begin() as db:
         db.execute(table.delete())
 
@@ -355,13 +346,13 @@ def migrate_engines(
     """Run a restart-safe import verified to immutable per-table snapshots.
 
     PostgreSQL remains authoritative during stage one. Append-only ``market_quotes``
-    keeps its durable integer high-water and can resume by keyset. Every other table
-    is copied from one repeatable-read PostgreSQL transaction, so in-place checkpoint
-    updates and non-monotonic/hash primary keys cannot move underneath verification.
-    An interrupted relational table is recopied from the beginning of a fresh snapshot;
-    already-verified local snapshots are retained and their local digests are rechecked.
-    A later cutover must still quiesce writers and perform a final catch-up before
-    authority can transfer.
+    keeps its durable integer high-water and can resume or advance by keyset. Every
+    other table is copied from one repeatable-read PostgreSQL transaction, so in-place
+    checkpoint updates and non-monotonic/hash primary keys cannot move underneath
+    copy/verification. An interrupted relational table is recopied from the beginning
+    of a fresh snapshot; already-verified local snapshots are retained and their local
+    digests are rechecked. A later cutover must still quiesce writers and perform a
+    final catch-up before authority can transfer.
     """
 
     source_metadata, target_metadata = MetaData(), MetaData()
@@ -395,17 +386,32 @@ def migrate_engines(
             _publish(report, progress_path)
 
             if name == "market_quotes":
+                checkpoint = table_report.get("last_primary_key")
                 if table_report.get("verified") is True:
                     _verify_existing_market_destination(table_report, history)
                     if table_report.get("verified") is True:
-                        continue
-                checkpoint = table_report.get("last_primary_key")
-                if "high_water_primary_key" in table_report:
+                        latest_high_water = _capture_high_water(source, source_table)
+                        stored_high_water = table_report.get("high_water_primary_key")
+                        if latest_high_water == stored_high_water:
+                            continue
+                        table_report.update(
+                            verified=False,
+                            high_water_primary_key=latest_high_water,
+                        )
+                        table_report.pop("destination_inventory", None)
+                        _publish(report, progress_path)
+                        high_water = latest_high_water
+                    else:
+                        high_water = _capture_high_water(source, source_table)
+                        table_report["high_water_primary_key"] = high_water
+                        _publish(report, progress_path)
+                elif "high_water_primary_key" in table_report:
                     high_water = table_report.get("high_water_primary_key")
                 else:
                     high_water = _capture_high_water(source, source_table)
                     table_report["high_water_primary_key"] = high_water
                     _publish(report, progress_path)
+
                 source_inventory = _source_market_inventory(
                     source, source_table, high_water=high_water
                 )
