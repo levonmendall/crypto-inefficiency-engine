@@ -37,6 +37,8 @@ from inefficiency_engine.partitioned_market_history import PartitionedMarketHist
 
 BATCH_SIZE = 2_000
 SKIPPED_RUNTIME_TABLES = {"cycle_history_index_runtime_state"}
+RESUMABLE_APPEND_ONLY_TABLES = {"cycle_historical_quotes"}
+MAX_APPEND_ONLY_RECONCILIATION_PASSES = 8
 
 
 def _progress_path() -> Path:
@@ -211,7 +213,6 @@ def _verify_existing_market_destination(
 
 def _portable_column_type(column: Any):
     """Map reflected PostgreSQL types to the smallest lossless SQLite affinity."""
-
     try:
         python_type = column.type.python_type
     except (AttributeError, NotImplementedError):
@@ -233,7 +234,6 @@ def _portable_column_type(column: Any):
 
 def bootstrap_local_schema_from_source(source_metadata: MetaData, target_engine: Engine) -> set[str]:
     """Create every reflected production table before copying any canonical rows."""
-
     target_metadata = MetaData()
     for source_table in source_metadata.sorted_tables:
         if source_table.name in SKIPPED_RUNTIME_TABLES:
@@ -334,6 +334,181 @@ def _open_relational_snapshot(source: Engine) -> Connection:
     return db
 
 
+def _row_count(engine: Engine, table: Table) -> int:
+    with engine.connect() as db:
+        return int(db.execute(select(func.count()).select_from(table)).scalar_one())
+
+
+def _canonical_rows(rows: list[dict[str, object]], columns: list[str]) -> list[str]:
+    return [
+        json.dumps([row.get(name) for name in columns], sort_keys=True, default=str)
+        for row in rows
+    ]
+
+
+def _migrate_resumable_append_only_table(
+    source: Engine,
+    target: Engine,
+    source_table: Table,
+    target_table: Table,
+    shared: list[str],
+    table_report: dict[str, Any],
+    report: dict[str, Any],
+    progress_path: Path,
+    *,
+    batch_size: int,
+    completed_batches: int,
+    interrupt_after_batches: int | None,
+) -> int:
+    """Copy an immutable append-only archive without a long-lived source session.
+
+    ``cycle_historical_quotes`` uses a SHA-256 quote_id and INSERT ... ON CONFLICT DO
+    NOTHING, so its rows are immutable but new identifiers are not monotonic. Durable
+    keyset progress may therefore resume safely after transport failure, while a final
+    full reconciliation pass catches identifiers inserted behind an earlier checkpoint.
+    Exact source/target row content is then compared in bounded batches. No source
+    connection is held for the duration of the archive copy or verification.
+    """
+    primary_key = _primary_key(source_table)
+    if len(primary_key) != 1:
+        raise RuntimeError(f"resumable append-only migration requires one primary key: {source_table.name}")
+    source_pk = primary_key[0]
+    target_pk = target_table.c[source_pk.name]
+
+    if _verified_target_is_intact(target, target_table, shared, table_report):
+        return completed_batches
+
+    checkpoint = table_report.get("last_primary_key")
+    reconciliation_pass = max(1, int(table_report.get("reconciliation_pass") or 1))
+    table_report.update(
+        destination="sqlite",
+        verified=False,
+        migration_mode="resumable_append_only_reconciliation",
+        verification_scope="append_only_exact_content_reconciliation",
+    )
+    table_report.pop("restart_from_beginning", None)
+    table_report.pop("high_water_primary_key", None)
+    _publish(report, progress_path)
+
+    base_statement = select(*(source_table.c[name] for name in shared)).order_by(source_pk).limit(batch_size)
+
+    while reconciliation_pass <= MAX_APPEND_ONLY_RECONCILIATION_PASSES:
+        table_report["reconciliation_pass"] = reconciliation_pass
+        table_report["last_primary_key"] = checkpoint
+        _publish(report, progress_path)
+
+        while True:
+            with source.connect() as db:
+                rows = [
+                    dict(row)
+                    for row in db.execute(
+                        _after_checkpoint(base_statement, primary_key, checkpoint)
+                    ).mappings()
+                ]
+            if not rows:
+                break
+            _upsert_rows(target, target_table, rows)
+            checkpoint = [rows[-1][source_pk.name]]
+            table_report.update(last_primary_key=checkpoint, copied_rows_at_least=_row_count(target, target_table))
+            _publish(report, progress_path)
+            completed_batches += 1
+            if interrupt_after_batches == completed_batches:
+                raise InterruptedError("injected migration interruption")
+
+        source_count = _row_count(source, source_table)
+        target_count = _row_count(target, target_table)
+        table_report.update(source_rows_observed=source_count, target_rows_observed=target_count)
+        _publish(report, progress_path)
+
+        if source_count != target_count:
+            reconciliation_pass += 1
+            checkpoint = None
+            table_report.update(
+                reconciliation_pass=reconciliation_pass,
+                last_primary_key=None,
+                reconciliation_reason="source_target_count_not_converged",
+            )
+            _publish(report, progress_path)
+            continue
+
+        verify_checkpoint: list[object] | None = None
+        verified_count = 0
+        content_mismatch = False
+        while True:
+            with source.connect() as db:
+                source_rows = [
+                    dict(row)
+                    for row in db.execute(
+                        _after_checkpoint(base_statement, primary_key, verify_checkpoint)
+                    ).mappings()
+                ]
+            if not source_rows:
+                break
+            keys = [row[source_pk.name] for row in source_rows]
+            target_statement = (
+                select(*(target_table.c[name] for name in shared))
+                .where(target_pk.in_(keys))
+                .order_by(target_pk)
+            )
+            with target.connect() as db:
+                target_rows = [dict(row) for row in db.execute(target_statement).mappings()]
+            if _canonical_rows(source_rows, shared) != _canonical_rows(target_rows, shared):
+                content_mismatch = True
+                break
+            verified_count += len(source_rows)
+            verify_checkpoint = [source_rows[-1][source_pk.name]]
+
+        source_count_after = _row_count(source, source_table)
+        target_count_after = _row_count(target, target_table)
+        if (
+            content_mismatch
+            or verified_count != source_count_after
+            or source_count_after != target_count_after
+        ):
+            reconciliation_pass += 1
+            checkpoint = None
+            table_report.update(
+                reconciliation_pass=reconciliation_pass,
+                last_primary_key=None,
+                reconciliation_reason=(
+                    "row_content_not_converged" if content_mismatch
+                    else "source_changed_during_exact_verification"
+                ),
+            )
+            _publish(report, progress_path)
+            continue
+
+        high_water = _capture_high_water(target, target_table)
+        target_digest_count, target_digest = _row_digest(
+            target,
+            target_table,
+            shared,
+            high_water=high_water,
+        )
+        if target_digest_count != target_count_after:
+            raise RuntimeError(
+                f"append-only target digest count mismatch for {source_table.name}: "
+                f"count={target_count_after} digest_count={target_digest_count}"
+            )
+        table_report.pop("reconciliation_reason", None)
+        table_report.update(
+            source_rows=source_count_after,
+            verified_rows=target_count_after,
+            row_digest=target_digest,
+            high_water_primary_key=high_water,
+            last_primary_key=high_water,
+            verification_scope="append_only_exact_content_reconciliation",
+            verified=True,
+        )
+        _publish(report, progress_path)
+        return completed_batches
+
+    raise RuntimeError(
+        f"append-only reconciliation did not converge for {source_table.name} after "
+        f"{MAX_APPEND_ONLY_RECONCILIATION_PASSES} passes"
+    )
+
+
 def migrate_engines(
     source: Engine,
     target: EvidenceStore,
@@ -343,18 +518,14 @@ def migrate_engines(
     batch_size: int = BATCH_SIZE,
     interrupt_after_batches: int | None = None,
 ) -> dict[str, object]:
-    """Run a restart-safe import verified to immutable per-table snapshots.
+    """Run a restart-safe import verified to deterministic Stage 1 snapshots.
 
-    PostgreSQL remains authoritative during stage one. Append-only ``market_quotes``
-    keeps its durable integer high-water and can resume or advance by keyset. Every
-    other table is copied from one repeatable-read PostgreSQL transaction, so in-place
-    checkpoint updates and non-monotonic/hash primary keys cannot move underneath
-    copy/verification. An interrupted relational table is recopied from the beginning
-    of a fresh snapshot; already-verified local snapshots are retained and their local
-    digests are rechecked. A later cutover must still quiesce writers and perform a
-    final catch-up before authority can transfer.
+    Mutable relational tables keep the repeatable-read/read-only snapshot semantics.
+    ``cycle_historical_quotes`` is separately proven append-only and is copied with
+    durable, short-lived keyset batches so a PostgreSQL transport drop no longer
+    discards minutes of completed archive work. ``market_quotes`` retains its existing
+    integer high-water Parquet migration. PostgreSQL remains authoritative throughout.
     """
-
     source_metadata, target_metadata = MetaData(), MetaData()
     source_metadata.reflect(source)
     bootstrap_local_schema_from_source(source_metadata, target.engine)
@@ -394,10 +565,7 @@ def migrate_engines(
                         stored_high_water = table_report.get("high_water_primary_key")
                         if latest_high_water == stored_high_water:
                             continue
-                        table_report.update(
-                            verified=False,
-                            high_water_primary_key=latest_high_water,
-                        )
+                        table_report.update(verified=False, high_water_primary_key=latest_high_water)
                         table_report.pop("destination_inventory", None)
                         _publish(report, progress_path)
                         high_water = latest_high_water
@@ -412,9 +580,7 @@ def migrate_engines(
                     table_report["high_water_primary_key"] = high_water
                     _publish(report, progress_path)
 
-                source_inventory = _source_market_inventory(
-                    source, source_table, high_water=high_water
-                )
+                source_inventory = _source_market_inventory(source, source_table, high_water=high_water)
                 statement = select(
                     source_table.c.id,
                     source_table.c.lineage_hash,
@@ -455,6 +621,22 @@ def migrate_engines(
             shared = [column.name for column in source_table.columns if column.name in target_table.c]
             if any(column.name not in shared for column in primary_key):
                 raise RuntimeError(f"target schema missing primary key columns for {name}")
+
+            if name in RESUMABLE_APPEND_ONLY_TABLES:
+                completed_batches = _migrate_resumable_append_only_table(
+                    source,
+                    target.engine,
+                    source_table,
+                    target_table,
+                    shared,
+                    table_report,
+                    report,
+                    progress_path,
+                    batch_size=batch_size,
+                    completed_batches=completed_batches,
+                    interrupt_after_batches=interrupt_after_batches,
+                )
+                continue
 
             if _verified_target_is_intact(target.engine, target_table, shared, table_report):
                 continue
@@ -528,6 +710,7 @@ def migrate_engines(
         report.update(state="failed", error_type=type(exc).__name__, error=str(exc))
         _publish(report, progress_path)
         raise
+
     report.pop("error", None)
     report.pop("error_type", None)
     report.update(

@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import inspect, insert
+from sqlalchemy import Column, MetaData, Table, Text, create_engine, inspect, insert
 
 from inefficiency_engine.durable_control_cache import ensure_durable_control_cache_schema
 from inefficiency_engine.durable_control_cycle_history import ensure_durable_control_cycle_history_schema
@@ -150,3 +150,61 @@ def test_migration_fails_closed_when_a_committed_partition_is_missing(tmp_path):
     failed = json.loads(progress.read_text())
     assert failed["state"] == "failed"
     assert failed["forward_evidence_granted"] is False
+
+
+def test_cycle_history_resume_keeps_copied_rows_and_reconciles_hash_ids_inserted_behind_checkpoint(tmp_path):
+    source = create_engine(f"sqlite:///{tmp_path / 'cycle-source.sqlite3'}")
+    metadata = MetaData()
+    cycle = Table(
+        "cycle_historical_quotes",
+        metadata,
+        Column("quote_id", Text, primary_key=True),
+        Column("payload_json", Text, nullable=False),
+    )
+    metadata.create_all(source)
+    with source.begin() as db:
+        db.execute(cycle.insert(), [
+            {"quote_id": "b", "payload_json": "payload-b"},
+            {"quote_id": "d", "payload_json": "payload-d"},
+        ])
+
+    target = EvidenceStore(tmp_path / "cycle-target.sqlite3")
+    history = PartitionedMarketHistory(tmp_path / "cycle-history")
+    progress = tmp_path / "cycle-progress.json"
+
+    with pytest.raises(InterruptedError):
+        migrate_engines(
+            source,
+            target,
+            history,
+            progress_path=progress,
+            batch_size=1,
+            interrupt_after_batches=1,
+        )
+
+    interrupted = json.loads(progress.read_text())
+    cycle_progress = interrupted["tables"]["cycle_historical_quotes"]
+    assert cycle_progress["last_primary_key"] == ["b"]
+    assert cycle_progress["migration_mode"] == "resumable_append_only_reconciliation"
+    with target.engine.connect() as db:
+        assert db.exec_driver_sql("SELECT COUNT(*) FROM cycle_historical_quotes").scalar_one() == 1
+
+    # SHA-derived quote IDs are non-monotonic. Simulate a live append that sorts
+    # behind the durable checkpoint. The resumed tail pass misses it by design, then
+    # count/content reconciliation must reset to the beginning without clearing the
+    # already-copied target and converge exactly.
+    with source.begin() as db:
+        db.execute(cycle.insert(), {"quote_id": "a", "payload_json": "payload-a"})
+
+    result = migrate_engines(source, target, history, progress_path=progress, batch_size=1)
+    table_result = result["tables"]["cycle_historical_quotes"]
+    assert result["state"] == "verified"
+    assert table_result["verified"] is True
+    assert table_result["verification_scope"] == "append_only_exact_content_reconciliation"
+    assert table_result["reconciliation_pass"] >= 2
+    assert table_result["source_rows"] == table_result["verified_rows"] == 3
+    with target.engine.connect() as db:
+        rows = db.exec_driver_sql(
+            "SELECT quote_id, payload_json FROM cycle_historical_quotes ORDER BY quote_id"
+        ).all()
+    assert rows == [("a", "payload-a"), ("b", "payload-b"), ("d", "payload-d")]
