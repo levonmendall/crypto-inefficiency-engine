@@ -15,8 +15,12 @@ _STAGE_ONE_CAPTURED_APPEND_ONLY_TABLES = {
     "dashboard_projection_snapshots",
     "source_coverage_history",
     "source_event_observations",
+    "worker_heartbeats",
 }
-_STAGE_ONE_MONOTONIC_HIGH_WATER_TABLES = {"source_event_observations"}
+_STAGE_ONE_MONOTONIC_HIGH_WATER_TABLES = {
+    "source_event_observations",
+    "worker_heartbeats",
+}
 
 
 def _running_stage_one_migration() -> bool:
