@@ -50,8 +50,11 @@ No application code uses PostgreSQL advisory locks. PostgreSQL planner/index ass
 3. A writer takes a manifest `BEGIN IMMEDIATE` reservation, writes a hidden temporary Parquet file, fsyncs it, atomically renames it, fsyncs the directory, and commits manifest visibility.
 4. Readers consult only committed manifest rows and never glob temporary/orphan files.
 5. Range results are ordered by `observed_at` and durable monotonic history ID, preserving the former `(observed_at, id)` tie-break behavior.
-6. Certification checks real partition count, row count, earliest coverage and latest coverage. Directory existence alone can never certify history.
-7. Historical imports do not create scans, outcomes, candidates, forward samples, or allocation authority.
+6. Certification physically opens every committed Parquet file and verifies its checksum, exact schema, row count, recorded range, partition identity/date, and manifest lineage references. Missing or corrupt files fail closed.
+7. Coverage is evaluated independently for every required venue/asset identity. The full required window must have no start, end, or internal gap greater than 12 hours; global earliest/latest timestamps cannot certify a lane.
+8. The importer preserves source lineage hashes, compares the sorted distinct-lineage digest/count, identity scope, and observed-time coverage against the physically verified destination, and reports source row count separately from intentional lineage deduplication.
+9. Every relational table is copied in foreign-key dependency order using deterministic primary-key keyset pagination. The atomic progress file records each committed last primary key, so restarts resume after the durable checkpoint rather than returning to offset zero.
+10. Historical imports do not create forward outcomes, candidates, forward samples, or allocation authority.
 
 ## Staged cutover
 

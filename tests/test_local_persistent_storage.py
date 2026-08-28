@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -71,3 +72,48 @@ def test_partition_readiness_is_fail_closed_for_empty_storage(tmp_path):
     assert status["ready"] is False
     assert status["reason"] == "partition_coverage_incomplete"
     assert status["live_execution_authority"] is False
+
+
+def test_readiness_requires_continuous_coverage_for_every_required_identity(tmp_path):
+    history = PartitionedMarketHistory(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    history.append([_quote(1, start), _quote(2, start + timedelta(days=2))])
+    status = history.readiness(
+        required_start=start,
+        required_end=start + timedelta(days=2),
+        required_identities=[("coinbase", "BTC"), ("kraken", "ETH")],
+        max_gap=timedelta(hours=12),
+    )
+    assert status["ready"] is False
+    assert "continuity_gap:coinbase|BTC" in status["errors"]
+    assert "required_identity_missing:kraken|ETH" in status["errors"]
+
+
+def test_readiness_physically_verifies_missing_corrupt_and_manifest_mismatch(tmp_path):
+    observed = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    history = PartitionedMarketHistory(tmp_path)
+    history.append([_quote(1, observed)])
+    with sqlite3.connect(history.manifest_path) as db:
+        relative = db.execute("SELECT path FROM partitions").fetchone()[0]
+    path = history.root / relative
+    path.write_bytes(b"corrupt")
+    status = history.readiness(required_identities=[("coinbase", "BTC")])
+    assert status["ready"] is False
+    assert any(error.startswith("checksum_mismatch:") for error in status["errors"])
+    path.unlink()
+    status = history.readiness(required_identities=[("coinbase", "BTC")])
+    assert any(error.startswith("partition_missing:") for error in status["errors"])
+
+
+def test_readiness_accepts_bounded_per_stream_continuity(tmp_path):
+    history = PartitionedMarketHistory(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    history.append(_quote(index, start + timedelta(hours=6 * index)) for index in range(9))
+    status = history.readiness(
+        required_start=start,
+        required_end=start + timedelta(days=2),
+        required_identities=[("coinbase", "BTC")],
+        max_gap=timedelta(hours=12),
+    )
+    assert status["ready"] is True
+    assert status["valid"] is True

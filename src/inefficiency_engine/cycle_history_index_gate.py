@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 import os
 from datetime import datetime, timedelta, timezone
+from sqlalchemy import select
 
 from inefficiency_engine.runtime_index_maintenance import (
     CYCLE_HISTORY_CONTROL_GATE_INDEX_SPECS,
@@ -50,9 +51,24 @@ def cycle_history_exact_index_status(store: Any) -> dict[str, object]:
         from inefficiency_engine.partitioned_market_history import PartitionedMarketHistory
 
         end = datetime.now(timezone.utc)
+        required_identities: set[tuple[str, str]] = set()
+        try:
+            table = store.market_quotes
+            with store.engine.connect() as db:
+                required_identities = {
+                    (str(venue), str(asset).upper())
+                    for venue, asset in db.execute(
+                        select(table.c.venue, table.c.asset)
+                        .where(table.c.observed_at >= (end - timedelta(minutes=10)).isoformat())
+                        .distinct()
+                    )
+                }
+        except Exception:
+            required_identities = set()
         status = PartitionedMarketHistory().readiness(
             required_start=end - timedelta(days=180),
             required_end=end - timedelta(minutes=10),
+            required_identities=required_identities,
         )
         return {
             **status,
