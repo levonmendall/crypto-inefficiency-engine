@@ -4,9 +4,10 @@ import argparse
 import hashlib
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import (
     BigInteger,
@@ -29,6 +30,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import OperationalError
 
 from inefficiency_engine.evidence import EvidenceStore
 from inefficiency_engine.local_storage import local_storage_paths
@@ -39,6 +41,15 @@ BATCH_SIZE = 2_000
 SKIPPED_RUNTIME_TABLES = {"cycle_history_index_runtime_state"}
 RESUMABLE_APPEND_ONLY_TABLES = {"cycle_historical_quotes"}
 MAX_APPEND_ONLY_RECONCILIATION_PASSES = 8
+APPEND_ONLY_SOURCE_READ_RETRY_DELAYS_SECONDS = (1.0, 3.0, 8.0)
+_TRANSIENT_SOURCE_READ_MARKERS = (
+    "unexpected eof while reading",
+    "consuming input failed",
+    "server closed the connection unexpectedly",
+    "connection reset by peer",
+    "ssl connection has been closed unexpectedly",
+    "terminating connection due to administrator command",
+)
 
 
 def _progress_path() -> Path:
@@ -346,6 +357,71 @@ def _canonical_rows(rows: list[dict[str, object]], columns: list[str]) -> list[s
     ]
 
 
+def _is_transient_source_read_error(exc: OperationalError) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _TRANSIENT_SOURCE_READ_MARKERS)
+
+
+def _source_read_with_retry(
+    source: Engine,
+    reader: Callable[[], Any],
+    table_report: dict[str, Any],
+    report: dict[str, Any],
+    progress_path: Path,
+    *,
+    phase: str,
+) -> Any:
+    """Retry one append-only source read on a fresh pooled connection.
+
+    The production PostgreSQL source has repeatedly dropped TLS connections while a
+    cycle-history batch was being consumed. Because the archive path is append-only
+    and durable progress is committed only after the full batch lands locally, the
+    same read can be retried safely. Each retry disposes the source pool so the next
+    ``source.connect()`` establishes a fresh connection. Non-transport errors and a
+    bounded series of transport failures still fail closed.
+    """
+    retries_this_read = 0
+    while True:
+        try:
+            value = reader()
+            if retries_this_read:
+                table_report["last_source_retry_recovered"] = True
+                _publish(report, progress_path)
+            return value
+        except OperationalError as exc:
+            if (
+                not _is_transient_source_read_error(exc)
+                or retries_this_read >= len(APPEND_ONLY_SOURCE_READ_RETRY_DELAYS_SECONDS)
+            ):
+                raise
+            delay = APPEND_ONLY_SOURCE_READ_RETRY_DELAYS_SECONDS[retries_this_read]
+            retries_this_read += 1
+            source.dispose()
+            table_report.update(
+                source_transport_retries=int(table_report.get("source_transport_retries") or 0) + 1,
+                last_source_retry_phase=phase,
+                last_source_retry_delay_seconds=delay,
+                last_source_retry_recovered=False,
+            )
+            _publish(report, progress_path)
+            time.sleep(delay)
+
+
+def _source_rows_after_checkpoint(
+    source: Engine,
+    statement,
+    primary_key: list[Any],
+    checkpoint: list[object] | None,
+) -> list[dict[str, object]]:
+    with source.connect() as db:
+        return [
+            dict(row)
+            for row in db.execute(
+                _after_checkpoint(statement, primary_key, checkpoint)
+            ).mappings()
+        ]
+
+
 def _migrate_resumable_append_only_table(
     source: Engine,
     target: Engine,
@@ -398,13 +474,16 @@ def _migrate_resumable_append_only_table(
         _publish(report, progress_path)
 
         while True:
-            with source.connect() as db:
-                rows = [
-                    dict(row)
-                    for row in db.execute(
-                        _after_checkpoint(base_statement, primary_key, checkpoint)
-                    ).mappings()
-                ]
+            rows = _source_read_with_retry(
+                source,
+                lambda: _source_rows_after_checkpoint(
+                    source, base_statement, primary_key, checkpoint
+                ),
+                table_report,
+                report,
+                progress_path,
+                phase="copy_batch",
+            )
             if not rows:
                 break
             _upsert_rows(target, target_table, rows)
@@ -415,7 +494,14 @@ def _migrate_resumable_append_only_table(
             if interrupt_after_batches == completed_batches:
                 raise InterruptedError("injected migration interruption")
 
-        source_count = _row_count(source, source_table)
+        source_count = _source_read_with_retry(
+            source,
+            lambda: _row_count(source, source_table),
+            table_report,
+            report,
+            progress_path,
+            phase="source_count",
+        )
         target_count = _row_count(target, target_table)
         table_report.update(source_rows_observed=source_count, target_rows_observed=target_count)
         _publish(report, progress_path)
@@ -435,13 +521,16 @@ def _migrate_resumable_append_only_table(
         verified_count = 0
         content_mismatch = False
         while True:
-            with source.connect() as db:
-                source_rows = [
-                    dict(row)
-                    for row in db.execute(
-                        _after_checkpoint(base_statement, primary_key, verify_checkpoint)
-                    ).mappings()
-                ]
+            source_rows = _source_read_with_retry(
+                source,
+                lambda: _source_rows_after_checkpoint(
+                    source, base_statement, primary_key, verify_checkpoint
+                ),
+                table_report,
+                report,
+                progress_path,
+                phase="verification_batch",
+            )
             if not source_rows:
                 break
             keys = [row[source_pk.name] for row in source_rows]
@@ -458,7 +547,14 @@ def _migrate_resumable_append_only_table(
             verified_count += len(source_rows)
             verify_checkpoint = [source_rows[-1][source_pk.name]]
 
-        source_count_after = _row_count(source, source_table)
+        source_count_after = _source_read_with_retry(
+            source,
+            lambda: _row_count(source, source_table),
+            table_report,
+            report,
+            progress_path,
+            phase="final_source_count",
+        )
         target_count_after = _row_count(target, target_table)
         if (
             content_mismatch
