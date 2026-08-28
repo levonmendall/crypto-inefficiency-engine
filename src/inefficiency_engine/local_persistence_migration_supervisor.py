@@ -35,6 +35,7 @@ _TRANSIENT_SOURCE_FAILURE_MARKERS = (
     "connection reset by peer",
     "ssl connection has been closed unexpectedly",
     "terminating connection due to administrator command",
+    "the database system is in recovery mode",
 )
 
 
@@ -111,7 +112,7 @@ def _bounded_public_error(value: object) -> str | None:
 
 
 def _is_transient_source_disconnect(progress: dict[str, Any]) -> bool:
-    """Classify only transport-level PostgreSQL failures as retryable."""
+    """Classify only proven transient PostgreSQL source failures as retryable."""
 
     error_type = str(progress.get("error_type") or "").lower()
     error = str(progress.get("error") or "").lower()

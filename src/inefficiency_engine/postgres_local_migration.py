@@ -49,6 +49,7 @@ _TRANSIENT_SOURCE_READ_MARKERS = (
     "connection reset by peer",
     "ssl connection has been closed unexpectedly",
     "terminating connection due to administrator command",
+    "the database system is in recovery mode",
 )
 
 
@@ -377,8 +378,8 @@ def _source_read_with_retry(
     cycle-history batch was being consumed. Because the archive path is append-only
     and durable progress is committed only after the full batch lands locally, the
     same read can be retried safely. Each retry disposes the source pool so the next
-    ``source.connect()`` establishes a fresh connection. Non-transport errors and a
-    bounded series of transport failures still fail closed.
+    ``source.connect()`` establishes a fresh connection. Non-transient errors and a
+    bounded series of transient source failures still fail closed.
     """
     retries_this_read = 0
     while True:
