@@ -20,7 +20,11 @@ from inefficiency_engine.local_storage import (
 )
 
 AUTO_MIGRATION_ENV = "CIE_AUTO_LOCAL_PERSISTENCE_MIGRATION"
-MIGRATION_COMMAND = [sys.executable, "-m", "inefficiency_engine.postgres_local_migration"]
+MIGRATION_COMMAND = [
+    sys.executable,
+    "-m",
+    "inefficiency_engine.stage_one_local_persistence_migration",
+]
 API_BIND_WAIT_SECONDS = 180.0
 TRUE_VALUES = {"1", "true", "yes", "on"}
 MAX_TRANSIENT_SOURCE_RETRIES = 3
@@ -220,6 +224,11 @@ def migration_status_payload() -> dict[str, object]:
     )
     market = tables.get("market_quotes") if isinstance(tables.get("market_quotes"), dict) else {}
     destination = market.get("destination_inventory") if isinstance(market.get("destination_inventory"), dict) else {}
+    cycle_history = (
+        tables.get("cycle_historical_quotes")
+        if isinstance(tables.get("cycle_historical_quotes"), dict)
+        else {}
+    )
     return {
         "state": supervisor.get("state") or progress.get("state") or "not_started",
         "supervisor_reason": supervisor.get("reason"),
@@ -237,6 +246,19 @@ def migration_status_payload() -> dict[str, object]:
         "tables_total": len(tables),
         "tables_verified": verified_tables,
         "current_table": current_table,
+        "cycle_historical_quotes": {
+            "verified": cycle_history.get("verified"),
+            "migration_mode": cycle_history.get("migration_mode"),
+            "verification_scope": cycle_history.get("verification_scope"),
+            "snapshot_row_count": cycle_history.get("snapshot_row_count"),
+            "snapshot_rows_copied": cycle_history.get("snapshot_rows_copied"),
+            "snapshot_rows_verified": cycle_history.get("snapshot_rows_verified"),
+            "snapshot_captured_at": cycle_history.get("snapshot_captured_at"),
+            "last_progress_at": cycle_history.get("last_progress_at"),
+            "last_primary_key": cycle_history.get("last_primary_key"),
+            "source_transport_retries": cycle_history.get("source_transport_retries", 0),
+            "snapshot_capture_retries": cycle_history.get("snapshot_capture_retries", 0),
+        },
         "market_quotes": {
             "verified": market.get("verified"),
             "source_rows": market.get("source_rows"),
