@@ -20,6 +20,8 @@ SNAPSHOT_VERIFICATION_SCOPE = "captured_primary_key_membership"
 MAX_SNAPSHOT_BATCH_SIZE = 256
 SNAPSHOT_STREAM_BUFFER_ROWS = 512
 SNAPSHOT_CAPTURE_PROGRESS_INTERVAL_ROWS = 10_000
+RELATIONAL_SOURCE_RETRY_DELAYS_SECONDS = (1.0, 3.0, 8.0)
+_BASE_MIGRATE_ENGINES = base.migrate_engines
 
 
 def _now() -> str:
@@ -450,8 +452,71 @@ def _migrate_captured_append_only_table(
     return completed_batches
 
 
+def _current_unverified_relational_table(progress_path: Path) -> str | None:
+    progress = base._load_progress(progress_path)
+    current_table = str(progress.get("current_table") or "").strip()
+    if (
+        not current_table
+        or current_table == "market_quotes"
+        or current_table in base.RESUMABLE_APPEND_ONLY_TABLES
+    ):
+        return None
+    tables = progress.get("tables")
+    if not isinstance(tables, dict):
+        return None
+    table_report = tables.get(current_table)
+    if not isinstance(table_report, dict) or table_report.get("verified") is True:
+        return None
+    return current_table
+
+
+def _migrate_engines_with_relational_source_retry(
+    source: Engine,
+    target: Any,
+    history: Any,
+    *,
+    progress_path: Path,
+    batch_size: int = base.BATCH_SIZE,
+    interrupt_after_batches: int | None = None,
+) -> dict[str, object]:
+    """Restart only a transiently interrupted mutable-table snapshot in this child.
+
+    Mutable relational tables require one repeatable-read transaction, so a dropped
+    PostgreSQL connection cannot resume at a checkpoint without weakening snapshot
+    consistency. The base importer already restarts an unverified mutable table from
+    the beginning while preserving all verified tables. Keep that exact behavior, but
+    do it inside the migration child for proven transient transport/recovery errors so
+    one TLS EOF does not consume an entire supervisor attempt.
+    """
+
+    retries = 0
+    while True:
+        try:
+            return _BASE_MIGRATE_ENGINES(
+                source,
+                target,
+                history,
+                progress_path=progress_path,
+                batch_size=batch_size,
+                interrupt_after_batches=interrupt_after_batches,
+            )
+        except OperationalError as exc:
+            current_table = _current_unverified_relational_table(progress_path)
+            if (
+                current_table is None
+                or not base._is_transient_source_read_error(exc)
+                or retries >= len(RELATIONAL_SOURCE_RETRY_DELAYS_SECONDS)
+            ):
+                raise
+            delay = RELATIONAL_SOURCE_RETRY_DELAYS_SECONDS[retries]
+            retries += 1
+            source.dispose()
+            time.sleep(delay)
+
+
 def install_stage_one_repair() -> None:
     base._migrate_resumable_append_only_table = _migrate_captured_append_only_table
+    base.migrate_engines = _migrate_engines_with_relational_source_retry
 
 
 def main() -> int:
