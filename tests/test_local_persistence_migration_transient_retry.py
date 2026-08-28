@@ -47,6 +47,19 @@ def test_exact_production_ssl_eof_is_retryable():
     ) is False
 
 
+def test_exact_production_database_recovery_mode_is_retryable():
+    assert supervisor._is_transient_source_disconnect(
+        {
+            "error_type": "OperationalError",
+            "error": (
+                "(psycopg.OperationalError) connection failed: connection to server "
+                "at '10.15.140.76', port 5432 failed: FATAL:  the database system "
+                "is in recovery mode"
+            ),
+        }
+    ) is True
+
+
 def test_supervisor_retries_transient_source_disconnect_then_verifies(tmp_path, monkeypatch):
     paths = _configure(monkeypatch, tmp_path)
     progress_path = paths[1]
@@ -78,6 +91,52 @@ def test_supervisor_retries_transient_source_disconnect_then_verifies(tmp_path, 
         progress_path.write_text(json.dumps({
             "state": "verified",
             "completed_at": "2026-08-28T02:30:00+00:00",
+            "tables": {"cycle_historical_quotes": {"verified": True}},
+        }))
+        return FakeChild(0)
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", fake_popen)
+    supervisor.run_local_persistence_migration_supervisor(threading.Event())
+
+    status = json.loads(paths[0].read_text())
+    assert calls == [1, 2]
+    assert status["state"] == "verified"
+    assert status["reason"] == "snapshot_verification_complete"
+    assert status["attempt"] == 2
+    assert status["source_disconnect_retries"] == 1
+
+
+def test_supervisor_retries_recovery_mode_then_verifies(tmp_path, monkeypatch):
+    paths = _configure(monkeypatch, tmp_path)
+    progress_path = paths[1]
+    calls = []
+
+    class FakeChild:
+        pid = 2468
+
+        def __init__(self, returncode: int):
+            self.returncode = returncode
+
+        def poll(self):
+            return self.returncode
+
+    def fake_popen(*args, **kwargs):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            progress_path.write_text(json.dumps({
+                "state": "failed",
+                "current_table": "cycle_historical_quotes",
+                "error_type": "OperationalError",
+                "error": (
+                    "(psycopg.OperationalError) connection failed: FATAL:  "
+                    "the database system is in recovery mode"
+                ),
+                "tables": {"cycle_historical_quotes": {"verified": False}},
+            }))
+            return FakeChild(1)
+        progress_path.write_text(json.dumps({
+            "state": "verified",
+            "completed_at": "2026-08-28T03:35:00+00:00",
             "tables": {"cycle_historical_quotes": {"verified": True}},
         }))
         return FakeChild(0)
