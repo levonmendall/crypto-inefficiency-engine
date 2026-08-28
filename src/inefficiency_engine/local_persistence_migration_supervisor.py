@@ -13,7 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from inefficiency_engine.local_storage import local_storage_paths
+from inefficiency_engine.local_storage import (
+    DEFAULT_PRODUCTION_STORAGE_ROOT,
+    local_storage_paths,
+)
 
 AUTO_MIGRATION_ENV = "CIE_AUTO_LOCAL_PERSISTENCE_MIGRATION"
 MIGRATION_COMMAND = [sys.executable, "-m", "inefficiency_engine.postgres_local_migration"]
@@ -23,6 +26,43 @@ TRUE_VALUES = {"1", "true", "yes", "on"}
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _configured_storage_root() -> Path:
+    configured = os.getenv("CIE_STORAGE_ROOT", "").strip()
+    return Path(configured or DEFAULT_PRODUCTION_STORAGE_ROOT).expanduser().resolve()
+
+
+def _automatic_migration_enabled() -> bool:
+    configured = os.getenv(AUTO_MIGRATION_ENV)
+    if configured is not None and configured.strip():
+        return configured.strip().lower() in TRUE_VALUES
+    # This migration guard is installed only in the Render production runtime. Using
+    # the immutable release identity as the default means a manually configured
+    # service does not depend on Blueprint env-var synchronization to start stage one.
+    return bool(os.getenv("RENDER_GIT_COMMIT", "").strip())
+
+
+def _authoritative_postgres_url() -> str:
+    return (
+        os.getenv("CIE_DATABASE_URL", "").strip()
+        or os.getenv("DATABASE_URL", "").strip()
+    )
+
+
+def _migration_source_url() -> str:
+    return os.getenv("CIE_MIGRATION_POSTGRES_URL", "").strip() or _authoritative_postgres_url()
+
+
+def _storage_root_state() -> tuple[bool, str]:
+    root = _configured_storage_root()
+    if not root.is_absolute() or str(root).startswith("/tmp"):
+        return False, "storage_root_not_durable"
+    if not root.exists():
+        return False, "storage_root_missing"
+    if not root.is_dir() or not os.access(root, os.W_OK | os.X_OK):
+        return False, "storage_root_unwritable"
+    return True, "ready"
 
 
 def _paths() -> tuple[Path, Path, Path, Path, Path]:
@@ -53,24 +93,16 @@ def _publish_status(payload: dict[str, object]) -> None:
 
 
 def migration_preflight() -> tuple[bool, str]:
-    if os.getenv(AUTO_MIGRATION_ENV, "").strip().lower() not in TRUE_VALUES:
+    if not _automatic_migration_enabled():
         return False, "automatic_migration_disabled"
-    storage_root = os.getenv("CIE_STORAGE_ROOT", "").strip()
-    if not storage_root:
-        return False, "storage_root_missing"
-    root = Path(storage_root).expanduser()
-    if not root.is_absolute() or str(root).startswith("/tmp"):
-        return False, "storage_root_not_durable"
-    migration_url = os.getenv("CIE_MIGRATION_POSTGRES_URL", "").strip()
-    if not migration_url:
-        return False, "migration_postgres_url_missing"
-    authoritative_url = (
-        os.getenv("CIE_DATABASE_URL", "").strip()
-        or os.getenv("DATABASE_URL", "").strip()
-    )
+    storage_ready, storage_reason = _storage_root_state()
+    if not storage_ready:
+        return False, storage_reason
+    authoritative_url = _authoritative_postgres_url()
     if not authoritative_url:
         return False, "authoritative_postgres_url_missing"
-    if migration_url != authoritative_url:
+    explicit_migration_url = os.getenv("CIE_MIGRATION_POSTGRES_URL", "").strip()
+    if explicit_migration_url and explicit_migration_url != authoritative_url:
         return False, "migration_source_not_authoritative_database"
     if os.getenv("CIE_MARKET_HISTORY_BACKEND", "").strip().lower() == "parquet":
         return False, "local_history_authority_already_enabled"
@@ -111,8 +143,28 @@ def _terminate_child(child: subprocess.Popen[bytes]) -> None:
         child.wait(timeout=8.0)
 
 
+def _blocked_status(reason: str) -> dict[str, object]:
+    return {
+        "state": "blocked",
+        "supervisor_reason": reason,
+        "storage_root": str(_configured_storage_root()),
+        "storage_root_ready": False,
+        "postgresql_authoritative": True,
+        "cutover_ready": False,
+        "paper_only": True,
+        "allocation_authority": False,
+        "live_execution_authority": False,
+    }
+
+
 def migration_status_payload() -> dict[str, object]:
-    status_path, progress_path, _, _, _ = _paths()
+    storage_ready, storage_reason = _storage_root_state()
+    if not storage_ready:
+        return _blocked_status(storage_reason)
+    try:
+        status_path, progress_path, _, _, _ = _paths()
+    except OSError:
+        return _blocked_status("storage_root_unwritable")
     supervisor = _read_json(status_path)
     progress = _read_json(progress_path)
     tables = progress.get("tables") if isinstance(progress.get("tables"), dict) else {}
@@ -151,6 +203,8 @@ def migration_status_payload() -> dict[str, object]:
             "destination_lineage_count": destination.get("lineage_count"),
             "destination_valid": destination.get("valid"),
         },
+        "storage_root": str(_configured_storage_root()),
+        "storage_root_ready": True,
         "postgresql_authoritative": True,
         "cutover_ready": False,
         "paper_only": True,
@@ -162,20 +216,30 @@ def migration_status_payload() -> dict[str, object]:
 def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> None:
     ready, reason = migration_preflight()
     if not ready:
-        _publish_status(
-            {
-                "state": "blocked",
-                "reason": reason,
-                "observed_at": _now(),
-                "postgresql_authoritative": True,
-                "cutover_ready": False,
-                "paper_only": True,
-                "live_execution_authority": False,
-            }
-        )
+        # A missing/unwritable mount cannot persist a status file by definition. The
+        # read endpoint derives this blocked state directly without touching the mount.
+        if reason in {"storage_root_missing", "storage_root_unwritable", "storage_root_not_durable"}:
+            return
+        try:
+            _publish_status(
+                {
+                    "state": "blocked",
+                    "reason": reason,
+                    "observed_at": _now(),
+                    "postgresql_authoritative": True,
+                    "cutover_ready": False,
+                    "paper_only": True,
+                    "live_execution_authority": False,
+                }
+            )
+        except OSError:
+            pass
         return
 
-    status_path, progress_path, lock_path, stdout_path, stderr_path = _paths()
+    try:
+        status_path, progress_path, lock_path, stdout_path, stderr_path = _paths()
+    except OSError:
+        return
     progress = _read_json(progress_path)
     if progress.get("state") == "verified":
         _publish_status(
@@ -239,12 +303,15 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
             return
 
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        child_env = os.environ.copy()
+        child_env["CIE_MIGRATION_POSTGRES_URL"] = _migration_source_url()
         with stdout_path.open("ab") as stdout_file, stderr_path.open("ab") as stderr_file:
             child = subprocess.Popen(
                 MIGRATION_COMMAND,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=stderr_file,
+                env=child_env,
                 start_new_session=True,
             )
             _publish_status(
