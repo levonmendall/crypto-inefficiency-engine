@@ -320,12 +320,6 @@ def _migrate_captured_append_only_table(
             return completed_batches
 
     if table_report.get("migration_mode") != SNAPSHOT_MIGRATION_MODE:
-        # The legacy implementation tried to converge against the moving live table.
-        # Preserve its non-authoritative local rows instead of DELETEing a potentially
-        # huge SQLite table in one transaction. That destructive reset can churn the
-        # WAL/page cache enough to OOM the combined 2 GiB Render service. Because this
-        # archive is immutable, existing rows are safe to retain: captured membership
-        # is inserted with DO NOTHING and then verified exactly by key/content.
         preserved_retries = int(table_report.get("source_transport_retries") or 0)
         path = _manifest_path(progress_path, source_table.name)
         try:
@@ -479,17 +473,20 @@ def _migrate_engines_with_relational_source_retry(
     batch_size: int = base.BATCH_SIZE,
     interrupt_after_batches: int | None = None,
 ) -> dict[str, object]:
-    """Restart only a transiently interrupted mutable-table snapshot in this child.
+    """Restart a transiently interrupted mutable-table snapshot in this child.
 
     Mutable relational tables require one repeatable-read transaction, so a dropped
     PostgreSQL connection cannot resume at a checkpoint without weakening snapshot
     consistency. The base importer already restarts an unverified mutable table from
-    the beginning while preserving all verified tables. Keep that exact behavior, but
-    do it inside the migration child for proven transient transport/recovery errors so
-    one TLS EOF does not consume an entire supervisor attempt.
+    the beginning while preserving all verified tables. Retry that exact operation in
+    this child, but scope the bounded transport budget to the table that actually
+    failed. Successful advancement to a different table resets the budget, preventing
+    unrelated transient disconnects across a long multi-table migration from
+    cumulatively exhausting one global retry allowance.
     """
 
     retries = 0
+    retry_table: str | None = None
     while True:
         try:
             return _BASE_MIGRATE_ENGINES(
@@ -502,6 +499,9 @@ def _migrate_engines_with_relational_source_retry(
             )
         except OperationalError as exc:
             current_table = _current_unverified_relational_table(progress_path)
+            if current_table is not None and current_table != retry_table:
+                retry_table = current_table
+                retries = 0
             if (
                 current_table is None
                 or not base._is_transient_source_read_error(exc)
