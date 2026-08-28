@@ -44,7 +44,7 @@ def _stores(tmp_path):
     for index in range(3):
         observed = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(hours=index)
         source.record_scan(
-            scan_id=f"scan-{index}", started_at=observed, completed_at=observed,
+            scan_id=f"scan-{index", started_at=observed, completed_at=observed,
             providers=[ProviderStatus(provider="test", ok=True, observed_at=observed)],
             funding_quotes=[], market_quotes=[_quote(index)], opportunities=[],
         )
@@ -100,6 +100,44 @@ def test_interrupted_migration_resumes_from_durable_primary_key_checkpoint(tmp_p
     assert result["tables"]["market_quotes"]["last_primary_key"] == [4]
 
 
+def test_retry_does_not_revalidate_verified_mutable_table_against_new_source_state(tmp_path):
+    source, target, history = _stores(tmp_path)
+    progress = tmp_path / "progress.json"
+    first = migrate_engines(source.engine, target, history, progress_path=progress, batch_size=1)
+    table_name = "source_coverage_history_migrations"
+    first_table = first["tables"][table_name]
+
+    # Production checkpoint tables update rows in place under stable primary keys.
+    # A later retry must retain the already-proven target snapshot instead of pairing
+    # its end checkpoint with a newly-mutated source row and reporting a false digest
+    # mismatch, which is the race observed in stage-one production migration.
+    with source.engine.begin() as db:
+        db.exec_driver_sql(
+            "UPDATE source_coverage_history_migrations "
+            "SET checkpoint_heartbeat_id = 99, updated_at = '2026-01-02T00:00:00+00:00' "
+            "WHERE migration_name = 'production-schema-test'"
+        )
+    failed_retry = json.loads(progress.read_text())
+    failed_retry.update(
+        state="failed",
+        error_type="RuntimeError",
+        error="injected later-table failure",
+        completed_at=None,
+    )
+    progress.write_text(json.dumps(failed_retry))
+
+    resumed = migrate_engines(source.engine, target, history, progress_path=progress, batch_size=1)
+    assert resumed["state"] == "verified"
+    assert resumed["tables"][table_name]["row_digest"] == first_table["row_digest"]
+    with target.engine.connect() as db:
+        copied = db.exec_driver_sql(
+            "SELECT checkpoint_heartbeat_id, updated_at "
+            "FROM source_coverage_history_migrations "
+            "WHERE migration_name = 'production-schema-test'"
+        ).one()
+    assert tuple(copied) == (42, "2026-01-01T00:00:00+00:00")
+
+
 def test_migration_fails_closed_when_a_committed_partition_is_missing(tmp_path):
     source, target, history = _stores(tmp_path)
     progress = tmp_path / "progress.json"
@@ -107,7 +145,7 @@ def test_migration_fails_closed_when_a_committed_partition_is_missing(tmp_path):
     with history._connect() as db:
         relative = db.execute("SELECT path FROM partitions ORDER BY path LIMIT 1").fetchone()[0]
     (history.root / relative).unlink()
-    with pytest.raises(RuntimeError, match="market_quotes equivalence mismatch"):
+    with pytest.raises(RuntimeError, match="verified market_quotes destination changed"):
         migrate_engines(source.engine, target, history, progress_path=progress, batch_size=1)
     failed = json.loads(progress.read_text())
     assert failed["state"] == "failed"
