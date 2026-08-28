@@ -36,6 +36,8 @@ _TRANSIENT_SOURCE_FAILURE_MARKERS = (
     "ssl connection has been closed unexpectedly",
     "terminating connection due to administrator command",
     "the database system is in recovery mode",
+    "the database system is not yet accepting connections",
+    "consistent recovery state has not been yet reached",
 )
 
 

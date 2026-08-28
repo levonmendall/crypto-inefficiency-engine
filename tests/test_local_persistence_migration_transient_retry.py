@@ -60,6 +60,20 @@ def test_exact_production_database_recovery_mode_is_retryable():
     ) is True
 
 
+def test_exact_production_not_yet_accepting_connections_is_retryable():
+    assert supervisor._is_transient_source_disconnect(
+        {
+            "error_type": "OperationalError",
+            "error": (
+                "(psycopg.OperationalError) connection failed: connection to server "
+                "at '10.15.140.76', port 5432 failed: FATAL:  the database system "
+                "is not yet accepting connections DETAIL:  Consistent recovery state "
+                "has not been yet reached."
+            ),
+        }
+    ) is True
+
+
 def test_supervisor_retries_transient_source_disconnect_then_verifies(tmp_path, monkeypatch):
     paths = _configure(monkeypatch, tmp_path)
     progress_path = paths[1]
