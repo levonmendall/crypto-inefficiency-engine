@@ -8,7 +8,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, MetaData, Table, create_engine, func, select, tuple_
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Column,
+    Engine,
+    Float,
+    ForeignKey,
+    Integer,
+    LargeBinary,
+    MetaData,
+    Numeric,
+    Table,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    func,
+    select,
+    tuple_,
+)
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from inefficiency_engine.evidence import EvidenceStore
@@ -117,6 +135,75 @@ def _verify_market_equivalence(source: dict[str, object], history: PartitionedMa
     return destination
 
 
+def _portable_column_type(column: Any):
+    """Map reflected PostgreSQL types to the smallest lossless SQLite affinity."""
+
+    try:
+        python_type = column.type.python_type
+    except (AttributeError, NotImplementedError):
+        return Text()
+    if python_type is bool:
+        return Boolean()
+    if python_type is int:
+        if column.primary_key and len(column.table.primary_key.columns) == 1:
+            # SQLite rowid autoincrement requires the exact INTEGER affinity.
+            return Integer()
+        return BigInteger() if isinstance(column.type, BigInteger) else Integer()
+    if python_type is float:
+        return Float()
+    if python_type.__name__ == "Decimal":
+        return Numeric()
+    if python_type is bytes:
+        return LargeBinary()
+    return Text()
+
+
+def bootstrap_local_schema_from_source(source_metadata: MetaData, target_engine: Engine) -> set[str]:
+    """Create every reflected production table before copying any canonical rows.
+
+    Runtime modules remain the owners of their models. This bootstrap mirrors the
+    already-deployed schema with portable SQLite affinities so supplemental source,
+    control, history, portfolio and reconciliation tables cannot be omitted merely
+    because ``EvidenceStore`` itself does not declare them.
+    """
+
+    target_metadata = MetaData()
+    for source_table in source_metadata.sorted_tables:
+        if source_table.name in SKIPPED_RUNTIME_TABLES:
+            continue
+        columns: list[Column[Any]] = []
+        for source_column in source_table.columns:
+            arguments: list[Any] = []
+            for foreign_key in source_column.foreign_keys:
+                arguments.append(ForeignKey(foreign_key.target_fullname))
+            columns.append(
+                Column(
+                    source_column.name,
+                    _portable_column_type(source_column),
+                    *arguments,
+                    primary_key=source_column.primary_key,
+                    nullable=source_column.nullable,
+                    unique=source_column.unique,
+                    autoincrement=(
+                        True
+                        if source_column.primary_key
+                        and len(source_table.primary_key.columns) == 1
+                        and isinstance(_portable_column_type(source_column), Integer)
+                        else "auto"
+                    ),
+                )
+            )
+        constraints: list[Any] = []
+        for constraint in source_table.constraints:
+            if isinstance(constraint, UniqueConstraint):
+                names = [column.name for column in constraint.columns]
+                if names and not any(set(names) == {column.name} for column in source_table.columns if column.unique):
+                    constraints.append(UniqueConstraint(*names, name=constraint.name))
+        Table(source_table.name, target_metadata, *columns, *constraints)
+    target_metadata.create_all(target_engine)
+    return set(target_metadata.tables)
+
+
 def migrate_engines(
     source: Engine,
     target: EvidenceStore,
@@ -130,6 +217,7 @@ def migrate_engines(
 
     source_metadata, target_metadata = MetaData(), MetaData()
     source_metadata.reflect(source)
+    bootstrap_local_schema_from_source(source_metadata, target.engine)
     target_metadata.reflect(target.engine)
     previous = _load_progress(progress_path)
     report: dict[str, Any] = {

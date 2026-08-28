@@ -58,11 +58,11 @@ No application code uses PostgreSQL advisory locks. PostgreSQL planner/index ass
 
 ## Staged cutover
 
-1. Deploy code with PostgreSQL compatibility and run tests. Do not change production storage yet.
-2. Attach the disk and configure the migration-only `CIE_MIGRATION_POSTGRES_URL` secret manually. Run `python -m inefficiency_engine.postgres_local_migration`; it is idempotent and publishes table progress.
-3. Require verified table counts and partition coverage. Any absent target schema or count shortfall fails closed.
-4. Start the service with `CIE_STORAGE_ROOT` and `CIE_MARKET_HISTORY_BACKEND=parquet`. PostgreSQL exact-index readiness is no longer consulted for cycle-history certification.
-5. Keep the old PostgreSQL resource available read-only until a redeploy/restart persistence test and source-history/portfolio/reconciliation equivalence checks pass.
+1. **Disk/population PR (this PR):** attach the disk while retaining the existing `DATABASE_URL` binding and `databases:` resource. Do not set `CIE_MARKET_HISTORY_BACKEND=parquet`; production continues reading and writing PostgreSQL. The migration URL is sourced from the same managed database binding without exposing its value.
+2. Run `python -m inefficiency_engine.postgres_local_migration`. It bootstraps every reflected production table—not only `EvidenceStore` tables—then performs the idempotent, keyset-checkpointed copy and publishes progress.
+3. Require verified table identity digests, physical partition equivalence and full required coverage. Exercise a restart/redeploy while PostgreSQL remains authoritative and confirm the disk survives.
+4. **Separate cutover PR:** only after the verified migration evidence is reviewed, set the local SQLite path and `CIE_MARKET_HISTORY_BACKEND=parquet`, then remove `DATABASE_URL` and the Blueprint database resource. PostgreSQL exact-index readiness ceases to be authoritative only in this later stage.
+5. Keep the old PostgreSQL resource available read-only until post-cutover source-history, portfolio, control, bridge and reconciliation equivalence checks pass.
 6. In a later cleanup PR, after production evidence proves all direct raw-history readers use the file adapter, bound/remove the relational current-scan compatibility projection. PostgreSQL migration/index code remains until that verification.
 
 ## Unchanged invariants

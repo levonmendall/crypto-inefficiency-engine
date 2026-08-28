@@ -62,10 +62,12 @@ def test_render_blueprint_defines_single_paid_combined_runtime():
     assert runtime_env["CIE_SHADOW_MAX_CANDIDATES"]["value"] == "80"
     assert runtime_env["CIE_DEX_ROUTE_TIER_SHADOW_MAX_CONCURRENCY"]["value"] == "1"
 
-    assert databases == {}
-    assert "DATABASE_URL" not in runtime_env
+    assert databases["cie-evidence"]["plan"] != "free"
+    assert runtime_env["DATABASE_URL"]["fromDatabase"]["name"] == "cie-evidence"
+    assert runtime_env["CIE_MIGRATION_POSTGRES_URL"]["fromDatabase"]["name"] == "cie-evidence"
     assert runtime_env["CIE_STORAGE_ROOT"]["value"] == "/var/data/cie"
-    assert runtime_env["CIE_MARKET_HISTORY_BACKEND"]["value"] == "parquet"
+    assert "CIE_MARKET_HISTORY_BACKEND" not in runtime_env
+    assert "CIE_EVIDENCE_DB_PATH" not in runtime_env
     assert runtime["disk"] == {
         "name": "cie-durable-storage",
         "mountPath": "/var/data/cie",
