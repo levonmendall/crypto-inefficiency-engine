@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -22,6 +23,9 @@ AUTO_MIGRATION_ENV = "CIE_AUTO_LOCAL_PERSISTENCE_MIGRATION"
 MIGRATION_COMMAND = [sys.executable, "-m", "inefficiency_engine.postgres_local_migration"]
 API_BIND_WAIT_SECONDS = 180.0
 TRUE_VALUES = {"1", "true", "yes", "on"}
+_URL_CREDENTIALS = re.compile(
+    r"(?i)\b(postgres(?:ql)?(?:\+psycopg)?://)([^@\s]+)@"
+)
 
 
 def _now() -> str:
@@ -82,6 +86,18 @@ def _read_json(path: Path) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
+
+
+def _bounded_public_error(value: object) -> str | None:
+    """Expose enough terminal truth to diagnose migration failures without secrets."""
+
+    if value is None:
+        return None
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    if not text:
+        return None
+    text = _URL_CREDENTIALS.sub(r"\1***@", text)
+    return text[:600]
 
 
 def _publish_status(payload: dict[str, object]) -> None:
@@ -190,6 +206,8 @@ def migration_status_payload() -> dict[str, object]:
         "progress_state": progress.get("state"),
         "progress_started_at": progress.get("started_at"),
         "progress_completed_at": progress.get("completed_at"),
+        "progress_error_type": progress.get("error_type"),
+        "progress_error": _bounded_public_error(progress.get("error")),
         "verification_scope": progress.get("verification_scope"),
         "tables_total": len(tables),
         "tables_verified": verified_tables,
