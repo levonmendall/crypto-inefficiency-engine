@@ -101,6 +101,7 @@ def test_retry_verified_helper_accepts_only_already_verified_tables(monkeypatch)
 def test_stage_one_runtime_guard_routes_proven_append_only_ledgers_to_captured_path(monkeypatch):
     routed = set(migration.RESUMABLE_APPEND_ONLY_TABLES)
     routed.discard("dashboard_projection_snapshots")
+    routed.discard("funding_quotes")
     routed.discard("source_coverage_history")
     routed.discard("source_event_observations")
     routed.discard("worker_heartbeats")
@@ -115,10 +116,12 @@ def test_stage_one_runtime_guard_routes_proven_append_only_ledgers_to_captured_p
 
     assert "cycle_historical_quotes" in migration.RESUMABLE_APPEND_ONLY_TABLES
     assert "dashboard_projection_snapshots" in migration.RESUMABLE_APPEND_ONLY_TABLES
+    assert "funding_quotes" in migration.RESUMABLE_APPEND_ONLY_TABLES
     assert "source_coverage_history" in migration.RESUMABLE_APPEND_ONLY_TABLES
     assert "source_event_observations" in migration.RESUMABLE_APPEND_ONLY_TABLES
     assert "worker_heartbeats" in migration.RESUMABLE_APPEND_ONLY_TABLES
     assert package._STAGE_ONE_MONOTONIC_HIGH_WATER_TABLES == {
+        "funding_quotes",
         "source_event_observations",
         "worker_heartbeats",
     }
@@ -128,6 +131,7 @@ def test_stage_one_runtime_guard_routes_proven_append_only_ledgers_to_captured_p
     "table_name",
     [
         "dashboard_projection_snapshots",
+        "funding_quotes",
         "source_coverage_history",
         "source_event_observations",
         "worker_heartbeats",
