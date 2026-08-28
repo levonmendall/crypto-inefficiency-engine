@@ -44,7 +44,7 @@ def _stores(tmp_path):
     for index in range(3):
         observed = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(hours=index)
         source.record_scan(
-            scan_id=f"scan-{index", started_at=observed, completed_at=observed,
+            scan_id=f"scan-{index}", started_at=observed, completed_at=observed,
             providers=[ProviderStatus(provider="test", ok=True, observed_at=observed)],
             funding_quotes=[], market_quotes=[_quote(index)], opportunities=[],
         )
