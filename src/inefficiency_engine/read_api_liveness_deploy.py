@@ -155,7 +155,7 @@ class DatabaseIndependentLivenessApp:
             and path == LOCAL_PERSISTENCE_MIGRATION_PATH
             and method in {"GET", "HEAD"}
         ):
-            from inefficiency_engine.local_persistence_migration_supervisor import (
+            from inefficiency_engine.local_persistence_migration_status import (
                 migration_status_payload,
             )
 
