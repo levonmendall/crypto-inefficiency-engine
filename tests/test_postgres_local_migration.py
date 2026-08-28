@@ -5,7 +5,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import Column, MetaData, Table, Text, create_engine, inspect, insert
+from sqlalchemy.exc import OperationalError
 
+from inefficiency_engine import postgres_local_migration as migration_module
 from inefficiency_engine.durable_control_cache import ensure_durable_control_cache_schema
 from inefficiency_engine.durable_control_cycle_history import ensure_durable_control_cycle_history_schema
 from inefficiency_engine.evidence import EvidenceStore, ProviderStatus
@@ -208,3 +210,55 @@ def test_cycle_history_resume_keeps_copied_rows_and_reconciles_hash_ids_inserted
             "SELECT quote_id, payload_json FROM cycle_historical_quotes ORDER BY quote_id"
         ).all()
     assert rows == [("a", "payload-a"), ("b", "payload-b"), ("d", "payload-d")]
+
+
+def test_cycle_history_source_read_retries_transient_disconnect_in_same_child(tmp_path, monkeypatch):
+    source = create_engine(f"sqlite:///{tmp_path / 'retry-source.sqlite3'}")
+    progress = tmp_path / "retry-progress.json"
+    table_report: dict[str, object] = {}
+    report: dict[str, object] = {
+        "state": "running",
+        "tables": {"cycle_historical_quotes": table_report},
+    }
+    attempts = 0
+    dispose_calls = 0
+    original_dispose = source.dispose
+
+    def dispose() -> None:
+        nonlocal dispose_calls
+        dispose_calls += 1
+        original_dispose()
+
+    def reader():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OperationalError(
+                "SELECT cycle_historical_quotes",
+                {},
+                RuntimeError("SSL error: unexpected eof while reading"),
+            )
+        return ["recovered"]
+
+    monkeypatch.setattr(source, "dispose", dispose)
+    monkeypatch.setattr(migration_module.time, "sleep", lambda _seconds: None)
+
+    result = migration_module._source_read_with_retry(
+        source,
+        reader,
+        table_report,
+        report,
+        progress,
+        phase="copy_batch",
+    )
+
+    assert result == ["recovered"]
+    assert attempts == 2
+    assert dispose_calls == 1
+    assert table_report["source_transport_retries"] == 1
+    assert table_report["last_source_retry_phase"] == "copy_batch"
+    assert table_report["last_source_retry_recovered"] is True
+    persisted = json.loads(progress.read_text())
+    persisted_cycle = persisted["tables"]["cycle_historical_quotes"]
+    assert persisted_cycle["source_transport_retries"] == 1
+    assert persisted_cycle["last_source_retry_recovered"] is True
