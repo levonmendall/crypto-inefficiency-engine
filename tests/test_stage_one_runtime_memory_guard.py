@@ -99,6 +99,7 @@ def test_stage_one_runtime_guard_routes_proven_append_only_ledgers_to_captured_p
     routed = set(migration.RESUMABLE_APPEND_ONLY_TABLES)
     routed.discard("dashboard_projection_snapshots")
     routed.discard("source_coverage_history")
+    routed.discard("source_event_observations")
 
     def fake_migrate(source, target, history, *, progress_path, batch_size, interrupt_after_batches=None):
         return {"state": "verified"}
@@ -111,11 +112,16 @@ def test_stage_one_runtime_guard_routes_proven_append_only_ledgers_to_captured_p
     assert "cycle_historical_quotes" in migration.RESUMABLE_APPEND_ONLY_TABLES
     assert "dashboard_projection_snapshots" in migration.RESUMABLE_APPEND_ONLY_TABLES
     assert "source_coverage_history" in migration.RESUMABLE_APPEND_ONLY_TABLES
+    assert "source_event_observations" in migration.RESUMABLE_APPEND_ONLY_TABLES
 
 
 @pytest.mark.parametrize(
     "table_name",
-    ["dashboard_projection_snapshots", "source_coverage_history"],
+    [
+        "dashboard_projection_snapshots",
+        "source_coverage_history",
+        "source_event_observations",
+    ],
 )
 def test_captured_append_only_routing_avoids_generic_whole_import_retry(
     table_name, tmp_path, monkeypatch
