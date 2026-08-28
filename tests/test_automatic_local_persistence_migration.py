@@ -4,11 +4,9 @@ import hashlib
 import json
 import threading
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 
 import yaml
 
-import inefficiency_engine.local_persistence_migration_supervisor as migration_supervisor
 from inefficiency_engine.evidence import EvidenceStore, ProviderStatus
 from inefficiency_engine.local_persistence_migration_supervisor import (
     migration_preflight,
@@ -61,9 +59,9 @@ def test_render_stage_one_enables_guard_without_cutover():
     assert "CIE_EVIDENCE_DB_PATH" not in env
 
 
-def test_migration_preflight_requires_same_authoritative_postgres(monkeypatch):
+def test_migration_preflight_requires_same_authoritative_postgres(tmp_path, monkeypatch):
     monkeypatch.setenv("CIE_AUTO_LOCAL_PERSISTENCE_MIGRATION", "true")
-    monkeypatch.setenv("CIE_STORAGE_ROOT", "/var/data/cie")
+    monkeypatch.setenv("CIE_STORAGE_ROOT", str(tmp_path))
     monkeypatch.setenv("DATABASE_URL", "postgresql://authoritative")
     monkeypatch.setenv("CIE_MIGRATION_POSTGRES_URL", "postgresql://other")
     assert migration_preflight() == (False, "migration_source_not_authoritative_database")
@@ -73,18 +71,36 @@ def test_migration_preflight_requires_same_authoritative_postgres(monkeypatch):
     assert migration_preflight() == (False, "local_history_authority_already_enabled")
 
 
+def test_render_release_defaults_to_authoritative_database_without_blueprint_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("CIE_AUTO_LOCAL_PERSISTENCE_MIGRATION", raising=False)
+    monkeypatch.delenv("CIE_MIGRATION_POSTGRES_URL", raising=False)
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "abc123")
+    monkeypatch.setenv("CIE_STORAGE_ROOT", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL", "postgresql://authoritative")
+    assert migration_preflight() == (True, "ready")
+
+
+def test_missing_disk_is_truthfully_blocked_instead_of_status_503(tmp_path, monkeypatch):
+    missing = tmp_path / "not-mounted"
+    monkeypatch.setenv("CIE_AUTO_LOCAL_PERSISTENCE_MIGRATION", "true")
+    monkeypatch.setenv("CIE_STORAGE_ROOT", str(missing))
+    monkeypatch.setenv("DATABASE_URL", "postgresql://authoritative")
+    assert migration_preflight() == (False, "storage_root_missing")
+    payload = migration_status_payload()
+    assert payload["state"] == "blocked"
+    assert payload["supervisor_reason"] == "storage_root_missing"
+    assert payload["storage_root_ready"] is False
+    assert payload["postgresql_authoritative"] is True
+    assert payload["cutover_ready"] is False
+
+
 def test_verified_progress_is_restart_safe_and_never_grants_cutover(tmp_path, monkeypatch):
     monkeypatch.setenv("CIE_AUTO_LOCAL_PERSISTENCE_MIGRATION", "true")
-    monkeypatch.setenv("CIE_STORAGE_ROOT", "/var/data/cie")
+    monkeypatch.setenv("CIE_STORAGE_ROOT", str(tmp_path))
     monkeypatch.setenv("DATABASE_URL", "postgresql://same")
     monkeypatch.setenv("CIE_MIGRATION_POSTGRES_URL", "postgresql://same")
     migration = tmp_path / "migration"
     migration.mkdir(parents=True)
-    monkeypatch.setattr(
-        migration_supervisor,
-        "local_storage_paths",
-        lambda: SimpleNamespace(migration=migration),
-    )
     (migration / "postgres-import-progress.json").write_text(json.dumps({
         "state": "verified",
         "completed_at": "2026-08-28T01:00:00+00:00",
@@ -105,6 +121,7 @@ def test_verified_progress_is_restart_safe_and_never_grants_cutover(tmp_path, mo
     payload = migration_status_payload()
     assert payload["state"] == "verified"
     assert payload["progress_state"] == "verified"
+    assert payload["storage_root_ready"] is True
     assert payload["postgresql_authoritative"] is True
     assert payload["cutover_ready"] is False
     assert payload["live_execution_authority"] is False
