@@ -14,6 +14,7 @@ from inefficiency_engine.read_api_durable_history_projection_deploy import app a
 END_TO_END_CERTIFICATION_DEADLINE_SECONDS = 8.0
 RUNTIME_HEARTBEAT_SNAPSHOT_DEADLINE_SECONDS = 8.0
 INTERNAL_RUNTIME_HEARTBEAT_PATH = "/v3/internal/runtime-heartbeats"
+LOCAL_PERSISTENCE_MIGRATION_PATH = "/v3/internal/local-persistence-migration"
 RUNTIME_HEARTBEAT_SNAPSHOT_COMMAND = [
     sys.executable,
     "-m",
@@ -151,6 +152,38 @@ class DatabaseIndependentLivenessApp:
 
         if (
             scope.get("type") == "http"
+            and path == LOCAL_PERSISTENCE_MIGRATION_PATH
+            and method in {"GET", "HEAD"}
+        ):
+            from inefficiency_engine.local_persistence_migration_supervisor import (
+                migration_status_payload,
+            )
+
+            status = 200
+            try:
+                body_value = await asyncio.to_thread(migration_status_payload)
+            except Exception as exc:
+                status = 503
+                body_value = {
+                    "detail": {
+                        "message": "local persistence migration status is temporarily unavailable",
+                        "error_type": type(exc).__name__,
+                        "diagnostic_only": True,
+                        "allocation_authority": False,
+                        "live_execution_authority": False,
+                        "paper_only": True,
+                    }
+                }
+            await _send_json(
+                send,
+                status=status,
+                value=body_value,
+                head_only=method == "HEAD",
+            )
+            return
+
+        if (
+            scope.get("type") == "http"
             and path == "/v3/operations/end-to-end-certification"
             and method in {"GET", "HEAD"}
         ):
@@ -225,6 +258,7 @@ def liveness_payload() -> dict[str, object]:
         "internal_runtime_heartbeat_deadline_seconds": (
             RUNTIME_HEARTBEAT_SNAPSHOT_DEADLINE_SECONDS
         ),
+        "local_persistence_migration_endpoint": LOCAL_PERSISTENCE_MIGRATION_PATH,
         "end_to_end_certification_endpoint": "/v3/operations/end-to-end-certification",
         "end_to_end_certification_deadline_seconds": END_TO_END_CERTIFICATION_DEADLINE_SECONDS,
         "durable_history_endpoint": "/v3/dashboard/durable-lane-history",
@@ -240,6 +274,7 @@ __all__ = [
     "DatabaseIndependentLivenessApp",
     "END_TO_END_CERTIFICATION_DEADLINE_SECONDS",
     "INTERNAL_RUNTIME_HEARTBEAT_PATH",
+    "LOCAL_PERSISTENCE_MIGRATION_PATH",
     "RUNTIME_HEARTBEAT_SNAPSHOT_COMMAND",
     "RUNTIME_HEARTBEAT_SNAPSHOT_DEADLINE_SECONDS",
     "app",
