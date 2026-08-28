@@ -24,8 +24,24 @@ services:
     startCommand: PYTHONPATH=src python -m inefficiency_engine.render_combined_postbind_history_projection
     healthCheckPath: /health
     maxShutdownDelaySeconds: 90
+    disk:
+      name: cie-durable-storage
+      mountPath: /var/data/cie
+      sizeGB: 50
     envVars:
+      # Stage 1 keeps PostgreSQL authoritative while the new disk is populated and
+      # verified. A later, separately reviewed cutover removes this binding.
       - key: DATABASE_URL
+        fromDatabase:
+          name: cie-evidence
+          property: connectionString
+      - key: CIE_STORAGE_ROOT
+        value: /var/data/cie
+      - key: CIE_SPOOL_ROOT
+        value: /tmp/cie-spool
+      # The bounded importer reads the same PostgreSQL resource without committing
+      # its secret. Normal runtime selection still prefers DATABASE_URL above.
+      - key: CIE_MIGRATION_POSTGRES_URL
         fromDatabase:
           name: cie-evidence
           property: connectionString
