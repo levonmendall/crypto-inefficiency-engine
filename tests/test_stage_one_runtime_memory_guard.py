@@ -4,8 +4,10 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 import inefficiency_engine as package
+import inefficiency_engine.local_persistence_migration_supervisor as supervisor
 import inefficiency_engine.postgres_local_migration as migration
 import inefficiency_engine.stage_one_local_persistence_migration as stage_one
 
@@ -232,3 +234,123 @@ def test_guard_priority_resume_runs_before_normal_migration(monkeypatch, tmp_pat
     )
 
     assert events == ["resume", "traverse"]
+
+
+def test_priority_resume_transient_failure_is_durable_and_supervisor_retryable(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    progress_path = tmp_path / "progress.json"
+    progress_path.write_text(
+        json.dumps(
+            {
+                "state": "running",
+                "current_table": "funding_quotes",
+                "tables": {
+                    "funding_quotes": {
+                        "verified": False,
+                        "migration_mode": "captured_monotonic_integer_high_water",
+                        "snapshot_high_water_captured": True,
+                        "snapshot_high_water_primary_key": [5714625],
+                        "snapshot_phase": "copying_snapshot",
+                        "last_primary_key": [5665703],
+                        "snapshot_rows_copied": 5638400,
+                        "source_transport_retries": 41,
+                    }
+                },
+                "postgresql_authoritative": True,
+                "cutover_ready": False,
+            }
+        )
+    )
+    traversal_calls: list[int] = []
+
+    def fake_resume(*args, **kwargs):
+        raise OperationalError(
+            "SELECT funding_quotes",
+            {},
+            Exception("server closed the connection unexpectedly"),
+        )
+
+    def fake_migrate(source, target, history, *, progress_path, batch_size, interrupt_after_batches=None):
+        traversal_calls.append(1)
+        return {"state": "verified"}
+
+    monkeypatch.setattr(package, "_resume_durable_monotonic_checkpoints_first", fake_resume)
+    monkeypatch.setattr(migration, "migrate_engines", fake_migrate)
+    package._install_stage_one_runtime_memory_guard()
+
+    target = SimpleNamespace(engine=_DisposableEngine())
+    with pytest.raises(OperationalError):
+        migration.migrate_engines(
+            object(),
+            target,
+            object(),
+            progress_path=progress_path,
+            batch_size=2_000,
+        )
+
+    persisted = json.loads(progress_path.read_text())
+    funding = persisted["tables"]["funding_quotes"]
+    assert persisted["state"] == "failed"
+    assert persisted["error_type"] == "OperationalError"
+    assert "server closed the connection unexpectedly" in persisted["error"]
+    assert persisted["failure_phase"] == "priority_monotonic_resume"
+    assert persisted["failure_table"] == "funding_quotes"
+    assert funding["last_primary_key"] == [5665703]
+    assert funding["snapshot_high_water_primary_key"] == [5714625]
+    assert funding["snapshot_rows_copied"] == 5638400
+    assert supervisor._is_transient_source_disconnect(persisted) is True
+    assert traversal_calls == []
+
+
+def test_priority_resume_nontransient_failure_remains_fail_closed(monkeypatch, tmp_path) -> None:
+    progress_path = tmp_path / "progress.json"
+    progress_path.write_text(
+        json.dumps(
+            {
+                "state": "running",
+                "current_table": "funding_quotes",
+                "tables": {
+                    "funding_quotes": {
+                        "verified": False,
+                        "migration_mode": "captured_monotonic_integer_high_water",
+                        "snapshot_high_water_captured": True,
+                        "snapshot_high_water_primary_key": [5714625],
+                        "snapshot_phase": "copying_snapshot",
+                        "last_primary_key": [5665703],
+                        "snapshot_rows_copied": 5638400,
+                    }
+                },
+            }
+        )
+    )
+
+    def fake_resume(*args, **kwargs):
+        raise RuntimeError("captured monotonic snapshot mismatch for funding_quotes")
+
+    monkeypatch.setattr(package, "_resume_durable_monotonic_checkpoints_first", fake_resume)
+    monkeypatch.setattr(
+        migration,
+        "migrate_engines",
+        lambda *args, **kwargs: {"state": "verified"},
+    )
+    package._install_stage_one_runtime_memory_guard()
+
+    with pytest.raises(RuntimeError):
+        migration.migrate_engines(
+            object(),
+            SimpleNamespace(engine=_DisposableEngine()),
+            object(),
+            progress_path=progress_path,
+            batch_size=2_000,
+        )
+
+    persisted = json.loads(progress_path.read_text())
+    assert persisted["state"] == "failed"
+    assert persisted["error_type"] == "RuntimeError"
+    assert persisted["failure_phase"] == "priority_monotonic_resume"
+    assert persisted["failure_table"] == "funding_quotes"
+    assert supervisor._is_transient_source_disconnect(persisted) is False
+    assert persisted["postgresql_authoritative"] is True
+    assert persisted["cutover_ready"] is False
