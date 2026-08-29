@@ -22,6 +22,7 @@ _FUNDING_CHECKPOINT_FIELDS = (
     "last_progress_at",
     "source_transport_retries",
 )
+_PROGRESS_FILENAME = "postgres-import-progress.json"
 
 
 def _funding_checkpoint(progress: dict[str, Any]) -> dict[str, object]:
@@ -29,6 +30,10 @@ def _funding_checkpoint(progress: dict[str, Any]) -> dict[str, object]:
     table = tables.get("funding_quotes") if isinstance(tables, dict) else None
     funding = table if isinstance(table, dict) else {}
     return {field: funding.get(field) for field in _FUNDING_CHECKPOINT_FIELDS}
+
+
+def _progress_path():
+    return local_storage_paths().migration / _PROGRESS_FILENAME
 
 
 def migration_status_payload() -> dict[str, object]:
@@ -40,6 +45,6 @@ def migration_status_payload() -> dict[str, object]:
     """
 
     payload = _base_migration_status_payload()
-    progress = _read_json(local_storage_paths().migration_progress)
+    progress = _read_json(_progress_path())
     payload["funding_quotes"] = _funding_checkpoint(progress)
     return payload
