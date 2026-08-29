@@ -29,6 +29,7 @@ _STAGE_ONE_RESUMABLE_MONOTONIC_PHASES = {
     "copying_snapshot",
     "verifying_snapshot",
 }
+_STAGE_ONE_PRIORITY_RESUME_FAILURE_PHASE = "priority_monotonic_resume"
 
 
 def _running_stage_one_migration() -> bool:
@@ -65,6 +66,30 @@ def _durable_monotonic_resume_candidates(progress: dict[str, Any]) -> list[str]:
     return candidates
 
 
+def _persist_priority_resume_failure(
+    migration: Any,
+    progress_path: Any,
+    exc: BaseException,
+) -> None:
+    """Publish priority-resume terminal truth without discarding its durable checkpoint."""
+
+    progress = migration._load_progress(progress_path)
+    current_table = str(progress.get("current_table") or "").strip() or None
+    progress.update(
+        state="failed",
+        error_type=type(exc).__name__,
+        error=str(exc),
+        failure_phase=_STAGE_ONE_PRIORITY_RESUME_FAILURE_PHASE,
+        failure_table=current_table,
+        paper_only=True,
+        live_execution_authority=False,
+        forward_evidence_granted=False,
+        postgresql_authoritative=True,
+        cutover_ready=False,
+    )
+    migration._publish(progress, progress_path)
+
+
 def _resume_durable_monotonic_checkpoints_first(
     migration: Any,
     migrate_monotonic_integer_append_only_table: Any,
@@ -97,6 +122,10 @@ def _resume_durable_monotonic_checkpoints_first(
     if not isinstance(tables, dict):
         return
 
+    progress.pop("error", None)
+    progress.pop("error_type", None)
+    progress.pop("failure_phase", None)
+    progress.pop("failure_table", None)
     progress.update(
         state="running",
         paper_only=True,
@@ -240,15 +269,19 @@ def _install_stage_one_runtime_memory_guard() -> None:
 
         migration._migrate_resumable_append_only_table = routed_append_only
         try:
-            _resume_durable_monotonic_checkpoints_first(
-                migration,
-                migrate_monotonic_integer_append_only_table,
-                source,
-                target,
-                progress_path=progress_path,
-                batch_size=bounded_batch_size,
-                interrupt_after_batches=interrupt_after_batches,
-            )
+            try:
+                _resume_durable_monotonic_checkpoints_first(
+                    migration,
+                    migrate_monotonic_integer_append_only_table,
+                    source,
+                    target,
+                    progress_path=progress_path,
+                    batch_size=bounded_batch_size,
+                    interrupt_after_batches=interrupt_after_batches,
+                )
+            except Exception as exc:
+                _persist_priority_resume_failure(migration, progress_path, exc)
+                raise
             return current(
                 source,
                 target,
