@@ -41,6 +41,7 @@ _TRANSIENT_SOURCE_FAILURE_MARKERS = (
     "consuming input failed",
     "server closed the connection unexpectedly",
     "connection reset by peer",
+    "connection refused",
     "ssl connection has been closed unexpectedly",
     "terminating connection due to administrator command",
     "the database system is in recovery mode",
@@ -656,7 +657,6 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
                     }
                 )
                 return
-
 
 __all__ = [
     "AUTO_MIGRATION_ENV",
