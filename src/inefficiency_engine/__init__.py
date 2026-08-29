@@ -10,10 +10,15 @@ __version__ = "3.8.3"
 
 _STAGE_ONE_MODULE = "inefficiency_engine.stage_one_local_persistence_migration"
 _STAGE_ONE_MAX_BATCH_SIZE = 256
+_STAGE_ONE_CAPTURED_SNAPSHOT_MODE = "captured_primary_key_membership_manifest"
+_STAGE_ONE_FUNDING_PARENT_TABLE = "scans"
+_STAGE_ONE_FUNDING_PARENT_REFRESH_TARGET = "parent_snapshot_refresh_high_water_primary_key"
+_STAGE_ONE_FUNDING_PARENT_VERIFIED = "parent_snapshot_verified_high_water_primary_key"
 _STAGE_ONE_CAPTURED_APPEND_ONLY_TABLES = {
     "cycle_historical_quotes",
     "dashboard_projection_snapshots",
     "funding_quotes",
+    "scans",
     "source_coverage_history",
     "source_event_observations",
     "worker_heartbeats",
@@ -90,6 +95,100 @@ def _persist_priority_resume_failure(
     migration._publish(progress, progress_path)
 
 
+def _ensure_funding_scan_parent_snapshot(
+    migration: Any,
+    source: Any,
+    target_engine: Any,
+    source_metadata: Any,
+    target_metadata: Any,
+    tables: dict[str, Any],
+    funding_report: dict[str, Any],
+    report: dict[str, Any],
+    progress_path: Any,
+    *,
+    high_water: list[object] | None,
+    batch_size: int,
+) -> None:
+    """Refresh and verify ``scans`` after the funding high-water is fixed.
+
+    ``funding_quotes.scan_id`` is a foreign key to ``scans.scan_id``.  Stage 1 keeps
+    the source live while it captures finite append-only snapshots, so a scans snapshot
+    taken before the funding high-water can legitimately miss parents referenced by the
+    later funding snapshot.  Bind the parent snapshot to the exact child high-water and
+    finish it first; retries resume the same captured parent manifest instead of
+    weakening SQLite foreign-key enforcement or resetting the funding checkpoint.
+    """
+
+    if not high_water:
+        return
+    if _STAGE_ONE_FUNDING_PARENT_TABLE not in source_metadata.tables:
+        raise RuntimeError("funding parent table missing from source schema: scans")
+    if _STAGE_ONE_FUNDING_PARENT_TABLE not in target_metadata.tables:
+        raise RuntimeError("funding parent table missing from target schema: scans")
+
+    from inefficiency_engine.stage_one_local_persistence_migration import (
+        _migrate_captured_append_only_table,
+    )
+
+    expected_high_water = list(high_water)
+    parent_report = tables.setdefault(_STAGE_ONE_FUNDING_PARENT_TABLE, {})
+    if not isinstance(parent_report, dict):
+        raise RuntimeError("funding parent table progress is not a mapping: scans")
+
+    if (
+        funding_report.get(_STAGE_ONE_FUNDING_PARENT_VERIFIED) == expected_high_water
+        and parent_report.get("verified") is True
+        and parent_report.get("migration_mode") == _STAGE_ONE_CAPTURED_SNAPSHOT_MODE
+    ):
+        return
+
+    refresh_target = funding_report.get(_STAGE_ONE_FUNDING_PARENT_REFRESH_TARGET)
+    if refresh_target != expected_high_water:
+        # Force one fresh finite scans membership snapshot *after* this funding
+        # high-water.  The captured-table implementation preserves destination rows
+        # and transport counters while replacing only its obsolete manifest/report.
+        parent_report["verified"] = False
+        parent_report["migration_mode"] = "funding_parent_snapshot_refresh_required"
+        funding_report[_STAGE_ONE_FUNDING_PARENT_REFRESH_TARGET] = expected_high_water
+        funding_report.pop(_STAGE_ONE_FUNDING_PARENT_VERIFIED, None)
+
+    source_table = source_metadata.tables[_STAGE_ONE_FUNDING_PARENT_TABLE]
+    target_table = target_metadata.tables[_STAGE_ONE_FUNDING_PARENT_TABLE]
+    primary_key = migration._primary_key(source_table)
+    shared = [column.name for column in source_table.columns if column.name in target_table.c]
+    if any(column.name not in shared for column in primary_key):
+        raise RuntimeError("target schema missing primary key columns for scans")
+
+    report["current_table"] = _STAGE_ONE_FUNDING_PARENT_TABLE
+    migration._publish(report, progress_path)
+    _migrate_captured_append_only_table(
+        source,
+        target_engine,
+        source_table,
+        target_table,
+        shared,
+        parent_report,
+        report,
+        progress_path,
+        batch_size=batch_size,
+        completed_batches=0,
+        interrupt_after_batches=None,
+    )
+    if (
+        parent_report.get("verified") is not True
+        or parent_report.get("migration_mode") != _STAGE_ONE_CAPTURED_SNAPSHOT_MODE
+    ):
+        raise RuntimeError("funding parent snapshot did not verify: scans")
+
+    funding_report[_STAGE_ONE_FUNDING_PARENT_VERIFIED] = expected_high_water
+    funding_report["parent_snapshot_table"] = _STAGE_ONE_FUNDING_PARENT_TABLE
+    funding_report["parent_snapshot_manifest_sha256"] = parent_report.get(
+        "snapshot_manifest_sha256"
+    )
+    report["current_table"] = "funding_quotes"
+    migration._publish(report, progress_path)
+
+
 def _resume_durable_monotonic_checkpoints_first(
     migration: Any,
     migrate_monotonic_integer_append_only_table: Any,
@@ -148,6 +247,24 @@ def _resume_durable_monotonic_checkpoints_first(
         table_report = tables[name]
         progress["current_table"] = name
         migration._publish(progress, progress_path)
+
+        before_snapshot_copy = None
+        if name == "funding_quotes":
+            def before_snapshot_copy(high_water: list[object] | None) -> None:
+                _ensure_funding_scan_parent_snapshot(
+                    migration,
+                    source,
+                    target.engine,
+                    source_metadata,
+                    target_metadata,
+                    tables,
+                    table_report,
+                    progress,
+                    progress_path,
+                    high_water=high_water,
+                    batch_size=batch_size,
+                )
+
         completed_batches = migrate_monotonic_integer_append_only_table(
             source,
             target.engine,
@@ -160,6 +277,7 @@ def _resume_durable_monotonic_checkpoints_first(
             batch_size=batch_size,
             completed_batches=completed_batches,
             interrupt_after_batches=interrupt_after_batches,
+            before_snapshot_copy=before_snapshot_copy,
         )
 
 
@@ -240,6 +358,26 @@ def _install_stage_one_runtime_memory_guard() -> None:
             if retry_resume and table_report.get("verified") is True:
                 return completed_batches
             if source_table.name in _STAGE_ONE_MONOTONIC_HIGH_WATER_TABLES:
+                before_snapshot_copy = None
+                if source_table.name == "funding_quotes":
+                    def before_snapshot_copy(high_water: list[object] | None) -> None:
+                        tables = report.get("tables")
+                        if not isinstance(tables, dict):
+                            raise RuntimeError("migration progress tables are unavailable")
+                        _ensure_funding_scan_parent_snapshot(
+                            migration,
+                            source_engine,
+                            target_engine,
+                            source_table.metadata,
+                            target_table.metadata,
+                            tables,
+                            table_report,
+                            report,
+                            progress,
+                            high_water=high_water,
+                            batch_size=batch_size,
+                        )
+
                 return migrate_monotonic_integer_append_only_table(
                     source_engine,
                     target_engine,
@@ -252,6 +390,7 @@ def _install_stage_one_runtime_memory_guard() -> None:
                     batch_size=batch_size,
                     completed_batches=completed_batches,
                     interrupt_after_batches=interrupt_after_batches,
+                    before_snapshot_copy=before_snapshot_copy,
                 )
             return resumable_append_only(
                 source_engine,
