@@ -144,9 +144,6 @@ def _ensure_funding_scan_parent_snapshot(
 
     refresh_target = funding_report.get(_STAGE_ONE_FUNDING_PARENT_REFRESH_TARGET)
     if refresh_target != expected_high_water:
-        # Force one fresh finite scans membership snapshot *after* this funding
-        # high-water.  The captured-table implementation preserves destination rows
-        # and transport counters while replacing only its obsolete manifest/report.
         parent_report["verified"] = False
         parent_report["migration_mode"] = "funding_parent_snapshot_refresh_required"
         funding_report[_STAGE_ONE_FUNDING_PARENT_REFRESH_TARGET] = expected_high_water
@@ -293,10 +290,12 @@ def _install_stage_one_runtime_memory_guard() -> None:
     """
 
     from inefficiency_engine import postgres_local_migration as migration
+    from inefficiency_engine.stage_one_market_inventory import install_bounded_market_inventory
     from inefficiency_engine.stage_one_monotonic_append_only import (
         migrate_monotonic_integer_append_only_table,
     )
 
+    install_bounded_market_inventory(migration)
     migration.RESUMABLE_APPEND_ONLY_TABLES.update(_STAGE_ONE_CAPTURED_APPEND_ONLY_TABLES)
 
     current = migration.migrate_engines
