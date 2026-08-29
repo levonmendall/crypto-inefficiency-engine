@@ -47,8 +47,6 @@ def test_stale_predecessor_running_status_does_not_strand_handoff(monkeypatch) -
             event.set()
 
     monkeypatch.setattr(runtime, "run_local_persistence_migration_supervisor", fake_run)
-    # A predecessor can overwrite the brief lock-blocked row while shutting down. The
-    # fresh process must still retry when its supervisor returned without terminal truth.
     monkeypatch.setattr(
         runtime,
         "migration_status_payload",
@@ -210,3 +208,88 @@ def test_guard_status_persists_release_identity_and_redacts_database_credentials
     assert payload["cutover_ready"] is False
     assert payload["allocation_authority"] is False
     assert payload["live_execution_authority"] is False
+
+
+def test_main_publishes_guard_startup_synchronously_before_threads_start(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeThread:
+        def __init__(self, *, target, args, name, daemon):
+            self.name = name
+
+        def start(self) -> None:
+            events.append(f"start:{self.name}")
+
+        def join(self, timeout=None) -> None:
+            events.append(f"join:{self.name}")
+
+    monkeypatch.setattr(runtime, "install_startup_database_recovery", lambda _base: None)
+    monkeypatch.setattr(runtime.threading, "Thread", FakeThread)
+    monkeypatch.setattr(
+        runtime,
+        "_publish_synchronous_migration_guard_startup",
+        lambda: events.append("sync_guard_startup") or "2026-08-29T03:00:00+00:00",
+    )
+    monkeypatch.setattr(runtime.base, "main", lambda: 0)
+
+    assert runtime.main() == 0
+    assert events[0] == "sync_guard_startup"
+    assert events[1:3] == [
+        "start:durable-lane-history-projection-supervisor",
+        "start:local-persistence-migration-supervisor",
+    ]
+
+
+def test_synchronous_guard_startup_records_durable_write_failure(
+    monkeypatch,
+) -> None:
+    fallback: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        runtime,
+        "_publish_migration_guard_status",
+        lambda **_payload: (_ for _ in ()).throw(OSError("No space left on device")),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_publish_migration_guard_fallback_status",
+        lambda **payload: fallback.append(dict(payload)),
+    )
+
+    runtime._publish_synchronous_migration_guard_startup()
+
+    assert len(fallback) == 1
+    assert fallback[0]["state"] == "durable_status_write_failed"
+    assert fallback[0]["reason"] == "main_startup_durable_status_write_failed"
+    assert fallback[0]["attempt"] == 0
+    assert fallback[0]["error_type"] == "OSError"
+    assert "No space left on device" in str(fallback[0]["error"])
+
+
+def test_background_guard_status_write_failure_is_not_silent(monkeypatch) -> None:
+    fallback: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        runtime,
+        "_publish_migration_guard_status",
+        lambda **_payload: (_ for _ in ()).throw(PermissionError("read-only disk")),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_publish_migration_guard_fallback_status",
+        lambda **payload: fallback.append(dict(payload)),
+    )
+
+    runtime._safe_publish_migration_guard_status(
+        state="running",
+        reason="supervisor_entry",
+        started_at="2026-08-29T03:00:00+00:00",
+        attempt=1,
+    )
+
+    assert len(fallback) == 1
+    assert fallback[0]["state"] == "durable_status_write_failed"
+    assert fallback[0]["reason"] == "background_durable_status_write_failed"
+    assert fallback[0]["error_type"] == "PermissionError"
