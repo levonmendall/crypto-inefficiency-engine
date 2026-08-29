@@ -191,12 +191,10 @@ def test_bounded_market_inventory_transient_eof_replays_only_current_batch(
     observed_checkpoints: list[int | None] = []
     failed = False
     dispose_calls = 0
-    original_dispose = source.dispose
 
     def dispose() -> None:
         nonlocal dispose_calls
         dispose_calls += 1
-        original_dispose()
 
     def transient_once(*args, **kwargs):
         nonlocal failed
