@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -68,7 +69,7 @@ def _prepare_inventory(
     high_water: list[object] | None,
 ) -> tuple[int | None, int]:
     token = _high_water_token(high_water)
-    with _connect_inventory(path) as db:
+    with closing(_connect_inventory(path)) as db:
         stored = _meta_get(db, "high_water")
         if stored != token:
             db.execute("BEGIN IMMEDIATE")
@@ -134,7 +135,7 @@ def _accumulate_batch(
     ]
     checkpoint = int(rows[-1]["id"])
     source_rows = previous_source_rows + len(rows)
-    with _connect_inventory(path) as db:
+    with closing(_connect_inventory(path)) as db:
         db.execute("BEGIN IMMEDIATE")
         db.executemany(
             """INSERT INTO lineages(
@@ -160,7 +161,7 @@ def _finalize_inventory(path: Path) -> dict[str, object]:
     minimum: str | None = None
     maximum: str | None = None
     lineage_count = 0
-    with _connect_inventory(path) as db:
+    with closing(_connect_inventory(path)) as db:
         source_rows = int(_meta_get(db, "source_rows") or 0)
         cursor = db.execute(
             "SELECT lineage_hash, venue, asset, min_observed_at, max_observed_at "
@@ -224,6 +225,7 @@ def bounded_market_source_inventory(
         source_inventory_last_primary_key=[checkpoint] if checkpoint is not None else None,
         source_inventory_rows_scanned=source_rows,
         source_inventory_batch_size=MARKET_INVENTORY_BATCH_SIZE,
+        source_inventory_accumulator_file=path.name,
         last_progress_at=_now(),
     )
     migration._publish(report, progress_path)
