@@ -23,6 +23,12 @@ _STAGE_ONE_MONOTONIC_HIGH_WATER_TABLES = {
     "source_event_observations",
     "worker_heartbeats",
 }
+_STAGE_ONE_MONOTONIC_MIGRATION_MODE = "captured_monotonic_integer_high_water"
+_STAGE_ONE_RESUMABLE_MONOTONIC_PHASES = {
+    "high_water_captured",
+    "copying_snapshot",
+    "verifying_snapshot",
+}
 
 
 def _running_stage_one_migration() -> bool:
@@ -31,15 +37,112 @@ def _running_stage_one_migration() -> bool:
     return _STAGE_ONE_MODULE in tuple(getattr(sys, "orig_argv", ()))
 
 
+def _durable_monotonic_resume_candidates(progress: dict[str, Any]) -> list[str]:
+    """Return unfinished monotonic snapshots that already own a durable boundary.
+
+    A fresh Stage 1 child must honor persisted restart-safe work before walking the
+    schema from the beginning. This does not skip later integrity checks; it only makes
+    the durable unfinished checkpoint the first unit of work after a process restart.
+    """
+
+    tables = progress.get("tables")
+    if not isinstance(tables, dict):
+        return []
+    candidates: list[str] = []
+    for name in sorted(_STAGE_ONE_MONOTONIC_HIGH_WATER_TABLES):
+        table_report = tables.get(name)
+        if not isinstance(table_report, dict):
+            continue
+        if table_report.get("verified") is True:
+            continue
+        if table_report.get("migration_mode") != _STAGE_ONE_MONOTONIC_MIGRATION_MODE:
+            continue
+        if table_report.get("snapshot_high_water_captured") is not True:
+            continue
+        if table_report.get("snapshot_phase") not in _STAGE_ONE_RESUMABLE_MONOTONIC_PHASES:
+            continue
+        candidates.append(name)
+    return candidates
+
+
+def _resume_durable_monotonic_checkpoints_first(
+    migration: Any,
+    migrate_monotonic_integer_append_only_table: Any,
+    source: Any,
+    target: Any,
+    *,
+    progress_path: Any,
+    batch_size: int,
+    interrupt_after_batches: int | None,
+) -> None:
+    """Finish durable monotonic checkpoints before normal schema traversal.
+
+    Normal ``migrate_engines`` still runs afterward and therefore retains its complete
+    fresh-process integrity scan. The priority pass only prevents a 54/55 checkpoint
+    from being stranded behind rescans of dozens of already completed tables.
+    """
+
+    progress = migration._load_progress(progress_path)
+    candidates = _durable_monotonic_resume_candidates(progress)
+    if not candidates:
+        return
+
+    source_metadata = migration.MetaData()
+    source_metadata.reflect(source)
+    migration.bootstrap_local_schema_from_source(source_metadata, target.engine)
+    target_metadata = migration.MetaData()
+    target_metadata.reflect(target.engine)
+
+    tables = progress.get("tables")
+    if not isinstance(tables, dict):
+        return
+
+    progress.update(
+        state="running",
+        paper_only=True,
+        live_execution_authority=False,
+        forward_evidence_granted=False,
+        postgresql_authoritative=True,
+        cutover_ready=False,
+        verification_scope="captured_primary_key_high_water",
+    )
+    completed_batches = 0
+    for name in candidates:
+        if name not in source_metadata.tables or name not in target_metadata.tables:
+            raise RuntimeError(f"durable resume table missing from reflected schema: {name}")
+        source_table = source_metadata.tables[name]
+        target_table = target_metadata.tables[name]
+        primary_key = migration._primary_key(source_table)
+        shared = [column.name for column in source_table.columns if column.name in target_table.c]
+        if any(column.name not in shared for column in primary_key):
+            raise RuntimeError(f"target schema missing primary key columns for {name}")
+        table_report = tables[name]
+        progress["current_table"] = name
+        migration._publish(progress, progress_path)
+        completed_batches = migrate_monotonic_integer_append_only_table(
+            source,
+            target.engine,
+            source_table,
+            target_table,
+            shared,
+            table_report,
+            progress,
+            progress_path,
+            batch_size=batch_size,
+            completed_batches=completed_batches,
+            interrupt_after_batches=interrupt_after_batches,
+        )
+
+
 def _install_stage_one_runtime_memory_guard() -> None:
     """Keep Stage 1 retries inside the 2 GiB Render cgroup memory budget.
 
     The migration-specific entrypoint already owns the retry semantics. This early hook
     bounds each relational batch, routes proven append-only Stage 1 ledgers through
-    restart-safe finite capture paths, and makes a *same-process* retry skip integrity
+    restart-safe finite capture paths, prioritizes durable unfinished monotonic
+    checkpoints after a process restart, and makes a *same-process* retry skip integrity
     rescans of tables that the immediately preceding attempt already verified. A fresh
-    migration process still performs every full integrity check, so restart behavior
-    remains fail-closed.
+    migration process still performs every full integrity check before Stage 1 can finish.
     """
 
     from inefficiency_engine import postgres_local_migration as migration
@@ -47,11 +150,6 @@ def _install_stage_one_runtime_memory_guard() -> None:
         migrate_monotonic_integer_append_only_table,
     )
 
-    # These tables have immutable INSERT-only writers. Stage 1 therefore does not need
-    # the generic mutable-table repeatable-read payload transaction. Hash/non-monotonic
-    # ledgers retain the exact captured-membership implementation installed by the
-    # Stage 1 entrypoint; proven monotonic integer ledgers can use a durable high-water
-    # plus bounded keyset reads instead.
     migration.RESUMABLE_APPEND_ONLY_TABLES.update(_STAGE_ONE_CAPTURED_APPEND_ONLY_TABLES)
 
     current = migration.migrate_engines
@@ -142,6 +240,15 @@ def _install_stage_one_runtime_memory_guard() -> None:
 
         migration._migrate_resumable_append_only_table = routed_append_only
         try:
+            _resume_durable_monotonic_checkpoints_first(
+                migration,
+                migrate_monotonic_integer_append_only_table,
+                source,
+                target,
+                progress_path=progress_path,
+                batch_size=bounded_batch_size,
+                interrupt_after_batches=interrupt_after_batches,
+            )
             return current(
                 source,
                 target,
