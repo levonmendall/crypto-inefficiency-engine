@@ -274,6 +274,16 @@ def bounded_market_source_inventory(
 
 
 def install_bounded_market_inventory(migration: Any) -> None:
+    # Stage 1 already has bounded, fail-closed retry budgets for source reads. Treat a
+    # PostgreSQL TCP refusal as the same transient transport class as reset/EOF/recovery
+    # so the next attempt uses a fresh pool while preserving every durable checkpoint.
+    marker = "connection refused"
+    if marker not in migration._TRANSIENT_SOURCE_READ_MARKERS:
+        migration._TRANSIENT_SOURCE_READ_MARKERS = (
+            *migration._TRANSIENT_SOURCE_READ_MARKERS,
+            marker,
+        )
+
     def replacement(
         source: Engine,
         table: Table,
