@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from pathlib import Path
-from types import SimpleNamespace
+import json
 
 import inefficiency_engine.local_persistence_migration_status as status
 
 
-def test_status_projects_durable_funding_checkpoint_without_changing_authority(monkeypatch) -> None:
+def test_status_projects_durable_funding_checkpoint_without_changing_authority(
+    monkeypatch,
+    tmp_path,
+) -> None:
     base = {
         "state": "running",
         "current_table": "funding_quotes",
@@ -37,16 +39,15 @@ def test_status_projects_durable_funding_checkpoint_without_changing_authority(m
         },
     }
 
+    monkeypatch.setenv("CIE_STORAGE_ROOT", str(tmp_path))
     monkeypatch.setattr(status, "_base_migration_status_payload", lambda: dict(base))
-    monkeypatch.setattr(status, "_read_json", lambda _path: progress)
-    monkeypatch.setattr(
-        status,
-        "local_storage_paths",
-        lambda: SimpleNamespace(migration_progress=Path("progress.json")),
-    )
+    progress_path = tmp_path / "migration" / status._PROGRESS_FILENAME
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    progress_path.write_text(json.dumps(progress))
 
     payload = status.migration_status_payload()
 
+    assert status._progress_path() == progress_path
     assert payload["funding_quotes"] == {
         "verified": False,
         "migration_mode": "captured_monotonic_integer_high_water",
@@ -67,7 +68,11 @@ def test_status_projects_durable_funding_checkpoint_without_changing_authority(m
     assert payload["cutover_ready"] is False
 
 
-def test_status_fails_closed_when_funding_checkpoint_is_absent(monkeypatch) -> None:
+def test_status_fails_closed_when_funding_checkpoint_is_absent(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("CIE_STORAGE_ROOT", str(tmp_path))
     monkeypatch.setattr(
         status,
         "_base_migration_status_payload",
@@ -80,15 +85,12 @@ def test_status_fails_closed_when_funding_checkpoint_is_absent(monkeypatch) -> N
             "cutover_ready": False,
         },
     )
-    monkeypatch.setattr(status, "_read_json", lambda _path: {})
-    monkeypatch.setattr(
-        status,
-        "local_storage_paths",
-        lambda: SimpleNamespace(migration_progress=Path("missing.json")),
-    )
 
     payload = status.migration_status_payload()
 
+    assert status._progress_path() == (
+        tmp_path / "migration" / status._PROGRESS_FILENAME
+    )
     assert set(payload["funding_quotes"]) == set(status._FUNDING_CHECKPOINT_FIELDS)
     assert all(value is None for value in payload["funding_quotes"].values())
     assert payload["postgresql_authoritative"] is True
