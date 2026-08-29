@@ -53,9 +53,6 @@ def test_stage_one_runtime_guard_caps_batches_and_skips_verified_rescans_on_retr
     }
     assert calls[0]["batch_size"] == 256
     assert calls[0]["verified_helper"] is original_verified
-    # Append-only work is routed even on the first call so proven monotonic integer
-    # ledgers can use their finite high-water path; the original handler is restored
-    # immediately after the guarded import returns.
     assert calls[0]["append_helper"] is not original_append
 
     assert guarded(object(), target, object(), progress_path=object(), batch_size=2_000) == {
@@ -66,7 +63,6 @@ def test_stage_one_runtime_guard_caps_batches_and_skips_verified_rescans_on_retr
     assert calls[1]["append_helper"] is not original_append
     assert target_engine.dispose_calls == 1
 
-    # The temporary substitutions are always restored after each call.
     assert migration._verified_target_is_intact is original_verified
     assert migration._migrate_resumable_append_only_table is original_append
 
@@ -164,3 +160,67 @@ def test_stage_one_module_detection_uses_original_python_argv(monkeypatch):
 
     monkeypatch.setattr(package.sys, "orig_argv", ["python", "-m", "inefficiency_engine.render_combined"])
     assert package._running_stage_one_migration() is False
+
+
+def test_durable_funding_checkpoint_is_selected_before_schema_traversal() -> None:
+    progress = {
+        "state": "running",
+        "current_table": "source_event_observations",
+        "tables": {
+            "dashboard_projection_snapshots": {"verified": True},
+            "funding_quotes": {
+                "verified": False,
+                "migration_mode": "captured_monotonic_integer_high_water",
+                "snapshot_high_water_captured": True,
+                "snapshot_high_water_primary_key": [5714625],
+                "snapshot_phase": "copying_snapshot",
+                "last_primary_key": [4542494],
+                "snapshot_rows_copied": 4526080,
+            },
+            "source_event_observations": {"verified": True},
+            "worker_heartbeats": {"verified": True},
+        },
+    }
+
+    assert package._durable_monotonic_resume_candidates(progress) == ["funding_quotes"]
+
+
+def test_verified_or_unbounded_monotonic_tables_are_not_priority_resumed() -> None:
+    progress = {
+        "tables": {
+            "funding_quotes": {
+                "verified": True,
+                "migration_mode": "captured_monotonic_integer_high_water",
+                "snapshot_high_water_captured": True,
+                "snapshot_phase": "verified",
+            },
+            "source_event_observations": {
+                "verified": False,
+                "migration_mode": "captured_monotonic_integer_high_water",
+                "snapshot_high_water_captured": False,
+                "snapshot_phase": "capturing_high_water",
+            },
+        }
+    }
+
+    assert package._durable_monotonic_resume_candidates(progress) == []
+
+
+def test_guard_priority_resume_runs_before_normal_migration(monkeypatch):
+    events: list[str] = []
+
+    def fake_resume(*args, **kwargs):
+        events.append("resume")
+
+    def fake_migrate(source, target, history, *, progress_path, batch_size, interrupt_after_batches=None):
+        events.append("traverse")
+        return {"state": "verified"}
+
+    monkeypatch.setattr(package, "_resume_durable_monotonic_checkpoints_first", fake_resume)
+    monkeypatch.setattr(migration, "migrate_engines", fake_migrate)
+    package._install_stage_one_runtime_memory_guard()
+
+    target = SimpleNamespace(engine=_DisposableEngine())
+    migration.migrate_engines(object(), target, object(), progress_path=object(), batch_size=2_000)
+
+    assert events == ["resume", "traverse"]
