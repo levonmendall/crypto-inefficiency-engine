@@ -29,6 +29,10 @@ API_BIND_WAIT_SECONDS = 180.0
 TRUE_VALUES = {"1", "true", "yes", "on"}
 MAX_TRANSIENT_SOURCE_RETRIES = 3
 TRANSIENT_SOURCE_RETRY_DELAYS_SECONDS = (1.0, 3.0, 8.0)
+MONOTONIC_COPY_STALL_SECONDS = 900.0
+MAX_STALLED_PROGRESS_RESTARTS = 3
+STALLED_PROGRESS_RETRY_DELAY_SECONDS = 1.0
+MONOTONIC_MIGRATION_MODE = "captured_monotonic_integer_high_water"
 _URL_CREDENTIALS = re.compile(
     r"(?i)\b(postgres(?:ql)?(?:\+psycopg)?://)([^@\s]+)@"
 )
@@ -125,6 +129,56 @@ def _is_transient_source_disconnect(progress: dict[str, Any]) -> bool:
     if "operationalerror" not in error_type and "psycopg.operationalerror" not in error:
         return False
     return any(marker in error for marker in _TRANSIENT_SOURCE_FAILURE_MARKERS)
+
+
+def _monotonic_copy_progress_marker(
+    progress: dict[str, Any],
+) -> tuple[object, ...] | None:
+    """Return durable copy progress only for restart-safe monotonic snapshots.
+
+    Stage-one monotonic tables publish after every bounded source batch and persist
+    both the source high-water and the last committed primary-key checkpoint. A child
+    that remains alive while this marker does not move is therefore safe to terminate
+    and relaunch from the durable checkpoint. Other migration phases are intentionally
+    excluded because they may perform finite work without publishing batch progress.
+    """
+
+    current_table = str(progress.get("current_table") or "").strip()
+    tables = progress.get("tables")
+    if not current_table or not isinstance(tables, dict):
+        return None
+    table_report = tables.get(current_table)
+    if not isinstance(table_report, dict):
+        return None
+    if table_report.get("verified") is True:
+        return None
+    if table_report.get("migration_mode") != MONOTONIC_MIGRATION_MODE:
+        return None
+    if table_report.get("snapshot_phase") != "copying_snapshot":
+        return None
+    return (
+        current_table,
+        table_report.get("last_progress_at"),
+        json.dumps(table_report.get("last_primary_key"), sort_keys=True, default=str),
+        int(table_report.get("snapshot_rows_copied") or 0),
+    )
+
+
+def _stalled_checkpoint_details(progress: dict[str, Any]) -> dict[str, object]:
+    current_table = str(progress.get("current_table") or "").strip()
+    tables = progress.get("tables")
+    table_report = tables.get(current_table) if isinstance(tables, dict) else None
+    if not isinstance(table_report, dict):
+        table_report = {}
+    return {
+        "stalled_current_table": current_table or None,
+        "stalled_last_progress_at": table_report.get("last_progress_at"),
+        "stalled_last_primary_key": table_report.get("last_primary_key"),
+        "stalled_snapshot_rows_copied": table_report.get("snapshot_rows_copied"),
+        "stalled_snapshot_high_water_primary_key": table_report.get(
+            "snapshot_high_water_primary_key"
+        ),
+    }
 
 
 def _publish_status(payload: dict[str, object]) -> None:
@@ -237,6 +291,14 @@ def migration_status_payload() -> dict[str, object]:
         "child_return_code": supervisor.get("child_return_code"),
         "supervisor_attempt": supervisor.get("attempt"),
         "source_disconnect_retries": supervisor.get("source_disconnect_retries", 0),
+        "stalled_progress_restarts": supervisor.get("stalled_progress_restarts", 0),
+        "stalled_current_table": supervisor.get("stalled_current_table"),
+        "stalled_last_progress_at": supervisor.get("stalled_last_progress_at"),
+        "stalled_last_primary_key": supervisor.get("stalled_last_primary_key"),
+        "stalled_snapshot_rows_copied": supervisor.get("stalled_snapshot_rows_copied"),
+        "stalled_snapshot_high_water_primary_key": supervisor.get(
+            "stalled_snapshot_high_water_primary_key"
+        ),
         "progress_state": progress.get("state"),
         "progress_started_at": progress.get("started_at"),
         "progress_completed_at": progress.get("completed_at"),
@@ -371,6 +433,7 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
         child_env = os.environ.copy()
         child_env["CIE_MIGRATION_POSTGRES_URL"] = _migration_source_url()
         source_disconnect_retries = 0
+        stalled_progress_restarts = 0
         attempt = 0
 
         with stdout_path.open("ab") as stdout_file, stderr_path.open("ab") as stderr_file:
@@ -392,6 +455,7 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
                         "child_pid": child.pid,
                         "attempt": attempt,
                         "source_disconnect_retries": source_disconnect_retries,
+                        "stalled_progress_restarts": stalled_progress_restarts,
                         "observed_at": _now(),
                         "postgresql_authoritative": True,
                         "cutover_ready": False,
@@ -399,6 +463,11 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
                         "live_execution_authority": False,
                     }
                 )
+                progress = _read_json(progress_path)
+                last_copy_marker = _monotonic_copy_progress_marker(progress)
+                marker_changed_at = time.monotonic()
+                stalled_progress: dict[str, Any] | None = None
+
                 while child.poll() is None:
                     if stop_event.wait(1.0):
                         _terminate_child(child)
@@ -411,6 +480,7 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
                                 "child_return_code": child.returncode,
                                 "attempt": attempt,
                                 "source_disconnect_retries": source_disconnect_retries,
+                                "stalled_progress_restarts": stalled_progress_restarts,
                                 "postgresql_authoritative": True,
                                 "cutover_ready": False,
                                 "paper_only": True,
@@ -418,6 +488,85 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
                             }
                         )
                         return
+
+                    progress = _read_json(progress_path)
+                    copy_marker = _monotonic_copy_progress_marker(progress)
+                    if copy_marker is None:
+                        last_copy_marker = None
+                        marker_changed_at = time.monotonic()
+                        continue
+                    if copy_marker != last_copy_marker:
+                        last_copy_marker = copy_marker
+                        marker_changed_at = time.monotonic()
+                        continue
+                    if time.monotonic() - marker_changed_at < MONOTONIC_COPY_STALL_SECONDS:
+                        continue
+
+                    stalled_progress = progress
+                    _terminate_child(child)
+                    break
+
+                if stalled_progress is not None:
+                    stalled_progress_restarts += 1
+                    checkpoint_details = _stalled_checkpoint_details(stalled_progress)
+                    if stalled_progress_restarts > MAX_STALLED_PROGRESS_RESTARTS:
+                        _publish_status(
+                            {
+                                "state": "failed",
+                                "reason": "stalled_monotonic_copy_retry_exhausted",
+                                "started_at": started_at,
+                                "completed_at": _now(),
+                                "child_return_code": child.returncode,
+                                "attempt": attempt,
+                                "source_disconnect_retries": source_disconnect_retries,
+                                "stalled_progress_restarts": stalled_progress_restarts,
+                                **checkpoint_details,
+                                "postgresql_authoritative": True,
+                                "cutover_ready": False,
+                                "paper_only": True,
+                                "live_execution_authority": False,
+                            }
+                        )
+                        return
+
+                    _publish_status(
+                        {
+                            "state": "retry_wait",
+                            "reason": "stalled_monotonic_copy_progress",
+                            "started_at": started_at,
+                            "child_return_code": child.returncode,
+                            "attempt": attempt,
+                            "source_disconnect_retries": source_disconnect_retries,
+                            "stalled_progress_restarts": stalled_progress_restarts,
+                            "retry_after_seconds": STALLED_PROGRESS_RETRY_DELAY_SECONDS,
+                            **checkpoint_details,
+                            "observed_at": _now(),
+                            "postgresql_authoritative": True,
+                            "cutover_ready": False,
+                            "paper_only": True,
+                            "live_execution_authority": False,
+                        }
+                    )
+                    if stop_event.wait(STALLED_PROGRESS_RETRY_DELAY_SECONDS):
+                        _publish_status(
+                            {
+                                "state": "interrupted",
+                                "reason": "service_shutdown",
+                                "started_at": started_at,
+                                "completed_at": _now(),
+                                "child_return_code": child.returncode,
+                                "attempt": attempt,
+                                "source_disconnect_retries": source_disconnect_retries,
+                                "stalled_progress_restarts": stalled_progress_restarts,
+                                **checkpoint_details,
+                                "postgresql_authoritative": True,
+                                "cutover_ready": False,
+                                "paper_only": True,
+                                "live_execution_authority": False,
+                            }
+                        )
+                        return
+                    continue
 
                 return_code = int(child.returncode or 0)
                 progress = _read_json(progress_path)
@@ -432,6 +581,7 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
                             "child_return_code": return_code,
                             "attempt": attempt,
                             "source_disconnect_retries": source_disconnect_retries,
+                            "stalled_progress_restarts": stalled_progress_restarts,
                             "progress_state": progress.get("state"),
                             "postgresql_authoritative": True,
                             "cutover_ready": False,
@@ -458,6 +608,7 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
                             "child_return_code": return_code,
                             "attempt": attempt,
                             "source_disconnect_retries": source_disconnect_retries,
+                            "stalled_progress_restarts": stalled_progress_restarts,
                             "retry_after_seconds": delay,
                             "progress_state": progress.get("state"),
                             "observed_at": _now(),
@@ -477,6 +628,7 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
                                 "child_return_code": return_code,
                                 "attempt": attempt,
                                 "source_disconnect_retries": source_disconnect_retries,
+                                "stalled_progress_restarts": stalled_progress_restarts,
                                 "postgresql_authoritative": True,
                                 "cutover_ready": False,
                                 "paper_only": True,
@@ -495,6 +647,7 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
                         "child_return_code": return_code,
                         "attempt": attempt,
                         "source_disconnect_retries": source_disconnect_retries,
+                        "stalled_progress_restarts": stalled_progress_restarts,
                         "progress_state": progress.get("state"),
                         "postgresql_authoritative": True,
                         "cutover_ready": False,
