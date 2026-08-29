@@ -374,14 +374,13 @@ def _source_read_with_retry(
     *,
     phase: str,
 ) -> Any:
-    """Retry one append-only source read on a fresh pooled connection.
+    """Retry one restart-safe source read on a fresh pooled connection.
 
-    The production PostgreSQL source has repeatedly dropped TLS connections while a
-    cycle-history batch was being consumed. Because the archive path is append-only
-    and durable progress is committed only after the full batch lands locally, the
-    same read can be retried safely. Each retry disposes the source pool so the next
-    ``source.connect()`` establishes a fresh connection. Non-transient errors and a
-    bounded series of transient source failures still fail closed.
+    Stage 1 uses this only where repeating the exact source read cannot weaken the
+    captured snapshot boundary: append-only table batches and finite market-history
+    reads at an already captured integer high-water. Each retry disposes the source
+    pool so the next ``source.connect()`` establishes a fresh connection.
+    Non-transient errors and a bounded series of transient failures still fail closed.
     """
     retries_this_read = 0
     while True:
@@ -408,6 +407,71 @@ def _source_read_with_retry(
             )
             _publish(report, progress_path)
             time.sleep(delay)
+
+
+def _market_source_high_water_with_retry(
+    source: Engine,
+    table: Table,
+    table_report: dict[str, Any],
+    report: dict[str, Any],
+    progress_path: Path,
+) -> list[object] | None:
+    return _source_read_with_retry(
+        source,
+        lambda: _capture_high_water(source, table),
+        table_report,
+        report,
+        progress_path,
+        phase="market_high_water_capture",
+    )
+
+
+def _market_source_inventory_with_retry(
+    source: Engine,
+    table: Table,
+    table_report: dict[str, Any],
+    report: dict[str, Any],
+    progress_path: Path,
+    *,
+    high_water: list[object] | None,
+) -> dict[str, object]:
+    return _source_read_with_retry(
+        source,
+        lambda: _source_market_inventory(source, table, high_water=high_water),
+        table_report,
+        report,
+        progress_path,
+        phase="market_source_inventory",
+    )
+
+
+def _market_rows_after_checkpoint(
+    source: Engine,
+    statement: Any,
+    primary_key: list[Any],
+    checkpoint: list[object] | None,
+) -> list[Any]:
+    with source.connect() as db:
+        return list(db.execute(_after_checkpoint(statement, primary_key, checkpoint)))
+
+
+def _market_source_batch_with_retry(
+    source: Engine,
+    statement: Any,
+    primary_key: list[Any],
+    checkpoint: list[object] | None,
+    table_report: dict[str, Any],
+    report: dict[str, Any],
+    progress_path: Path,
+) -> list[Any]:
+    return _source_read_with_retry(
+        source,
+        lambda: _market_rows_after_checkpoint(source, statement, primary_key, checkpoint),
+        table_report,
+        report,
+        progress_path,
+        phase="market_copy_batch",
+    )
 
 
 def _source_rows_after_checkpoint(
@@ -657,10 +721,17 @@ def migrate_engines(
 
             if name == "market_quotes":
                 checkpoint = table_report.get("last_primary_key")
+                table_report.update(
+                    destination="parquet",
+                    migration_mode="captured_primary_key_high_water",
+                    verification_scope="captured_primary_key_high_water",
+                )
                 if table_report.get("verified") is True:
                     _verify_existing_market_destination(table_report, history)
                     if table_report.get("verified") is True:
-                        latest_high_water = _capture_high_water(source, source_table)
+                        latest_high_water = _market_source_high_water_with_retry(
+                            source, source_table, table_report, report, progress_path
+                        )
                         stored_high_water = table_report.get("high_water_primary_key")
                         if latest_high_water == stored_high_water:
                             continue
@@ -669,17 +740,28 @@ def migrate_engines(
                         _publish(report, progress_path)
                         high_water = latest_high_water
                     else:
-                        high_water = _capture_high_water(source, source_table)
+                        high_water = _market_source_high_water_with_retry(
+                            source, source_table, table_report, report, progress_path
+                        )
                         table_report["high_water_primary_key"] = high_water
                         _publish(report, progress_path)
                 elif "high_water_primary_key" in table_report:
                     high_water = table_report.get("high_water_primary_key")
                 else:
-                    high_water = _capture_high_water(source, source_table)
+                    high_water = _market_source_high_water_with_retry(
+                        source, source_table, table_report, report, progress_path
+                    )
                     table_report["high_water_primary_key"] = high_water
                     _publish(report, progress_path)
 
-                source_inventory = _source_market_inventory(source, source_table, high_water=high_water)
+                source_inventory = _market_source_inventory_with_retry(
+                    source,
+                    source_table,
+                    table_report,
+                    report,
+                    progress_path,
+                    high_water=high_water,
+                )
                 statement = select(
                     source_table.c.id,
                     source_table.c.lineage_hash,
@@ -687,8 +769,15 @@ def migrate_engines(
                 ).order_by(*primary_key).limit(batch_size)
                 statement = _at_or_before_high_water(statement, primary_key, high_water)
                 while True:
-                    with source.connect() as db:
-                        rows = list(db.execute(_after_checkpoint(statement, primary_key, checkpoint)))
+                    rows = _market_source_batch_with_retry(
+                        source,
+                        statement,
+                        primary_key,
+                        checkpoint,
+                        table_report,
+                        report,
+                        progress_path,
+                    )
                     if not rows:
                         break
                     history.append_records(
@@ -697,7 +786,6 @@ def migrate_engines(
                     )
                     checkpoint = [rows[-1]._mapping[column.name] for column in primary_key]
                     table_report.update(
-                        destination="parquet",
                         source_rows=source_inventory["source_rows"],
                         source_lineage_count=source_inventory["lineage_count"],
                         last_primary_key=checkpoint,
@@ -708,7 +796,6 @@ def migrate_engines(
                         raise InterruptedError("injected migration interruption")
                 table_report.update(
                     verified=True,
-                    verification_scope="captured_primary_key_high_water",
                     destination_inventory=_verify_market_equivalence(source_inventory, history),
                 )
                 _publish(report, progress_path)
