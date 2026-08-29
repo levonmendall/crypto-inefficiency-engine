@@ -5,6 +5,7 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 from inefficiency_engine import render_combined_postbind_lane_repair as base
 from inefficiency_engine.durable_lane_history_projection_supervisor import (
@@ -24,6 +25,7 @@ from inefficiency_engine.startup_database_recovery import (
 MIGRATION_DEPLOY_HANDOFF_RETRY_SECONDS = 2.0
 MIGRATION_GUARD_EXCEPTION_RETRY_SECONDS = 2.0
 MIGRATION_GUARD_STATUS_FILENAME = "migration-guard.json"
+MIGRATION_GUARD_FALLBACK_STATUS_PATH = Path("/tmp/cie-migration-guard-fallback.json")
 _TERMINAL_MIGRATION_STATES = {"failed", "interrupted", "verified"}
 _URL_CREDENTIALS = re.compile(
     r"(?i)\b(postgres(?:ql)?(?:\+psycopg)?://)([^@\s]+)@"
@@ -48,7 +50,7 @@ def _bounded_guard_error(value: object) -> str | None:
     return text[:600]
 
 
-def _publish_migration_guard_status(
+def _guard_status_payload(
     *,
     state: str,
     reason: str | None,
@@ -56,18 +58,8 @@ def _publish_migration_guard_status(
     attempt: int,
     error_type: str | None = None,
     error: object | None = None,
-) -> None:
-    """Persist outer migration-guard truth independently of supervisor ownership.
-
-    A fresh Render process can start while its predecessor still owns the importer lock.
-    This file proves the new guard thread itself started even before it can acquire that
-    lock, and it prevents a daemon-thread exception from leaving only the predecessor's
-    stale supervisor row as production telemetry.
-    """
-
-    path = _guard_status_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+) -> dict[str, object]:
+    return {
         "state": state,
         "reason": reason,
         "started_at": started_at,
@@ -82,18 +74,133 @@ def _publish_migration_guard_status(
         "allocation_authority": False,
         "live_execution_authority": False,
     }
-    temporary = path.with_suffix(".tmp")
+
+
+def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, sort_keys=True, indent=2, default=str))
     os.replace(temporary, path)
 
 
+def _publish_migration_guard_status(
+    *,
+    state: str,
+    reason: str | None,
+    started_at: str,
+    attempt: int,
+    error_type: str | None = None,
+    error: object | None = None,
+) -> None:
+    """Persist outer migration-guard truth independently of supervisor ownership."""
+
+    _atomic_write_json(
+        _guard_status_path(),
+        _guard_status_payload(
+            state=state,
+            reason=reason,
+            started_at=started_at,
+            attempt=attempt,
+            error_type=error_type,
+            error=error,
+        ),
+    )
+
+
+def _publish_migration_guard_fallback_status(
+    *,
+    state: str,
+    reason: str,
+    started_at: str,
+    attempt: int,
+    error_type: str | None = None,
+    error: object | None = None,
+) -> None:
+    """Persist current-process guard failures outside the durable migration disk.
+
+    This fallback is diagnostic only. It cannot authorize migration, cutover, allocation,
+    or live execution. Its purpose is to distinguish "guard never ran" from "guard ran but
+    could not write /var/data/cie", including a full or unwritable persistent disk.
+    """
+
+    payload = _guard_status_payload(
+        state=state,
+        reason=reason,
+        started_at=started_at,
+        attempt=attempt,
+        error_type=error_type,
+        error=error,
+    )
+    payload["diagnostic_only"] = True
+    _atomic_write_json(MIGRATION_GUARD_FALLBACK_STATUS_PATH, payload)
+
+
+def _clear_migration_guard_fallback_status() -> None:
+    try:
+        MIGRATION_GUARD_FALLBACK_STATUS_PATH.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
+def _record_guard_publish_failure(
+    *,
+    started_at: str,
+    attempt: int,
+    exc: BaseException,
+    reason: str,
+) -> None:
+    try:
+        _publish_migration_guard_fallback_status(
+            state="durable_status_write_failed",
+            reason=reason,
+            started_at=started_at,
+            attempt=attempt,
+            error_type=type(exc).__name__,
+            error=exc,
+        )
+    except Exception:
+        # The status endpoint also probes the durable root directly, so even a failure
+        # of both files remains distinguishable from healthy storage.
+        return
+
+
+def _publish_synchronous_migration_guard_startup() -> str:
+    """Publish guard startup from the main thread before the daemon thread can start."""
+
+    started_at = _now()
+    try:
+        _publish_migration_guard_status(
+            state="main_startup",
+            reason="before_guard_thread_start",
+            started_at=started_at,
+            attempt=0,
+        )
+    except Exception as exc:
+        _record_guard_publish_failure(
+            started_at=started_at,
+            attempt=0,
+            exc=exc,
+            reason="main_startup_durable_status_write_failed",
+        )
+    else:
+        _clear_migration_guard_fallback_status()
+    return started_at
+
+
 def _safe_publish_migration_guard_status(**kwargs: object) -> None:
-    """Guard telemetry must never be able to kill migration supervision."""
+    """Publish guard telemetry without allowing telemetry I/O to kill supervision."""
 
     try:
         _publish_migration_guard_status(**kwargs)
-    except Exception:
-        return
+    except Exception as exc:
+        _record_guard_publish_failure(
+            started_at=str(kwargs.get("started_at") or _now()),
+            attempt=int(kwargs.get("attempt") or 0),
+            exc=exc,
+            reason="background_durable_status_write_failed",
+        )
 
 
 def _migration_is_terminal(status: dict[str, object]) -> bool:
@@ -105,14 +212,7 @@ def _migration_is_terminal(status: dict[str, object]) -> bool:
 def _run_local_persistence_migration_with_deploy_handoff(
     stop_event: threading.Event,
 ) -> None:
-    """Keep a fresh deploy eligible to take over an in-flight Stage 1 migration.
-
-    Render can briefly overlap shutdown of the predecessor process with startup of the
-    replacement. The migration supervisor correctly uses an exclusive durable-file lock
-    to prevent concurrent importers, but a one-shot lock miss must not permanently strand
-    a restart-safe migration. Guard lifecycle telemetry is persisted independently so a
-    fresh process cannot silently lose this daemon thread before it acquires ownership.
-    """
+    """Keep a fresh deploy eligible to take over an in-flight Stage 1 migration."""
 
     guard_started_at = _now()
     guard_attempt = 0
@@ -173,9 +273,6 @@ def _run_local_persistence_migration_with_deploy_handoff(
                 )
                 return
 
-            # A ready, incomplete supervisor that returned without terminal truth is a
-            # deploy-handoff/silent-startup condition, not a new migration attempt. Wait
-            # for the predecessor lock to clear and re-enter the restart-safe supervisor.
             _safe_publish_migration_guard_status(
                 state="retry_wait",
                 reason="deploy_handoff_incomplete",
@@ -191,10 +288,6 @@ def _run_local_persistence_migration_with_deploy_handoff(
                 )
                 return
         except Exception as exc:
-            # A daemon-thread exception previously had no durable truth and could strand
-            # the migration behind a stale predecessor status forever. Record the exact
-            # bounded failure, then retry only while durable state remains nonterminal and
-            # PostgreSQL has not ceded authority.
             status: dict[str, object] = {}
             try:
                 status = migration_status_payload()
@@ -226,9 +319,6 @@ def _run_local_persistence_migration_with_deploy_handoff(
 def main() -> int:
     """Run the canonical combined service plus independent durable background guards."""
 
-    # Production schema bootstrap must remain serialized before permanent child startup,
-    # but Render's attached PostgreSQL can be briefly unavailable in recovery mode during
-    # a deploy. Patch only that bootstrap boundary with a bounded, recovery-specific retry.
     install_startup_database_recovery(base.base)
 
     stop_event = threading.Event()
@@ -244,6 +334,12 @@ def main() -> int:
         name="local-persistence-migration-supervisor",
         daemon=True,
     )
+
+    # This synchronous main-thread marker is intentionally before either background
+    # guard starts. A fresh deployment must therefore expose one of two truths:
+    # durable guard startup evidence, or a current-process fallback write failure.
+    _publish_synchronous_migration_guard_startup()
+
     history_projection_guard.start()
     migration_guard.start()
     try:
