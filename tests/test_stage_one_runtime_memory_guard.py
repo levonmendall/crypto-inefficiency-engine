@@ -18,7 +18,7 @@ class _DisposableEngine:
         self.dispose_calls += 1
 
 
-def test_stage_one_runtime_guard_caps_batches_and_skips_verified_rescans_on_retry(monkeypatch):
+def test_stage_one_runtime_guard_caps_batches_and_skips_verified_rescans_on_retry(monkeypatch, tmp_path):
     calls: list[dict[str, object]] = []
     original_verified = migration._verified_target_is_intact
     original_append = migration._migrate_resumable_append_only_table
@@ -47,15 +47,16 @@ def test_stage_one_runtime_guard_caps_batches_and_skips_verified_rescans_on_retr
 
     target_engine = _DisposableEngine()
     target = SimpleNamespace(engine=target_engine)
+    progress_path = tmp_path / "progress.json"
 
-    assert guarded(object(), target, object(), progress_path=object(), batch_size=2_000) == {
+    assert guarded(object(), target, object(), progress_path=progress_path, batch_size=2_000) == {
         "state": "verified"
     }
     assert calls[0]["batch_size"] == 256
     assert calls[0]["verified_helper"] is original_verified
     assert calls[0]["append_helper"] is not original_append
 
-    assert guarded(object(), target, object(), progress_path=object(), batch_size=2_000) == {
+    assert guarded(object(), target, object(), progress_path=progress_path, batch_size=2_000) == {
         "state": "verified"
     }
     assert calls[1]["batch_size"] == 256
@@ -67,7 +68,7 @@ def test_stage_one_runtime_guard_caps_batches_and_skips_verified_rescans_on_retr
     assert migration._migrate_resumable_append_only_table is original_append
 
 
-def test_retry_verified_helper_accepts_only_already_verified_tables(monkeypatch):
+def test_retry_verified_helper_accepts_only_already_verified_tables(monkeypatch, tmp_path):
     observed: dict[str, object] = {}
 
     def fake_verified(target, table, shared, table_report):
@@ -86,8 +87,9 @@ def test_retry_verified_helper_accepts_only_already_verified_tables(monkeypatch)
     guarded = migration.migrate_engines
 
     target = SimpleNamespace(engine=_DisposableEngine())
-    guarded(object(), target, object(), progress_path=object(), batch_size=2_000)
-    guarded(object(), target, object(), progress_path=object(), batch_size=2_000)
+    progress_path = tmp_path / "progress.json"
+    guarded(object(), target, object(), progress_path=progress_path, batch_size=2_000)
+    guarded(object(), target, object(), progress_path=progress_path, batch_size=2_000)
 
     assert observed["verified_result"] is True
     assert observed["unverified_result"] is False
@@ -206,7 +208,7 @@ def test_verified_or_unbounded_monotonic_tables_are_not_priority_resumed() -> No
     assert package._durable_monotonic_resume_candidates(progress) == []
 
 
-def test_guard_priority_resume_runs_before_normal_migration(monkeypatch):
+def test_guard_priority_resume_runs_before_normal_migration(monkeypatch, tmp_path):
     events: list[str] = []
 
     def fake_resume(*args, **kwargs):
@@ -221,6 +223,12 @@ def test_guard_priority_resume_runs_before_normal_migration(monkeypatch):
     package._install_stage_one_runtime_memory_guard()
 
     target = SimpleNamespace(engine=_DisposableEngine())
-    migration.migrate_engines(object(), target, object(), progress_path=object(), batch_size=2_000)
+    migration.migrate_engines(
+        object(),
+        target,
+        object(),
+        progress_path=tmp_path / "progress.json",
+        batch_size=2_000,
+    )
 
     assert events == ["resume", "traverse"]
