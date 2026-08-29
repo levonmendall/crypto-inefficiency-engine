@@ -4,7 +4,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import Engine, Table, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -91,6 +91,7 @@ def migrate_monotonic_integer_append_only_table(
     batch_size: int,
     completed_batches: int,
     interrupt_after_batches: int | None,
+    before_snapshot_copy: Callable[[list[object] | None], None] | None = None,
 ) -> int:
     """Migrate one immutable integer-PK ledger to one durable finite high-water.
 
@@ -98,7 +99,9 @@ def migrate_monotonic_integer_append_only_table(
     Every subsequent source operation is a bounded keyset read, so a dropped TLS
     connection retries only that small read and a process restart resumes from the
     durable primary-key checkpoint. Rows inserted after the high-water are deliberately
-    deferred to the final quiesced catch-up.
+    deferred to the final quiesced catch-up.  A caller may provide a dependency
+    precondition that runs after the high-water is durable but before any child rows are
+    copied; ``funding_quotes`` uses this to capture and verify its ``scans`` parents.
     """
 
     primary_key = base._primary_key(source_table)
@@ -161,6 +164,9 @@ def migrate_monotonic_integer_append_only_table(
             last_progress_at=_now(),
         )
         base._publish(report, progress_path)
+
+    if before_snapshot_copy is not None:
+        before_snapshot_copy(high_water)
 
     checkpoint = table_report.get("last_primary_key")
     copied = int(table_report.get("snapshot_rows_copied") or 0)
