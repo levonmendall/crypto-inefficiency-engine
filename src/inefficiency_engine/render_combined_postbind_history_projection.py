@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
+import re
 import threading
+from datetime import datetime, timezone
 
 from inefficiency_engine import render_combined_postbind_lane_repair as base
 from inefficiency_engine.durable_lane_history_projection_supervisor import (
@@ -11,13 +15,91 @@ from inefficiency_engine.local_persistence_migration_supervisor import (
     migration_status_payload,
     run_local_persistence_migration_supervisor,
 )
+from inefficiency_engine.local_storage import local_storage_paths
 from inefficiency_engine.startup_database_recovery import (
     install_startup_database_recovery,
 )
 
 
 MIGRATION_DEPLOY_HANDOFF_RETRY_SECONDS = 2.0
+MIGRATION_GUARD_EXCEPTION_RETRY_SECONDS = 2.0
+MIGRATION_GUARD_STATUS_FILENAME = "migration-guard.json"
 _TERMINAL_MIGRATION_STATES = {"failed", "interrupted", "verified"}
+_URL_CREDENTIALS = re.compile(
+    r"(?i)\b(postgres(?:ql)?(?:\+psycopg)?://)([^@\s]+)@"
+)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _guard_status_path():
+    return local_storage_paths().migration / MIGRATION_GUARD_STATUS_FILENAME
+
+
+def _bounded_guard_error(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    if not text:
+        return None
+    text = _URL_CREDENTIALS.sub(r"\1***@", text)
+    return text[:600]
+
+
+def _publish_migration_guard_status(
+    *,
+    state: str,
+    reason: str | None,
+    started_at: str,
+    attempt: int,
+    error_type: str | None = None,
+    error: object | None = None,
+) -> None:
+    """Persist outer migration-guard truth independently of supervisor ownership.
+
+    A fresh Render process can start while its predecessor still owns the importer lock.
+    This file proves the new guard thread itself started even before it can acquire that
+    lock, and it prevents a daemon-thread exception from leaving only the predecessor's
+    stale supervisor row as production telemetry.
+    """
+
+    path = _guard_status_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "state": state,
+        "reason": reason,
+        "started_at": started_at,
+        "observed_at": _now(),
+        "attempt": int(attempt),
+        "error_type": error_type,
+        "error": _bounded_guard_error(error),
+        "release_commit": os.getenv("RENDER_GIT_COMMIT", "").strip() or None,
+        "postgresql_authoritative": True,
+        "cutover_ready": False,
+        "paper_only": True,
+        "allocation_authority": False,
+        "live_execution_authority": False,
+    }
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, sort_keys=True, indent=2, default=str))
+    os.replace(temporary, path)
+
+
+def _safe_publish_migration_guard_status(**kwargs: object) -> None:
+    """Guard telemetry must never be able to kill migration supervision."""
+
+    try:
+        _publish_migration_guard_status(**kwargs)
+    except Exception:
+        return
+
+
+def _migration_is_terminal(status: dict[str, object]) -> bool:
+    state = str(status.get("state") or "")
+    progress_state = str(status.get("progress_state") or "")
+    return state in _TERMINAL_MIGRATION_STATES or progress_state in {"failed", "verified"}
 
 
 def _run_local_persistence_migration_with_deploy_handoff(
@@ -28,34 +110,117 @@ def _run_local_persistence_migration_with_deploy_handoff(
     Render can briefly overlap shutdown of the predecessor process with startup of the
     replacement. The migration supervisor correctly uses an exclusive durable-file lock
     to prevent concurrent importers, but a one-shot lock miss must not permanently strand
-    a restart-safe migration. Retry only while preflight is still valid and durable state
-    remains nonterminal. A real migration failure therefore still stops here and never
-    receives a fresh source-disconnect retry budget merely because this guard exists.
+    a restart-safe migration. Guard lifecycle telemetry is persisted independently so a
+    fresh process cannot silently lose this daemon thread before it acquires ownership.
     """
 
+    guard_started_at = _now()
+    guard_attempt = 0
+    _safe_publish_migration_guard_status(
+        state="started",
+        reason=None,
+        started_at=guard_started_at,
+        attempt=guard_attempt,
+    )
+
     while not stop_event.is_set():
-        ready, _reason = migration_preflight()
-        run_local_persistence_migration_supervisor(stop_event)
-        if stop_event.is_set() or not ready:
-            return
+        guard_attempt += 1
+        _safe_publish_migration_guard_status(
+            state="running",
+            reason="supervisor_entry",
+            started_at=guard_started_at,
+            attempt=guard_attempt,
+        )
+        try:
+            ready, preflight_reason = migration_preflight()
+            run_local_persistence_migration_supervisor(stop_event)
+            if stop_event.is_set():
+                _safe_publish_migration_guard_status(
+                    state="interrupted",
+                    reason="service_shutdown",
+                    started_at=guard_started_at,
+                    attempt=guard_attempt,
+                )
+                return
+            if not ready:
+                _safe_publish_migration_guard_status(
+                    state="blocked",
+                    reason=preflight_reason,
+                    started_at=guard_started_at,
+                    attempt=guard_attempt,
+                )
+                return
 
-        status = migration_status_payload()
-        state = str(status.get("state") or "")
-        progress_state = str(status.get("progress_state") or "")
-        supervisor_reason = str(status.get("supervisor_reason") or "")
+            status = migration_status_payload()
+            state = str(status.get("state") or "")
+            progress_state = str(status.get("progress_state") or "")
+            supervisor_reason = str(status.get("supervisor_reason") or "")
 
-        if state in _TERMINAL_MIGRATION_STATES:
-            return
-        if progress_state in {"failed", "verified"}:
-            return
-        if state == "blocked" and supervisor_reason != "another_importer_holds_lock":
-            return
+            if _migration_is_terminal(status):
+                _safe_publish_migration_guard_status(
+                    state="terminal",
+                    reason=state or progress_state or "migration_terminal",
+                    started_at=guard_started_at,
+                    attempt=guard_attempt,
+                )
+                return
+            if state == "blocked" and supervisor_reason != "another_importer_holds_lock":
+                _safe_publish_migration_guard_status(
+                    state="blocked",
+                    reason=supervisor_reason or "migration_blocked",
+                    started_at=guard_started_at,
+                    attempt=guard_attempt,
+                )
+                return
 
-        # A ready, incomplete supervisor that returned without terminal truth is a
-        # deploy-handoff/silent-startup condition, not a new migration attempt. Wait for
-        # the predecessor lock to clear and re-enter the same restart-safe supervisor.
-        if stop_event.wait(MIGRATION_DEPLOY_HANDOFF_RETRY_SECONDS):
-            return
+            # A ready, incomplete supervisor that returned without terminal truth is a
+            # deploy-handoff/silent-startup condition, not a new migration attempt. Wait
+            # for the predecessor lock to clear and re-enter the restart-safe supervisor.
+            _safe_publish_migration_guard_status(
+                state="retry_wait",
+                reason="deploy_handoff_incomplete",
+                started_at=guard_started_at,
+                attempt=guard_attempt,
+            )
+            if stop_event.wait(MIGRATION_DEPLOY_HANDOFF_RETRY_SECONDS):
+                _safe_publish_migration_guard_status(
+                    state="interrupted",
+                    reason="service_shutdown",
+                    started_at=guard_started_at,
+                    attempt=guard_attempt,
+                )
+                return
+        except Exception as exc:
+            # A daemon-thread exception previously had no durable truth and could strand
+            # the migration behind a stale predecessor status forever. Record the exact
+            # bounded failure, then retry only while durable state remains nonterminal and
+            # PostgreSQL has not ceded authority.
+            status: dict[str, object] = {}
+            try:
+                status = migration_status_payload()
+            except Exception:
+                pass
+            terminal = _migration_is_terminal(status)
+            postgresql_authoritative = status.get("postgresql_authoritative")
+            can_retry = not terminal and postgresql_authoritative is not False
+            _safe_publish_migration_guard_status(
+                state="error_retry_wait" if can_retry else "failed",
+                reason="migration_guard_exception",
+                started_at=guard_started_at,
+                attempt=guard_attempt,
+                error_type=type(exc).__name__,
+                error=exc,
+            )
+            if not can_retry:
+                return
+            if stop_event.wait(MIGRATION_GUARD_EXCEPTION_RETRY_SECONDS):
+                _safe_publish_migration_guard_status(
+                    state="interrupted",
+                    reason="service_shutdown",
+                    started_at=guard_started_at,
+                    attempt=guard_attempt,
+                )
+                return
 
 
 def main() -> int:
