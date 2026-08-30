@@ -12,16 +12,23 @@ _ORIGINAL_MIGRATE = migration.migrate
 
 
 def _market_quotes_resume_checkpoint(progress: dict[str, Any]) -> bool:
-    """Return whether durable state proves a restart-safe market_quotes resume."""
+    """Return whether durable state proves the final market_quotes resume is isolated."""
 
     if str(progress.get("current_table") or "") != "market_quotes":
         return False
     tables = progress.get("tables")
-    market = tables.get("market_quotes") if isinstance(tables, dict) else None
+    if not isinstance(tables, dict) or not tables:
+        return False
+    market = tables.get("market_quotes")
     if not isinstance(market, dict) or market.get("verified") is True:
         return False
     if market.get("migration_mode") != MARKET_QUOTES_MIGRATION_MODE:
         return False
+    for table_name, table_report in tables.items():
+        if table_name == "market_quotes":
+            continue
+        if not isinstance(table_report, dict) or table_report.get("verified") is not True:
+            return False
     checkpoint = market.get("last_primary_key")
     high_water = market.get("high_water_primary_key")
     return bool(
@@ -37,14 +44,13 @@ def _storage_repaired_migrate(
     *,
     batch_size: int = migration.BATCH_SIZE,
 ) -> dict[str, object]:
-    """Use a larger batch only for an already-checkpointed market-history resume.
+    """Use a larger batch only for the isolated final market-history resume.
 
     The original 2,000-row source batch can touch many venue/asset/day partitions and
-    therefore create many small immutable Parquet files. On the current Stage 1 resume,
-    every other canonical table is already verified. Raising only this proven resume
-    batch reduces filesystem metadata/file amplification while retaining the captured
-    market high-water and keyset checkpoint. Fresh migrations keep the canonical base
-    batch size until they reach a separately proven resume state.
+    therefore create many small immutable Parquet files. The larger batch is enabled
+    only when every other durable table report is already verified and market_quotes
+    retains its captured high-water plus keyset checkpoint. Fresh or mixed-table
+    migrations keep the canonical base batch size.
     """
 
     progress = migration._load_progress(migration._progress_path())
