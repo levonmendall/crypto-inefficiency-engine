@@ -3,7 +3,7 @@ from __future__ import annotations
 from inefficiency_engine import stage_one_local_persistence_storage_repair as repair
 
 
-def _market_progress(*, checkpoint=True, high_water=True):
+def _market_progress(*, checkpoint=True, high_water=True, other_verified=True):
     market = {
         "verified": False,
         "migration_mode": "captured_primary_key_high_water",
@@ -15,14 +15,18 @@ def _market_progress(*, checkpoint=True, high_water=True):
     return {
         "state": "running",
         "current_table": "market_quotes",
-        "tables": {"market_quotes": market},
+        "tables": {
+            "funding_quotes": {"verified": other_verified},
+            "market_quotes": market,
+        },
     }
 
 
-def test_market_quotes_resume_checkpoint_requires_both_durable_bounds():
+def test_market_quotes_resume_checkpoint_requires_both_bounds_and_final_table_isolation():
     assert repair._market_quotes_resume_checkpoint(_market_progress())
     assert not repair._market_quotes_resume_checkpoint(_market_progress(checkpoint=False))
     assert not repair._market_quotes_resume_checkpoint(_market_progress(high_water=False))
+    assert not repair._market_quotes_resume_checkpoint(_market_progress(other_verified=False))
 
 
 def test_storage_repaired_migrate_uses_larger_batch_only_for_market_resume(monkeypatch):
