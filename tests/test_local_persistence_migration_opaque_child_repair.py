@@ -99,6 +99,15 @@ def test_stderr_tail_is_bounded_redacted_and_keeps_terminal_end(tmp_path: Path):
     assert tail.endswith("terminal database failure at the very end")
 
 
+def test_storage_exhaustion_requires_proven_errno_or_quota_message():
+    assert repair._is_storage_exhaustion(
+        "OSError: [Errno 28] No space left on device: /var/data/cie/migration/progress.tmp"
+    )
+    assert repair._is_storage_exhaustion("write failed: Disk quota exceeded")
+    assert not repair._is_storage_exhaustion("opaque child failure")
+    assert not repair._is_storage_exhaustion(None)
+
+
 def test_wrapper_relaunches_after_opaque_market_checkpoint_exit(monkeypatch, tmp_path: Path):
     progress_path = tmp_path / "progress.json"
     stderr_path = tmp_path / "stderr.log"
@@ -147,6 +156,47 @@ def test_wrapper_relaunches_after_opaque_market_checkpoint_exit(monkeypatch, tmp
     assert published[0]["checkpoint_last_primary_key"] == [1_748_641]
     assert published[0]["checkpoint_high_water_primary_key"] == [2_812_933]
     assert published[0]["error_type"] == "OpaqueMigrationChildExit"
+
+
+def test_wrapper_fails_immediately_when_storage_is_exhausted(monkeypatch, tmp_path: Path):
+    progress_path = tmp_path / "progress.json"
+    stderr_path = tmp_path / "stderr.log"
+    stderr_path.write_text(
+        "OSError: [Errno 28] No space left on device: "
+        "'/var/data/cie/migration/postgres-import-progress.tmp'"
+    )
+    run_calls = []
+    published = []
+
+    monkeypatch.setattr(
+        repair.base,
+        "run_local_persistence_migration_supervisor",
+        lambda stop_event: run_calls.append(True),
+    )
+    monkeypatch.setattr(repair.base, "migration_status_payload", _opaque_failure_status)
+    monkeypatch.setattr(
+        repair.base,
+        "_paths",
+        lambda: (
+            tmp_path / "status.json",
+            progress_path,
+            tmp_path / "lock",
+            tmp_path / "stdout.log",
+            stderr_path,
+        ),
+    )
+    monkeypatch.setattr(repair.base, "_read_json", lambda path: _copying_progress())
+    monkeypatch.setattr(repair.base, "_publish_status", lambda payload: published.append(payload))
+
+    repair.run_local_persistence_migration_supervisor(threading.Event())
+
+    assert len(run_calls) == 1
+    assert published[-1]["state"] == "failed"
+    assert published[-1]["reason"] == "migration_storage_exhausted"
+    assert published[-1]["error_type"] == "NoSpaceLeftOnDevice"
+    assert published[-1]["opaque_child_restarts"] == 0
+    assert published[-1]["checkpoint_last_primary_key"] == [1_748_641]
+    assert published[-1]["checkpoint_high_water_primary_key"] == [2_812_933]
 
 
 def test_wrapper_fails_closed_when_opaque_retry_budget_is_exhausted(monkeypatch, tmp_path: Path):

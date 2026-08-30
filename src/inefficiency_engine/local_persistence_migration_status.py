@@ -91,6 +91,10 @@ def _storage_diagnostics() -> dict[str, object]:
     used_bytes: int | None = None
     free_bytes: int | None = None
     free_ratio: float | None = None
+    inode_total: int | None = None
+    inode_free: int | None = None
+    inode_used: int | None = None
+    inode_free_ratio: float | None = None
     probe = root if exists else root.parent
     try:
         usage = shutil.disk_usage(probe)
@@ -98,6 +102,14 @@ def _storage_diagnostics() -> dict[str, object]:
         used_bytes = int(usage.used)
         free_bytes = int(usage.free)
         free_ratio = float(usage.free / usage.total) if usage.total else None
+    except OSError:
+        pass
+    try:
+        filesystem = os.statvfs(probe)
+        inode_total = int(filesystem.f_files)
+        inode_free = int(filesystem.f_ffree)
+        inode_used = max(0, inode_total - inode_free)
+        inode_free_ratio = float(inode_free / inode_total) if inode_total else None
     except OSError:
         pass
     return {
@@ -108,6 +120,10 @@ def _storage_diagnostics() -> dict[str, object]:
         "migration_storage_used_bytes": used_bytes,
         "migration_storage_free_bytes": free_bytes,
         "migration_storage_free_ratio": free_ratio,
+        "migration_storage_inode_total": inode_total,
+        "migration_storage_inode_used": inode_used,
+        "migration_storage_inode_free": inode_free,
+        "migration_storage_inode_free_ratio": inode_free_ratio,
         "migration_guard_durable_status_present": _guard_status_path().is_file(),
         "migration_guard_fallback_status_present": _guard_fallback_status_path().is_file(),
     }

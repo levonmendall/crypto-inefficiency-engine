@@ -71,7 +71,7 @@ def test_render_blueprint_defines_single_paid_combined_runtime():
     assert runtime["disk"] == {
         "name": "cie-durable-storage",
         "mountPath": "/var/data/cie",
-        "sizeGB": 10,
+        "sizeGB": 40,
     }
 
 

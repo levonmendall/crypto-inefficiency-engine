@@ -13,6 +13,11 @@ MAX_OPAQUE_CHILD_RESTARTS = 3
 OPAQUE_CHILD_RETRY_DELAYS_SECONDS = (1.0, 3.0, 8.0)
 STDERR_TAIL_BYTES = 16_384
 MARKET_QUOTES_MIGRATION_MODE = "captured_primary_key_high_water"
+_STORAGE_EXHAUSTION_MARKERS = (
+    "no space left on device",
+    "errno 28",
+    "disk quota exceeded",
+)
 
 migration_preflight = base.migration_preflight
 
@@ -35,12 +40,21 @@ def _read_stderr_tail(path: Path, *, max_bytes: int = STDERR_TAIL_BYTES) -> str 
     return redacted[-600:]
 
 
+def _is_storage_exhaustion(stderr_tail: str | None) -> bool:
+    """Return true only when child stderr proves a filesystem-capacity failure."""
+
+    if not stderr_tail:
+        return False
+    normalized = stderr_tail.lower()
+    return any(marker in normalized for marker in _STORAGE_EXHAUSTION_MARKERS)
+
+
 def _market_quotes_checkpoint_marker(progress: dict[str, Any]) -> tuple[object, ...] | None:
     """Return the restart-safe Stage 1 market_quotes checkpoint marker.
 
     The importer captures one finite integer primary-key high-water and then copies
     bounded batches constrained to ``id <= high_water`` while persisting
-    ``last_primary_key`` after each committed Parquet append.  An opaque process exit
+    ``last_primary_key`` after each committed Parquet append. An opaque process exit
     can therefore resume safely only when both durable boundaries are present.
     """
 
@@ -126,6 +140,7 @@ def _publish_repair_status(
     retry_after_seconds: float | None,
     progress: dict[str, Any],
     stderr_tail: str | None,
+    error_type: str = "OpaqueMigrationChildExit",
 ) -> None:
     error = (
         f"migration child exited code={child_return_code} without durable progress error"
@@ -138,7 +153,7 @@ def _publish_repair_status(
         "observed_at": base._now(),
         "child_return_code": child_return_code,
         "opaque_child_restarts": int(opaque_child_restarts),
-        "error_type": "OpaqueMigrationChildExit",
+        "error_type": error_type,
         "error": base._bounded_public_error(error),
         "child_stderr_tail": stderr_tail,
         "progress_state": progress.get("state"),
@@ -207,6 +222,20 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
         stderr_tail = _read_stderr_tail(stderr_path)
         started_at = status.get("supervisor_started_at") or base._now()
         return_code = status.get("child_return_code")
+
+        if _is_storage_exhaustion(stderr_tail):
+            _publish_repair_status(
+                state="failed",
+                reason="migration_storage_exhausted",
+                started_at=started_at,
+                child_return_code=return_code,
+                opaque_child_restarts=opaque_child_restarts,
+                retry_after_seconds=None,
+                progress=progress,
+                stderr_tail=stderr_tail,
+                error_type="NoSpaceLeftOnDevice",
+            )
+            return
 
         if opaque_child_restarts >= MAX_OPAQUE_CHILD_RESTARTS:
             _publish_repair_status(
