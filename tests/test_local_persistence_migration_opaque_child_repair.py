@@ -81,6 +81,41 @@ def test_funding_snapshot_mode_is_not_mistaken_for_market_quotes_resume():
     assert not repair._restart_safe_opaque_child_exit(_opaque_failure_status(), progress)
 
 
+def test_inode_recovery_compacts_only_checkpointed_market_history(monkeypatch):
+    observed = []
+
+    class FakeHistory:
+        def compact_redundant_partitions(self, *, target_free_inodes):
+            observed.append(target_free_inodes)
+            return {
+                "compacted_groups": 12,
+                "files_collapsed": 200_000,
+                "rows_rewritten": 300_000,
+                "garbage_reaped": 0,
+                "inode_total_before": 1_638_400,
+                "inode_free_before": 4,
+                "inode_total_after": 1_638_400,
+                "inode_free_after": target_free_inodes + 1,
+                "target_free_inodes": target_free_inodes,
+                "target_reached": True,
+            }
+
+    monkeypatch.setattr(repair, "PartitionedMarketHistory", FakeHistory)
+    monkeypatch.setattr(repair, "_inode_capacity", lambda: (1_638_400, 4))
+    repair._LAST_INODE_RECOVERY = {}
+
+    result = repair._recover_market_history_inode_pressure(_copying_progress())
+
+    assert observed == [163_840]
+    assert result is not None
+    assert result["state"] == "complete"
+    assert result["files_collapsed"] == 200_000
+    assert result["checkpoint_last_primary_key"] == [1_748_641]
+    assert repair._recover_market_history_inode_pressure(
+        _copying_progress(checkpoint=False)
+    ) is None
+
+
 def test_stderr_tail_is_bounded_redacted_and_keeps_terminal_end(tmp_path: Path):
     stderr_path = tmp_path / "stderr.log"
     stderr_path.write_text(
@@ -145,6 +180,7 @@ def test_wrapper_relaunches_after_opaque_market_checkpoint_exit(monkeypatch, tmp
     )
     monkeypatch.setattr(repair.base, "_read_json", lambda path: _copying_progress())
     monkeypatch.setattr(repair.base, "_publish_status", lambda payload: published.append(payload))
+    monkeypatch.setattr(repair, "_inode_capacity", lambda: (1_638_400, 1_000_000))
     monkeypatch.setattr(repair, "OPAQUE_CHILD_RETRY_DELAYS_SECONDS", (0.0, 0.0, 0.0))
 
     repair.run_local_persistence_migration_supervisor(threading.Event())
@@ -187,6 +223,7 @@ def test_wrapper_fails_immediately_when_storage_is_exhausted(monkeypatch, tmp_pa
     )
     monkeypatch.setattr(repair.base, "_read_json", lambda path: _copying_progress())
     monkeypatch.setattr(repair.base, "_publish_status", lambda payload: published.append(payload))
+    monkeypatch.setattr(repair, "_inode_capacity", lambda: (1_638_400, 1_000_000))
 
     repair.run_local_persistence_migration_supervisor(threading.Event())
 
@@ -225,6 +262,7 @@ def test_wrapper_fails_closed_when_opaque_retry_budget_is_exhausted(monkeypatch,
     )
     monkeypatch.setattr(repair.base, "_read_json", lambda path: _copying_progress())
     monkeypatch.setattr(repair.base, "_publish_status", lambda payload: published.append(payload))
+    monkeypatch.setattr(repair, "_inode_capacity", lambda: (1_638_400, 1_000_000))
     monkeypatch.setattr(repair, "MAX_OPAQUE_CHILD_RESTARTS", 1)
     monkeypatch.setattr(repair, "OPAQUE_CHILD_RETRY_DELAYS_SECONDS", (0.0,))
 
