@@ -23,22 +23,35 @@ def test_coarse_stage_one_command_is_scoped_to_child_launch(monkeypatch) -> None
     assert original[-1] == "inefficiency_engine.stage_one_local_persistence_migration"
 
 
-def test_coarse_stage_one_installs_runtime_guard_before_canonical_main(monkeypatch) -> None:
+def test_coarse_stage_one_installs_guard_after_stage_one_repair(monkeypatch) -> None:
     events: list[str] = []
     original_history = coarse.migration.PartitionedMarketHistory
 
-    monkeypatch.setattr(
-        coarse,
-        "_install_stage_one_runtime_memory_guard",
-        lambda: events.append("guard"),
-    )
-    monkeypatch.setattr(
-        coarse.stage_one,
-        "main",
-        lambda: events.append("main") or 0,
-    )
+    def stage_one_wrapper(*args, **kwargs):
+        return {"state": "stage_one_wrapper"}
+
+    def guarded_wrapper(*args, **kwargs):
+        return {"state": "guarded_wrapper"}
+
+    def install_stage_one_repair() -> None:
+        events.append("stage_one_repair")
+        monkeypatch.setattr(coarse.migration, "migrate_engines", stage_one_wrapper)
+
+    def install_runtime_guard() -> None:
+        events.append("guard")
+        assert coarse.migration.migrate_engines is stage_one_wrapper
+        monkeypatch.setattr(coarse.migration, "migrate_engines", guarded_wrapper)
+
+    def migration_main() -> int:
+        events.append("migration_main")
+        assert coarse.migration.migrate_engines is guarded_wrapper
+        return 0
+
+    monkeypatch.setattr(coarse.stage_one, "install_stage_one_repair", install_stage_one_repair)
+    monkeypatch.setattr(coarse, "_install_stage_one_runtime_memory_guard", install_runtime_guard)
+    monkeypatch.setattr(coarse.migration, "main", migration_main)
     monkeypatch.setattr(coarse.migration, "PartitionedMarketHistory", original_history)
 
     assert coarse.main() == 0
-    assert events == ["guard", "main"]
+    assert events == ["stage_one_repair", "guard", "migration_main"]
     assert coarse.migration.PartitionedMarketHistory is coarse.CoarsePartitionedMarketHistory

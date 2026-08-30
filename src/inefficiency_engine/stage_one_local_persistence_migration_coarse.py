@@ -11,9 +11,10 @@ from inefficiency_engine.coarse_partitioned_market_history import (
 def main() -> int:
     """Run canonical Stage 1 with only the physical market-history writer replaced."""
 
+    stage_one.install_stage_one_repair()
     _install_stage_one_runtime_memory_guard()
     migration.PartitionedMarketHistory = CoarsePartitionedMarketHistory
-    return stage_one.main()
+    return migration.main()
 
 
 if __name__ == "__main__":
