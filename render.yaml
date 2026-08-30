@@ -27,11 +27,11 @@ services:
     disk:
       name: cie-durable-storage
       mountPath: /var/data/cie
-      # Stage-one history plus verified relational state exceeded the original
-      # 10 GB quota while PostgreSQL was still authoritative. Grow in place with
-      # enough headroom to finish the captured market snapshot and retain runtime
-      # compaction/verification working space. Render disks can grow but not shrink.
-      sizeGB: 25
+      # Production reported an approximately 25 GB filesystem and then returned
+      # ENOSPC while the final captured market snapshot was still incomplete. Grow
+      # the durable disk beyond that observed capacity so Stage 1 has both data and
+      # filesystem-metadata headroom. Render persistent disks grow in place.
+      sizeGB: 40
     envVars:
       # Stage 1 keeps PostgreSQL authoritative while the new disk is populated and
       # verified. A later, separately reviewed cutover removes this binding.
