@@ -33,17 +33,13 @@ _STORAGE_EXHAUSTION_MARKERS = (
 _LAST_INODE_RECOVERY: dict[str, object] = {}
 _LAST_MARKET_HISTORY_REBUILD: dict[str, object] = {}
 
-# Keep the canonical base supervisor implementation and lifecycle, but select a Stage-1
-# wrapper that replaces only the physical market-history writer. The existing source
-# high-water, table ordering, retry policy, verification and fail-closed semantics stay
-# in postgres_local_migration/stage_one_local_persistence_migration.
-base.MIGRATION_COMMAND = list(COARSE_MIGRATION_COMMAND)
+# The base command remains canonical at module scope. The coarse Stage-1 wrapper is
+# selected only while the supervisor actually launches its child, then immediately
+# restored. This preserves the deployment contract and avoids test/import side effects.
 migration_preflight = base.migration_preflight
 
 
 def _read_stderr_tail(path: Path, *, max_bytes: int = STDERR_TAIL_BYTES) -> str | None:
-    """Read the newest bounded stderr tail, redact credentials, and keep the end."""
-
     try:
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
@@ -60,8 +56,6 @@ def _read_stderr_tail(path: Path, *, max_bytes: int = STDERR_TAIL_BYTES) -> str 
 
 
 def _is_storage_exhaustion(stderr_tail: str | None) -> bool:
-    """Return true only when child stderr proves a filesystem-capacity failure."""
-
     if not stderr_tail:
         return False
     normalized = stderr_tail.lower()
@@ -69,15 +63,11 @@ def _is_storage_exhaustion(stderr_tail: str | None) -> bool:
 
 
 def _market_quotes_checkpoint_marker(progress: dict[str, Any]) -> tuple[object, ...] | None:
-    """Return the restart-safe Stage 1 market_quotes checkpoint marker."""
-
     if str(progress.get("current_table") or "") != "market_quotes":
         return None
     tables = progress.get("tables")
     table_report = tables.get("market_quotes") if isinstance(tables, dict) else None
-    if not isinstance(table_report, dict):
-        return None
-    if table_report.get("verified") is True:
+    if not isinstance(table_report, dict) or table_report.get("verified") is True:
         return None
     if table_report.get("migration_mode") != MARKET_QUOTES_MIGRATION_MODE:
         return None
@@ -130,8 +120,6 @@ def _inode_recovery_target(inode_total: int | None) -> int:
 
 
 def _recover_market_history_inode_pressure(progress: dict[str, Any]) -> dict[str, object] | None:
-    """Reclaim fragment inodes for an already-coarse checkpointed migration."""
-
     global _LAST_INODE_RECOVERY
     if _market_quotes_checkpoint_marker(progress) is None:
         return None
@@ -139,7 +127,6 @@ def _recover_market_history_inode_pressure(progress: dict[str, Any]) -> dict[str
     target = _inode_recovery_target(inode_total)
     if inode_free is None or inode_free >= target:
         return None
-
     _LAST_INODE_RECOVERY = {
         "state": "running",
         "started_at": base._now(),
@@ -184,12 +171,19 @@ def _prepare_market_history_layout(progress_path: Path) -> dict[str, object] | N
     return result
 
 
+def _run_base_supervisor_with_coarse_command(stop_event: threading.Event) -> None:
+    original_command = list(base.MIGRATION_COMMAND)
+    base.MIGRATION_COMMAND = list(COARSE_MIGRATION_COMMAND)
+    try:
+        base.run_local_persistence_migration_supervisor(stop_event)
+    finally:
+        base.MIGRATION_COMMAND = original_command
+
+
 def _restart_safe_opaque_child_exit(
     status: dict[str, object],
     progress: dict[str, Any],
 ) -> bool:
-    """Retry only an unexplained process exit with a proven market_quotes checkpoint."""
-
     if status.get("state") != "failed":
         return False
     if status.get("supervisor_reason") != "migration_child_failed":
@@ -252,8 +246,6 @@ def _publish_repair_status(
 
 
 def migration_status_payload() -> dict[str, object]:
-    """Project base migration truth plus process-level recovery diagnostics."""
-
     payload = base.migration_status_payload()
     try:
         status_path, _, _, _, _ = base._paths()
@@ -290,8 +282,6 @@ def migration_status_payload() -> dict[str, object]:
 
 
 def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> None:
-    """Run Stage 1 with coarse-layout rebuild and bounded process recovery."""
-
     try:
         _, progress_path, _, _, _ = base._paths()
     except OSError:
@@ -362,7 +352,7 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
 
     opaque_child_restarts = 0
     while not stop_event.is_set():
-        base.run_local_persistence_migration_supervisor(stop_event)
+        _run_base_supervisor_with_coarse_command(stop_event)
         if stop_event.is_set():
             return
 
