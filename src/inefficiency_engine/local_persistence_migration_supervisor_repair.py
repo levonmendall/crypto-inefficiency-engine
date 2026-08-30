@@ -7,17 +7,21 @@ from pathlib import Path
 from typing import Any
 
 from inefficiency_engine import local_persistence_migration_supervisor as base
+from inefficiency_engine.partitioned_market_history import PartitionedMarketHistory
 
 
 MAX_OPAQUE_CHILD_RESTARTS = 3
 OPAQUE_CHILD_RETRY_DELAYS_SECONDS = (1.0, 3.0, 8.0)
 STDERR_TAIL_BYTES = 16_384
 MARKET_QUOTES_MIGRATION_MODE = "captured_primary_key_high_water"
+INODE_RECOVERY_MIN_FREE = 131_072
+INODE_RECOVERY_FREE_RATIO = 0.10
 _STORAGE_EXHAUSTION_MARKERS = (
     "no space left on device",
     "errno 28",
     "disk quota exceeded",
 )
+_LAST_INODE_RECOVERY: dict[str, object] = {}
 
 migration_preflight = base.migration_preflight
 
@@ -102,6 +106,58 @@ def _checkpoint_details(progress: dict[str, Any]) -> dict[str, object]:
     }
 
 
+def _inode_capacity() -> tuple[int | None, int | None]:
+    try:
+        filesystem = os.statvfs(base._configured_storage_root())
+    except OSError:
+        return None, None
+    return int(filesystem.f_files), int(filesystem.f_ffree)
+
+
+def _inode_recovery_target(inode_total: int | None) -> int:
+    if inode_total is None or inode_total <= 0:
+        return INODE_RECOVERY_MIN_FREE
+    return max(INODE_RECOVERY_MIN_FREE, int(inode_total * INODE_RECOVERY_FREE_RATIO))
+
+
+def _recover_market_history_inode_pressure(progress: dict[str, Any]) -> dict[str, object] | None:
+    """Reclaim Parquet fragment inodes before relaunching a checkpointed migration."""
+
+    global _LAST_INODE_RECOVERY
+    if _market_quotes_checkpoint_marker(progress) is None:
+        return None
+    inode_total, inode_free = _inode_capacity()
+    target = _inode_recovery_target(inode_total)
+    if inode_free is None or inode_free >= target:
+        return None
+
+    _LAST_INODE_RECOVERY = {
+        "state": "running",
+        "started_at": base._now(),
+        "inode_total_before": inode_total,
+        "inode_free_before": inode_free,
+        "target_free_inodes": target,
+        **_checkpoint_details(progress),
+    }
+    try:
+        history = PartitionedMarketHistory()
+        result = history.compact_redundant_partitions(target_free_inodes=target)
+    except Exception as exc:
+        _LAST_INODE_RECOVERY.update(
+            state="failed",
+            completed_at=base._now(),
+            error_type=type(exc).__name__,
+            error=base._bounded_public_error(exc),
+        )
+        raise
+    _LAST_INODE_RECOVERY.update(
+        result,
+        state="complete" if result.get("target_reached") else "insufficient",
+        completed_at=base._now(),
+    )
+    return dict(_LAST_INODE_RECOVERY)
+
+
 def _restart_safe_opaque_child_exit(
     status: dict[str, object],
     progress: dict[str, Any],
@@ -141,11 +197,14 @@ def _publish_repair_status(
     progress: dict[str, Any],
     stderr_tail: str | None,
     error_type: str = "OpaqueMigrationChildExit",
+    error: object | None = None,
 ) -> None:
-    error = (
-        f"migration child exited code={child_return_code} without durable progress error"
-        + (f"; stderr_tail={stderr_tail}" if stderr_tail else "")
-    )
+    public_error = error
+    if public_error is None:
+        public_error = (
+            f"migration child exited code={child_return_code} without durable progress error"
+            + (f"; stderr_tail={stderr_tail}" if stderr_tail else "")
+        )
     payload: dict[str, object] = {
         "state": state,
         "reason": reason,
@@ -154,7 +213,7 @@ def _publish_repair_status(
         "child_return_code": child_return_code,
         "opaque_child_restarts": int(opaque_child_restarts),
         "error_type": error_type,
-        "error": base._bounded_public_error(error),
+        "error": base._bounded_public_error(public_error),
         "child_stderr_tail": stderr_tail,
         "progress_state": progress.get("state"),
         **_checkpoint_details(progress),
@@ -198,11 +257,61 @@ def migration_status_payload() -> dict[str, object]:
         if field in {"error", "child_stderr_tail"}:
             value = base._bounded_public_error(value)
         payload[f"supervisor_{field}"] = value
+    for field, value in _LAST_INODE_RECOVERY.items():
+        if field == "error":
+            value = base._bounded_public_error(value)
+        payload[f"supervisor_inode_compaction_{field}"] = value
     return payload
 
 
 def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> None:
-    """Run Stage 1 with bounded recovery for opaque checkpoint-safe child exits."""
+    """Run Stage 1 with inode recovery and bounded opaque-child recovery."""
+
+    try:
+        _, progress_path, _, _, _ = base._paths()
+    except OSError:
+        return
+    progress = base._read_json(progress_path)
+    try:
+        inode_recovery = _recover_market_history_inode_pressure(progress)
+    except Exception as exc:
+        try:
+            _publish_repair_status(
+                state="failed",
+                reason="market_history_inode_compaction_failed",
+                started_at=_LAST_INODE_RECOVERY.get("started_at") or base._now(),
+                child_return_code=None,
+                opaque_child_restarts=0,
+                retry_after_seconds=None,
+                progress=progress,
+                stderr_tail=None,
+                error_type=type(exc).__name__,
+                error=exc,
+            )
+        except OSError:
+            pass
+        return
+    if inode_recovery is not None and not inode_recovery.get("target_reached"):
+        try:
+            _publish_repair_status(
+                state="failed",
+                reason="market_history_inode_headroom_not_recovered",
+                started_at=inode_recovery.get("started_at") or base._now(),
+                child_return_code=None,
+                opaque_child_restarts=0,
+                retry_after_seconds=None,
+                progress=progress,
+                stderr_tail=None,
+                error_type="InodeHeadroomUnavailable",
+                error=(
+                    "market history compaction could not restore required inode headroom: "
+                    f"free={inode_recovery.get('inode_free_after')} "
+                    f"target={inode_recovery.get('target_free_inodes')}"
+                ),
+            )
+        except OSError:
+            pass
+        return
 
     opaque_child_restarts = 0
     while not stop_event.is_set():
@@ -279,6 +388,8 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
 
 
 __all__ = [
+    "INODE_RECOVERY_FREE_RATIO",
+    "INODE_RECOVERY_MIN_FREE",
     "MARKET_QUOTES_MIGRATION_MODE",
     "MAX_OPAQUE_CHILD_RESTARTS",
     "migration_preflight",
