@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import threading
 from pathlib import Path
@@ -11,12 +12,13 @@ from inefficiency_engine import local_persistence_migration_supervisor as base
 MAX_OPAQUE_CHILD_RESTARTS = 3
 OPAQUE_CHILD_RETRY_DELAYS_SECONDS = (1.0, 3.0, 8.0)
 STDERR_TAIL_BYTES = 16_384
+MARKET_QUOTES_MIGRATION_MODE = "captured_primary_key_high_water"
 
 migration_preflight = base.migration_preflight
 
 
 def _read_stderr_tail(path: Path, *, max_bytes: int = STDERR_TAIL_BYTES) -> str | None:
-    """Read only a bounded tail of the child stderr log and redact credentials."""
+    """Read the newest bounded stderr tail, redact credentials, and keep the end."""
 
     try:
         with path.open("rb") as handle:
@@ -26,7 +28,45 @@ def _read_stderr_tail(path: Path, *, max_bytes: int = STDERR_TAIL_BYTES) -> str 
             text = handle.read(max(1, int(max_bytes))).decode("utf-8", errors="replace")
     except OSError:
         return None
-    return base._bounded_public_error(text)
+    flattened = text.replace("\r", " ").replace("\n", " ").strip()
+    if not flattened:
+        return None
+    redacted = base._URL_CREDENTIALS.sub(r"\1***@", flattened)
+    return redacted[-600:]
+
+
+def _market_quotes_checkpoint_marker(progress: dict[str, Any]) -> tuple[object, ...] | None:
+    """Return the restart-safe Stage 1 market_quotes checkpoint marker.
+
+    The importer captures one finite integer primary-key high-water and then copies
+    bounded batches constrained to ``id <= high_water`` while persisting
+    ``last_primary_key`` after each committed Parquet append.  An opaque process exit
+    can therefore resume safely only when both durable boundaries are present.
+    """
+
+    if str(progress.get("current_table") or "") != "market_quotes":
+        return None
+    tables = progress.get("tables")
+    table_report = tables.get("market_quotes") if isinstance(tables, dict) else None
+    if not isinstance(table_report, dict):
+        return None
+    if table_report.get("verified") is True:
+        return None
+    if table_report.get("migration_mode") != MARKET_QUOTES_MIGRATION_MODE:
+        return None
+    high_water = table_report.get("high_water_primary_key")
+    checkpoint = table_report.get("last_primary_key")
+    if not isinstance(high_water, list) or not high_water:
+        return None
+    if not isinstance(checkpoint, list) or not checkpoint:
+        return None
+    return (
+        "market_quotes",
+        json.dumps(high_water, sort_keys=True, default=str),
+        json.dumps(checkpoint, sort_keys=True, default=str),
+        table_report.get("source_rows"),
+        table_report.get("source_lineage_count"),
+    )
 
 
 def _checkpoint_details(progress: dict[str, Any]) -> dict[str, object]:
@@ -37,8 +77,10 @@ def _checkpoint_details(progress: dict[str, Any]) -> dict[str, object]:
         table_report = {}
     return {
         "checkpoint_current_table": current_table or None,
+        "checkpoint_migration_mode": table_report.get("migration_mode"),
         "checkpoint_last_progress_at": table_report.get("last_progress_at"),
         "checkpoint_last_primary_key": table_report.get("last_primary_key"),
+        "checkpoint_high_water_primary_key": table_report.get("high_water_primary_key"),
         "checkpoint_snapshot_rows_copied": table_report.get("snapshot_rows_copied"),
         "checkpoint_snapshot_high_water_primary_key": table_report.get(
             "snapshot_high_water_primary_key"
@@ -50,11 +92,11 @@ def _restart_safe_opaque_child_exit(
     status: dict[str, object],
     progress: dict[str, Any],
 ) -> bool:
-    """Retry only an unexplained process exit with a proven resumable checkpoint.
+    """Retry only an unexplained process exit with a proven market_quotes checkpoint.
 
-    Explicit migration failures remain fail-closed.  The only automatic recovery is
-    for a nonzero child exit that did not publish semantic failure truth and whose
-    current table is still in the bounded monotonic snapshot-copy phase.
+    Explicit migration failures remain fail-closed. The only automatic recovery is
+    for a nonzero child exit that did not publish semantic failure truth while the
+    current table retains both its captured high-water and committed keyset checkpoint.
     """
 
     if status.get("state") != "failed":
@@ -71,7 +113,7 @@ def _restart_safe_opaque_child_exit(
         return False
     if progress.get("error_type") not in (None, "") or progress.get("error") not in (None, ""):
         return False
-    return base._monotonic_copy_progress_marker(progress) is not None
+    return _market_quotes_checkpoint_marker(progress) is not None
 
 
 def _publish_repair_status(
@@ -129,8 +171,10 @@ def migration_status_payload() -> dict[str, object]:
         "error",
         "child_stderr_tail",
         "checkpoint_current_table",
+        "checkpoint_migration_mode",
         "checkpoint_last_progress_at",
         "checkpoint_last_primary_key",
+        "checkpoint_high_water_primary_key",
         "checkpoint_snapshot_rows_copied",
         "checkpoint_snapshot_high_water_primary_key",
         "retry_after_seconds",
@@ -206,6 +250,7 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
 
 
 __all__ = [
+    "MARKET_QUOTES_MIGRATION_MODE",
     "MAX_OPAQUE_CHILD_RESTARTS",
     "migration_preflight",
     "migration_status_payload",

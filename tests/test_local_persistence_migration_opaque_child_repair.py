@@ -6,23 +6,23 @@ from pathlib import Path
 from inefficiency_engine import local_persistence_migration_supervisor_repair as repair
 
 
-def _copying_progress(*, error_type=None, error=None):
+def _copying_progress(*, error_type=None, error=None, checkpoint=True, high_water=True):
+    market = {
+        "verified": None,
+        "migration_mode": "captured_primary_key_high_water",
+        "source_rows": 2_794_738,
+        "source_lineage_count": 2_787_792,
+    }
+    if checkpoint:
+        market["last_primary_key"] = [1_748_641]
+    if high_water:
+        market["high_water_primary_key"] = [2_812_933]
     return {
         "state": "running",
         "current_table": "market_quotes",
         "error_type": error_type,
         "error": error,
-        "tables": {
-            "market_quotes": {
-                "verified": None,
-                "migration_mode": "captured_monotonic_integer_high_water",
-                "snapshot_phase": "copying_snapshot",
-                "last_progress_at": "2026-08-29T23:30:00+00:00",
-                "last_primary_key": [1748641],
-                "snapshot_rows_copied": 1700000,
-                "snapshot_high_water_primary_key": [2812933],
-            }
-        },
+        "tables": {"market_quotes": market},
     }
 
 
@@ -36,10 +36,28 @@ def _opaque_failure_status():
     }
 
 
-def test_opaque_child_exit_is_retryable_only_with_restart_safe_checkpoint():
+def test_market_quotes_marker_matches_real_stage_one_checkpoint_shape():
+    marker = repair._market_quotes_checkpoint_marker(_copying_progress())
+
+    assert marker is not None
+    assert marker[0] == "market_quotes"
+    assert "2812933" in marker[1]
+    assert "1748641" in marker[2]
+
+
+def test_opaque_child_exit_is_retryable_only_with_restart_safe_market_checkpoint():
     assert repair._restart_safe_opaque_child_exit(
         _opaque_failure_status(),
         _copying_progress(),
+    )
+
+    assert not repair._restart_safe_opaque_child_exit(
+        _opaque_failure_status(),
+        _copying_progress(checkpoint=False),
+    )
+    assert not repair._restart_safe_opaque_child_exit(
+        _opaque_failure_status(),
+        _copying_progress(high_water=False),
     )
 
     explicit_failure = _copying_progress(
@@ -52,21 +70,36 @@ def test_opaque_child_exit_is_retryable_only_with_restart_safe_checkpoint():
     )
 
 
-def test_stderr_tail_is_bounded_and_redacts_postgres_credentials(tmp_path: Path):
+def test_funding_snapshot_mode_is_not_mistaken_for_market_quotes_resume():
+    progress = _copying_progress()
+    progress["tables"]["market_quotes"]["migration_mode"] = (
+        "captured_monotonic_integer_high_water"
+    )
+    progress["tables"]["market_quotes"]["snapshot_phase"] = "copying_snapshot"
+
+    assert repair._market_quotes_checkpoint_marker(progress) is None
+    assert not repair._restart_safe_opaque_child_exit(_opaque_failure_status(), progress)
+
+
+def test_stderr_tail_is_bounded_redacted_and_keeps_terminal_end(tmp_path: Path):
     stderr_path = tmp_path / "stderr.log"
     stderr_path.write_text(
-        "prefix\npostgresql://user:secret@example.test/db\nterminal database failure\n"
+        "prefix\n"
+        + ("x" * 900)
+        + "\npostgresql://user:secret@example.test/db\n"
+        + "terminal database failure at the very end\n"
     )
 
     tail = repair._read_stderr_tail(stderr_path)
 
     assert tail is not None
+    assert len(tail) <= 600
     assert "secret" not in tail
     assert "postgresql://***@example.test/db" in tail
-    assert "terminal database failure" in tail
+    assert tail.endswith("terminal database failure at the very end")
 
 
-def test_wrapper_relaunches_after_opaque_checkpoint_exit(monkeypatch, tmp_path: Path):
+def test_wrapper_relaunches_after_opaque_market_checkpoint_exit(monkeypatch, tmp_path: Path):
     progress_path = tmp_path / "progress.json"
     stderr_path = tmp_path / "stderr.log"
     stderr_path.write_text("opaque child failure")
@@ -110,7 +143,9 @@ def test_wrapper_relaunches_after_opaque_checkpoint_exit(monkeypatch, tmp_path: 
     assert len(run_calls) == 2
     assert published[0]["state"] == "retry_wait"
     assert published[0]["reason"] == "opaque_checkpoint_child_exit"
-    assert published[0]["checkpoint_last_primary_key"] == [1748641]
+    assert published[0]["checkpoint_migration_mode"] == "captured_primary_key_high_water"
+    assert published[0]["checkpoint_last_primary_key"] == [1_748_641]
+    assert published[0]["checkpoint_high_water_primary_key"] == [2_812_933]
     assert published[0]["error_type"] == "OpaqueMigrationChildExit"
 
 
