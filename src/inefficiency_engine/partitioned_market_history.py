@@ -19,6 +19,8 @@ SCHEMA_VERSION = 1
 REQUIRED_COLUMNS = (
     "history_id", "lineage_hash", "venue", "asset", "observed_at", "payload_json"
 )
+MAX_PARTITION_FILES_PER_GROUP = 16
+COMPACTION_BATCH_ROWS = 65_536
 
 
 def _utc(value: datetime) -> datetime:
@@ -36,25 +38,34 @@ def _file_checksum(path: Path) -> str:
 
 
 class PartitionedMarketHistory:
-    """Atomic append-only Parquet history with a WAL-backed manifest.
+    """Atomic Parquet history with bounded physical-file amplification.
 
-    Parquet files are immutable and become visible only after fsync+rename and a
-    committed manifest row. Readers never glob temporary files. The manifest's
-    unique lineage hash preserves the relational ledger's deduplication semantics
-    across processes and restartable imports.
+    Every Parquet file remains immutable after publication. When one logical
+    ``(venue, asset, day)`` group accumulates too many immutable fragments, those
+    fragments are rewritten into one new immutable file and the SQLite manifest is
+    switched atomically. Superseded files are then deleted through a durable garbage
+    ledger, so a crash cannot orphan the authoritative lineage mapping.
     """
 
-    def __init__(self, root: str | Path | None = None):
+    def __init__(
+        self,
+        root: str | Path | None = None,
+        *,
+        max_partition_files_per_group: int = MAX_PARTITION_FILES_PER_GROUP,
+    ):
         paths = local_storage_paths(root)
         self.root = paths.market_history
         self.manifest_path = self.root / "manifest.sqlite3"
+        self.max_partition_files_per_group = max(0, int(max_partition_files_per_group))
         self._initialize_manifest()
+        self._reap_compaction_garbage()
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.manifest_path, timeout=30.0, isolation_level=None)
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA busy_timeout=30000")
+        db.execute("PRAGMA temp_store=MEMORY")
         return db
 
     def _initialize_manifest(self) -> None:
@@ -84,10 +95,268 @@ class PartitionedMarketHistory:
                 "CREATE INDEX IF NOT EXISTS ix_partitions_range "
                 "ON partitions(venue, asset, day, min_observed_at, max_observed_at)"
             )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS compaction_garbage (
+                    path TEXT PRIMARY KEY
+                )"""
+            )
 
     @staticmethod
     def _lineage(quote: MarketQuote) -> str:
         return hashlib.sha256(quote.model_dump_json().encode()).hexdigest()
+
+    def _inode_capacity(self) -> tuple[int | None, int | None]:
+        try:
+            filesystem = os.statvfs(self.root)
+        except OSError:
+            return None, None
+        return int(filesystem.f_files), int(filesystem.f_ffree)
+
+    def _reap_compaction_garbage(self) -> int:
+        """Delete files made non-authoritative by an already committed compaction."""
+
+        with self._connect() as db:
+            garbage = [str(row[0]) for row in db.execute("SELECT path FROM compaction_garbage")]
+        cleared: list[str] = []
+        for relative in garbage:
+            with self._connect() as db:
+                if db.execute("SELECT 1 FROM partitions WHERE path = ?", (relative,)).fetchone():
+                    db.execute("DELETE FROM compaction_garbage WHERE path = ?", (relative,))
+                    continue
+            try:
+                (self.root / relative).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                continue
+            cleared.append(relative)
+        if cleared:
+            with self._connect() as db:
+                db.executemany(
+                    "DELETE FROM compaction_garbage WHERE path = ?",
+                    [(relative,) for relative in cleared],
+                )
+        return len(cleared)
+
+    def _partition_group_count_connection(
+        self,
+        db: sqlite3.Connection,
+        venue: str,
+        asset: str,
+        day: str,
+    ) -> int:
+        return int(
+            db.execute(
+                "SELECT COUNT(*) FROM partitions WHERE venue = ? AND asset = ? AND day = ?",
+                (venue, asset, day),
+            ).fetchone()[0]
+        )
+
+    def compact_partition_group(self, venue: str, asset: str, day: str) -> dict[str, object]:
+        """Collapse one logical partition group through an atomic manifest switch."""
+
+        directory: Path | None = None
+        temp_path: Path | None = None
+        final_path: Path | None = None
+        new_relative: str | None = None
+        old_paths: list[str] = []
+        manifest_switched = False
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            parts = list(
+                db.execute(
+                    "SELECT path, min_observed_at, max_observed_at, row_count, checksum, schema_version "
+                    "FROM partitions WHERE venue = ? AND asset = ? AND day = ? ORDER BY path",
+                    (venue, asset, day),
+                )
+            )
+            if len(parts) < 2:
+                db.rollback()
+                return {
+                    "compacted": False,
+                    "venue": venue,
+                    "asset": asset,
+                    "day": day,
+                    "files_before": len(parts),
+                    "files_after": len(parts),
+                    "rows": int(parts[0][3]) if parts else 0,
+                }
+
+            old_paths = [str(part[0]) for part in parts]
+            expected_rows = sum(int(part[3]) for part in parts)
+            minimum = min(str(part[1]) for part in parts)
+            maximum = max(str(part[2]) for part in parts)
+            directory = (self.root / old_paths[0]).parent
+            name = f"compact-{uuid.uuid4().hex}.parquet"
+            final_path = directory / name
+            temp_path = directory / f".{name}.tmp"
+            writer: pq.ParquetWriter | None = None
+            written_rows = 0
+            try:
+                for relative, _, _, row_count, checksum, schema_version in parts:
+                    if int(schema_version) != SCHEMA_VERSION:
+                        raise RuntimeError(f"cannot compact schema version mismatch: {relative}")
+                    source_path = self.root / str(relative)
+                    if not source_path.is_file():
+                        raise RuntimeError(f"cannot compact missing partition: {relative}")
+                    if _file_checksum(source_path) != str(checksum):
+                        raise RuntimeError(f"cannot compact checksum mismatch: {relative}")
+                    parquet = pq.ParquetFile(source_path)
+                    if tuple(parquet.schema_arrow.names) != REQUIRED_COLUMNS:
+                        raise RuntimeError(f"cannot compact parquet schema mismatch: {relative}")
+                    if int(parquet.metadata.num_rows) != int(row_count):
+                        raise RuntimeError(f"cannot compact row count mismatch: {relative}")
+                    if writer is None:
+                        writer = pq.ParquetWriter(temp_path, parquet.schema_arrow, compression="zstd")
+                    for batch in parquet.iter_batches(batch_size=COMPACTION_BATCH_ROWS):
+                        writer.write_batch(batch)
+                        written_rows += batch.num_rows
+                if writer is None:
+                    raise RuntimeError("cannot compact empty partition set")
+                writer.close()
+                writer = None
+                if written_rows != expected_rows:
+                    raise RuntimeError(
+                        f"compaction row count mismatch: expected={expected_rows} written={written_rows}"
+                    )
+                with temp_path.open("rb") as handle:
+                    os.fsync(handle.fileno())
+                os.replace(temp_path, final_path)
+                directory_fd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                compacted = pq.ParquetFile(final_path)
+                if tuple(compacted.schema_arrow.names) != REQUIRED_COLUMNS:
+                    raise RuntimeError("compacted parquet schema mismatch")
+                if int(compacted.metadata.num_rows) != expected_rows:
+                    raise RuntimeError("compacted parquet row count mismatch")
+                checksum = _file_checksum(final_path)
+                new_relative = str(final_path.relative_to(self.root))
+                db.execute(
+                    "INSERT INTO partitions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        new_relative,
+                        venue,
+                        asset,
+                        day,
+                        minimum,
+                        maximum,
+                        expected_rows,
+                        checksum,
+                        datetime.now(timezone.utc).isoformat(),
+                        SCHEMA_VERSION,
+                    ),
+                )
+                db.executemany(
+                    "UPDATE quote_lineage SET partition_path = ? WHERE partition_path = ?",
+                    [(new_relative, relative) for relative in old_paths],
+                )
+                moved = int(
+                    db.execute(
+                        "SELECT COUNT(*) FROM quote_lineage WHERE partition_path = ?",
+                        (new_relative,),
+                    ).fetchone()[0]
+                )
+                if moved != expected_rows:
+                    raise RuntimeError(
+                        f"compaction lineage count mismatch: expected={expected_rows} moved={moved}"
+                    )
+                db.executemany(
+                    "INSERT OR IGNORE INTO compaction_garbage(path) VALUES (?)",
+                    [(relative,) for relative in old_paths],
+                )
+                db.executemany(
+                    "DELETE FROM partitions WHERE path = ?",
+                    [(relative,) for relative in old_paths],
+                )
+                db.commit()
+                manifest_switched = True
+            except Exception:
+                if writer is not None:
+                    writer.close()
+                db.rollback()
+                raise
+            finally:
+                if not manifest_switched:
+                    for path in (temp_path, final_path):
+                        if path is None:
+                            continue
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            pass
+
+        deleted = self._reap_compaction_garbage()
+        return {
+            "compacted": True,
+            "venue": venue,
+            "asset": asset,
+            "day": day,
+            "files_before": len(old_paths),
+            "files_after": 1,
+            "files_deleted": deleted,
+            "rows": expected_rows,
+            "new_path": new_relative,
+        }
+
+    def compact_redundant_partitions(
+        self,
+        *,
+        target_free_inodes: int | None = None,
+        max_groups: int | None = None,
+    ) -> dict[str, object]:
+        """Compact redundant logical groups until the requested inode headroom exists."""
+
+        garbage_reaped = self._reap_compaction_garbage()
+        inode_total_before, inode_free_before = self._inode_capacity()
+        with self._connect() as db:
+            groups = list(
+                db.execute(
+                    "SELECT venue, asset, day, COUNT(*) AS fragment_count "
+                    "FROM partitions GROUP BY venue, asset, day "
+                    "HAVING COUNT(*) > 1 ORDER BY fragment_count DESC"
+                )
+            )
+        compacted_groups = 0
+        files_collapsed = 0
+        rows_rewritten = 0
+        for venue, asset, day, fragment_count in groups:
+            if max_groups is not None and compacted_groups >= int(max_groups):
+                break
+            _, current_free = self._inode_capacity()
+            if (
+                target_free_inodes is not None
+                and current_free is not None
+                and current_free >= int(target_free_inodes)
+            ):
+                break
+            result = self.compact_partition_group(str(venue), str(asset), str(day))
+            if not result.get("compacted"):
+                continue
+            compacted_groups += 1
+            files_collapsed += max(0, int(fragment_count) - 1)
+            rows_rewritten += int(result.get("rows") or 0)
+        inode_total_after, inode_free_after = self._inode_capacity()
+        return {
+            "compacted_groups": compacted_groups,
+            "files_collapsed": files_collapsed,
+            "rows_rewritten": rows_rewritten,
+            "garbage_reaped": garbage_reaped,
+            "inode_total_before": inode_total_before,
+            "inode_free_before": inode_free_before,
+            "inode_total_after": inode_total_after,
+            "inode_free_after": inode_free_after,
+            "target_free_inodes": target_free_inodes,
+            "target_reached": (
+                target_free_inodes is None
+                or inode_free_after is None
+                or inode_free_after >= int(target_free_inodes)
+            ),
+        }
 
     def append(self, quotes: Iterable[MarketQuote]) -> int:
         return self.append_records((None, self._lineage(quote), quote) for quote in quotes)
@@ -121,6 +390,14 @@ class PartitionedMarketHistory:
         candidates = list({lineage: (source_id, quote) for source_id, lineage, quote in rows}.items())
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if (
+                self.max_partition_files_per_group > 0
+                and self._partition_group_count_connection(db, venue, asset, day)
+                >= self.max_partition_files_per_group
+            ):
+                db.rollback()
+                self.compact_partition_group(venue, asset, day)
+                return self._append_partition(venue, asset, day, rows)
             existing = {
                 item[0]
                 for item in db.execute(
@@ -160,28 +437,41 @@ class PartitionedMarketHistory:
                 "observed_at": [_utc(item[2].observed_at).isoformat() for item in accepted],
                 "payload_json": [item[2].model_dump_json() for item in accepted],
             }
-            pq.write_table(pa.table(payload), temp_path, compression="zstd")
-            with temp_path.open("rb") as handle:
-                os.fsync(handle.fileno())
-            os.replace(temp_path, final_path)
-            directory_fd = os.open(directory, os.O_RDONLY)
+            manifest_committed = False
             try:
-                os.fsync(directory_fd)
+                pq.write_table(pa.table(payload), temp_path, compression="zstd")
+                with temp_path.open("rb") as handle:
+                    os.fsync(handle.fileno())
+                os.replace(temp_path, final_path)
+                directory_fd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                checksum = _file_checksum(final_path)
+                relative = str(final_path.relative_to(self.root))
+                observed_values = payload["observed_at"]
+                db.execute(
+                    "INSERT INTO partitions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (relative, venue, asset, day, min(observed_values), max(observed_values), len(accepted), checksum,
+                     datetime.now(timezone.utc).isoformat(), SCHEMA_VERSION),
+                )
+                db.executemany(
+                    "INSERT INTO quote_lineage(lineage_hash, partition_path, history_id) VALUES (?, ?, ?)",
+                    [(item[0], relative, history_id) for history_id, item in zip(history_ids, accepted)],
+                )
+                db.commit()
+                manifest_committed = True
             finally:
-                os.close(directory_fd)
-            checksum = _file_checksum(final_path)
-            relative = str(final_path.relative_to(self.root))
-            observed_values = payload["observed_at"]
-            db.execute(
-                "INSERT INTO partitions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (relative, venue, asset, day, min(observed_values), max(observed_values), len(accepted), checksum,
-                 datetime.now(timezone.utc).isoformat(), SCHEMA_VERSION),
-            )
-            db.executemany(
-                "INSERT INTO quote_lineage(lineage_hash, partition_path, history_id) VALUES (?, ?, ?)",
-                [(item[0], relative, history_id) for history_id, item in zip(history_ids, accepted)],
-            )
-            db.commit()
+                if not manifest_committed:
+                    db.rollback()
+                    for path in (temp_path, final_path):
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            pass
         return len(accepted)
 
     def range(self, *, start: datetime, end: datetime, venues: Iterable[str] | None = None,
@@ -332,4 +622,9 @@ class PartitionedMarketHistory:
         }
 
 
-__all__ = ["PartitionedMarketHistory", "SCHEMA_VERSION"]
+__all__ = [
+    "COMPACTION_BATCH_ROWS",
+    "MAX_PARTITION_FILES_PER_GROUP",
+    "PartitionedMarketHistory",
+    "SCHEMA_VERSION",
+]
