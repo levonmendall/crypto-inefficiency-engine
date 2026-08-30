@@ -5,8 +5,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from inefficiency_engine.local_persistence_migration_supervisor import (
-    _read_json,
+from inefficiency_engine.local_persistence_migration_supervisor import _read_json
+from inefficiency_engine.local_persistence_migration_supervisor_repair import (
     migration_status_payload as _base_migration_status_payload,
 )
 from inefficiency_engine.local_storage import DEFAULT_PRODUCTION_STORAGE_ROOT
