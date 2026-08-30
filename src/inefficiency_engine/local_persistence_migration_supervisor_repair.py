@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any
 
 from inefficiency_engine import local_persistence_migration_supervisor as base
-from inefficiency_engine.partitioned_market_history import PartitionedMarketHistory
+from inefficiency_engine.market_history_inode_recovery import (
+    InodeRecoveryPartitionedMarketHistory,
+)
 
 
 MAX_OPAQUE_CHILD_RESTARTS = 3
@@ -140,7 +142,7 @@ def _recover_market_history_inode_pressure(progress: dict[str, Any]) -> dict[str
         **_checkpoint_details(progress),
     }
     try:
-        history = PartitionedMarketHistory()
+        history = InodeRecoveryPartitionedMarketHistory()
         result = history.compact_redundant_partitions(target_free_inodes=target)
     except Exception as exc:
         _LAST_INODE_RECOVERY.update(
