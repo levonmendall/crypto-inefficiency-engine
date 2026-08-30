@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 from inefficiency_engine import local_persistence_migration_supervisor as base
 from inefficiency_engine.market_history_inode_recovery import (
     InodeRecoveryPartitionedMarketHistory,
+    prepare_unverified_market_history_rebuild,
 )
 
 
@@ -18,19 +20,26 @@ STDERR_TAIL_BYTES = 16_384
 MARKET_QUOTES_MIGRATION_MODE = "captured_primary_key_high_water"
 INODE_RECOVERY_MIN_FREE = 131_072
 INODE_RECOVERY_FREE_RATIO = 0.10
+COARSE_MIGRATION_COMMAND = [
+    sys.executable,
+    "-m",
+    "inefficiency_engine.stage_one_local_persistence_migration_coarse",
+]
 _STORAGE_EXHAUSTION_MARKERS = (
     "no space left on device",
     "errno 28",
     "disk quota exceeded",
 )
 _LAST_INODE_RECOVERY: dict[str, object] = {}
+_LAST_MARKET_HISTORY_REBUILD: dict[str, object] = {}
 
+# The base command remains canonical at module scope. The coarse Stage-1 wrapper is
+# selected only while the supervisor actually launches its child, then immediately
+# restored. This preserves the deployment contract and avoids test/import side effects.
 migration_preflight = base.migration_preflight
 
 
 def _read_stderr_tail(path: Path, *, max_bytes: int = STDERR_TAIL_BYTES) -> str | None:
-    """Read the newest bounded stderr tail, redact credentials, and keep the end."""
-
     try:
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
@@ -47,8 +56,6 @@ def _read_stderr_tail(path: Path, *, max_bytes: int = STDERR_TAIL_BYTES) -> str 
 
 
 def _is_storage_exhaustion(stderr_tail: str | None) -> bool:
-    """Return true only when child stderr proves a filesystem-capacity failure."""
-
     if not stderr_tail:
         return False
     normalized = stderr_tail.lower()
@@ -56,21 +63,11 @@ def _is_storage_exhaustion(stderr_tail: str | None) -> bool:
 
 
 def _market_quotes_checkpoint_marker(progress: dict[str, Any]) -> tuple[object, ...] | None:
-    """Return the restart-safe Stage 1 market_quotes checkpoint marker.
-
-    The importer captures one finite integer primary-key high-water and then copies
-    bounded batches constrained to ``id <= high_water`` while persisting
-    ``last_primary_key`` after each committed Parquet append. An opaque process exit
-    can therefore resume safely only when both durable boundaries are present.
-    """
-
     if str(progress.get("current_table") or "") != "market_quotes":
         return None
     tables = progress.get("tables")
     table_report = tables.get("market_quotes") if isinstance(tables, dict) else None
-    if not isinstance(table_report, dict):
-        return None
-    if table_report.get("verified") is True:
+    if not isinstance(table_report, dict) or table_report.get("verified") is True:
         return None
     if table_report.get("migration_mode") != MARKET_QUOTES_MIGRATION_MODE:
         return None
@@ -123,8 +120,6 @@ def _inode_recovery_target(inode_total: int | None) -> int:
 
 
 def _recover_market_history_inode_pressure(progress: dict[str, Any]) -> dict[str, object] | None:
-    """Reclaim Parquet fragment inodes before relaunching a checkpointed migration."""
-
     global _LAST_INODE_RECOVERY
     if _market_quotes_checkpoint_marker(progress) is None:
         return None
@@ -132,7 +127,6 @@ def _recover_market_history_inode_pressure(progress: dict[str, Any]) -> dict[str
     target = _inode_recovery_target(inode_total)
     if inode_free is None or inode_free >= target:
         return None
-
     _LAST_INODE_RECOVERY = {
         "state": "running",
         "started_at": base._now(),
@@ -160,17 +154,36 @@ def _recover_market_history_inode_pressure(progress: dict[str, Any]) -> dict[str
     return dict(_LAST_INODE_RECOVERY)
 
 
+def _prepare_market_history_layout(progress_path: Path) -> dict[str, object] | None:
+    global _LAST_MARKET_HISTORY_REBUILD
+    try:
+        result = prepare_unverified_market_history_rebuild(progress_path)
+    except Exception as exc:
+        _LAST_MARKET_HISTORY_REBUILD = {
+            "state": "failed",
+            "completed_at": base._now(),
+            "error_type": type(exc).__name__,
+            "error": base._bounded_public_error(exc),
+        }
+        raise
+    if result is not None:
+        _LAST_MARKET_HISTORY_REBUILD = dict(result)
+    return result
+
+
+def _run_base_supervisor_with_coarse_command(stop_event: threading.Event) -> None:
+    original_command = list(base.MIGRATION_COMMAND)
+    base.MIGRATION_COMMAND = list(COARSE_MIGRATION_COMMAND)
+    try:
+        base.run_local_persistence_migration_supervisor(stop_event)
+    finally:
+        base.MIGRATION_COMMAND = original_command
+
+
 def _restart_safe_opaque_child_exit(
     status: dict[str, object],
     progress: dict[str, Any],
 ) -> bool:
-    """Retry only an unexplained process exit with a proven market_quotes checkpoint.
-
-    Explicit migration failures remain fail-closed. The only automatic recovery is
-    for a nonzero child exit that did not publish semantic failure truth while the
-    current table retains both its captured high-water and committed keyset checkpoint.
-    """
-
     if status.get("state") != "failed":
         return False
     if status.get("supervisor_reason") != "migration_child_failed":
@@ -233,8 +246,6 @@ def _publish_repair_status(
 
 
 def migration_status_payload() -> dict[str, object]:
-    """Project base migration truth plus process-level terminal diagnostics."""
-
     payload = base.migration_status_payload()
     try:
         status_path, _, _, _, _ = base._paths()
@@ -263,16 +274,40 @@ def migration_status_payload() -> dict[str, object]:
         if field == "error":
             value = base._bounded_public_error(value)
         payload[f"supervisor_inode_compaction_{field}"] = value
+    for field, value in _LAST_MARKET_HISTORY_REBUILD.items():
+        if field == "error":
+            value = base._bounded_public_error(value)
+        payload[f"supervisor_market_history_rebuild_{field}"] = value
     return payload
 
 
 def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> None:
-    """Run Stage 1 with inode recovery and bounded opaque-child recovery."""
-
     try:
         _, progress_path, _, _, _ = base._paths()
     except OSError:
         return
+
+    progress = base._read_json(progress_path)
+    try:
+        _prepare_market_history_layout(progress_path)
+    except Exception as exc:
+        try:
+            _publish_repair_status(
+                state="failed",
+                reason="unverified_market_history_rebuild_failed",
+                started_at=_LAST_MARKET_HISTORY_REBUILD.get("started_at") or base._now(),
+                child_return_code=None,
+                opaque_child_restarts=0,
+                retry_after_seconds=None,
+                progress=progress,
+                stderr_tail=None,
+                error_type=type(exc).__name__,
+                error=exc,
+            )
+        except OSError:
+            pass
+        return
+
     progress = base._read_json(progress_path)
     try:
         inode_recovery = _recover_market_history_inode_pressure(progress)
@@ -317,7 +352,7 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
 
     opaque_child_restarts = 0
     while not stop_event.is_set():
-        base.run_local_persistence_migration_supervisor(stop_event)
+        _run_base_supervisor_with_coarse_command(stop_event)
         if stop_event.is_set():
             return
 
@@ -390,6 +425,7 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
 
 
 __all__ = [
+    "COARSE_MIGRATION_COMMAND",
     "INODE_RECOVERY_FREE_RATIO",
     "INODE_RECOVERY_MIN_FREE",
     "MARKET_QUOTES_MIGRATION_MODE",
