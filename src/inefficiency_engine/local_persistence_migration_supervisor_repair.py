@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -13,12 +14,21 @@ MAX_OPAQUE_CHILD_RESTARTS = 3
 OPAQUE_CHILD_RETRY_DELAYS_SECONDS = (1.0, 3.0, 8.0)
 STDERR_TAIL_BYTES = 16_384
 MARKET_QUOTES_MIGRATION_MODE = "captured_primary_key_high_water"
+STORAGE_REPAIRED_MIGRATION_COMMAND = [
+    sys.executable,
+    "-m",
+    "inefficiency_engine.stage_one_local_persistence_storage_repair",
+]
 _STORAGE_EXHAUSTION_MARKERS = (
     "no space left on device",
     "errno 28",
     "disk quota exceeded",
 )
 
+# The production supervisor resolves this constant at child launch time. Route only
+# the Stage 1 importer through the storage-aware entrypoint; authority and cutover
+# remain owned by the existing supervisor/guard layers.
+base.MIGRATION_COMMAND = list(STORAGE_REPAIRED_MIGRATION_COMMAND)
 migration_preflight = base.migration_preflight
 
 
@@ -281,6 +291,7 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
 __all__ = [
     "MARKET_QUOTES_MIGRATION_MODE",
     "MAX_OPAQUE_CHILD_RESTARTS",
+    "STORAGE_REPAIRED_MIGRATION_COMMAND",
     "migration_preflight",
     "migration_status_payload",
     "run_local_persistence_migration_supervisor",
