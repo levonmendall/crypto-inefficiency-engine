@@ -100,7 +100,7 @@ def test_inode_recovery_compacts_only_checkpointed_market_history(monkeypatch):
                 "target_reached": True,
             }
 
-    monkeypatch.setattr(repair, "PartitionedMarketHistory", FakeHistory)
+    monkeypatch.setattr(repair, "InodeRecoveryPartitionedMarketHistory", FakeHistory)
     monkeypatch.setattr(repair, "_inode_capacity", lambda: (1_638_400, 4))
     repair._LAST_INODE_RECOVERY = {}
 
