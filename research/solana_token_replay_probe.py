@@ -9,8 +9,6 @@ WALLETS = {
     "kadenox": "B32QbbdDAyhvUQzjcaM5j6ZVKwjCxAwGH5Xgvb9SJqnC",
     "cented": "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o",
 }
-# Deterministically selected BEFORE replay from the locked chronological holdout:
-# first holdout event, midpoint holdout event, final holdout event.
 PROBES = [
     {"index": 4751, "mint": "64aNTxPrArrcHq2seN6EXYKfCmovtpv7zCTFB8Pfpump", "kol": "kadenox", "proxy": 1787848076},
     {"index": 5251, "mint": "DYhUVrUTCpw481ivCdaQ4uwF3BWvE7qNPq1Kv2nNpump", "kol": "kadenox", "proxy": 1788122171},
@@ -23,7 +21,7 @@ def rpc(payload):
     req = urllib.request.Request(RPC, data=data, headers={"Content-Type": "application/json", "User-Agent": "cie-alpha-replay/1"})
     for attempt in range(5):
         try:
-            with urllib.request.urlopen(req, timeout=30) as response:
+            with urllib.request.urlopen(req, timeout=45) as response:
                 return json.loads(response.read())
         except Exception:
             if attempt == 4:
@@ -38,27 +36,43 @@ def one(method, params):
     return body.get("result")
 
 
+def batch_transactions(signatures, batch_size=100):
+    out = []
+    config = {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}
+    for start in range(0, len(signatures), batch_size):
+        chunk = signatures[start:start + batch_size]
+        payload = [
+            {"jsonrpc": "2.0", "id": i, "method": "getTransaction", "params": [sig, config]}
+            for i, sig in enumerate(chunk)
+        ]
+        body = rpc(payload)
+        if not isinstance(body, list):
+            raise RuntimeError(f"unexpected batch response: {type(body)!r}")
+        by_id = {int(item["id"]): item for item in body if isinstance(item, dict) and "id" in item}
+        for i, sig in enumerate(chunk):
+            item = by_id.get(i) or {}
+            tx = item.get("result")
+            if tx is not None:
+                out.append((sig, tx))
+        print(f"batch_transactions fetched={min(start + len(chunk), len(signatures))}/{len(signatures)}", flush=True)
+    return out
+
+
 def account_keys(tx):
     keys = tx["transaction"]["message"]["accountKeys"]
-    out = []
-    for key in keys:
-        out.append(key.get("pubkey") if isinstance(key, dict) else key)
-    return out
+    return [key.get("pubkey") if isinstance(key, dict) else key for key in keys]
 
 
 def ui_amount(balance):
     amount = balance.get("uiTokenAmount", {}) if balance else {}
     raw = amount.get("amount")
     decimals = amount.get("decimals", 0)
-    if raw is None:
-        return 0.0
-    return int(raw) / (10 ** int(decimals))
+    return 0.0 if raw is None else int(raw) / (10 ** int(decimals))
 
 
 def token_delta_for_owner(tx, mint, owner):
     meta = tx.get("meta") or {}
-    pre = {}
-    post = {}
+    pre, post = {}, {}
     for row in meta.get("preTokenBalances") or []:
         if row.get("mint") == mint and row.get("owner") == owner:
             pre[row.get("accountIndex")] = ui_amount(row)
@@ -74,8 +88,7 @@ def wallet_native_delta(tx, owner):
         return None
     idx = keys.index(owner)
     meta = tx.get("meta") or {}
-    pre = meta.get("preBalances") or []
-    post = meta.get("postBalances") or []
+    pre, post = meta.get("preBalances") or [], meta.get("postBalances") or []
     if idx >= len(pre) or idx >= len(post):
         return None
     return (post[idx] - pre[idx]) / 1e9
@@ -89,31 +102,20 @@ def tx_summary(signature, tx, mint, wallet):
     side = "buy" if token_delta > 0 else "sell" if token_delta < 0 else "other"
     price_sol = None
     if token_delta and native_delta is not None:
-        # Remove the source wallet's transaction fee from native outflow when possible.
         economic_sol = native_delta + fee_sol if native_delta < 0 else native_delta
         price_sol = abs(economic_sol / token_delta)
     return {
-        "signature": signature,
-        "blockTime": tx.get("blockTime"),
-        "slot": tx.get("slot"),
-        "err": meta.get("err"),
-        "fee_sol": fee_sol,
-        "side": side,
-        "token_delta": token_delta,
-        "native_delta_sol": native_delta,
+        "signature": signature, "blockTime": tx.get("blockTime"), "slot": tx.get("slot"),
+        "err": meta.get("err"), "fee_sol": fee_sol, "side": side,
+        "token_delta": token_delta, "native_delta_sol": native_delta,
         "approx_execution_price_sol_per_token": price_sol,
     }
 
 
 def replay_probe(probe):
-    mint = probe["mint"]
-    wallet = WALLETS[probe["kol"]]
-    lower = probe["proxy"] - 7200
-    upper = probe["proxy"] + 600
-    before = None
-    sig_rows = []
-    pages = 0
-    reached_lower = False
+    mint, wallet = probe["mint"], WALLETS[probe["kol"]]
+    lower, upper = probe["proxy"] - 7200, probe["proxy"] + 600
+    before, sig_rows, pages, reached_lower = None, [], 0, False
     while pages < 30:
         cfg = {"limit": 1000, "commitment": "confirmed"}
         if before:
@@ -136,16 +138,10 @@ def replay_probe(probe):
         before = rows[-1].get("signature")
         if not before:
             break
-
-    # Only fetch transaction bodies near the source wallet's known last-trade second.
-    # This is a feasibility probe, not yet the full 5,751-event replay.
     nearby = [r for r in sig_rows if lower <= int(r.get("blockTime") or 0) <= upper]
-    txs = []
-    for row in nearby[:3000]:
-        sig = row["signature"]
-        tx = one("getTransaction", [sig, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}])
-        if tx is not None:
-            txs.append((sig, tx))
+    # All available mint-touching signatures in the bounded window, capped only as a feasibility safety boundary.
+    signatures = [row["signature"] for row in nearby[:5000]]
+    txs = batch_transactions(signatures)
 
     wallet_txs = []
     for sig, tx in txs:
@@ -157,9 +153,7 @@ def replay_probe(probe):
     buys = [x for x in wallet_txs if x["side"] == "buy" and x["err"] is None]
     first_buy = buys[0] if buys else None
 
-    # Ledger flow around first buy: successful/failed mint-touching transactions per second.
-    flow = {}
-    delayed = {}
+    flow, delayed = {}, {}
     if first_buy:
         t0 = int(first_buy["blockTime"])
         for row in sig_rows:
@@ -169,43 +163,36 @@ def replay_probe(probe):
             key = str(int(bt) - t0)
             bucket = flow.setdefault(key, {"success": 0, "failed": 0})
             bucket["failed" if row.get("err") is not None else "success"] += 1
-        # Exact wall-clock 250ms cannot be reconstructed from integer-second blockTime.
-        delayed["250ms"] = {"certified": False, "reason": "Solana historical blockTime is integer-second resolution"}
+        delayed["250ms"] = {"certified": False, "reason": "historical Solana blockTime is integer-second resolution"}
         for delay in (1, 3, 5, 10):
             target = t0 + delay
-            candidates = [
-                (sig, tx) for sig, tx in txs
-                if tx.get("blockTime") is not None and int(tx["blockTime"]) >= target and int(tx["blockTime"]) <= target + 2
-                and (tx.get("meta") or {}).get("err") is None
-            ]
-            candidates.sort(key=lambda pair: (pair[1].get("blockTime") or 0, pair[1].get("slot") or 0))
+            candidates = sorted(
+                [(sig, tx) for sig, tx in txs if tx.get("blockTime") is not None
+                 and target <= int(tx["blockTime"]) <= target + 2
+                 and (tx.get("meta") or {}).get("err") is None],
+                key=lambda pair: (pair[1].get("blockTime") or 0, pair[1].get("slot") or 0),
+            )
             observed = None
             for sig, tx in candidates:
-                # Find a token owner with nonzero mint delta and a usable native delta.
-                owners = []
                 meta = tx.get("meta") or {}
+                owners = []
                 for bal in (meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or []):
                     if bal.get("mint") == mint and bal.get("owner"):
                         owners.append(bal["owner"])
                 for owner in dict.fromkeys(owners):
-                    s = tx_summary(sig, tx, mint, owner)
-                    if s["side"] in ("buy", "sell") and s["approx_execution_price_sol_per_token"]:
-                        observed = s
+                    summary = tx_summary(sig, tx, mint, owner)
+                    if summary["side"] in ("buy", "sell") and summary["approx_execution_price_sol_per_token"]:
+                        observed = summary
                         break
                 if observed:
                     break
             delayed[f"{delay}s"] = {"certified": observed is not None, "observed_trade": observed}
 
     return {
-        **probe,
-        "wallet": wallet,
-        "signature_pages": pages,
-        "signature_rows_window": len(sig_rows),
-        "reached_two_hours_before_proxy": reached_lower,
-        "transactions_fetched": len(txs),
-        "wallet_transactions": wallet_txs,
-        "first_buy": first_buy,
-        "flow_relative_seconds": flow,
+        **probe, "wallet": wallet, "signature_pages": pages,
+        "signature_rows_window": len(sig_rows), "reached_two_hours_before_proxy": reached_lower,
+        "transactions_fetched": len(txs), "wallet_transactions": wallet_txs,
+        "first_buy": first_buy, "flow_relative_seconds": flow,
         "delayed_observed_prices": delayed,
     }
 
