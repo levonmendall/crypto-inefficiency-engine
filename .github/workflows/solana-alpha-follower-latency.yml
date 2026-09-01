@@ -1,0 +1,30 @@
+name: Solana Alpha Follower Latency
+
+on:
+  push:
+    branches: [research/solana-alpha-certification]
+    paths:
+      - research/solana_follower_latency_probe.py
+      - .github/workflows/solana-alpha-follower-latency.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  follower-latency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Measure follower executable prices after source entry
+        run: python research/solana_follower_latency_probe.py
+      - name: Upload follower latency evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-follower-latency
+          path: solana-follower-latency.json
