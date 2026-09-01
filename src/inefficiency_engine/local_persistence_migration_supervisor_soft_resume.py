@@ -12,6 +12,8 @@ from inefficiency_engine.instance_memory import (
 
 
 MEMORY_PRESSURE_RESUME_GATE = "existing_soft_threshold"
+_ORIGINAL_MEMORY_STATUS_FIELDS = repair._memory_status_fields
+_ORIGINAL_PUBLISH_REPAIR_STATUS = repair._publish_repair_status
 
 
 @dataclass(frozen=True)
@@ -55,7 +57,7 @@ def _soft_resume_snapshot() -> _SoftResumeSnapshot:
 
 
 def _memory_status_fields(marker: dict[str, Any], snapshot: Any) -> dict[str, object]:
-    fields = repair._memory_status_fields(marker, snapshot)
+    fields = _ORIGINAL_MEMORY_STATUS_FIELDS(marker, snapshot)
     fields.update(
         memory_pressure_resume_gate=MEMORY_PRESSURE_RESUME_GATE,
         memory_pressure_resume_gate_mb=snapshot.soft_mb,
@@ -76,7 +78,7 @@ def _publish_repair_status(**kwargs: Any) -> None:
             "aggregate instance memory is below the existing soft threshold; resuming "
             "from the durable market checkpoint"
         )
-    repair._soft_resume_original_publish_repair_status(**kwargs)
+    _ORIGINAL_PUBLISH_REPAIR_STATUS(**kwargs)
 
 
 def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> None:
@@ -94,7 +96,6 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
     original_snapshot = repair.instance_memory_snapshot
     original_fields = repair._memory_status_fields
     original_publish = repair._publish_repair_status
-    repair._soft_resume_original_publish_repair_status = original_publish
     repair.instance_memory_snapshot = _soft_resume_snapshot
     repair._memory_status_fields = _memory_status_fields
     repair._publish_repair_status = _publish_repair_status
@@ -104,10 +105,6 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
         repair.instance_memory_snapshot = original_snapshot
         repair._memory_status_fields = original_fields
         repair._publish_repair_status = original_publish
-        try:
-            delattr(repair, "_soft_resume_original_publish_repair_status")
-        except AttributeError:
-            pass
 
 
 def migration_preflight():
