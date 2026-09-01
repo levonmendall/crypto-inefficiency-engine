@@ -5,6 +5,10 @@ on:
     branches: [research/solana-alpha-certification]
   workflow_dispatch:
 
+concurrency:
+  group: solana-alpha-certification-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
