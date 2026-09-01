@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
@@ -13,6 +14,13 @@ from sqlalchemy import Engine, Table, select
 
 MARKET_INVENTORY_BATCH_SIZE = 2_000
 MARKET_INVENTORY_MODE = "bounded_primary_key_accumulator"
+MARKET_INVENTORY_FINAL_SUMMARY_VERSION = 1
+_FINAL_SUMMARY_META_KEYS = (
+    "final_summary_version",
+    "final_summary_high_water",
+    "final_summary_checkpoint",
+    "final_summary_payload",
+)
 
 
 def _now() -> str:
@@ -57,6 +65,13 @@ def _meta_set(db: sqlite3.Connection, key: str, value: object) -> None:
         "INSERT INTO meta(key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, str(value)),
+    )
+
+
+def _invalidate_finalized_inventory(db: sqlite3.Connection) -> None:
+    db.executemany(
+        "DELETE FROM meta WHERE key = ?",
+        ((key,) for key in _FINAL_SUMMARY_META_KEYS),
     )
 
 
@@ -137,6 +152,7 @@ def _accumulate_batch(
     source_rows = previous_source_rows + len(rows)
     with closing(_connect_inventory(path)) as db:
         db.execute("BEGIN IMMEDIATE")
+        _invalidate_finalized_inventory(db)
         db.executemany(
             """INSERT INTO lineages(
                    lineage_hash, venue, asset, min_observed_at, max_observed_at
@@ -189,6 +205,133 @@ def _finalize_inventory(path: Path) -> dict[str, object]:
     }
 
 
+def _validated_final_summary_payload(raw: str | None, *, source_rows: int) -> dict[str, object] | None:
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        cached_source_rows = int(payload["source_rows"])
+        lineage_count = int(payload["lineage_count"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if cached_source_rows != source_rows or cached_source_rows < 0:
+        return None
+    if lineage_count < 0 or lineage_count > cached_source_rows:
+        return None
+
+    digest = payload.get("lineage_digest")
+    if not isinstance(digest, str) or len(digest) != 64:
+        return None
+    try:
+        int(digest, 16)
+    except ValueError:
+        return None
+
+    identities = payload.get("identities")
+    if not isinstance(identities, list) or not all(isinstance(value, str) for value in identities):
+        return None
+    if identities != sorted(set(identities)):
+        return None
+
+    minimum = payload.get("min_observed_at")
+    maximum = payload.get("max_observed_at")
+    if minimum is not None and not isinstance(minimum, str):
+        return None
+    if maximum is not None and not isinstance(maximum, str):
+        return None
+    if minimum is not None and maximum is not None and minimum > maximum:
+        return None
+    if cached_source_rows > 0 and (minimum is None or maximum is None):
+        return None
+
+    return {
+        "source_rows": cached_source_rows,
+        "lineage_count": lineage_count,
+        "lineage_digest": digest,
+        "min_observed_at": minimum,
+        "max_observed_at": maximum,
+        "identities": identities,
+    }
+
+
+def _read_finalized_inventory(
+    path: Path,
+    high_water: list[object] | None,
+) -> dict[str, object] | None:
+    if not high_water or len(high_water) != 1:
+        return None
+    expected_token = _high_water_token(high_water)
+    expected_checkpoint = str(int(high_water[0]))
+    with closing(_connect_inventory(path)) as db:
+        if _meta_get(db, "high_water") != expected_token:
+            return None
+        if (_meta_get(db, "checkpoint") or "") != expected_checkpoint:
+            return None
+        if _meta_get(db, "final_summary_version") != str(MARKET_INVENTORY_FINAL_SUMMARY_VERSION):
+            return None
+        if _meta_get(db, "final_summary_high_water") != expected_token:
+            return None
+        if _meta_get(db, "final_summary_checkpoint") != expected_checkpoint:
+            return None
+        source_rows = int(_meta_get(db, "source_rows") or 0)
+        raw = _meta_get(db, "final_summary_payload")
+    return _validated_final_summary_payload(raw, source_rows=source_rows)
+
+
+def _persist_finalized_inventory(
+    path: Path,
+    high_water: list[object] | None,
+    inventory: dict[str, object],
+) -> None:
+    if not high_water or len(high_water) != 1:
+        return
+    expected_token = _high_water_token(high_water)
+    expected_checkpoint = str(int(high_water[0]))
+    payload = json.dumps(inventory, sort_keys=True, separators=(",", ":"))
+    with closing(_connect_inventory(path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        if _meta_get(db, "high_water") != expected_token:
+            db.rollback()
+            raise RuntimeError("market source inventory high-water changed before summary commit")
+        if (_meta_get(db, "checkpoint") or "") != expected_checkpoint:
+            db.rollback()
+            raise RuntimeError("market source inventory checkpoint incomplete before summary commit")
+        if int(_meta_get(db, "source_rows") or 0) != int(inventory["source_rows"]):
+            db.rollback()
+            raise RuntimeError("market source inventory row count changed before summary commit")
+        _meta_set(db, "final_summary_version", MARKET_INVENTORY_FINAL_SUMMARY_VERSION)
+        _meta_set(db, "final_summary_high_water", expected_token)
+        _meta_set(db, "final_summary_checkpoint", expected_checkpoint)
+        _meta_set(db, "final_summary_payload", payload)
+        db.commit()
+
+
+def _evict_inventory_page_cache(path: Path) -> None:
+    """Best-effort eviction of clean accumulator pages after the one exact full scan.
+
+    Render charges filesystem page cache to the cgroup. The finalized source inventory
+    is durable and can be reopened later, so keeping its multi-million-row SQLite pages
+    resident after finalization has no correctness value. POSIX_FADV_DONTNEED only hints
+    that clean pages may be reclaimed; unsupported hosts simply retain the old behavior.
+    """
+
+    fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if not callable(fadvise) or dontneed is None:
+        return
+    for candidate in (path, Path(f"{path}-wal")):
+        try:
+            with candidate.open("rb", buffering=0) as handle:
+                fadvise(handle.fileno(), 0, 0, dontneed)
+        except (FileNotFoundError, OSError):
+            continue
+
+
 def bounded_market_source_inventory(
     migration: Any,
     source: Engine,
@@ -206,7 +349,10 @@ def bounded_market_source_inventory(
     that query, forcing each retry to restart the whole aggregation. This accumulator
     reads only bounded primary-key batches under the already-fixed market high-water,
     commits each batch into a durable local SQLite lineage inventory, and resumes from
-    that separate inventory checkpoint after a child or service restart.
+    that separate inventory checkpoint after a child or service restart. Once the exact
+    accumulator is complete, its deterministic final summary is cached under that same
+    high-water so later memory-pressure child restarts do not reread millions of local
+    lineage rows before they can resume the durable market copy checkpoint.
     """
 
     required = {"id", "lineage_hash", "venue", "asset", "observed_at"}
@@ -260,12 +406,21 @@ def bounded_market_source_inventory(
         )
         migration._publish(report, progress_path)
 
-    inventory = _finalize_inventory(path)
+    inventory = _read_finalized_inventory(path, high_water)
+    summary_source = "durable_cache"
+    if inventory is None:
+        inventory = _finalize_inventory(path)
+        _persist_finalized_inventory(path, high_water, inventory)
+        _evict_inventory_page_cache(path)
+        summary_source = "exact_recompute"
+
     table_report.update(
         source_inventory_phase="verified",
         source_inventory_last_primary_key=high_water,
         source_inventory_rows_scanned=inventory["source_rows"],
         source_inventory_lineage_count=inventory["lineage_count"],
+        source_inventory_final_summary_version=MARKET_INVENTORY_FINAL_SUMMARY_VERSION,
+        source_inventory_final_summary_source=summary_source,
         source_inventory_completed_at=_now(),
         last_progress_at=_now(),
     )
@@ -309,6 +464,7 @@ def install_bounded_market_inventory(migration: Any) -> None:
 
 __all__ = [
     "MARKET_INVENTORY_BATCH_SIZE",
+    "MARKET_INVENTORY_FINAL_SUMMARY_VERSION",
     "MARKET_INVENTORY_MODE",
     "bounded_market_source_inventory",
     "install_bounded_market_inventory",
