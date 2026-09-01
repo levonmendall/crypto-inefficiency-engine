@@ -116,6 +116,7 @@ def test_bounded_market_inventory_preserves_exact_equivalence(monkeypatch, tmp_p
     assert table_report["source_inventory_high_water_primary_key"] == [3]
     assert table_report["source_inventory_last_primary_key"] == [3]
     assert table_report["source_inventory_rows_scanned"] == 3
+    assert table_report["source_inventory_final_summary_source"] == "exact_recompute"
     assert table_report.get("last_primary_key") is None
 
 
@@ -259,4 +260,126 @@ def test_bounded_market_inventory_new_high_water_resets_only_inventory_accumulat
     assert second["source_rows"] == 3
     assert table_report["source_inventory_high_water_primary_key"] == [3]
     assert table_report["source_inventory_rows_scanned"] == 3
+    assert table_report["source_inventory_final_summary_source"] == "exact_recompute"
     assert table_report["last_primary_key"] == [900]
+
+
+def test_bounded_market_inventory_reuses_exact_final_summary_after_child_restart(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    source, table = _market_source()
+    monkeypatch.setattr(inventory, "MARKET_INVENTORY_BATCH_SIZE", 2)
+    progress = tmp_path / "progress.json"
+    first_report: dict[str, object] = {"last_primary_key": [2996655]}
+    first = inventory.bounded_market_source_inventory(
+        migration,
+        source,
+        table,
+        first_report,
+        _report(first_report),
+        progress,
+        high_water=[3],
+    )
+    assert first_report["source_inventory_final_summary_source"] == "exact_recompute"
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("completed inventory must not be rescanned on child restart")
+
+    monkeypatch.setattr(inventory, "_read_market_inventory_batch", forbidden)
+    monkeypatch.setattr(inventory, "_finalize_inventory", forbidden)
+    second_report: dict[str, object] = {"last_primary_key": [2996655]}
+    second = inventory.bounded_market_source_inventory(
+        migration,
+        source,
+        table,
+        second_report,
+        _report(second_report),
+        progress,
+        high_water=[3],
+    )
+
+    assert second == first
+    assert second_report["source_inventory_final_summary_source"] == "durable_cache"
+    assert second_report["source_inventory_final_summary_version"] == (
+        inventory.MARKET_INVENTORY_FINAL_SUMMARY_VERSION
+    )
+    assert second_report["last_primary_key"] == [2996655]
+
+
+def test_final_summary_cache_is_invalidated_by_new_inventory_progress(monkeypatch, tmp_path) -> None:
+    source, table = _market_source()
+    monkeypatch.setattr(inventory, "MARKET_INVENTORY_BATCH_SIZE", 2)
+    progress = tmp_path / "progress.json"
+    table_report: dict[str, object] = {}
+
+    inventory.bounded_market_source_inventory(
+        migration,
+        source,
+        table,
+        table_report,
+        _report(table_report),
+        progress,
+        high_water=[2],
+    )
+    path = inventory._inventory_path(progress)
+    assert inventory._read_finalized_inventory(path, [2]) is not None
+
+    inventory._accumulate_batch(
+        path,
+        [
+            {
+                "id": 3,
+                "lineage_hash": "lineage-c",
+                "venue": "venue-3",
+                "asset": "SOL",
+                "observed_at": "2026-08-29T03:00:00+00:00",
+            }
+        ],
+        previous_source_rows=2,
+    )
+
+    assert inventory._read_finalized_inventory(path, [2]) is None
+
+
+def test_corrupt_final_summary_falls_back_to_exact_recompute(monkeypatch, tmp_path) -> None:
+    source, table = _market_source()
+    monkeypatch.setattr(inventory, "MARKET_INVENTORY_BATCH_SIZE", 2)
+    progress = tmp_path / "progress.json"
+    first_report: dict[str, object] = {}
+    expected = inventory.bounded_market_source_inventory(
+        migration,
+        source,
+        table,
+        first_report,
+        _report(first_report),
+        progress,
+        high_water=[3],
+    )
+    path = inventory._inventory_path(progress)
+    with inventory.closing(inventory._connect_inventory(path)) as db:
+        inventory._meta_set(db, "final_summary_payload", "{not-json")
+
+    original_finalize = inventory._finalize_inventory
+    finalize_calls = 0
+
+    def record_finalize(*args, **kwargs):
+        nonlocal finalize_calls
+        finalize_calls += 1
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(inventory, "_finalize_inventory", record_finalize)
+    second_report: dict[str, object] = {}
+    observed = inventory.bounded_market_source_inventory(
+        migration,
+        source,
+        table,
+        second_report,
+        _report(second_report),
+        progress,
+        high_water=[3],
+    )
+
+    assert observed == expected
+    assert finalize_calls == 1
+    assert second_report["source_inventory_final_summary_source"] == "exact_recompute"
