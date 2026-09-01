@@ -9,13 +9,19 @@ permissions:
   contents: read
 
 jobs:
-  kol-history-metadata:
+  episode-universe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Probe raw token-history metadata
-        run: python research/kolexplorer_history_probe.py
+      - name: Build deterministic multi-wallet episode universe
+        run: python research/solana_alpha_episode_universe.py
+      - name: Upload locked episode universe
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-episode-universe
+          path: solana-alpha-episode-universe.json
