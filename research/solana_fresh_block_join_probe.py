@@ -17,7 +17,7 @@ def call(method, params):
     req = urllib.request.Request(
         RPC,
         data=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode(),
-        headers={"Content-Type":"application/json","User-Agent":"cie-fresh-block-join/1"},
+        headers={"Content-Type":"application/json","User-Agent":"cie-fresh-block-join/2"},
     )
     last = None
     for attempt in range(4):
@@ -60,9 +60,10 @@ def locate(target):
     return slot, int(bt(slot)), rate, trace
 
 
-def keys(item):
+def keys(transaction):
     out=[]
-    for key in item["transaction"]["message"]["accountKeys"]:
+    message=transaction.get("message") or {}
+    for key in message.get("accountKeys") or []:
         out.append(key.get("pubkey") if isinstance(key,dict) else key)
     return out
 
@@ -111,7 +112,7 @@ def main():
                     idx=row.get("accountIndex")
                     if isinstance(idx,int) and idx<len(account_keys) and account_keys[idx] not in token_accounts:
                         token_accounts.append(account_keys[idx])
-            matches.append({"signature":sigs[0] if sigs else None,"slot":int(slot),"blockTime":int(btime),"token_delta":d,"err":meta.get("err"),"token_accounts":token_accounts})
+            matches.append({"signature":sigs[0] if sigs else None,"slot":int(slot),"blockTime":int(btime),"token_delta":d,"err":meta.get("err"),"fee_lamports":meta.get("fee"),"token_accounts":token_accounts})
     result={**PROBE,"anchor_slot":anchor,"anchor_time":anchor_time,"slots_per_second":rate,"trace":trace,"scanned":scanned,"matches":matches}
     print("SOLANA_FRESH_BLOCK_JOIN="+json.dumps(result,sort_keys=True),flush=True)
     with open("solana-fresh-block-join.json","w",encoding="utf-8") as f: json.dump(result,f,sort_keys=True)
