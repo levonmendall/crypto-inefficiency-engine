@@ -4,11 +4,16 @@ import json
 import time
 import urllib.request
 
+from solders.pubkey import Pubkey
+
 RPC = "https://solana-rpc.publicnode.com"
+TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+ASSOCIATED_TOKEN_PROGRAM = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 WALLETS = {
     "kadenox": "B32QbbdDAyhvUQzjcaM5j6ZVKwjCxAwGH5Xgvb9SJqnC",
     "cented": "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o",
 }
+# Selected by position in the already-locked chronological OOS set before replay.
 PROBES = [
     {"index": 4751, "mint": "64aNTxPrArrcHq2seN6EXYKfCmovtpv7zCTFB8Pfpump", "kol": "kadenox", "proxy": 1787848076},
     {"index": 5251, "mint": "DYhUVrUTCpw481ivCdaQ4uwF3BWvE7qNPq1Kv2nNpump", "kol": "kadenox", "proxy": 1788122171},
@@ -18,15 +23,22 @@ PROBES = [
 
 def rpc(payload):
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(RPC, data=data, headers={"Content-Type": "application/json", "User-Agent": "cie-alpha-replay/1"})
-    for attempt in range(5):
+    req = urllib.request.Request(
+        RPC,
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "cie-alpha-replay/2"},
+    )
+    last = None
+    for attempt in range(6):
         try:
             with urllib.request.urlopen(req, timeout=45) as response:
                 return json.loads(response.read())
-        except Exception:
-            if attempt == 4:
+        except Exception as exc:
+            last = exc
+            if attempt == 5:
                 raise
-            time.sleep(0.4 * (attempt + 1))
+            time.sleep(0.5 * (attempt + 1))
+    raise last
 
 
 def one(method, params):
@@ -36,7 +48,7 @@ def one(method, params):
     return body.get("result")
 
 
-def batch_transactions(signatures, batch_size=100):
+def batch_transactions(signatures, batch_size=20):
     out = []
     config = {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}
     for start in range(0, len(signatures), batch_size):
@@ -51,11 +63,41 @@ def batch_transactions(signatures, batch_size=100):
         by_id = {int(item["id"]): item for item in body if isinstance(item, dict) and "id" in item}
         for i, sig in enumerate(chunk):
             item = by_id.get(i) or {}
+            if item.get("error"):
+                continue
             tx = item.get("result")
             if tx is not None:
                 out.append((sig, tx))
-        print(f"batch_transactions fetched={min(start + len(chunk), len(signatures))}/{len(signatures)}", flush=True)
     return out
+
+
+def associated_token_account(owner: str, mint: str) -> str:
+    owner_pk = Pubkey.from_string(owner)
+    mint_pk = Pubkey.from_string(mint)
+    ata, _ = Pubkey.find_program_address(
+        [bytes(owner_pk), bytes(TOKEN_PROGRAM), bytes(mint_pk)],
+        ASSOCIATED_TOKEN_PROGRAM,
+    )
+    return str(ata)
+
+
+def signatures_for_address(address: str, max_pages=8):
+    before = None
+    rows = []
+    for _ in range(max_pages):
+        cfg = {"limit": 1000, "commitment": "confirmed"}
+        if before:
+            cfg["before"] = before
+        page = one("getSignaturesForAddress", [address, cfg]) or []
+        if not page:
+            break
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        before = page[-1].get("signature")
+        if not before:
+            break
+    return rows
 
 
 def account_keys(tx):
@@ -105,94 +147,152 @@ def tx_summary(signature, tx, mint, wallet):
         economic_sol = native_delta + fee_sol if native_delta < 0 else native_delta
         price_sol = abs(economic_sol / token_delta)
     return {
-        "signature": signature, "blockTime": tx.get("blockTime"), "slot": tx.get("slot"),
-        "err": meta.get("err"), "fee_sol": fee_sol, "side": side,
-        "token_delta": token_delta, "native_delta_sol": native_delta,
-        "approx_execution_price_sol_per_token": price_sol,
+        "signature": signature,
+        "blockTime": tx.get("blockTime"),
+        "slot": tx.get("slot"),
+        "err": meta.get("err"),
+        "fee_sol": fee_sol,
+        "side": side,
+        "token_delta": token_delta,
+        "native_delta_sol": native_delta,
+        "execution_price_sol_per_token": price_sol,
     }
 
 
-def replay_probe(probe):
-    mint, wallet = probe["mint"], WALLETS[probe["kol"]]
-    lower, upper = probe["proxy"] - 7200, probe["proxy"] + 600
-    before, sig_rows, pages, reached_lower = None, [], 0, False
-    while pages < 30:
-        cfg = {"limit": 1000, "commitment": "confirmed"}
-        if before:
-            cfg["before"] = before
-        rows = one("getSignaturesForAddress", [mint, cfg]) or []
-        if not rows:
-            break
-        pages += 1
-        for row in rows:
-            bt = row.get("blockTime")
-            if bt is None:
-                continue
-            if bt < lower:
-                reached_lower = True
-                break
-            if bt <= upper:
-                sig_rows.append(row)
-        if reached_lower or len(rows) < 1000:
-            break
-        before = rows[-1].get("signature")
-        if not before:
-            break
-    nearby = [r for r in sig_rows if lower <= int(r.get("blockTime") or 0) <= upper]
-    # All available mint-touching signatures in the bounded window, capped only as a feasibility safety boundary.
-    signatures = [row["signature"] for row in nearby[:5000]]
-    txs = batch_transactions(signatures)
+def mint_token_accounts_in_tx(tx, mint):
+    keys = account_keys(tx)
+    meta = tx.get("meta") or {}
+    result = []
+    seen = set()
+    for row in (meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or []):
+        if row.get("mint") != mint:
+            continue
+        idx = row.get("accountIndex")
+        if not isinstance(idx, int) or idx >= len(keys):
+            continue
+        account = keys[idx]
+        if account in seen:
+            continue
+        seen.add(account)
+        result.append({"account": account, "owner": row.get("owner")})
+    return result
 
-    wallet_txs = []
-    for sig, tx in txs:
-        if wallet in account_keys(tx):
-            summary = tx_summary(sig, tx, mint, wallet)
-            if summary["side"] != "other" or summary["err"] is not None:
-                wallet_txs.append(summary)
-    wallet_txs.sort(key=lambda x: (x["blockTime"] or 0, x["slot"] or 0))
-    buys = [x for x in wallet_txs if x["side"] == "buy" and x["err"] is None]
+
+def observed_trade_from_tx(signature, tx, mint, source_wallet=None):
+    meta = tx.get("meta") or {}
+    if meta.get("err") is not None:
+        return None
+    owners = []
+    for bal in (meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or []):
+        if bal.get("mint") == mint and bal.get("owner"):
+            owners.append(bal["owner"])
+    for owner in dict.fromkeys(owners):
+        if owner == source_wallet:
+            continue
+        summary = tx_summary(signature, tx, mint, owner)
+        if summary["side"] in ("buy", "sell") and summary["execution_price_sol_per_token"]:
+            return summary
+    return None
+
+
+def replay_probe(probe):
+    mint = probe["mint"]
+    wallet = WALLETS[probe["kol"]]
+    ata = associated_token_account(wallet, mint)
+
+    # An ATA is token-specific, so its complete history is the cleanest historical
+    # join from the locked wallet-token episode to exact source transactions.
+    ata_sig_rows = signatures_for_address(ata, max_pages=8)
+    ata_txs = batch_transactions([r["signature"] for r in ata_sig_rows[:8000]])
+    source_txs = []
+    for sig, tx in ata_txs:
+        summary = tx_summary(sig, tx, mint, wallet)
+        if summary["side"] != "other" or summary["err"] is not None:
+            source_txs.append(summary)
+    source_txs.sort(key=lambda x: (x["blockTime"] or 0, x["slot"] or 0))
+    buys = [x for x in source_txs if x["side"] == "buy" and x["err"] is None]
     first_buy = buys[0] if buys else None
 
-    flow, delayed = {}, {}
+    flow = {}
+    delayed = {
+        "250ms": {
+            "certified": False,
+            "reason": "historical Solana blockTime is integer-second resolution",
+        }
+    }
+    pool_accounts = []
+    pool_signature_rows = []
+    pool_transactions = []
+
     if first_buy:
+        first_pair = next((pair for pair in ata_txs if pair[0] == first_buy["signature"]), None)
+        if first_pair:
+            _, first_tx = first_pair
+            candidates = mint_token_accounts_in_tx(first_tx, mint)
+            # Exclude the source ATA. Remaining mint token accounts are candidate
+            # bonding-curve / AMM vault accounts touched by the exact source buy.
+            pool_accounts = [x for x in candidates if x["account"] != ata]
+
         t0 = int(first_buy["blockTime"])
-        for row in sig_rows:
-            bt = row.get("blockTime")
-            if bt is None or not (t0 - 10 <= int(bt) <= t0 + 15):
+        lower, upper = t0 - 15, t0 + 20
+        combined = {}
+        # Query each counterparty token account. Deduplicate signatures because the
+        # same trade can touch more than one pool-side token account.
+        for item in pool_accounts[:4]:
+            try:
+                rows = signatures_for_address(item["account"], max_pages=5)
+            except Exception:
                 continue
-            key = str(int(bt) - t0)
-            bucket = flow.setdefault(key, {"success": 0, "failed": 0})
+            for row in rows:
+                bt = row.get("blockTime")
+                if bt is None or not (lower <= int(bt) <= upper):
+                    continue
+                combined[row["signature"]] = row
+        pool_signature_rows = sorted(
+            combined.values(), key=lambda r: (int(r.get("blockTime") or 0), r.get("slot") or 0)
+        )
+        pool_transactions = batch_transactions([r["signature"] for r in pool_signature_rows])
+
+        for row in pool_signature_rows:
+            bt = int(row.get("blockTime") or 0)
+            rel = str(bt - t0)
+            bucket = flow.setdefault(rel, {"success": 0, "failed": 0})
             bucket["failed" if row.get("err") is not None else "success"] += 1
-        delayed["250ms"] = {"certified": False, "reason": "historical Solana blockTime is integer-second resolution"}
+
+        observed_market_trades = []
+        for sig, tx in pool_transactions:
+            observed = observed_trade_from_tx(sig, tx, mint, source_wallet=wallet)
+            if observed:
+                observed_market_trades.append(observed)
+        observed_market_trades.sort(key=lambda x: (x["blockTime"] or 0, x["slot"] or 0))
+
         for delay in (1, 3, 5, 10):
             target = t0 + delay
-            candidates = sorted(
-                [(sig, tx) for sig, tx in txs if tx.get("blockTime") is not None
-                 and target <= int(tx["blockTime"]) <= target + 2
-                 and (tx.get("meta") or {}).get("err") is None],
-                key=lambda pair: (pair[1].get("blockTime") or 0, pair[1].get("slot") or 0),
-            )
-            observed = None
-            for sig, tx in candidates:
-                meta = tx.get("meta") or {}
-                owners = []
-                for bal in (meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or []):
-                    if bal.get("mint") == mint and bal.get("owner"):
-                        owners.append(bal["owner"])
-                for owner in dict.fromkeys(owners):
-                    summary = tx_summary(sig, tx, mint, owner)
-                    if summary["side"] in ("buy", "sell") and summary["approx_execution_price_sol_per_token"]:
-                        observed = summary
-                        break
-                if observed:
-                    break
-            delayed[f"{delay}s"] = {"certified": observed is not None, "observed_trade": observed}
+            eligible = [x for x in observed_market_trades if x.get("blockTime") is not None and int(x["blockTime"]) >= target]
+            observed = eligible[0] if eligible else None
+            slippage_bps = None
+            if observed and first_buy.get("execution_price_sol_per_token"):
+                source_price = float(first_buy["execution_price_sol_per_token"])
+                follower_price = float(observed["execution_price_sol_per_token"])
+                if source_price > 0:
+                    slippage_bps = (follower_price / source_price - 1.0) * 10000.0
+            delayed[f"{delay}s"] = {
+                "certified": observed is not None,
+                "observed_trade": observed,
+                "price_slippage_vs_source_bps": slippage_bps,
+            }
 
     return {
-        **probe, "wallet": wallet, "signature_pages": pages,
-        "signature_rows_window": len(sig_rows), "reached_two_hours_before_proxy": reached_lower,
-        "transactions_fetched": len(txs), "wallet_transactions": wallet_txs,
-        "first_buy": first_buy, "flow_relative_seconds": flow,
+        **probe,
+        "wallet": wallet,
+        "associated_token_account": ata,
+        "ata_signature_rows": len(ata_sig_rows),
+        "source_transactions": source_txs,
+        "first_buy": first_buy,
+        "pool_accounts": pool_accounts,
+        "pool_signature_rows_window": len(pool_signature_rows),
+        "pool_transactions_fetched": len(pool_transactions),
+        "flow_relative_seconds": flow,
         "delayed_observed_prices": delayed,
     }
 
@@ -206,12 +306,22 @@ def main():
             result = {**probe, "error": repr(exc)}
         results.append(result)
         print("probe=" + json.dumps(result, sort_keys=True), flush=True)
-    passed_join = sum(bool(r.get("first_buy")) for r in results)
-    summary = {"rpc": RPC, "probe_count": len(results), "first_buy_recovered": passed_join, "results": results}
+    recovered = sum(bool(r.get("first_buy")) for r in results)
+    delayed_counts = {
+        f"{delay}s": sum(bool((r.get("delayed_observed_prices") or {}).get(f"{delay}s", {}).get("certified")) for r in results)
+        for delay in (1, 3, 5, 10)
+    }
+    summary = {
+        "rpc": RPC,
+        "probe_count": len(results),
+        "first_buy_recovered": recovered,
+        "delayed_price_recovered": delayed_counts,
+        "results": results,
+    }
     print("SOLANA_TOKEN_REPLAY_PROBE=" + json.dumps(summary, sort_keys=True), flush=True)
     with open("solana-token-replay-probe.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, sort_keys=True)
-    if passed_join == 0:
+    if recovered == 0:
         raise SystemExit(4)
 
 
