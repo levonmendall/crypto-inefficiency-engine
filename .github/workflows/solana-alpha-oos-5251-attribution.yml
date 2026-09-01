@@ -1,0 +1,30 @@
+name: Solana Alpha OOS 5251 Attribution
+
+on:
+  push:
+    branches: [research/solana-alpha-certification]
+    paths:
+      - research/solana_oos_5251_attribution_probe.py
+      - .github/workflows/solana-alpha-oos-5251-attribution.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  attribution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Inspect exact block wallet attribution
+        run: python research/solana_oos_5251_attribution_probe.py
+      - name: Upload attribution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-oos-5251-attribution
+          path: solana-oos-5251-attribution.json
