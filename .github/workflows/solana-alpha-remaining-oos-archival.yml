@@ -1,0 +1,36 @@
+name: Solana Alpha Remaining OOS Archival
+
+on:
+  push:
+    branches: [research/solana-alpha-certification]
+    paths:
+      - research/solana_remaining_oos_archival_runner.py
+      - .github/workflows/solana-alpha-remaining-oos-archival.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    strategy:
+      fail-fast: false
+      matrix:
+        probe_index: [4751, 5251]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Replay predetermined OOS probe on archival RPC
+        env:
+          PROBE_INDEX: ${{ matrix.probe_index }}
+        run: python research/solana_remaining_oos_archival_runner.py
+      - name: Upload archival OOS evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-oos-archival-${{ matrix.probe_index }}
+          path: solana-oos-archival-${{ matrix.probe_index }}.json
