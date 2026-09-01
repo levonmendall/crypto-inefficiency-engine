@@ -1,0 +1,30 @@
+name: Solana Alpha Locked Event Execution
+
+on:
+  push:
+    branches: [research/solana-alpha-certification]
+    paths:
+      - research/solana_locked_event_execution_replay.py
+      - .github/workflows/solana-alpha-locked-event-execution.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  locked-event-execution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Replay locked OOS event with follower latency
+        run: python research/solana_locked_event_execution_replay.py
+      - name: Upload execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-locked-event-execution
+          path: solana-locked-event-execution.json
