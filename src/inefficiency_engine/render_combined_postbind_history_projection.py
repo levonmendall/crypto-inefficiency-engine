@@ -11,7 +11,7 @@ from inefficiency_engine import render_combined_postbind_lane_repair as base
 from inefficiency_engine.durable_lane_history_projection_supervisor import (
     run_durable_lane_history_projection_supervisor,
 )
-from inefficiency_engine.local_persistence_migration_supervisor_repair import (
+from inefficiency_engine.local_persistence_migration_supervisor_soft_resume import (
     migration_preflight,
     migration_status_payload,
     run_local_persistence_migration_supervisor,
