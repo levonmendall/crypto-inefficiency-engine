@@ -9,45 +9,56 @@ permissions:
   contents: read
 
 jobs:
-  provider-availability:
+  rpc-endpoint-benchmark:
     runs-on: ubuntu-latest
-    env:
-      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
-      BIRDEYE_API_KEY: ${{ secrets.BIRDEYE_API_KEY }}
-      BITQUERY_API_KEY: ${{ secrets.BITQUERY_API_KEY }}
-      SHYFT_API_KEY: ${{ secrets.SHYFT_API_KEY }}
+    timeout-minutes: 15
     steps:
-      - name: Helius credential available
-        if: ${{ env.HELIUS_API_KEY != '' }}
-        run: echo available
-      - name: Birdeye credential available
-        if: ${{ env.BIRDEYE_API_KEY != '' }}
-        run: echo available
-      - name: Bitquery credential available
-        if: ${{ env.BITQUERY_API_KEY != '' }}
-        run: echo available
-      - name: Shyft credential available
-        if: ${{ env.SHYFT_API_KEY != '' }}
-        run: echo available
-      - name: Provider availability probe complete
-        run: echo complete
-
-  historical-rpc-coverage:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Probe public Solana historical RPC coverage
+      - name: Benchmark 30-day signature backfill on Kadenox
         shell: bash
         run: |
-          set -o pipefail
-          python research/solana_alpha_rpc_probe.py 2>&1 | tee solana-alpha-rpc-probe.log
-      - name: Upload probe evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: solana-alpha-rpc-probe
-          path: solana-alpha-rpc-probe.log
+          python - <<'PY'
+          import datetime as dt, json, time, urllib.error, urllib.request
+          address='B32QbbdDAyhvUQzjcaM5j6ZVKwjCxAwGH5Xgvb9SJqnC'
+          start=int(dt.datetime(2026,8,2,19,45,tzinfo=dt.timezone.utc).timestamp())
+          end=int(dt.datetime(2026,9,1,19,45,tzinfo=dt.timezone.utc).timestamp())
+          endpoints=[
+            'https://solana.drpc.org/',
+            'https://solana-rpc.publicnode.com',
+            'https://api.mainnet-beta.solana.com',
+          ]
+          def call(url, before=None):
+            cfg={'limit':1000,'commitment':'confirmed'}
+            if before: cfg['before']=before
+            data=json.dumps({'jsonrpc':'2.0','id':1,'method':'getSignaturesForAddress','params':[address,cfg]}).encode()
+            req=urllib.request.Request(url,data=data,headers={'Content-Type':'application/json','User-Agent':'cie-solana-alpha-certification/1'})
+            with urllib.request.urlopen(req,timeout=20) as r:
+              body=json.loads(r.read())
+            if 'error' in body: raise RuntimeError(body['error'])
+            return body.get('result') or []
+          results=[]
+          for url in endpoints:
+            t0=time.monotonic(); before=None; pages=0; rows_window=0; reached=False; error=None; oldest=None
+            try:
+              while pages < 80:
+                rows=call(url,before)
+                if not rows: break
+                pages+=1
+                for row in rows:
+                  bt=row.get('blockTime')
+                  if bt is None: continue
+                  oldest=bt if oldest is None else min(oldest,bt)
+                  if bt < start:
+                    reached=True; break
+                  if bt <= end: rows_window += 1
+                if reached or len(rows)<1000: break
+                before=rows[-1].get('signature')
+                if not before: break
+            except Exception as exc:
+              error=repr(exc)
+            results.append({'url':url,'pages':pages,'rows_window':rows_window,'reached_start':reached,'oldest':oldest,'elapsed_s':round(time.monotonic()-t0,3),'error':error})
+            print('endpoint_result='+json.dumps(results[-1],sort_keys=True),flush=True)
+          print('SOLANA_RPC_ENDPOINT_BENCHMARK='+json.dumps(results,sort_keys=True),flush=True)
+          PY
