@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 jobs:
-  episode-universe:
+  token-replay-probe:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -21,11 +21,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Build deterministic multi-wallet episode universe
-        run: python research/solana_alpha_episode_universe.py
-      - name: Upload locked episode universe
+      - name: Replay deterministic locked holdout probes
+        run: python research/solana_token_replay_probe.py
+      - name: Upload replay evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: solana-alpha-episode-universe
-          path: solana-alpha-episode-universe.json
+          name: solana-token-replay-probe
+          path: solana-token-replay-probe.json
