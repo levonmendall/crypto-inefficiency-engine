@@ -11,7 +11,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,14 +26,24 @@ jobs:
         run: python -m compileall -q src
       - name: Install research dependency
         if: github.head_ref == 'research/convex-scout-backtest'
-        run: python -m pip install 'duckdb>=1.1,<2' 'pytz>=2024.1'
+        run: python -m pip install 'duckdb>=1.1,<2' 'pytz>=2024.1' 'huggingface_hub>=0.34,<2'
       - name: Convex Scout historical replay
         if: github.head_ref == 'research/convex-scout-backtest'
         run: python research/run_convex_scout_backtest.py --output convex-scout-backtest.json
+      - name: Inspect independent 39-day corpus
+        if: github.head_ref == 'research/convex-scout-backtest'
+        run: python research/inspect_pumpfun_corpus.py
       - name: Upload Convex Scout report
         if: github.head_ref == 'research/convex-scout-backtest' && always()
         uses: actions/upload-artifact@v4
         with:
           name: convex-scout-backtest
           path: convex-scout-backtest.json
+          if-no-files-found: warn
+      - name: Upload corpus schema
+        if: github.head_ref == 'research/convex-scout-backtest' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pumpfun-corpus-schema
+          path: pumpfun-corpus-schema.json
           if-no-files-found: warn
