@@ -9,27 +9,37 @@ permissions:
   contents: read
 
 jobs:
-  historical-rpc-coverage:
+  provider-availability:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     env:
       HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
       BIRDEYE_API_KEY: ${{ secrets.BIRDEYE_API_KEY }}
       BITQUERY_API_KEY: ${{ secrets.BITQUERY_API_KEY }}
       SHYFT_API_KEY: ${{ secrets.SHYFT_API_KEY }}
     steps:
+      - name: Helius credential available
+        if: ${{ env.HELIUS_API_KEY != '' }}
+        run: echo available
+      - name: Birdeye credential available
+        if: ${{ env.BIRDEYE_API_KEY != '' }}
+        run: echo available
+      - name: Bitquery credential available
+        if: ${{ env.BITQUERY_API_KEY != '' }}
+        run: echo available
+      - name: Shyft credential available
+        if: ${{ env.SHYFT_API_KEY != '' }}
+        run: echo available
+      - name: Provider availability probe complete
+        run: echo complete
+
+  historical-rpc-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Report provider credential availability without values
-        shell: bash
-        run: |
-          python - <<'PY'
-          import json, os
-          names = ("HELIUS_API_KEY", "BIRDEYE_API_KEY", "BITQUERY_API_KEY", "SHYFT_API_KEY")
-          print("SOLANA_PROVIDER_AVAILABILITY=" + json.dumps({name: bool(os.environ.get(name)) for name in names}, sort_keys=True))
-          PY
       - name: Probe public Solana historical RPC coverage
         shell: bash
         run: |
