@@ -1,0 +1,52 @@
+name: Solana Alpha Remaining OOS Matrix
+
+on:
+  push:
+    branches: [research/solana-alpha-certification]
+    paths:
+      - .github/workflows/solana-alpha-remaining-oos-matrix.yml
+      - research/solana_remaining_oos_replay.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    strategy:
+      fail-fast: false
+      matrix:
+        probe_index: [4751, 5251]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Replay predetermined holdout probe
+        env:
+          PROBE_INDEX: ${{ matrix.probe_index }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from research.solana_remaining_oos_replay import PROBES, run_probe
+          wanted = int(os.environ['PROBE_INDEX'])
+          probe = next(p for p in PROBES if int(p['index']) == wanted)
+          try:
+              result = run_probe(probe)
+          except Exception as exc:
+              result = {**probe, 'error': repr(exc)}
+          path = f"solana-oos-{wanted}.json"
+          with open(path, 'w', encoding='utf-8') as f:
+              json.dump(result, f, sort_keys=True)
+          print('SOLANA_OOS_PROBE=' + json.dumps(result, sort_keys=True), flush=True)
+          if 'follower' not in result:
+              raise SystemExit(4)
+          PY
+      - name: Upload OOS replay evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-oos-${{ matrix.probe_index }}
+          path: solana-oos-${{ matrix.probe_index }}.json
