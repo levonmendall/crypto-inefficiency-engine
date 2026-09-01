@@ -1,0 +1,30 @@
+name: Solana Alpha Archival Endpoint Probe
+
+on:
+  push:
+    branches: [research/solana-alpha-certification]
+    paths:
+      - research/solana_archival_endpoint_probe.py
+      - .github/workflows/solana-alpha-archival-endpoint.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  archival-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Probe exact historical block availability
+        run: python research/solana_archival_endpoint_probe.py
+      - name: Upload archival probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-archival-endpoint-probe
+          path: solana-archival-endpoint-probe.json
