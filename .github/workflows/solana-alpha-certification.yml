@@ -1,0 +1,30 @@
+name: Solana Alpha Certification
+
+on:
+  push:
+    branches: [research/solana-alpha-certification]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  historical-rpc-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Probe public Solana historical RPC coverage
+        shell: bash
+        run: |
+          set -o pipefail
+          python research/solana_alpha_rpc_probe.py 2>&1 | tee solana-alpha-rpc-probe.log
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-rpc-probe
+          path: solana-alpha-rpc-probe.log
