@@ -1,0 +1,30 @@
+name: Solana Alpha Fresh Block Join
+
+on:
+  push:
+    branches: [research/solana-alpha-certification]
+    paths:
+      - research/solana_fresh_block_join_probe.py
+      - .github/workflows/solana-alpha-fresh-block.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fresh-block-join:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Join final locked holdout event to Solana blocks
+        run: python research/solana_fresh_block_join_probe.py
+      - name: Upload join evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-fresh-block-join
+          path: solana-fresh-block-join.json
