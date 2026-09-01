@@ -1,0 +1,30 @@
+name: Solana Alpha Exact Block Probe
+
+on:
+  push:
+    branches: [research/solana-alpha-certification]
+    paths:
+      - research/solana_exact_block_probe.py
+      - .github/workflows/solana-alpha-exact-block.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-block-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Locate locked episode transactions by block time
+        run: python research/solana_exact_block_probe.py
+      - name: Upload exact block evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-exact-block-probe
+          path: solana-exact-block-probe.json
