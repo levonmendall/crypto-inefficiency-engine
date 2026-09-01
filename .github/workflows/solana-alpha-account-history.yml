@@ -1,0 +1,30 @@
+name: Solana Alpha Actual Account History
+
+on:
+  push:
+    branches: [research/solana-alpha-certification]
+    paths:
+      - research/solana_actual_account_history_probe.py
+      - .github/workflows/solana-alpha-account-history.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  account-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Trace discovered token account to first buy
+        run: python research/solana_actual_account_history_probe.py
+      - name: Upload account history evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-actual-account-history
+          path: solana-actual-account-history.json
