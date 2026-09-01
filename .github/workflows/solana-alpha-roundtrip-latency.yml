@@ -1,0 +1,30 @@
+name: Solana Alpha Roundtrip Latency
+
+on:
+  push:
+    branches: [research/solana-alpha-certification]
+    paths:
+      - research/solana_roundtrip_latency_probe.py
+      - .github/workflows/solana-alpha-roundtrip-latency.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  roundtrip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Measure delayed entry and delayed exit round trip
+        run: python research/solana_roundtrip_latency_probe.py
+      - name: Upload roundtrip evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-roundtrip-latency
+          path: solana-roundtrip-latency.json
