@@ -26,18 +26,18 @@ def rpc(payload):
     req = urllib.request.Request(
         RPC,
         data=data,
-        headers={"Content-Type": "application/json", "User-Agent": "cie-alpha-replay/2"},
+        headers={"Content-Type": "application/json", "User-Agent": "cie-alpha-replay/3"},
     )
     last = None
-    for attempt in range(6):
+    for attempt in range(7):
         try:
             with urllib.request.urlopen(req, timeout=45) as response:
                 return json.loads(response.read())
         except Exception as exc:
             last = exc
-            if attempt == 5:
+            if attempt == 6:
                 raise
-            time.sleep(0.5 * (attempt + 1))
+            time.sleep(0.6 * (attempt + 1))
     raise last
 
 
@@ -195,17 +195,146 @@ def observed_trade_from_tx(signature, tx, mint, source_wallet=None):
     return None
 
 
+def block_time(slot):
+    try:
+        return one("getBlockTime", [int(slot)])
+    except Exception:
+        return None
+
+
+def valid_slot_time(slot, radius=12):
+    for distance in range(radius + 1):
+        deltas = (0,) if distance == 0 else (distance, -distance)
+        for delta in deltas:
+            candidate = int(slot) + delta
+            if candidate < 0:
+                continue
+            value = block_time(candidate)
+            if value is not None:
+                return candidate, int(value)
+    return None, None
+
+
+def slot_for_timestamp(target):
+    current = int(one("getSlot", [{"commitment": "confirmed"}]))
+    # Ten million Solana slots comfortably spans this fixed 30-day research window.
+    lo = max(0, current - 10_000_000)
+    hi = current
+    lo_slot, lo_time = valid_slot_time(lo)
+    hi_slot, hi_time = valid_slot_time(hi)
+    if lo_time is None or hi_time is None or not (lo_time <= target <= hi_time):
+        raise RuntimeError(f"timestamp outside searchable slot bracket: target={target}, lo={lo_time}, hi={hi_time}")
+    lo, hi = lo_slot, hi_slot
+    best = (hi, abs(hi_time - target), hi_time)
+    for _ in range(32):
+        if lo > hi:
+            break
+        mid = (lo + hi) // 2
+        actual_slot, actual_time = valid_slot_time(mid)
+        if actual_time is None:
+            lo = mid + 1
+            continue
+        distance = abs(actual_time - target)
+        if distance < best[1]:
+            best = (actual_slot, distance, actual_time)
+        if actual_time < target:
+            lo = actual_slot + 1
+        elif actual_time > target:
+            hi = mid - 1
+        else:
+            return actual_slot, actual_time
+    return best[0], best[2]
+
+
+def get_block(slot):
+    config = {
+        "encoding": "jsonParsed",
+        "transactionDetails": "full",
+        "rewards": False,
+        "commitment": "confirmed",
+        "maxSupportedTransactionVersion": 0,
+    }
+    return one("getBlock", [int(slot), config])
+
+
+def source_trades_at_timestamp(target, mint, wallet, tolerance_seconds=2):
+    anchor_slot, anchor_time = slot_for_timestamp(target)
+    candidate_slots = one(
+        "getBlocks",
+        [max(0, anchor_slot - 24), anchor_slot + 24, {"commitment": "confirmed"}],
+    ) or []
+    matches = []
+    inspected = []
+    for slot in candidate_slots:
+        bt = block_time(slot)
+        if bt is None or abs(int(bt) - int(target)) > tolerance_seconds:
+            continue
+        inspected.append({"slot": int(slot), "blockTime": int(bt)})
+        block = get_block(slot)
+        if not block:
+            continue
+        for item in block.get("transactions") or []:
+            transaction = item.get("transaction") or {}
+            signatures = transaction.get("signatures") or []
+            if not signatures:
+                continue
+            tx = {
+                "transaction": transaction,
+                "meta": item.get("meta") or {},
+                "blockTime": int(bt),
+                "slot": int(slot),
+            }
+            delta = token_delta_for_owner(tx, mint, wallet)
+            if delta == 0:
+                continue
+            summary = tx_summary(signatures[0], tx, mint, wallet)
+            matches.append((signatures[0], tx, summary))
+    matches.sort(key=lambda x: (int(x[2].get("blockTime") or 0), int(x[2].get("slot") or 0)))
+    return anchor_slot, anchor_time, inspected, matches
+
+
 def replay_probe(probe):
     mint = probe["mint"]
     wallet = WALLETS[probe["kol"]]
-    ata = associated_token_account(wallet, mint)
+    canonical_ata = associated_token_account(wallet, mint)
 
-    # An ATA is token-specific, so its complete history is the cleanest historical
-    # join from the locked wallet-token episode to exact source transactions.
-    ata_sig_rows = signatures_for_address(ata, max_pages=8)
-    ata_txs = batch_transactions([r["signature"] for r in ata_sig_rows[:8000]])
+    # Primary join: KOL Explorer gives an exact Unix-second last-trade timestamp.
+    # Find that second on Solana and inspect only adjacent blocks for this wallet's
+    # mint balance change. No assumption about ATA layout is needed.
+    anchor_slot, anchor_time, inspected_blocks, last_matches = source_trades_at_timestamp(
+        int(probe["proxy"]), mint, wallet
+    )
+    exact_last = [x for x in last_matches if int(x[2].get("blockTime") or 0) == int(probe["proxy"])]
+    last_pair = (exact_last or last_matches)[-1] if (exact_last or last_matches) else None
+    last_trade = last_pair[2] if last_pair else None
+    last_tx = last_pair[1] if last_pair else None
+
+    actual_wallet_token_accounts = []
+    if last_tx:
+        actual_wallet_token_accounts = [
+            x for x in mint_token_accounts_in_tx(last_tx, mint) if x.get("owner") == wallet
+        ]
+
+    # Recover the token-specific account's complete history. This should expose the
+    # first buy even when the wallet's canonical ATA is not the account used.
+    source_pairs_by_signature = {}
+    account_signature_counts = {}
+    accounts_to_query = [x["account"] for x in actual_wallet_token_accounts]
+    if canonical_ata not in accounts_to_query:
+        accounts_to_query.append(canonical_ata)
+    for account in accounts_to_query:
+        try:
+            rows = signatures_for_address(account, max_pages=8)
+        except Exception:
+            rows = []
+        account_signature_counts[account] = len(rows)
+        for sig, tx in batch_transactions([r["signature"] for r in rows[:8000]]):
+            source_pairs_by_signature[sig] = tx
+    if last_pair:
+        source_pairs_by_signature[last_pair[0]] = last_pair[1]
+
     source_txs = []
-    for sig, tx in ata_txs:
+    for sig, tx in source_pairs_by_signature.items():
         summary = tx_summary(sig, tx, mint, wallet)
         if summary["side"] != "other" or summary["err"] is not None:
             source_txs.append(summary)
@@ -225,22 +354,17 @@ def replay_probe(probe):
     pool_transactions = []
 
     if first_buy:
-        first_pair = next((pair for pair in ata_txs if pair[0] == first_buy["signature"]), None)
-        if first_pair:
-            _, first_tx = first_pair
-            candidates = mint_token_accounts_in_tx(first_tx, mint)
-            # Exclude the source ATA. Remaining mint token accounts are candidate
-            # bonding-curve / AMM vault accounts touched by the exact source buy.
-            pool_accounts = [x for x in candidates if x["account"] != ata]
+        first_tx = source_pairs_by_signature.get(first_buy["signature"])
+        if first_tx:
+            source_accounts = {x["account"] for x in mint_token_accounts_in_tx(first_tx, mint) if x.get("owner") == wallet}
+            pool_accounts = [x for x in mint_token_accounts_in_tx(first_tx, mint) if x["account"] not in source_accounts]
 
         t0 = int(first_buy["blockTime"])
         lower, upper = t0 - 15, t0 + 20
         combined = {}
-        # Query each counterparty token account. Deduplicate signatures because the
-        # same trade can touch more than one pool-side token account.
-        for item in pool_accounts[:4]:
+        for item in pool_accounts[:6]:
             try:
-                rows = signatures_for_address(item["account"], max_pages=5)
+                rows = signatures_for_address(item["account"], max_pages=6)
             except Exception:
                 continue
             for row in rows:
@@ -254,8 +378,7 @@ def replay_probe(probe):
         pool_transactions = batch_transactions([r["signature"] for r in pool_signature_rows])
 
         for row in pool_signature_rows:
-            bt = int(row.get("blockTime") or 0)
-            rel = str(bt - t0)
+            rel = str(int(row.get("blockTime") or 0) - t0)
             bucket = flow.setdefault(rel, {"success": 0, "failed": 0})
             bucket["failed" if row.get("err") is not None else "success"] += 1
 
@@ -285,8 +408,14 @@ def replay_probe(probe):
     return {
         **probe,
         "wallet": wallet,
-        "associated_token_account": ata,
-        "ata_signature_rows": len(ata_sig_rows),
+        "canonical_associated_token_account": canonical_ata,
+        "anchor_slot": anchor_slot,
+        "anchor_block_time": anchor_time,
+        "inspected_blocks": inspected_blocks,
+        "last_trade_candidates": [x[2] for x in last_matches],
+        "last_trade": last_trade,
+        "actual_wallet_token_accounts": actual_wallet_token_accounts,
+        "account_signature_counts": account_signature_counts,
         "source_transactions": source_txs,
         "first_buy": first_buy,
         "pool_accounts": pool_accounts,
@@ -306,7 +435,8 @@ def main():
             result = {**probe, "error": repr(exc)}
         results.append(result)
         print("probe=" + json.dumps(result, sort_keys=True), flush=True)
-    recovered = sum(bool(r.get("first_buy")) for r in results)
+    last_recovered = sum(bool(r.get("last_trade")) for r in results)
+    first_recovered = sum(bool(r.get("first_buy")) for r in results)
     delayed_counts = {
         f"{delay}s": sum(bool((r.get("delayed_observed_prices") or {}).get(f"{delay}s", {}).get("certified")) for r in results)
         for delay in (1, 3, 5, 10)
@@ -314,14 +444,15 @@ def main():
     summary = {
         "rpc": RPC,
         "probe_count": len(results),
-        "first_buy_recovered": recovered,
+        "exact_last_trade_recovered": last_recovered,
+        "first_buy_recovered": first_recovered,
         "delayed_price_recovered": delayed_counts,
         "results": results,
     }
     print("SOLANA_TOKEN_REPLAY_PROBE=" + json.dumps(summary, sort_keys=True), flush=True)
     with open("solana-token-replay-probe.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, sort_keys=True)
-    if recovered == 0:
+    if last_recovered == 0:
         raise SystemExit(4)
 
 
