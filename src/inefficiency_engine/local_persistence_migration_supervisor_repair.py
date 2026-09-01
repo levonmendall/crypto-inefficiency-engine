@@ -4,10 +4,12 @@ import json
 import os
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from inefficiency_engine import local_persistence_migration_supervisor as base
+from inefficiency_engine.instance_memory import instance_memory_snapshot
 from inefficiency_engine.market_history_inode_recovery import (
     InodeRecoveryPartitionedMarketHistory,
     prepare_unverified_market_history_rebuild,
@@ -20,6 +22,9 @@ STDERR_TAIL_BYTES = 16_384
 MARKET_QUOTES_MIGRATION_MODE = "captured_primary_key_high_water"
 INODE_RECOVERY_MIN_FREE = 131_072
 INODE_RECOVERY_FREE_RATIO = 0.10
+MEMORY_PRESSURE_EXIT_CODE = 75
+MEMORY_PRESSURE_STATUS_FILENAME = "market-memory-guard.json"
+MEMORY_HEADROOM_POLL_SECONDS = 2.0
 COARSE_MIGRATION_COMMAND = [
     sys.executable,
     "-m",
@@ -102,6 +107,77 @@ def _checkpoint_details(progress: dict[str, Any]) -> dict[str, object]:
         "checkpoint_snapshot_high_water_primary_key": table_report.get(
             "snapshot_high_water_primary_key"
         ),
+    }
+
+
+def _timestamp(value: object) -> float | None:
+    try:
+        text = str(value or "").strip().replace("Z", "+00:00")
+        if not text:
+            return None
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _memory_pressure_status_path() -> Path:
+    _, progress_path, _, _, _ = base._paths()
+    return progress_path.parent / MEMORY_PRESSURE_STATUS_FILENAME
+
+
+def _proven_market_memory_pressure(
+    status: dict[str, object],
+    progress: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return fresh durable evidence only for PR #330's checkpointed memory exit.
+
+    The stderr file is append-only and may end with a traceback from an older child.
+    Code 75 is therefore not sufficient evidence by itself.  Require the durable
+    market-memory marker written immediately before SystemExit(75), exact agreement
+    with the current market checkpoint/high-water, and an observation timestamp no
+    older than this supervisor attempt.  Any missing or mismatched evidence falls back
+    to the existing opaque fail-closed path.
+    """
+
+    try:
+        if int(status.get("child_return_code") or 0) != MEMORY_PRESSURE_EXIT_CODE:
+            return None
+    except (TypeError, ValueError):
+        return None
+    if _market_quotes_checkpoint_marker(progress) is None:
+        return None
+
+    marker = base._read_json(_memory_pressure_status_path())
+    if marker.get("state") != "memory_pressure":
+        return None
+
+    tables = progress.get("tables")
+    market = tables.get("market_quotes") if isinstance(tables, dict) else None
+    if not isinstance(market, dict):
+        return None
+    if marker.get("checkpoint") != market.get("last_primary_key"):
+        return None
+    if marker.get("high_water_primary_key") != market.get("high_water_primary_key"):
+        return None
+
+    marker_at = _timestamp(marker.get("observed_at"))
+    supervisor_at = _timestamp(status.get("supervisor_started_at"))
+    if marker_at is None or supervisor_at is None or marker_at < supervisor_at:
+        return None
+    return marker
+
+
+def _memory_status_fields(marker: dict[str, Any], snapshot: Any) -> dict[str, object]:
+    return {
+        "memory_pressure_evidence_observed_at": marker.get("observed_at"),
+        "memory_pressure_checkpoint": marker.get("checkpoint"),
+        "memory_pressure_high_water_primary_key": marker.get("high_water_primary_key"),
+        "memory_pressure_exit_usage_mb": marker.get("usage_mb"),
+        "memory_pressure_exit_terminate_mb": marker.get("terminate_mb"),
+        "memory_pressure_current_usage_mb": snapshot.usage_mb,
+        "memory_pressure_current_start_block_mb": snapshot.start_block_mb,
+        "memory_pressure_current_terminate_mb": snapshot.terminate_mb,
+        "memory_pressure_current_source": snapshot.source,
     }
 
 
@@ -213,6 +289,7 @@ def _publish_repair_status(
     stderr_tail: str | None,
     error_type: str = "OpaqueMigrationChildExit",
     error: object | None = None,
+    extra_fields: dict[str, object] | None = None,
 ) -> None:
     public_error = error
     if public_error is None:
@@ -238,6 +315,8 @@ def _publish_repair_status(
         "allocation_authority": False,
         "live_execution_authority": False,
     }
+    if extra_fields:
+        payload.update(extra_fields)
     if retry_after_seconds is not None:
         payload["retry_after_seconds"] = float(retry_after_seconds)
     if state in {"failed", "interrupted"}:
@@ -265,6 +344,15 @@ def migration_status_payload() -> dict[str, object]:
         "checkpoint_snapshot_rows_copied",
         "checkpoint_snapshot_high_water_primary_key",
         "retry_after_seconds",
+        "memory_pressure_evidence_observed_at",
+        "memory_pressure_checkpoint",
+        "memory_pressure_high_water_primary_key",
+        "memory_pressure_exit_usage_mb",
+        "memory_pressure_exit_terminate_mb",
+        "memory_pressure_current_usage_mb",
+        "memory_pressure_current_start_block_mb",
+        "memory_pressure_current_terminate_mb",
+        "memory_pressure_current_source",
     ):
         value = supervisor.get(field)
         if field in {"error", "child_stderr_tail"}:
@@ -279,6 +367,30 @@ def migration_status_payload() -> dict[str, object]:
             value = base._bounded_public_error(value)
         payload[f"supervisor_market_history_rebuild_{field}"] = value
     return payload
+
+
+def _publish_memory_interruption(
+    *,
+    started_at: object,
+    return_code: object,
+    opaque_child_restarts: int,
+    progress: dict[str, Any],
+    stderr_tail: str | None,
+    fields: dict[str, object],
+) -> None:
+    _publish_repair_status(
+        state="interrupted",
+        reason="service_shutdown",
+        started_at=started_at,
+        child_return_code=return_code,
+        opaque_child_restarts=opaque_child_restarts,
+        retry_after_seconds=None,
+        progress=progress,
+        stderr_tail=stderr_tail,
+        error_type="StageOneMarketMemoryPressure",
+        error="service shutdown while waiting to resume checkpointed Stage 1 memory pressure",
+        extra_fields=fields,
+    )
 
 
 def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> None:
@@ -369,6 +481,97 @@ def run_local_persistence_migration_supervisor(stop_event: threading.Event) -> N
         started_at = status.get("supervisor_started_at") or base._now()
         return_code = status.get("child_return_code")
 
+        memory_marker = _proven_market_memory_pressure(status, progress)
+        memory_snapshot = instance_memory_snapshot() if memory_marker is not None else None
+        if (
+            memory_marker is not None
+            and memory_snapshot is not None
+            and memory_snapshot.usage_mb is not None
+            and memory_snapshot.start_block_mb is not None
+        ):
+            if opaque_child_restarts >= MAX_OPAQUE_CHILD_RESTARTS:
+                fields = _memory_status_fields(memory_marker, memory_snapshot)
+                _publish_repair_status(
+                    state="failed",
+                    reason="market_memory_pressure_retry_exhausted",
+                    started_at=started_at,
+                    child_return_code=return_code,
+                    opaque_child_restarts=opaque_child_restarts,
+                    retry_after_seconds=None,
+                    progress=progress,
+                    stderr_tail=None,
+                    error_type="StageOneMarketMemoryPressure",
+                    error=(
+                        "checkpointed Stage 1 memory-pressure exits exhausted the existing "
+                        f"{MAX_OPAQUE_CHILD_RESTARTS}-restart ceiling"
+                    ),
+                    extra_fields=fields,
+                )
+                return
+
+            delay = OPAQUE_CHILD_RETRY_DELAYS_SECONDS[
+                min(opaque_child_restarts, len(OPAQUE_CHILD_RETRY_DELAYS_SECONDS) - 1)
+            ]
+            opaque_child_restarts += 1
+
+            while memory_snapshot.start_blocked:
+                fields = _memory_status_fields(memory_marker, memory_snapshot)
+                _publish_repair_status(
+                    state="retry_wait",
+                    reason="market_memory_pressure_wait",
+                    started_at=started_at,
+                    child_return_code=return_code,
+                    opaque_child_restarts=opaque_child_restarts,
+                    retry_after_seconds=MEMORY_HEADROOM_POLL_SECONDS,
+                    progress=progress,
+                    stderr_tail=None,
+                    error_type="StageOneMarketMemoryPressure",
+                    error="waiting for aggregate instance memory to fall below the existing start-block threshold",
+                    extra_fields=fields,
+                )
+                if stop_event.wait(MEMORY_HEADROOM_POLL_SECONDS):
+                    _publish_memory_interruption(
+                        started_at=started_at,
+                        return_code=return_code,
+                        opaque_child_restarts=opaque_child_restarts,
+                        progress=progress,
+                        stderr_tail=None,
+                        fields=fields,
+                    )
+                    return
+                memory_snapshot = instance_memory_snapshot()
+                if memory_snapshot.usage_mb is None or memory_snapshot.start_block_mb is None:
+                    break
+
+            if memory_snapshot.usage_mb is not None and memory_snapshot.start_block_mb is not None:
+                fields = _memory_status_fields(memory_marker, memory_snapshot)
+                _publish_repair_status(
+                    state="retry_wait",
+                    reason="market_memory_pressure_headroom_recovered",
+                    started_at=started_at,
+                    child_return_code=return_code,
+                    opaque_child_restarts=opaque_child_restarts,
+                    retry_after_seconds=delay,
+                    progress=progress,
+                    stderr_tail=None,
+                    error_type="StageOneMarketMemoryPressure",
+                    error="aggregate instance memory is below the existing start-block threshold; resuming from durable market checkpoint",
+                    extra_fields=fields,
+                )
+                if stop_event.wait(delay):
+                    _publish_memory_interruption(
+                        started_at=started_at,
+                        return_code=return_code,
+                        opaque_child_restarts=opaque_child_restarts,
+                        progress=progress,
+                        stderr_tail=None,
+                        fields=fields,
+                    )
+                    return
+                continue
+            # If cgroup visibility disappears while waiting, do not infer memory
+            # recovery. Fall through to the pre-existing opaque fail-closed path.
+
         if _is_storage_exhaustion(stderr_tail):
             _publish_repair_status(
                 state="failed",
@@ -430,6 +633,8 @@ __all__ = [
     "INODE_RECOVERY_MIN_FREE",
     "MARKET_QUOTES_MIGRATION_MODE",
     "MAX_OPAQUE_CHILD_RESTARTS",
+    "MEMORY_HEADROOM_POLL_SECONDS",
+    "MEMORY_PRESSURE_EXIT_CODE",
     "migration_preflight",
     "migration_status_payload",
     "run_local_persistence_migration_supervisor",
