@@ -29,7 +29,7 @@ jobs:
         run: python -m pip install 'duckdb>=1.1,<2' 'pytz>=2024.1'
       - name: Convex Scout historical replay
         if: github.head_ref == 'research/convex-scout-backtest'
-        run: python research/convex_scout_backtest.py --output convex-scout-backtest.json
+        run: python research/run_convex_scout_backtest.py --output convex-scout-backtest.json
       - name: Upload Convex Scout report
         if: github.head_ref == 'research/convex-scout-backtest' && always()
         uses: actions/upload-artifact@v4
