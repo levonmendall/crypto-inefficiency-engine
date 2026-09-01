@@ -1,0 +1,30 @@
+name: Solana Alpha Fast Replay
+
+on:
+  push:
+    branches: [research/solana-alpha-certification]
+    paths:
+      - research/solana_token_replay_probe.py
+      - .github/workflows/solana-alpha-fast-replay.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fast-replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Replay locked holdout probes in RPC batches
+        run: python research/solana_token_replay_probe.py
+      - name: Upload fast replay evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-fast-replay
+          path: solana-token-replay-probe.json
