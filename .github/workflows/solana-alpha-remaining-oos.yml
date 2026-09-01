@@ -1,0 +1,30 @@
+name: Solana Alpha Remaining OOS Replay
+
+on:
+  push:
+    branches: [research/solana-alpha-certification]
+    paths:
+      - research/solana_remaining_oos_replay.py
+      - .github/workflows/solana-alpha-remaining-oos.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  remaining-oos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Replay remaining predetermined holdout probes
+        run: python research/solana_remaining_oos_replay.py
+      - name: Upload replay evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-alpha-remaining-oos-replay
+          path: solana-remaining-oos-replay.json
